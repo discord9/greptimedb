@@ -84,3 +84,20 @@ impl<K: Ord, V> DiffMap<K, V> {
         result
     }
 }
+
+#[test]
+fn test_diff_map(){
+    let mut a = DiffMap::default();
+    a.insert(1, 1);
+    a.insert(2, 2);
+    a.insert(3, 3);
+    assert_eq!(a.gen_diff(0), vec![((1, 1), 0, 1), ((2, 2), 0, 1), ((3, 3), 0, 1)]);
+
+    a.remove(&2);
+    assert_eq!(a.gen_diff(1), vec![((2, 2), 1, -1)]);
+
+    a.insert(2, 4);
+    assert_eq!(a.gen_diff(2), vec![((2, 4), 2, 1)]);
+    a.insert(2, 5);
+    assert_eq!(a.gen_diff(3), vec![((2, 4), 3, -1), ((2, 5), 3, 1)]);
+}
