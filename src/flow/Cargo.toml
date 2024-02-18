@@ -24,5 +24,6 @@ serde.workspace = true
 servers.workspace = true
 session.workspace = true
 snafu.workspace = true
+tokio-stream.workspace = true
 tokio.workspace = true
 tonic.workspace = true

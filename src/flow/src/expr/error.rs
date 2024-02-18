@@ -58,4 +58,10 @@ pub enum EvalError {
 
     #[snafu(display("Optimize error: {reason}"))]
     Optimize { reason: String, location: Location },
+
+    #[snafu(display("Data arrive late by {late_by:?} at {location}"))]
+    LateDataDiscarded {
+        late_by: std::time::Duration,
+        location: Location,
+    },
 }
