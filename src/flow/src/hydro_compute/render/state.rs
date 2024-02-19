@@ -55,31 +55,6 @@ impl ComputeState {
             .insert(id, Some(subgraph_id))
             .and_then(|v| v)
     }
-
-    pub fn add_input(&mut self, id: GlobalId) -> RawSend {
-        let (input_ok, ok_recv) = hydroflow::util::unbounded_channel::<DiffRow>();
-
-        let recv = ok_recv;
-        if let Some(recv_list) = self.input_recv.get_mut(&id) {
-            recv_list.push(recv);
-        } else if let Some(v) = self.input_recv.insert(id, vec![recv]) {
-            panic!("Can't add input more than once for each id {id:?}")
-        }
-
-        input_ok
-    }
-
-    pub fn add_output(&mut self, id: GlobalId) -> RawRecv {
-        let (send_ok, mut output_ok) = hydroflow::util::unbounded_channel::<DiffRow>();
-
-        let send = send_ok;
-        if let Some(send_list) = self.output_send.get_mut(&id) {
-            send_list.push(send);
-        } else if let Some(v) = self.output_send.insert(id, vec![send]) {
-            panic!("Can't add output more than once for each id {id:?}")
-        }
-        output_ok
-    }
 }
 
 /// State need to be schedule after certain time
@@ -120,7 +95,7 @@ impl TemporalFilterState {
     }
 
     /// trunc all the rows before(including) given time, and send them back
-    pub fn trunc_until(&mut self, time: Timestamp) -> Vec<(Row, Timestamp, Diff)> {
+    pub fn trunc_until_inclusive(&mut self, time: Timestamp) -> Vec<(Row, Timestamp, Diff)> {
         let mut ret = Vec::new();
         // drain all keys that are <= time
         let mut gt_time = self.spine.split_off(&(time + 1));
@@ -142,7 +117,7 @@ impl TemporalFilterState {
 /// Any keys that are not updated for a long time will be removed from the state
 /// and not sending any delta to downstream, since they are simple not used anymore
 #[derive(Debug)]
-pub struct ExpiringKeyValueStore {
+pub struct ExpiringKeyValueState {
     inner: DiffMap<Row, Row>,
     time2key: BTreeMap<Timestamp, BTreeSet<Row>>,
     /// duration after which a key is considered expired, and will be removed from state
@@ -151,7 +126,7 @@ pub struct ExpiringKeyValueStore {
     event_timestamp_from_row: ScalarExpr,
 }
 
-impl Default for ExpiringKeyValueStore {
+impl Default for ExpiringKeyValueState {
     fn default() -> Self {
         Self {
             inner: DiffMap::default(),
@@ -165,7 +140,7 @@ impl Default for ExpiringKeyValueStore {
     }
 }
 
-impl ScheduledAction for ExpiringKeyValueStore {
+impl ScheduledAction for ExpiringKeyValueState {
     fn schd_at(&self, now: repr::Timestamp) -> Option<repr::Timestamp> {
         self.time2key
             .iter()
@@ -174,7 +149,18 @@ impl ScheduledAction for ExpiringKeyValueStore {
     }
 }
 
-impl ExpiringKeyValueStore {
+impl ExpiringKeyValueState {
+    pub fn new(
+        key_expiration_duration: Option<Timestamp>,
+        event_timestamp_from_row: ScalarExpr,
+    ) -> Self {
+        Self {
+            inner: DiffMap::default(),
+            time2key: BTreeMap::new(),
+            key_expiration_duration,
+            event_timestamp_from_row,
+        }
+    }
     pub fn extract_event_ts(&self, row: &Row) -> Result<Timestamp, EvalError> {
         let ts = value_to_internal_ts(self.event_timestamp_from_row.eval(&row.inner)?)?;
         Ok(ts)
@@ -182,24 +168,30 @@ impl ExpiringKeyValueStore {
     pub fn get_expire_time(&self, current: Timestamp) -> Option<Timestamp> {
         self.key_expiration_duration.map(|d| current - d)
     }
-    pub fn trunc_expired(&mut self, cur_time: Timestamp) {
+
+    /// trunc all the rows before(excluding) given time silently
+    /// Return the number of rows removed
+    pub fn trunc_expired(&mut self, cur_time: Timestamp) -> usize {
         let expire_time = if let Some(t) = self.get_expire_time(cur_time) {
             t
         } else {
-            return;
+            return 0;
         };
-        // TODO(discord9): determine if include/exclude expire_time itself
+        // exclude expire_time itself
         let mut after = self.time2key.split_off(&expire_time);
         // swap
         std::mem::swap(&mut self.time2key, &mut after);
         let before = after;
+        let mut cnt = 0;
         for (_, keys) in before.into_iter() {
+            cnt += keys.len();
             for key in keys.into_iter() {
                 // should silently remove from inner
                 // w/out producing new delta row
                 self.inner.inner.remove(&key);
             }
         }
+        cnt
     }
 
     pub fn get(&self, k: &Row) -> Option<&Row> {
@@ -239,4 +231,82 @@ impl ExpiringKeyValueStore {
     pub fn gen_diff(&mut self, tick: repr::Timestamp) -> Vec<((Row, Row), repr::Timestamp, Diff)> {
         self.inner.gen_diff(tick)
     }
+}
+
+#[test]
+fn test_temporal_filter_state() {
+    let mut state = TemporalFilterState::default();
+    state.append_delta_row(vec![(Row::new(vec![Value::from(1)]), 1, 1)]);
+    state.append_delta_row(vec![(Row::new(vec![Value::from(1)]), 2, 1)]);
+    state.append_delta_row(vec![(Row::new(vec![Value::from(1)]), 3, -1)]);
+
+    assert_eq!(
+        state.trunc_until_inclusive(2),
+        vec![
+            (Row::new(vec![Value::from(1)]), 1, 1),
+            (Row::new(vec![Value::from(1)]), 2, 1)
+        ]
+    );
+}
+
+#[test]
+fn test_expiring_state() {
+    /// gen a state with 5s expiration and use column 0 as event timestamp
+    let mut s = ExpiringKeyValueState::new(Some(5000), ScalarExpr::Column(0));
+
+    // test insert
+    assert!(matches!(
+        s.insert(0, Row::new(vec![Value::from(0i64)]), Row::new(vec![])),
+        Ok(None)
+    ));
+    assert!(matches!(
+        s.insert(5000, Row::new(vec![Value::from(0i64)]), Row::new(vec![])),
+        Ok(Some(_))
+    ));
+
+    // test expired insert
+    assert!(matches!(
+        s.insert(5001, Row::new(vec![Value::from(0i64)]), Row::new(vec![])),
+        Err(EvalError::LateDataDiscarded { .. })
+    ));
+
+    // test trunc
+    assert_eq!(s.trunc_expired(5001), 1);
+
+    // test normal remove
+    assert!(matches!(
+        s.insert(5000, Row::new(vec![Value::from(5000i64)]), Row::new(vec![])),
+        Ok(None)
+    ));
+
+    assert!(matches!(
+        s.remove(5001, &Row::new(vec![Value::from(5000i64)])),
+        Ok(Some(_))
+    ));
+
+    // test insert -> expired -> failed remove
+    assert!(matches!(
+        s.insert(5000, Row::new(vec![Value::from(5000i64)]), Row::new(vec![])),
+        Ok(None)
+    ));
+    assert!(matches!(
+        s.remove(10_001, &Row::new(vec![Value::from(5000i64)])),
+        Err(EvalError::LateDataDiscarded { .. })
+    ));
+
+    let mut s = ExpiringKeyValueState::new(Some(5000), ScalarExpr::Column(0));
+
+    // test insert and truncate
+    assert!(matches!(
+        s.insert(0, Row::new(vec![Value::from(0i64)]), Row::new(vec![])),
+        Ok(None)
+    ));
+    assert!(matches!(
+        s.insert(0, Row::new(vec![Value::from(5000i64)]), Row::new(vec![])),
+        Ok(None)
+    ));
+    assert_eq!(s.trunc_expired(1), 0);
+    assert_eq!(s.trunc_expired(5000), 0);
+    assert_eq!(s.trunc_expired(5001), 1);
+    assert_eq!(s.trunc_expired(10_001), 1);
 }
