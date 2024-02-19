@@ -1,4 +1,5 @@
 use hydroflow::scheduled::handoff::VecHandoff;
+use hydroflow::scheduled::port::{Port, RECV, SEND};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -15,6 +16,11 @@ pub type Hoff = VecHandoff<DiffRow>;
 pub type RawRecv = UnboundedReceiverStream<DiffRow>;
 
 pub type RawSend = UnboundedSender<DiffRow>;
+
+/// Send Port for both (ok, err) using `T` as Handoff to store
+pub type SendPort<T = DiffRow> = Port<SEND, VecHandoff<T>>;
+/// Recv Port for both (ok, err) using `T` as Handoff to store
+pub type RecvPort<T = DiffRow> = Port<RECV, VecHandoff<T>>;
 
 /// An association of a global identifier to an expression.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
