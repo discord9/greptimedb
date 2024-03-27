@@ -28,7 +28,7 @@ use crate::expr::{EvalError, ScalarExpr};
 use crate::repr::DiffRow;
 use crate::utils::{ArrangeHandler, Arrangement};
 
-pub type Toff = TeeingHandoff<DiffRow>;
+pub type Toff<T = DiffRow> = TeeingHandoff<T>;
 
 /// A collection, represent a collections of data that is received from a handoff.
 pub struct Collection<T: 'static> {
@@ -84,6 +84,11 @@ impl Arranged {
                 writer: self.writer.clone(),
             })
     }
+
+    pub fn with_writer(self, writer: SubgraphId) -> Self {
+        self.writer.replace(Some(writer));
+        self
+    }
     pub fn add_reader(&self, id: SubgraphId) {
         self.readers.borrow_mut().push(id)
     }
@@ -118,6 +123,11 @@ impl CollectionBundle {
                 .collect(),
         }
     }
+    pub fn add_reader(&self, id: SubgraphId) {
+        for (_, arr) in self.arranged.iter() {
+            arr.add_reader(id)
+        }
+    }
 }
 
 /// A thread local error collector, used to collect errors during the evaluation of the plan
@@ -132,12 +142,16 @@ impl ErrCollector {
     pub fn push_err(&self, err: EvalError) {
         self.inner.borrow_mut().push_back(err)
     }
-    pub fn run<F>(&self, f: F)
+    pub fn run<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce() -> Result<(), EvalError>,
+        F: FnOnce() -> Result<R, EvalError>,
     {
-        if let Err(e) = f() {
-            self.push_err(e)
+        match f() {
+            Err(e) => {
+                self.push_err(e);
+                None
+            }
+            Ok(r) => Some(r),
         }
     }
 }

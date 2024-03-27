@@ -95,6 +95,11 @@ impl AggregateFunc {
         self.signature().generic_fn == GenericFn::Sum
     }
 
+    /// Get the length of accumulator state for this function
+    pub fn get_accum_len(&self)->Result<usize, EvalError>{
+        Accum::get_accum_len(self)
+    }
+
     /// Eval value, diff with accumulator
     ///
     /// Expect self to be accumulable aggregate functio, i.e. sum/count

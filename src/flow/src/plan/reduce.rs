@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expr::{AggregateExpr, Id, LocalId, MapFilterProject, SafeMfpPlan, ScalarExpr};
+use crate::expr::{
+    AggregateExpr, EvalError, Id, LocalId, MapFilterProject, SafeMfpPlan, ScalarExpr,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 pub struct KeyValPlan {
@@ -47,4 +52,24 @@ pub struct AccumulablePlan {
     pub simple_aggrs: Vec<(usize, usize, AggregateExpr)>,
     /// Same as above but for all of the `DISTINCT` accumulable aggregations.
     pub distinct_aggrs: Vec<(usize, usize, AggregateExpr)>,
+}
+
+impl AccumulablePlan {
+    /// Return a mapping from `input_idx` to `accum_start_offset`
+    pub fn get_offset(&self) -> Result<Vec<usize>, EvalError> {
+        let mut mapping = BTreeMap::new();
+        for (_, input_idx, aggr_fn) in self.simple_aggrs.iter().chain(self.distinct_aggrs.iter()) {
+            mapping.insert(*input_idx, aggr_fn.func.get_accum_len()?);
+        }
+        // sort and sum prefix
+        let prefix_sums = mapping
+            .values()
+            .scan(0, |sum, &num| {
+                let ret = Some(*sum);
+                *sum += num;
+                ret
+            })
+            .collect_vec();
+        Ok(prefix_sums)
+    }
 }

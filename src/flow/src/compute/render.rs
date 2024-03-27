@@ -19,6 +19,7 @@ use std::rc::Rc;
 use hydroflow::lattices::cc_traits::Get;
 use hydroflow::scheduled::graph::Hydroflow;
 use hydroflow::scheduled::graph_ext::GraphExt;
+use hydroflow::scheduled::port::{Port, RECV, SEND};
 use itertools::Itertools;
 use snafu::{OptionExt, ResultExt};
 
@@ -26,8 +27,8 @@ use crate::adapter::error::{Error, EvalSnafu, InvalidQuerySnafu};
 use crate::compute::state::DataflowState;
 use crate::compute::types::{Arranged, Collection, CollectionBundle, ErrCollector, Toff};
 use crate::expr::{self, EvalError, GlobalId, LocalId, MapFilterProject, MfpPlan, ScalarExpr};
-use crate::plan::Plan;
-use crate::repr::{self, DiffRow, Row};
+use crate::plan::{AccumulablePlan, KeyValPlan, Plan, ReducePlan};
+use crate::repr::{self, DiffRow, KeyValDiffRow, Row};
 use crate::utils::{ArrangeHandler, Arrangement};
 
 /// The Context for build a Operator with id of `GlobalId`
@@ -191,10 +192,7 @@ impl<'referred, 'df> Context<'referred, 'df> {
                         })
                         .collect_vec();
 
-                    err_collector.run(|| {
-                        arrange.write().apply_updates(now, updates)?;
-                        Ok(())
-                    });
+                    err_collector.run(|| arrange.write().apply_updates(now, updates));
                 }
 
                 // deal with output
@@ -210,10 +208,7 @@ impl<'referred, 'df> Context<'referred, 'df> {
                     .map(|((k, _v), t, d)| (k, t, d))
                     .collect_vec();
                 send.give(output);
-                err_collector.run(|| {
-                    arrange.write().set_compaction(now)?;
-                    Ok(())
-                });
+                err_collector.run(|| arrange.write().set_compaction(now));
                 // schedule the next time this operator should run
                 if let Some(i) = arrange.read().get_next_update_time(&now) {
                     scheduler.schedule_at(i)
@@ -233,6 +228,175 @@ impl<'referred, 'df> Context<'referred, 'df> {
             arranged,
         };
         Ok(bundle)
+    }
+
+    pub fn render_reduce(
+        &mut self,
+        input: CollectionBundle,
+        key_val_plan: KeyValPlan,
+        reduce_plan: ReducePlan,
+    ) -> Result<CollectionBundle, Error> {
+        let output_arrange = ArrangeHandler::from(Arrangement::new());
+        // because the output row is concat from (key .. val), so the key is the first `key_arity` columns
+        let key_arity = key_val_plan.key_plan.mfp.projection.len();
+
+        let (kv_send_port, kv_recv_port) =
+            self.df.make_edge::<_, Toff<KeyValDiffRow>>("reduce_get_kv");
+
+        // This closure capture following variables:
+        let as_of = self.compute_state.as_of.clone();
+        let err_collector = self.err_collector.clone();
+
+        // TODO(discord9): reduce memory allocation from Vec
+        // maybe using arena allocator for all those small allocations
+        self.df.add_subgraph_in_out(
+            "reduce",
+            input.collection.stream,
+            kv_send_port,
+            move |_ctx, recv, kv_send| {
+                let mut row_buf = Row::empty();
+                let mut datum_vec = Vec::with_capacity(key_arity + 1);
+                let mut kv_pairs = Vec::new();
+
+                for (mut input_row, ts, diff) in recv.take_inner().into_iter().flatten() {
+                    datum_vec.clear();
+                    datum_vec.extend(input_row.inner.clone());
+                    let key = match key_val_plan
+                        .key_plan
+                        .evaluate_into(&mut datum_vec, &mut row_buf)
+                    {
+                        Ok(Some(k)) => k,
+                        // didn't pass the filter
+                        Ok(None) => continue,
+                        Err(err) => {
+                            // gather all errors and continue
+                            err_collector.push_err(err);
+                            continue;
+                        }
+                    };
+
+                    let val = match key_val_plan
+                        .val_plan
+                        .evaluate_into(&mut input_row.inner, &mut row_buf)
+                    {
+                        Ok(Some(k)) => k,
+                        // didn't pass the filter
+                        Ok(None) => continue,
+                        Err(err) => {
+                            // gather all errors and continue
+                            err_collector.push_err(err);
+                            continue;
+                        }
+                    };
+                    kv_pairs.push(((key, val), ts, diff));
+                }
+                kv_send.give(kv_pairs);
+            },
+        );
+
+        self.render_reduce_plan(reduce_plan, kv_recv_port, key_arity)
+    }
+
+    pub fn render_reduce_plan(
+        &mut self,
+        reduce_plan: ReducePlan,
+        kv_recv_port: Port<RECV, Toff<KeyValDiffRow>>,
+        key_arity: usize,
+    ) -> Result<CollectionBundle, Error> {
+        match reduce_plan {
+            ReducePlan::Distinct => self.render_distinct(kv_recv_port, key_arity),
+            ReducePlan::Accumulable(accum_plan) => {
+                self.render_accumulable(accum_plan, kv_recv_port, key_arity)
+            }
+        }
+    }
+
+    pub fn render_distinct(
+        &mut self,
+        kv_recv_port: Port<RECV, Toff<KeyValDiffRow>>,
+        key_arity: usize,
+    ) -> Result<CollectionBundle, Error> {
+        let output_arrange = ArrangeHandler::from(Arrangement::new());
+
+        let (output_send_port, output_recv_port) = self.df.make_edge::<_, Toff>("distinct_reduce");
+
+        // This closure capture following variables:
+        let output_arrange_inner = output_arrange
+            .clone_full_arrange()
+            .expect("This arrange can't be written before clone happened");
+        let as_of = self.compute_state.as_of.clone();
+        let err_collector = self.err_collector.clone();
+
+        self.df.add_subgraph_in_out(
+            "reduce_distinct",
+            kv_recv_port,
+            output_send_port,
+            move |_ctx, recv, send| {
+                // hold the write lock of our output just in case
+                let output_arrange = &mut output_arrange_inner.write();
+                let now = *as_of.borrow();
+
+                for ((key, _val), ts, diff) in recv.take_inner().into_iter().flatten() {
+                    // if key is not in the set, add it to the set
+                    if output_arrange.get(now, &key).is_none() {
+                        // only need to store key
+                        err_collector.run(|| {
+                            output_arrange.apply_updates(now, vec![((key, Row::empty()), ts, diff)])
+                        });
+                    }
+                }
+                send.give(
+                    output_arrange
+                        .get_updates_since_last_compact_to(now)
+                        .into_iter()
+                        .map(|((k, _v), t, d)| (k, t, d))
+                        .collect_vec(),
+                );
+                err_collector.run(|| output_arrange.set_compaction(now));
+            },
+        );
+
+        let arranged = BTreeMap::from([(
+            (0..key_arity).map(ScalarExpr::Column).collect_vec(),
+            Arranged::new(output_arrange),
+        )]);
+        Ok(CollectionBundle {
+            collection: Collection::from_port(output_recv_port),
+            arranged,
+        })
+    }
+
+    pub fn render_accumulable(
+        &mut self,
+        accum_plan: AccumulablePlan,
+        kv_recv_port: Port<RECV, Toff<KeyValDiffRow>>,
+        key_arity: usize,
+    ) -> Result<CollectionBundle, Error> {
+        let output_arrange = ArrangeHandler::from(Arrangement::new());
+
+        let (output_send_port, output_recv_port) = self.df.make_edge::<_, Toff>("distinct_reduce");
+
+        // This closure capture following variables:
+        let output_arrange_inner = output_arrange
+            .clone_full_arrange()
+            .expect("This arrange can't be written before clone happened");
+        let as_of = self.compute_state.as_of.clone();
+        let err_collector = self.err_collector.clone();
+        let input_accum_offset = accum_plan.get_offset().context(EvalSnafu)?;
+
+        self.df.add_subgraph_in_out(
+            "reduce_accumulable",
+            kv_recv_port,
+            output_send_port,
+            move |_ctx, recv, send| {
+                let output_arrange = output_arrange_inner.write();
+                // TODO: batch values of the same key
+                for ((key, val), ts, diff) in recv.take_inner().into_iter().flatten() {
+
+                }
+            },
+        );
+        todo!()
     }
 }
 

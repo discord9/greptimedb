@@ -294,6 +294,15 @@ impl Arrangement {
         Ok(max_late_by)
     }
 
+    /// Get all updates since last compaction time(Excluded) to now(Included)
+    pub fn get_updates_since_last_compact_to(&self, now: Timestamp) -> Vec<KeyValDiffRow> {
+        let last = self.get_compaction();
+        match last {
+            Some(last) => self.get_updates_in_range((last + 1)..=now),
+            None => self.get_updates_in_range(..=now),
+        }
+    }
+
     /// get the updates of the arrangement from the given range of time
     pub fn get_updates_in_range<R: std::ops::RangeBounds<Timestamp> + Clone>(
         &self,

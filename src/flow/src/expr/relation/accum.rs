@@ -617,6 +617,29 @@ impl Accum {
             .build()),
         }
     }
+    pub fn get_accum_len(aggr_fn: &AggregateFunc) -> Result<usize, EvalError> {
+        match aggr_fn {
+            AggregateFunc::Any
+            | AggregateFunc::All
+            | AggregateFunc::MaxBool
+            | AggregateFunc::MinBool => Ok(2),
+            AggregateFunc::SumInt16
+            | AggregateFunc::SumInt32
+            | AggregateFunc::SumInt64
+            | AggregateFunc::SumUInt16
+            | AggregateFunc::SumUInt32
+            | AggregateFunc::SumUInt64 => Ok(2),
+            AggregateFunc::SumFloat32 | AggregateFunc::SumFloat64 => Ok(5),
+            f if f.is_max() || f.is_min() || matches!(f, AggregateFunc::Count) => Ok(2),
+            f => Err(InternalSnafu {
+                reason: format!(
+                    "Accumulator does not support this aggregation function: {:?}",
+                    f
+                ),
+            }
+            .build()),
+        }
+    }
 }
 
 fn err_try_from_val<T: Display>(reason: T) -> EvalError {
