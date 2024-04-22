@@ -315,6 +315,7 @@ impl Arrangement {
         Ok(max_late_by)
     }
 
+    /// TODO(discord9): add `take_updates_in_range`
     /// get the updates of the arrangement from the given range of time
     pub fn get_updates_in_range<R: std::ops::RangeBounds<Timestamp> + Clone>(
         &self,

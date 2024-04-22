@@ -15,4 +15,25 @@
 //! for getting data from source and sending results to sink
 //! and communicating with other parts of the database
 
+use std::collections::BTreeMap;
+
+use hydroflow::scheduled::graph::Hydroflow;
+use tokio::task::LocalSet;
+
+use crate::compute::DataflowState;
+
 pub(crate) mod error;
+
+pub type TaskName = String;
+
+/// FlowNodeManager manages the state of all tasks in the flow node, which should be run on the same thread
+pub struct FlowNodeManager<'a> {
+    pub task_states: BTreeMap<TaskName, ActiveDataflowState<'a>>,
+    pub local_set: LocalSet,
+}
+
+/// ActiveDataflowState is a wrapper around `Hydroflow` and `DataflowState`
+pub struct ActiveDataflowState<'a> {
+    df: Hydroflow<'a>,
+    state: DataflowState,
+}

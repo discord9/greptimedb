@@ -44,6 +44,7 @@ use crate::repr::{self, DiffRow, KeyValDiffRow, Row};
 use crate::utils::{ArrangeHandler, ArrangeReader, ArrangeWriter, Arrangement};
 
 mod map;
+mod src_sink;
 
 /// The Context for build a Operator with id of `GlobalId`
 pub struct Context<'referred, 'df> {
