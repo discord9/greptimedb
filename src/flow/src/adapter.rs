@@ -24,16 +24,16 @@ use crate::compute::DataflowState;
 
 pub(crate) mod error;
 
-pub type TaskName = String;
+pub type TaskId = u64;
 
 /// FlowNodeManager manages the state of all tasks in the flow node, which should be run on the same thread
-pub struct FlowNodeManager<'a> {
-    pub task_states: BTreeMap<TaskName, ActiveDataflowState<'a>>,
+pub struct FlowNodeManager<'subgraph> {
+    pub task_states: BTreeMap<TaskId, ActiveDataflowState<'subgraph>>,
     pub local_set: LocalSet,
 }
 
 /// ActiveDataflowState is a wrapper around `Hydroflow` and `DataflowState`
-pub struct ActiveDataflowState<'a> {
-    df: Hydroflow<'a>,
+pub struct ActiveDataflowState<'subgraph> {
+    df: Hydroflow<'subgraph>,
     state: DataflowState,
 }

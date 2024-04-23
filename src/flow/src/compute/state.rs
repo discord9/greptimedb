@@ -25,6 +25,7 @@ use crate::utils::{ArrangeHandler, Arrangement};
 
 /// input/output of a dataflow
 /// One `ComputeState` manage the input/output/schedule of one `Hydroflow`
+/// which is also corrseponding to one `Task`
 #[derive(Default)]
 pub struct DataflowState {
     /// it is important to use a deque to maintain the order of subgraph here
