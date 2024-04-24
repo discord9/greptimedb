@@ -14,11 +14,22 @@
 
 //! Transform Substrait into execution plan
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use datatypes::data_type::ConcreteDataType as CDT;
+use prost::Message;
+use query::parser::QueryLanguageParser;
+use query::plan::LogicalPlan;
+use query::QueryEngine;
+use session::context::QueryContext;
+use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 
-use crate::adapter::error::{Error, NotImplementedSnafu, TableNotFoundSnafu};
+use crate::adapter::error::{
+    Error, InvalidQueryPlanSnafu, InvalidQueryProstSnafu, InvalidQuerySubstraitSnafu,
+    NotImplementedSnafu, TableNotFoundSnafu,
+};
 use crate::expr::GlobalId;
+use crate::plan::TypedPlan;
 use crate::repr::RelationType;
 /// a simple macro to generate a not implemented error
 macro_rules! not_impl_err {
@@ -44,7 +55,7 @@ mod literal;
 mod plan;
 
 use literal::{from_substrait_literal, from_substrait_type};
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 use substrait::substrait_proto::proto::extensions::simple_extension_declaration::MappingType;
 use substrait::substrait_proto::proto::extensions::SimpleExtensionDeclaration;
 
@@ -80,6 +91,8 @@ impl FunctionExtensions {
 }
 
 /// A context that holds the information of the dataflow
+///
+/// This Context should be refresh everytime create task is required
 pub struct DataflowContext {
     /// `id` refer to any source table in the dataflow, and `name` is the name of the table
     /// which is a `Vec<String>` in substrait
@@ -111,6 +124,35 @@ impl DataflowContext {
             })?;
         Ok((id, schema))
     }
+}
+
+/// To reuse existing code for parse sql, the sql is first parsed into a datafusion logical plan,
+/// then to a substrait plan, and finally to a flow plan.
+/// TODO: check if use empty `QueryContext` influence anything
+pub async fn sql_to_flow_plan(
+    ctx: &mut DataflowContext,
+    engine: &Arc<dyn QueryEngine>,
+    sql: &str,
+) -> Result<TypedPlan, Error> {
+    let stmt =
+        QueryLanguageParser::parse_sql(sql, &QueryContext::arc()).context(InvalidQueryPlanSnafu)?;
+    let plan = engine
+        .planner()
+        .plan(stmt, QueryContext::arc())
+        .await
+        .context(InvalidQueryPlanSnafu)?;
+    let LogicalPlan::DfPlan(plan) = plan;
+
+    // encode then decode so to rely on the impl of conversion from logical plan to substrait plan
+    let bytes = DFLogicalSubstraitConvertor {}
+        .encode(&plan)
+        .context(InvalidQuerySubstraitSnafu)?;
+
+    let sub_plan = substrait::substrait_proto::proto::Plan::decode(bytes)
+        .map_err(|inner| InvalidQueryProstSnafu { inner }.build())?;
+    let flow_plan = TypedPlan::from_substrait_plan(ctx, &sub_plan)?;
+
+    Ok(flow_plan)
 }
 
 #[cfg(test)]
