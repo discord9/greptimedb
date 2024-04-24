@@ -18,15 +18,16 @@ use std::rc::Rc;
 
 use hydroflow::scheduled::graph::Hydroflow;
 use hydroflow::scheduled::SubgraphId;
+use serde::{Deserialize, Serialize};
 
 use crate::compute::types::ErrCollector;
 use crate::repr::{self, Timestamp};
 use crate::utils::{ArrangeHandler, Arrangement};
 
-/// input/output of a dataflow
+/// input/output of a dataflow Task
 /// One `ComputeState` manage the input/output/schedule of one `Hydroflow`
 /// which is also corrseponding to one `Task`
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DataflowState {
     /// it is important to use a deque to maintain the order of subgraph here
     /// TODO(discord9): consider dedup? Also not necessary for hydroflow itself also do dedup when schedule
@@ -37,7 +38,7 @@ pub struct DataflowState {
     /// We *should* apply it to sources and imported shared state, because it improves performance.
     /// Which means it's also the current time in temporal filter to get current correct result
     as_of: Rc<RefCell<Timestamp>>,
-    /// error collector local to this `ComputeState`,
+    /// error collector local to this `DataflowState`,
     /// useful for distinguishing errors from different `Hydroflow`
     err_collector: ErrCollector,
     /// save all used arrange in this dataflow, since usually there is no delete operation

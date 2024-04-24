@@ -93,7 +93,7 @@ impl FunctionExtensions {
 /// A context that holds the information of the dataflow
 ///
 /// This Context should be refresh everytime create task is required
-pub struct DataflowContext {
+pub struct FlowNodeContext {
     /// `id` refer to any source table in the dataflow, and `name` is the name of the table
     /// which is a `Vec<String>` in substrait
     id_to_name: HashMap<GlobalId, Vec<String>>,
@@ -103,7 +103,7 @@ pub struct DataflowContext {
     schema: HashMap<GlobalId, RelationType>,
 }
 
-impl DataflowContext {
+impl FlowNodeContext {
     /// Retrieves a GlobalId and table schema representing a table previously registered by calling the [register_table] function.
     ///
     /// Returns an error if no table has been registered with the provided names
@@ -130,7 +130,7 @@ impl DataflowContext {
 /// then to a substrait plan, and finally to a flow plan.
 /// TODO: check if use empty `QueryContext` influence anything
 pub async fn sql_to_flow_plan(
-    ctx: &mut DataflowContext,
+    ctx: &mut FlowNodeContext,
     engine: &Arc<dyn QueryEngine>,
     sql: &str,
 ) -> Result<TypedPlan, Error> {
@@ -173,12 +173,12 @@ mod test {
     use super::*;
     use crate::repr::ColumnType;
 
-    pub fn create_test_ctx() -> DataflowContext {
+    pub fn create_test_ctx() -> FlowNodeContext {
         let gid = GlobalId::User(0);
         let name = vec!["numbers".to_string()];
         let schema = RelationType::new(vec![ColumnType::new(CDT::uint32_datatype(), false)]);
 
-        DataflowContext {
+        FlowNodeContext {
             id_to_name: HashMap::from([(gid, name.clone())]),
             name_to_id: HashMap::from([(name.clone(), gid)]),
             schema: HashMap::from([(gid, schema)]),
