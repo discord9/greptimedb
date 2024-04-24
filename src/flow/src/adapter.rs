@@ -63,9 +63,9 @@ pub struct FlowNodeManager<'subgraph> {
 
 /// mapping of table name <-> table id should be query from tableinfo manager
 struct TableNameIdMapping {
-    // for query `TableId -> TableName` mapping
+    /// for query `TableId -> TableName` mapping
     table_info_manager: TableInfoManager,
-    // for query `TableName -> TableId` mapping
+    /// for query `TableName -> TableId` mapping
     table_name_manager: TableNameManager,
     // a in memory cache, will be invalid if necessary
 }
