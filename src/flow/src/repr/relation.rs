@@ -181,6 +181,11 @@ impl RelationType {
         }
     }
 
+    pub fn with_time_index(mut self, time_index: Option<usize>) -> Self {
+        self.time_index = time_index;
+        self
+    }
+
     /// Adds a new key for the relation. Also sorts the key indices.
     ///
     /// will ignore empty key

@@ -300,8 +300,26 @@ impl TypedPlan {
             return not_impl_err!("Aggregate without an input is not supported");
         };
 
-        let group_exprs =
-            TypedExpr::from_substrait_agg_grouping(ctx, &agg.groupings, &input.typ, extensions)?;
+        let group_exprs = {
+            let group_exprs = TypedExpr::from_substrait_agg_grouping(
+                ctx,
+                &agg.groupings,
+                &input.typ,
+                extensions,
+            )?;
+
+            TypedExpr::expand_multi_value(&group_exprs)?
+        };
+
+        let time_index = group_exprs.iter().position(|expr| {
+            matches!(
+                &expr.expr,
+                ScalarExpr::CallUnary {
+                    func: UnaryFunc::TumbleWindowFloor { .. },
+                    expr: _
+                }
+            )
+        });
 
         let (mut aggr_exprs, post_mfp) =
             AggregateExpr::from_substrait_agg_measures(ctx, &agg.measures, &input.typ, extensions)?;
@@ -330,6 +348,7 @@ impl TypedPlan {
             } else {
                 RelationType::new(output_types).with_key((0..group_exprs.len()).collect_vec())
             }
+            .with_time_index(time_index)
         };
 
         // copy aggr_exprs to full_aggrs, and split them into simple_aggrs and distinct_aggrs
@@ -582,6 +601,64 @@ mod test {
                     ])
                     .unwrap()
                     .project(vec![3])
+                    .unwrap(),
+            },
+        };
+        assert_eq!(flow_plan.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_tumble_parse() {
+        let engine = create_test_query_engine();
+        let sql = "SELECT sum(number) FROM numbers_with_ts GROUP BY tumble(ts, cast(1000 AS INTERVAL), '2021-07-01 00:00:00'::timestamp)";
+        let plan = sql_to_substrait(engine.clone(), sql).await;
+
+        let mut ctx = create_test_ctx();
+        let flow_plan = TypedPlan::from_substrait_plan(&mut ctx, &plan);
+        let typ = RelationType::new(vec![ColumnType::new(
+            ConcreteDataType::uint32_datatype(),
+            true,
+        )]);
+        let aggr_expr = AggregateExpr {
+            func: AggregateFunc::SumUInt32,
+            expr: ScalarExpr::Column(0),
+            distinct: false,
+        };
+        let expected = TypedPlan {
+            typ: RelationType::new(vec![ColumnType::new(CDT::uint32_datatype(), true)]),
+            plan: Plan::Mfp {
+                input: Box::new(
+                    Plan::Reduce {
+                        input: Box::new(
+                            Plan::Get {
+                                id: crate::expr::Id::Global(GlobalId::User(0)),
+                            }
+                            .with_types(RelationType::new(vec![
+                                ColumnType::new(ConcreteDataType::uint32_datatype(), false),
+                            ])),
+                        ),
+                        key_val_plan: KeyValPlan {
+                            key_plan: MapFilterProject::new(1)
+                                .project(vec![])
+                                .unwrap()
+                                .into_safe(),
+                            val_plan: MapFilterProject::new(1)
+                                .project(vec![0])
+                                .unwrap()
+                                .into_safe(),
+                        },
+                        reduce_plan: ReducePlan::Accumulable(AccumulablePlan {
+                            full_aggrs: vec![aggr_expr.clone()],
+                            simple_aggrs: vec![AggrWithIndex::new(aggr_expr.clone(), 0, 0)],
+                            distinct_aggrs: vec![],
+                        }),
+                    }
+                    .with_types(typ),
+                ),
+                mfp: MapFilterProject::new(1)
+                    .map(vec![ScalarExpr::Column(0), ScalarExpr::Column(1)])
+                    .unwrap()
+                    .project(vec![2])
                     .unwrap(),
             },
         };

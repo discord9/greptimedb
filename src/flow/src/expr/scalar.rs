@@ -29,7 +29,8 @@ use crate::expr::func::{BinaryFunc, UnaryFunc, UnmaterializableFunc, VariadicFun
 use crate::repr::ColumnType;
 
 /// A scalar expression with a known type.
-#[derive(Debug, Clone)]
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypedExpr {
     /// The expression.
     pub expr: ScalarExpr,
@@ -40,6 +41,44 @@ pub struct TypedExpr {
 impl TypedExpr {
     pub fn new(expr: ScalarExpr, typ: ColumnType) -> Self {
         Self { expr, typ }
+    }
+}
+
+impl TypedExpr {
+    pub fn expand_multi_value(exprs: &[TypedExpr]) -> Result<Vec<TypedExpr>, Error> {
+        let mut ret = vec![];
+        for expr in exprs {
+            if let ScalarExpr::CallUnmaterializable(UnmaterializableFunc::TumbleWindow {
+                ts,
+                window_size,
+                start_time,
+            }) = &expr.expr
+            {
+                let floor = UnaryFunc::TumbleWindowFloor {
+                    window_size: *window_size,
+                    start_time: *start_time,
+                };
+                let ceil = UnaryFunc::TumbleWindowCeiling {
+                    window_size: *window_size,
+                    start_time: *start_time,
+                };
+                let floor = ScalarExpr::CallUnary {
+                    func: floor,
+                    expr: Box::new(ts.expr.clone()),
+                }
+                .with_type(ts.typ.clone());
+                ret.push(floor);
+                let ceil = ScalarExpr::CallUnary {
+                    func: ceil,
+                    expr: Box::new(ts.expr.clone()),
+                }
+                .with_type(ts.typ.clone());
+                ret.push(ceil);
+            } else {
+                ret.push(expr.clone())
+            }
+        }
+        Ok(ret)
     }
 }
 
@@ -83,6 +122,9 @@ pub enum ScalarExpr {
 }
 
 impl ScalarExpr {
+    pub fn with_type(self, typ: ColumnType) -> TypedExpr {
+        TypedExpr::new(self, typ)
+    }
     /// try to determine the type of the expression
     pub fn typ(&self, context: &[ColumnType]) -> Result<ColumnType, Error> {
         match self {

@@ -36,7 +36,7 @@ use crate::expr::error::{
     TypeMismatchSnafu,
 };
 use crate::expr::signature::{GenericFn, Signature};
-use crate::expr::{InvalidArgumentSnafu, ScalarExpr};
+use crate::expr::{InvalidArgumentSnafu, ScalarExpr, TypedExpr};
 use crate::repr::{value_to_internal_ts, Row};
 
 /// UnmaterializableFunc is a function that can't be eval independently,
@@ -45,6 +45,11 @@ use crate::repr::{value_to_internal_ts, Row};
 pub enum UnmaterializableFunc {
     Now,
     CurrentSchema,
+    TumbleWindow {
+        ts: Box<TypedExpr>,
+        window_size: common_time::Interval,
+        start_time: Option<DateTime>,
+    },
 }
 
 impl UnmaterializableFunc {
@@ -61,14 +66,44 @@ impl UnmaterializableFunc {
                 output: ConcreteDataType::string_datatype(),
                 generic_fn: GenericFn::CurrentSchema,
             },
+            Self::TumbleWindow { .. } => Signature {
+                input: smallvec![ConcreteDataType::datetime_datatype()],
+                output: ConcreteDataType::datetime_datatype(),
+                generic_fn: GenericFn::TumbleWindow,
+            },
         }
     }
 
     /// Create a UnmaterializableFunc from a string of the function name
-    pub fn from_str(name: &str) -> Result<Self, Error> {
-        match name {
+    pub fn from_str_args(name: &str, args: Vec<TypedExpr>) -> Result<Self, Error> {
+        match name.to_lowercase().as_str() {
             "now" => Ok(Self::Now),
             "current_schema" => Ok(Self::CurrentSchema),
+            "tumble" => {
+                let ts = args.first().context(InvalidQuerySnafu {
+                    reason: "Tumble window function requires a timestamp argument".to_string(),
+                })?;
+                let window_size = args
+                    .get(1)
+                    .and_then(|expr| expr.expr.as_literal())
+                    .context(InvalidQuerySnafu {
+                        reason: "Tumble window function requires a window size argument"
+                            .to_string(),
+                    })?.as_interval().context(InvalidQuerySnafu {
+                        reason: "Tumble window function requires window size argument to be Interval type"
+                            .to_string(),
+                    })?;
+                let start_time = match args.get(2) {
+                    Some(start_time) => start_time.expr.as_literal(),
+                    None => None,
+                }
+                .and_then(|s| s.as_datetime());
+                Ok(Self::TumbleWindow {
+                    ts: Box::new(ts.clone()),
+                    window_size,
+                    start_time,
+                })
+            }
             _ => InvalidQuerySnafu {
                 reason: format!("Unknown unmaterializable function: {}", name),
             }
@@ -87,6 +122,14 @@ pub enum UnaryFunc {
     IsFalse,
     StepTimestamp,
     Cast(ConcreteDataType),
+    TumbleWindowFloor {
+        window_size: common_time::Interval,
+        start_time: Option<DateTime>,
+    },
+    TumbleWindowCeiling {
+        window_size: common_time::Interval,
+        start_time: Option<DateTime>,
+    },
 }
 
 impl UnaryFunc {
@@ -117,6 +160,16 @@ impl UnaryFunc {
                 input: smallvec![ConcreteDataType::null_datatype()],
                 output: to.clone(),
                 generic_fn: GenericFn::Cast,
+            },
+            Self::TumbleWindowFloor { .. } => Signature {
+                input: smallvec![ConcreteDataType::datetime_datatype()],
+                output: ConcreteDataType::datetime_datatype(),
+                generic_fn: GenericFn::TumbleWindow,
+            },
+            Self::TumbleWindowCeiling { .. } => Signature {
+                input: smallvec![ConcreteDataType::datetime_datatype()],
+                output: ConcreteDataType::datetime_datatype(),
+                generic_fn: GenericFn::TumbleWindow,
             },
         }
     }
@@ -211,6 +264,7 @@ impl UnaryFunc {
                 debug!("Cast to type: {to:?}, result: {:?}", res);
                 res
             }
+            Self::TumbleWindowFloor { .. } | Self::TumbleWindowCeiling { .. } => todo!(),
         }
     }
 }

@@ -97,6 +97,44 @@ impl FunctionExtensions {
     }
 }
 
+#[derive(Debug)]
+pub struct TumbleFunction {}
+
+const TUMBLE_NAME: &str = "tumble";
+
+impl std::fmt::Display for TumbleFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", TUMBLE_NAME.to_ascii_uppercase())
+    }
+}
+
+impl common_function::function::Function for TumbleFunction {
+    fn name(&self) -> &str {
+        TUMBLE_NAME
+    }
+
+    fn return_type(&self, _input_types: &[CDT]) -> common_query::error::Result<CDT> {
+        Ok(CDT::datetime_datatype())
+    }
+
+    fn signature(&self) -> common_query::prelude::Signature {
+        common_query::prelude::Signature::variadic_any(common_query::prelude::Volatility::Immutable)
+    }
+
+    fn eval(
+        &self,
+        _func_ctx: common_function::function::FunctionContext,
+        _columns: &[datatypes::prelude::VectorRef],
+    ) -> common_query::error::Result<datatypes::prelude::VectorRef> {
+        UnexpectedSnafu {
+            reason: "Tumbler function is not implemented for datafusion executor",
+        }
+        .fail()
+        .map_err(BoxedError::new)
+        .context(common_query::error::ExecuteSnafu)
+    }
+}
+
 /// To reuse existing code for parse sql, the sql is first parsed into a datafusion logical plan,
 /// then to a substrait plan, and finally to a flow plan.
 pub async fn sql_to_flow_plan(
@@ -133,6 +171,11 @@ mod test {
 
     use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
+    use common_time::{Date, DateTime};
+    use datatypes::prelude::*;
+    use datatypes::schema::Schema;
+    use datatypes::vectors::VectorRef;
+    use itertools::Itertools;
     use prost::Message;
     use query::parser::QueryLanguageParser;
     use query::plan::LogicalPlan;
@@ -141,6 +184,7 @@ mod test {
     use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
     use substrait_proto::proto;
     use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
+    use table::test_util::MemTable;
 
     use super::*;
     use crate::adapter::node_context::IdToNameMap;
@@ -174,9 +218,37 @@ mod test {
             table: NumbersTable::table(NUMBERS_TABLE_ID),
         };
         catalog_list.register_table_sync(req).unwrap();
+
+        let schema = vec![
+            datatypes::schema::ColumnSchema::new("number", CDT::uint32_datatype(), false),
+            datatypes::schema::ColumnSchema::new("ts", CDT::datetime_datatype(), false),
+        ];
+        let mut columns = vec![];
+        let numbers = (1..=10).collect_vec();
+        let column: VectorRef = Arc::new(<u32 as Scalar>::VectorType::from_vec(numbers));
+        columns.push(column);
+
+        let ts = (1..=10).collect_vec();
+        let column: VectorRef = Arc::new(<DateTime as Scalar>::VectorType::from_vec(ts));
+        columns.push(column);
+
+        let schema = Arc::new(Schema::new(schema));
+        let recordbatch = common_recordbatch::RecordBatch::new(schema, columns).unwrap();
+        let table = MemTable::table("numbers_with_ts", recordbatch);
+
+        let req_with_ts = RegisterTableRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_SCHEMA_NAME.to_string(),
+            table_name: "numbers_with_ts".to_string(),
+            table_id: 1024,
+            table,
+        };
+        catalog_list.register_table_sync(req_with_ts).unwrap();
+
         let factory = query::QueryEngineFactory::new(catalog_list, None, None, None, false);
 
         let engine = factory.query_engine();
+        engine.register_function(Arc::new(TumbleFunction {}));
 
         assert_eq!("datafusion", engine.name());
         engine
