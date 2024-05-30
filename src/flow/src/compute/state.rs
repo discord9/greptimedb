@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
+use common_telemetry::debug;
 use hydroflow::scheduled::graph::Hydroflow;
 use hydroflow::scheduled::SubgraphId;
 
@@ -69,6 +70,7 @@ impl DataflowState {
             .borrow_mut()
             .split_off(&(*self.as_of.borrow() + 1));
         std::mem::swap(&mut before, &mut self.schedule_subgraph.borrow_mut());
+        debug!("Schedule subgraphs: {:?}", before);
         for (_, v) in before {
             for subgraph in v {
                 df.schedule_subgraph(subgraph);

@@ -1,0 +1,11 @@
+[http_options]
+addr = "0.0.0.0:4000"
+timeout = "120s"
+
+[storage]
+data_home = "/data/local/tmp/greptimedb/data/"
+type = "File"
+
+[logging]
+dir = "/data/local/tmp/greptimedb/logs"
+level = "info,flow=debug,operator=debug"

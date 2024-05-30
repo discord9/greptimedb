@@ -45,6 +45,7 @@ object-store.workspace = true
 partition.workspace = true
 prometheus.workspace = true
 query.workspace = true
+ratelimit = "0.9.1"
 regex.workspace = true
 serde_json.workspace = true
 servers.workspace = true

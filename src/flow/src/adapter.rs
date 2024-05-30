@@ -561,7 +561,7 @@ impl FlownodeManager {
             if buf_len == 0 {
                 break;
             } else {
-                debug!("Send buf len = {}", buf_len);
+                debug!("Send buf len = {} at now={}", buf_len, now);
             }
         }
 

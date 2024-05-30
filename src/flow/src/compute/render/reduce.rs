@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use common_telemetry::debug;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::value::{ListValue, Value};
 use hydroflow::scheduled::graph_ext::GraphExt;
@@ -501,7 +502,7 @@ fn reduce_accum_subgraph(
         .map(|d| d.write())
         .chain(std::iter::once(arrange));
     check_no_future_updates(all_arrange_used, err_collector, now);
-
+    debug!("Reduce Accum Subgraph send: {:?}", all_outputs);
     send.give(all_outputs);
 }
 

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use client::{Output, OutputData, OutputMeta};
 use common_base::readable_size::ReadableSize;
@@ -28,6 +29,7 @@ use common_datasource::util::find_dir_and_filename;
 use common_query::{OutputCost, OutputRows};
 use common_recordbatch::adapter::RecordBatchStreamTypeAdapter;
 use common_recordbatch::DfSendableRecordBatchStream;
+use common_telemetry::tracing::warn;
 use common_telemetry::{debug, tracing};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -424,8 +426,19 @@ impl StatementExecutor {
             let mut pending_mem_size = 0;
             let mut pending = vec![];
 
+            let ratelimiter = ratelimit::Ratelimiter::builder(25000, Duration::from_secs(1))
+                .initial_available(25000)
+                .max_tokens(25000)
+                .build()
+                .unwrap();
+            let ratelimiter = Arc::new(ratelimiter);
+
             while let Some(r) = stream.next().await {
                 let record_batch = r.context(error::ReadDfRecordBatchSnafu)?;
+
+                let rb_size = record_batch.num_rows();
+                let ratelimiter = ratelimiter.clone();
+
                 let vectors =
                     Helper::try_into_vectors(record_batch.columns()).context(IntoVectorsSnafu)?;
 
@@ -437,15 +450,24 @@ impl StatementExecutor {
                     .zip(vectors)
                     .collect::<HashMap<_, _>>();
 
-                pending.push(self.inserter.handle_table_insert(
-                    InsertRequest {
-                        catalog_name: req.catalog_name.to_string(),
-                        schema_name: req.schema_name.to_string(),
-                        table_name: req.table_name.to_string(),
-                        columns_values,
-                    },
-                    query_ctx.clone(),
-                ));
+                let insert_req = InsertRequest {
+                    catalog_name: req.catalog_name.to_string(),
+                    schema_name: req.schema_name.to_string(),
+                    table_name: req.table_name.to_string(),
+                    columns_values,
+                };
+                let query_ctx = query_ctx.clone();
+                pending.push(async move {
+                    for _ in 0..rb_size {
+                        if let Err(dur) = ratelimiter.try_wait() {
+                            warn!("Reach rate limit 25000 rps: {:?}", dur);
+                            tokio::time::sleep(dur).await;
+                        }
+                    }
+                    self.inserter
+                        .handle_table_insert(insert_req, query_ctx)
+                        .await
+                });
 
                 if pending_mem_size as u64 >= pending_mem_threshold {
                     let (rows, cost) = batch_insert(&mut pending, &mut pending_mem_size).await?;
