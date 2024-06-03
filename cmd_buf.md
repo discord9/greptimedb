@@ -7,6 +7,10 @@ python3 flow_benchmark.py create local target/release/greptime;
 python3 flow_benchmark.py baseline local target/release/greptime;
 
 python3 flow_benchmark.py flow local target/release/greptime;
+# 10 个 flow, _v 打印结果
+python3 flow_benchmark.py flow_10_v local target/release/greptime;
+# 1000 个 flow, 不打印结果
+python3 flow_benchmark.py flow_1000 local target/release/greptime;
 ```
 
 # adb 测试

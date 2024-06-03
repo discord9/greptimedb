@@ -88,7 +88,7 @@ COPY numbers_input TO
 WITH (format = 'parquet');
 """)
 
-def main_loop():
+def call_copy_from():
     do_sql(f"""
 COPY numbers_input FROM 
 "{PARQUET_PATH}"
@@ -98,6 +98,34 @@ WITH (format = 'parquet');
 def clean_stuff():
     # TODO: wait in here for a bit till database open ports
     pass
+
+def with_flow_n(n:int, verbose:bool):
+    clean_stuff()
+    do_sql(
+"""
+CREATE TABLE numbers_input (
+    number Int64,
+    ts TimestampNanosecond,
+    TIME INDEX(ts)
+);
+"""
+    )
+    for i in range(n):
+        do_sql(
+f"""
+CREATE FLOW test_numbers_{i}
+SINK TO out_num_cnt_{i}
+AS 
+select count(number) from numbers_input;
+"""
+    )
+    
+    call_copy_from()
+    print("main loop done, wait for 5 seconds")
+    time.sleep(5)
+    if verbose:
+        for i in range(n):
+            do_sql(f"select * from out_num_cnt_{i};")
 
 def with_flow():
     clean_stuff()
@@ -118,7 +146,7 @@ AS
 select count(number) from numbers_input;
 """
     )
-    main_loop()
+    call_copy_from()
     print("main loop done, wait for 5 seconds")
     time.sleep(5)
     do_sql("select * from out_num_cnt;")
@@ -135,7 +163,7 @@ CREATE TABLE numbers_input (
 """
     )
 
-    main_loop()
+    call_copy_from()
     print("main loop done, wait for 5 seconds")
     time.sleep(5)
     do_sql("select count(number) from numbers_input;")
@@ -191,6 +219,10 @@ if __name__ == "__main__":
         run_type = sys.argv[1] #create/baseline/flow/full
         is_remote = sys.argv[2]=="adb" if len(sys.argv) >= 3 else False
         is_remote = bool(is_remote)
+        if is_remote:
+            print("Running on remote device")
+        else:
+            print("Running on local device")
 
         binary_path = sys.argv[3] if len(sys.argv) >= 4 else None
         parquet_path = sys.argv[4] if len(sys.argv) >= 5 else None
@@ -204,6 +236,12 @@ if __name__ == "__main__":
         elif run_type == "flow":# run flow benchmark
             run_database("flow", binary_path, is_remote)
             with_flow()
+        elif run_type.startswith("flow_"):
+            run_args = run_type.split("_")
+            n = int(run_args[1])
+            verbose = len(run_args) >= 3 and run_args[2] == "v"
+            run_database(run_type, binary_path, is_remote)
+            with_flow_n(n, verbose)
         elif run_type == "baseline":# run baseline benchmark
             run_database("baseline", binary_path, is_remote)
             without_flow()
