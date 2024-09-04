@@ -481,38 +481,7 @@ fn reduce_batch_subgraph(
                 from_accum_values_to_live_accums(accums.unpack(), accum_plan.simple_aggrs.len())?;
 
             let mut accum_output = AccumOutput::new();
-            for AggrWithIndex {
-                expr,
-                input_idx,
-                output_idx,
-            } in accum_plan.simple_aggrs.iter()
-            {
-                let cur_accum_value = accum_list.get(*output_idx).cloned().unwrap_or_default();
-                let mut cur_accum = if cur_accum_value.is_empty() {
-                    Accum::new_accum(&expr.func.clone())?
-                } else {
-                    Accum::try_into_accum(&expr.func, cur_accum_value)?
-                };
-
-                for val_batch in val_batches.iter() {
-                    // if batch is empty, input null instead
-                    let cur_input = val_batch
-                        .batch()
-                        .get(*input_idx)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(NullVector::new(val_batch.row_count())));
-                    let len = cur_input.len();
-                    cur_accum.update_batch(&expr.func, VectorDiff::from(cur_input))?;
-
-                    trace!("Reduce accum after take {} rows: {:?}", len, cur_accum);
-                }
-                let final_output = cur_accum.eval(&expr.func)?;
-                trace!("Reduce accum final output: {:?}", final_output);
-                accum_output.insert_output(*output_idx, final_output);
-
-                let cur_accum_value = cur_accum.into_state();
-                accum_output.insert_accum(*output_idx, cur_accum_value);
-            }
+            eval_simple_batch_aggrs(accum_plan, accum_list, val_batches, &mut accum_output)?;
 
             let (new_accums, res_val_row) = accum_output.into_accum_output()?;
 
@@ -586,6 +555,47 @@ fn reduce_batch_subgraph(
             Ok(())
         });
     }
+}
+
+fn eval_simple_batch_aggrs(
+    accum_plan: &AccumulablePlan,
+    accum_list: Vec<Vec<Value>>,
+    val_batches: Vec<Batch>,
+    accum_output: &mut AccumOutput,
+) -> Result<(), EvalError> {
+    for AggrWithIndex {
+        expr,
+        input_idx,
+        output_idx,
+    } in accum_plan.simple_aggrs.iter()
+    {
+        let cur_accum_value = accum_list.get(*output_idx).cloned().unwrap_or_default();
+        let mut cur_accum = if cur_accum_value.is_empty() {
+            Accum::new_accum(&expr.func.clone())?
+        } else {
+            Accum::try_into_accum(&expr.func, cur_accum_value)?
+        };
+
+        for val_batch in val_batches.iter() {
+            // if batch is empty, input null instead
+            let cur_input = val_batch
+                .batch()
+                .get(*input_idx)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(NullVector::new(val_batch.row_count())));
+            let len = cur_input.len();
+            cur_accum.update_batch(&expr.func, VectorDiff::from(cur_input))?;
+
+            trace!("Reduce accum after take {} rows: {:?}", len, cur_accum);
+        }
+        let final_output = cur_accum.eval(&expr.func)?;
+        trace!("Reduce accum final output: {:?}", final_output);
+        accum_output.insert_output(*output_idx, final_output);
+
+        let cur_accum_value = cur_accum.into_state();
+        accum_output.insert_accum(*output_idx, cur_accum_value);
+    }
+    Ok(())
 }
 
 /// reduce subgraph, reduce the input data into a single row
