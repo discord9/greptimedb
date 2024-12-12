@@ -13,10 +13,14 @@ FROM
 GROUP BY
     tumble(ts, '1 second', '2021-07-01 00:00:00');
 
+SHOW CREATE TABLE out_num_cnt_basic;
+
 -- TODO(discord9): confirm if it's necessary to flush flow here?
 -- because flush_flow result is at most 1
 -- SQLNESS REPLACE (ADMIN\sFLUSH_FLOW\('\w+'\)\s+\|\n\+-+\+\n\|\s+)[0-9]+\s+\| $1 FLOW_FLUSHED  |
 ADMIN FLUSH_FLOW('test_numbers_basic');
+
+SHOW CREATE TABLE out_num_cnt_basic;
 
 -- SQLNESS ARG restart=true
 INSERT INTO
@@ -75,6 +79,8 @@ SELECT
 FROM
     input_basic;
 
+SHOW CREATE TABLE out_basic;
+
 DROP FLOW test_wildcard_basic;
 
 CREATE FLOW test_wildcard_basic sink TO out_basic AS
@@ -83,6 +89,9 @@ SELECT
 FROM
     input_basic;
 
+SHOW CREATE TABLE out_basic;
+
+-- SQLNESS ARG restart=true
 INSERT INTO
     input_basic
 VALUES
@@ -91,6 +100,8 @@ VALUES
 
 -- SQLNESS REPLACE (ADMIN\sFLUSH_FLOW\('\w+'\)\s+\|\n\+-+\+\n\|\s+)[0-9]+\s+\| $1 FLOW_FLUSHED  |
 ADMIN FLUSH_FLOW('test_wildcard_basic');
+
+SHOW CREATE TABLE out_basic;
 
 SELECT wildcard FROM out_basic;
 
@@ -111,6 +122,8 @@ SELECT
     DISTINCT number as dis
 FROM
     distinct_basic;
+
+SHOW CREATE TABLE out_distinct_basic;
 
 -- TODO(discord9): confirm if it's necessary to flush flow here?
 -- because flush_flow result is at most 1
@@ -186,6 +199,8 @@ where
 
 SHOW CREATE FLOW filter_numbers_basic;
 
+SHOW CREATE TABLE out_num_cnt_basic;
+
 drop flow filter_numbers_basic;
 
 drop table out_num_cnt_basic;
@@ -215,6 +230,8 @@ from
     bytes_log
 GROUP BY
     time_window;
+
+SHOW CREATE TABLE approx_rate;
 
 INSERT INTO
     bytes_log
@@ -265,6 +282,8 @@ SELECT
     DISTINCT country,
 FROM
     ngx_access_log;
+
+SHOW CREATE TABLE ngx_country;
 
 INSERT INTO
     ngx_access_log
@@ -330,6 +349,8 @@ FROM
 GROUP BY
     country,
     time_window;
+
+SHOW CREATE TABLE ngx_country;
 
 INSERT INTO
     ngx_access_log
@@ -408,6 +429,8 @@ GROUP BY
     loc
 HAVING
     max_temp > 100;
+
+SHOW CREATE TABLE temp_alerts;
 
 INSERT INTO
     temp_sensor_data
@@ -488,6 +511,8 @@ GROUP BY
     time_window,
     bucket_size;
 
+SHOW CREATE TABLE ngx_distribution;
+
 INSERT INTO
     ngx_access_log
 VALUES
@@ -551,6 +576,8 @@ SELECT
 FROM
     requests;
 
+SHOW CREATE TABLE requests_without_ip;
+
 INSERT INTO
     requests
 VALUES
@@ -605,6 +632,8 @@ FROM android_log
 GROUP BY
     time_window;
 
+SHOW CREATE TABLE android_log_abnormal;
+
 INSERT INTO android_log values
 ("am_crash", "2021-07-01 00:01:01.000"),
 ("asas.backtrace.ssss", "2021-07-01 00:01:01.000");
@@ -657,6 +686,8 @@ FROM android_log
 GROUP BY
     time_window;
 
+SHOW CREATE TABLE android_log_abnormal;
+
 INSERT INTO android_log values
 ("am_crash", "2021-07-01 00:01:01.000"),
 ("asas.backtrace.ssss", "2021-07-01 00:01:01.000");
@@ -693,6 +724,8 @@ SELECT
     sum(case when number > 10 then 1 else 0 end)/count(number) as avg_after_filter_num
 FROM
     numbers_input_basic;
+
+SHOW CREATE TABLE out_num_cnt_basic;
 
 -- TODO(discord9): confirm if it's necessary to flush flow here?
 -- because flush_flow result is at most 1
