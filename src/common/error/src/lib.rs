@@ -46,15 +46,17 @@ impl Header for ErrorInfoHeader {
     {
         let code = values
             .next()
-            .ok_or_else(|| axum::headers::Error::invalid())?
+            .ok_or_else(axum::headers::Error::invalid)?
             .to_str()
             .map_err(|_| axum::headers::Error::invalid())?
             .parse()
             .map_err(|_| axum::headers::Error::invalid())?;
-        let need_escape_val = values
+        let need_escape_val = values.next().ok_or_else(axum::headers::Error::invalid)?;
+        let msg = values
             .next()
-            .ok_or_else(|| axum::headers::Error::invalid())?;
-
+            .ok_or_else(axum::headers::Error::invalid)?
+            .as_bytes();
+        let msg = String::from_utf8_lossy(msg);
         let need_escape = if need_escape_val == "1" {
             true
         } else if need_escape_val == "0" {
@@ -63,17 +65,10 @@ impl Header for ErrorInfoHeader {
             return Err(axum::headers::Error::invalid());
         };
 
-        let msg = values
-            .next()
-            .ok_or_else(|| axum::headers::Error::invalid())?
-            .to_str()
-            .map_err(|_| axum::headers::Error::invalid())?
-            .to_string();
-
         let msg = if need_escape {
             unescape(&msg).map_err(|_| axum::headers::Error::invalid())?
         } else {
-            msg
+            msg.to_string()
         };
 
         Ok(ErrorInfoHeader { code, msg })
@@ -83,15 +78,8 @@ impl Header for ErrorInfoHeader {
         let mut need_escape = false;
         let msg = HeaderValue::from_str(&self.msg).unwrap_or_else(|_| {
             need_escape = true;
-            HeaderValue::from_bytes(
-                &self
-                    .msg
-                    .as_bytes()
-                    .iter()
-                    .flat_map(|b| std::ascii::escape_default(*b))
-                    .collect::<Vec<u8>>(),
-            )
-            .expect("Already escaped string should be valid ascii")
+            HeaderValue::from_bytes(self.msg.escape_default().to_string().as_bytes())
+                .expect("Already escaped string should be valid ascii")
         });
         let need_escape = if need_escape { "1" } else { "0" };
         values.extend([
@@ -129,4 +117,30 @@ pub fn from_err_code_msg_to_header(code: u32, msg: &str) -> HeaderMap {
 /// Get error info from header, return None if header is invalid
 pub fn from_header_map_to_err_info(header: &HeaderMap) -> Option<ErrorInfoHeader> {
     ErrorInfoHeader::from_header_map(header)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_back_and_forth() {
+        let testcases = [
+            (1003, "test"),
+            (
+                1002,
+                "Unexpected, violated: Invalid database name: ㊙️database",
+            ),
+        ];
+        for (code, msg) in &testcases[1..] {
+            let info = ErrorInfoHeader {
+                code: *code,
+                msg: msg.to_string(),
+            };
+            let header = from_err_code_msg_to_header(info.code, &info.msg);
+            let info2 = from_header_map_to_err_info(&header).unwrap();
+            assert_eq!(info.code, info2.code);
+            assert_eq!(info.msg, info2.msg);
+        }
+    }
 }

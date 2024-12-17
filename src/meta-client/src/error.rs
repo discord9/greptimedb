@@ -14,9 +14,8 @@
 
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
-use common_error::{from_header_map_to_err_info, ErrorInfoHeader};
+use common_error::ErrorInfoHeader;
 use common_macro::stack_trace_debug;
-use headers::Header;
 use snafu::{Location, Snafu};
 use tonic::Status;
 
@@ -164,7 +163,7 @@ impl From<Status> for Error {
                 let code = StatusCode::Internal;
                 let msg = format!(
                     "Failed to decode error info header, tonic message: {}",
-                    e.message().to_string()
+                    e.message()
                 );
                 Self::MetaServer {
                     code,

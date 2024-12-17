@@ -166,7 +166,7 @@ impl From<Status> for Error {
                 let code = StatusCode::Internal;
                 let msg = format!(
                     "Failed to decode error info header, tonic message: {}",
-                    e.message().to_string()
+                    e.message()
                 );
                 Self::Server {
                     code,
