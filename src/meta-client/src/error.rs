@@ -34,6 +34,7 @@ pub enum Error {
     MetaServer {
         code: StatusCode,
         msg: String,
+        stack_errors: Vec<String>,
         tonic_code: tonic::Code,
     },
 
@@ -155,6 +156,7 @@ impl From<Status> for Error {
                 Self::MetaServer {
                     code,
                     msg,
+                    stack_errors: info.stack_errors,
                     tonic_code: e.code(),
                 }
             }
@@ -168,6 +170,7 @@ impl From<Status> for Error {
                 Self::MetaServer {
                     code,
                     msg,
+                    stack_errors: Vec::new(),
                     tonic_code: e.code(),
                 }
             }

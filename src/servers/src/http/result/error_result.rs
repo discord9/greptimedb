@@ -15,8 +15,8 @@
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use common_error::ext::ErrorExt;
-use common_error::from_err_code_msg_to_header;
 use common_error::status_code::StatusCode;
+use common_error::{from_err_code_msg_stack_to_header, from_stacked_errors_to_list};
 use common_telemetry::{debug, error};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,7 @@ pub struct ErrorResponse {
     code: u32,
     error: String,
     execution_time_ms: u64,
+    stack_errors: Vec<String>,
 }
 
 impl ErrorResponse {
@@ -38,8 +39,10 @@ impl ErrorResponse {
         } else {
             debug!("Failed to handle HTTP request, err: {:?}", error);
         }
-
-        Self::from_error_message(code, error.output_msg())
+        let stack_errors = from_stacked_errors_to_list(&error);
+        let mut err = Self::from_error_message(code, error.output_msg());
+        err.stack_errors = stack_errors;
+        err
     }
 
     pub fn from_error_message(code: StatusCode, msg: String) -> Self {
@@ -47,6 +50,7 @@ impl ErrorResponse {
             code: code as u32,
             error: msg,
             execution_time_ms: 0,
+            stack_errors: vec![],
         }
     }
 
@@ -72,12 +76,13 @@ impl IntoResponse for ErrorResponse {
     fn into_response(self) -> Response {
         let code = self.code;
         let execution_time = self.execution_time_ms;
-        let new_header = from_err_code_msg_to_header(
+        let new_header = from_err_code_msg_stack_to_header(
             code,
             &format!(
                 "error: {}, execution_time_ms: {}",
                 self.error, execution_time
             ),
+            self.stack_errors.clone(),
         );
         let mut resp = Json(self).into_response();
         resp.headers_mut().extend(new_header);

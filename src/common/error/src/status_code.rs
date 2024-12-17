@@ -234,7 +234,7 @@ macro_rules! define_into_tonic_status {
                 use tonic::codegen::http::{HeaderMap, HeaderValue};
                 use tonic::metadata::MetadataMap;
                 use $crate::headers::HeaderMapExt;
-                use $crate::ErrorInfoHeader;
+                use $crate::{from_stacked_errors_to_list, ErrorInfoHeader};
 
                 let mut headers = HeaderMap::<HeaderValue>::with_capacity(2);
 
@@ -245,6 +245,7 @@ macro_rules! define_into_tonic_status {
                 let error_info = ErrorInfoHeader {
                     code: status_code as u32,
                     msg: root_error.to_string(),
+                    stack_errors: from_stacked_errors_to_list(&err),
                 };
                 headers.typed_insert(error_info);
 

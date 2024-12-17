@@ -62,6 +62,7 @@ pub fn from_grpc_response(response: GreptimeResponse) -> Result<u32> {
         ServerSnafu {
             code: status_code,
             msg: status.err_msg,
+            stack_errors: Vec::new(),
         }
         .fail()
     }

@@ -17,7 +17,7 @@
 use std::any::Any;
 
 use common_error::ext::BoxedError;
-use common_error::{define_into_tonic_status, from_err_code_msg_to_header};
+use common_error::{define_into_tonic_status, ErrorInfoHeader};
 use common_macro::stack_trace_debug;
 use common_telemetry::common_error::ext::ErrorExt;
 use common_telemetry::common_error::status_code::StatusCode;
@@ -190,9 +190,8 @@ pub enum Error {
 /// the outer message is the full error stack, and inner message in header is the last error message that can be show directly to user
 pub fn to_status_with_last_err(err: impl ErrorExt) -> tonic::Status {
     let msg = err.to_string();
-    let last_err_msg = common_error::ext::StackError::last(&err).to_string();
-    let code = err.status_code() as u32;
-    let header = from_err_code_msg_to_header(code, &last_err_msg);
+    let error_header = ErrorInfoHeader::from_error(&err);
+    let header = error_header.to_header_map();
 
     tonic::Status::with_metadata(
         tonic::Code::InvalidArgument,

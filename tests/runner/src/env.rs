@@ -679,6 +679,7 @@ impl GreptimeDB {
                         result = ServerSnafu {
                             code: status_code,
                             msg,
+                            stack_errors: Vec::new(),
                         }
                         .fail();
                     }

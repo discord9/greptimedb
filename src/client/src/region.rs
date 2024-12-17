@@ -103,14 +103,18 @@ impl RegionRequester {
                 let e: error::Error = e.into();
                 let code = e.status_code();
                 let msg = e.to_string();
-                let error = ServerSnafu { code, msg }
-                    .fail::<()>()
-                    .map_err(BoxedError::new)
-                    .with_context(|_| FlightGetSnafu {
-                        tonic_code,
-                        addr: flight_client.addr().to_string(),
-                    })
-                    .unwrap_err();
+                let error = ServerSnafu {
+                    code,
+                    msg,
+                    stack_errors: Vec::new(),
+                }
+                .fail::<()>()
+                .map_err(BoxedError::new)
+                .with_context(|_| FlightGetSnafu {
+                    tonic_code,
+                    addr: flight_client.addr().to_string(),
+                })
+                .unwrap_err();
                 error!(
                     e; "Failed to do Flight get, addr: {}, code: {}",
                     flight_client.addr(),
@@ -240,6 +244,7 @@ pub fn check_response_header(header: &Option<ResponseHeader>) -> Result<()> {
         ServerSnafu {
             code,
             msg: status.err_msg.clone(),
+            stack_errors: Vec::new(),
         }
         .fail()
     }

@@ -231,13 +231,18 @@ impl Database {
             let e: Error = e.into();
             let code = e.status_code();
             let msg = e.to_string();
-            let error =
-                Err(BoxedError::new(ServerSnafu { code, msg }.build())).with_context(|_| {
-                    FlightGetSnafu {
-                        addr: client.addr().to_string(),
-                        tonic_code,
-                    }
-                });
+            let error = Err(BoxedError::new(
+                ServerSnafu {
+                    code,
+                    msg,
+                    stack_errors: Vec::new(),
+                }
+                .build(),
+            ))
+            .with_context(|_| FlightGetSnafu {
+                addr: client.addr().to_string(),
+                tonic_code,
+            });
             error!(
                 "Failed to do Flight get, addr: {}, code: {}, source: {:?}",
                 client.addr(),

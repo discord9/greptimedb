@@ -98,6 +98,7 @@ pub enum Error {
     Server {
         code: StatusCode,
         msg: String,
+        stack_errors: Vec<String>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -158,6 +159,7 @@ impl From<Status> for Error {
                 Self::Server {
                     code,
                     msg,
+                    stack_errors: info.stack_errors,
                     location: location!(),
                 }
             }
@@ -171,6 +173,7 @@ impl From<Status> for Error {
                 Self::Server {
                     code,
                     msg,
+                    stack_errors: Vec::new(),
                     location: location!(),
                 }
             }

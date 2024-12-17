@@ -18,6 +18,7 @@ pub mod ext;
 pub mod mock;
 pub mod status_code;
 
+use ext::{ErrorExt, StackError};
 pub use headers::{self, Header, HeaderMapExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 pub use snafu;
@@ -28,10 +29,12 @@ pub const ERROR_INFO_HEADER_NAME: &str = "x-greptime-err-info";
 pub static GREPTIME_DB_HEADER_ERROR_INFO: HeaderName =
     HeaderName::from_static(ERROR_INFO_HEADER_NAME);
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ErrorInfoHeader {
     pub code: u32,
     pub msg: String,
+    /// Stack trace of errors
+    pub stack_errors: Vec<String>,
 }
 
 impl Header for ErrorInfoHeader {
@@ -51,46 +54,60 @@ impl Header for ErrorInfoHeader {
             .map_err(|_| axum::headers::Error::invalid())?
             .parse()
             .map_err(|_| axum::headers::Error::invalid())?;
-        let need_escape_val = values.next().ok_or_else(axum::headers::Error::invalid)?;
+
         let msg = values
             .next()
             .ok_or_else(axum::headers::Error::invalid)?
             .as_bytes();
+
+        let stack_errors = {
+            let mut stack_errors = Vec::new();
+            for value in values {
+                let msg = value.as_bytes();
+                let msg = String::from_utf8_lossy(msg);
+                let msg = unescape(&msg).map_err(|_| axum::headers::Error::invalid())?;
+                stack_errors.push(msg);
+            }
+            stack_errors
+        };
+
         let msg = String::from_utf8_lossy(msg);
-        let need_escape = if need_escape_val == "1" {
-            true
-        } else if need_escape_val == "0" {
-            false
-        } else {
-            return Err(axum::headers::Error::invalid());
-        };
 
-        let msg = if need_escape {
-            unescape(&msg).map_err(|_| axum::headers::Error::invalid())?
-        } else {
-            msg.to_string()
-        };
+        let msg = unescape(&msg).map_err(|_| axum::headers::Error::invalid())?;
 
-        Ok(ErrorInfoHeader { code, msg })
+        Ok(ErrorInfoHeader {
+            code,
+            msg,
+            stack_errors,
+        })
     }
 
     fn encode<E: Extend<HeaderValue>>(&self, values: &mut E) {
-        let mut need_escape = false;
-        let msg = HeaderValue::from_str(&self.msg).unwrap_or_else(|_| {
-            need_escape = true;
-            HeaderValue::from_bytes(self.msg.escape_default().to_string().as_bytes())
-                .expect("Already escaped string should be valid ascii")
-        });
-        let need_escape = if need_escape { "1" } else { "0" };
-        values.extend([
-            HeaderValue::from(self.code),
-            HeaderValue::from_static(need_escape),
-            msg,
-        ]);
+        let msg = HeaderValue::from_bytes(self.msg.escape_default().to_string().as_bytes())
+            .expect("Already escaped string should be valid ascii");
+
+        values.extend([HeaderValue::from(self.code), msg]);
+
+        for err_msg in self.stack_errors.iter() {
+            let msg = HeaderValue::from_bytes(err_msg.escape_default().to_string().as_bytes())
+                .expect("Already escaped string should be valid ascii");
+            values.extend([msg]);
+        }
     }
 }
 
 impl ErrorInfoHeader {
+    pub fn from_error(error: &impl ErrorExt) -> Self {
+        let code = error.status_code() as u32;
+        let msg = error.output_msg();
+        let stack_errors = from_stacked_errors_to_list(error);
+        ErrorInfoHeader {
+            code,
+            msg,
+            stack_errors,
+        }
+    }
+
     pub fn from_header_map(header: &HeaderMap) -> Option<ErrorInfoHeader> {
         let mut values = header.get_all(ErrorInfoHeader::name()).iter();
 
@@ -99,24 +116,43 @@ impl ErrorInfoHeader {
             Err(_err) => None,
         }
     }
+
+    pub fn to_header_map(&self) -> HeaderMap {
+        let mut header = HeaderMap::new();
+        header.typed_insert(self.clone());
+        header
+    }
 }
 
 /// Create a http header map from error code and message.
 /// using `GREPTIME_DB_HEADER_ERROR_INFO` as header name
-pub fn from_err_code_msg_to_header(code: u32, msg: &str) -> HeaderMap {
+pub fn from_err_code_msg_stack_to_header(
+    code: u32,
+    msg: &str,
+    stack_errors: Vec<String>,
+) -> HeaderMap {
     let mut header = HeaderMap::new();
 
     let error_info = ErrorInfoHeader {
         code,
         msg: msg.to_string(),
+        stack_errors,
     };
     header.typed_insert(error_info);
     header
 }
 
-/// Get error info from header, return None if header is invalid
-pub fn from_header_map_to_err_info(header: &HeaderMap) -> Option<ErrorInfoHeader> {
-    ErrorInfoHeader::from_header_map(header)
+pub fn from_stacked_errors_to_list(err: &impl StackError) -> Vec<String> {
+    let mut buf = Vec::new();
+    err.debug_fmt(0, &mut buf);
+    let mut layer = 1;
+    let mut err: &dyn StackError = err;
+    while let Some(nxt) = err.next() {
+        err.debug_fmt(layer, &mut buf);
+        layer += 1;
+        err = nxt;
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -126,21 +162,33 @@ mod test {
     #[test]
     fn test_back_and_forth() {
         let testcases = [
-            (1003, "test"),
+            (1003, "test", vec![]),
             (
                 1002,
                 "Unexpected, violated: Invalid database name: ㊙️database",
+                vec![],
+            ),
+            (
+                1003,
+                "test",
+                vec![
+                    "0: test".to_string(),
+                    "1: stack error 1".to_string(),
+                    "2: stack error 2".to_string(),
+                ],
             ),
         ];
-        for (code, msg) in &testcases[1..] {
+        for (code, msg, stack_errors) in &testcases[1..] {
             let info = ErrorInfoHeader {
                 code: *code,
                 msg: msg.to_string(),
+                stack_errors: stack_errors.clone(),
             };
-            let header = from_err_code_msg_to_header(info.code, &info.msg);
-            let info2 = from_header_map_to_err_info(&header).unwrap();
-            assert_eq!(info.code, info2.code);
-            assert_eq!(info.msg, info2.msg);
+            let mut header = HeaderMap::new();
+            header.typed_insert(info.clone());
+            let info2 = ErrorInfoHeader::from_header_map(&header).unwrap();
+
+            assert_eq!(info, info2);
         }
     }
 }
