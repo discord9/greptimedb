@@ -233,18 +233,20 @@ macro_rules! define_into_tonic_status {
             fn from(err: $Error) -> Self {
                 use tonic::codegen::http::{HeaderMap, HeaderValue};
                 use tonic::metadata::MetadataMap;
-                use $crate::GREPTIME_DB_HEADER_ERROR_CODE;
+                use $crate::headers::HeaderMapExt;
+                use $crate::ErrorInfoHeader;
 
                 let mut headers = HeaderMap::<HeaderValue>::with_capacity(2);
 
                 // If either of the status_code or error msg cannot convert to valid HTTP header value
                 // (which is a very rare case), just ignore. Client will use Tonic status code and message.
                 let status_code = err.status_code();
-                headers.insert(
-                    GREPTIME_DB_HEADER_ERROR_CODE,
-                    HeaderValue::from(status_code as u32),
-                );
                 let root_error = err.output_msg();
+                let error_info = ErrorInfoHeader {
+                    code: status_code as u32,
+                    msg: root_error.to_string(),
+                };
+                headers.typed_insert(error_info);
 
                 let metadata = MetadataMap::from_headers(headers);
                 tonic::Status::with_metadata(

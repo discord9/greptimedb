@@ -16,7 +16,7 @@ use std::any::Any;
 
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
-use common_error::{GREPTIME_DB_HEADER_ERROR_CODE, GREPTIME_DB_HEADER_ERROR_MSG};
+use common_error::ErrorInfoHeader;
 use common_macro::stack_trace_debug;
 use snafu::{location, Location, Snafu};
 use tonic::{Code, Status};
@@ -146,29 +146,34 @@ impl ErrorExt for Error {
 
 impl From<Status> for Error {
     fn from(e: Status) -> Self {
-        fn get_metadata_value(e: &Status, key: &str) -> Option<String> {
-            e.metadata()
-                .get(key)
-                .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok())
-        }
+        let headers = e.metadata().clone().into_headers();
 
-        let code = get_metadata_value(&e, GREPTIME_DB_HEADER_ERROR_CODE)
-            .and_then(|s| {
-                if let Ok(code) = s.parse::<u32>() {
-                    StatusCode::from_u32(code)
-                } else {
-                    None
+        match ErrorInfoHeader::from_header_map(&headers) {
+            Some(info) => {
+                common_telemetry::info!("Error info: {info:#?}");
+                let code = StatusCode::from_u32(info.code).unwrap_or(StatusCode::Unknown);
+                let msg = info.msg;
+
+                common_telemetry::info!("Code: {code}, Msg: {msg}");
+                Self::Server {
+                    code,
+                    msg,
+                    location: location!(),
                 }
-            })
-            .unwrap_or(StatusCode::Unknown);
-
-        let msg = get_metadata_value(&e, GREPTIME_DB_HEADER_ERROR_MSG)
-            .unwrap_or_else(|| e.message().to_string());
-
-        Self::Server {
-            code,
-            msg,
-            location: location!(),
+            }
+            None => {
+                common_telemetry::error!("Failed to decode error info header, header: {headers:?}");
+                let code = StatusCode::Internal;
+                let msg = format!(
+                    "Failed to decode error info header, tonic message: {}",
+                    e.message().to_string()
+                );
+                Self::Server {
+                    code,
+                    msg,
+                    location: location!(),
+                }
+            }
         }
     }
 }

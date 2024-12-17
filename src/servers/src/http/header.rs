@@ -44,7 +44,8 @@ pub mod constants {
     pub const GREPTIME_DB_HEADER_METRICS: &str = "x-greptime-metrics";
     pub const GREPTIME_DB_HEADER_NAME: &str = "x-greptime-db-name";
     pub const GREPTIME_TIMEZONE_HEADER_NAME: &str = "x-greptime-timezone";
-    pub const GREPTIME_DB_HEADER_ERROR_CODE: &str = common_error::GREPTIME_DB_HEADER_ERROR_CODE;
+    pub const GREPTIME_DB_HEADER_ERROR_CODE: &str = "x-greptime-err-code";
+    pub const GREPTIME_DB_HEADER_ERROR_INFO: &str = common_error::ERROR_INFO_HEADER_NAME;
     pub const GREPTIME_LOG_PIPELINE_NAME_HEADER_NAME: &str = "x-greptime-log-pipeline-name";
     pub const GREPTIME_LOG_PIPELINE_VERSION_HEADER_NAME: &str = "x-greptime-log-pipeline-version";
     pub const GREPTIME_LOG_TABLE_NAME_HEADER_NAME: &str = "x-greptime-log-table-name";

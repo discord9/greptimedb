@@ -26,6 +26,7 @@ common-recordbatch.workspace = true
 common-telemetry.workspace = true
 enum_dispatch = "0.3"
 futures-util.workspace = true
+headers.workspace = true
 lazy_static.workspace = true
 moka = { workspace = true, features = ["future"] }
 parking_lot.workspace = true

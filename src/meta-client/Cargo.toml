@@ -17,6 +17,7 @@ common-meta.workspace = true
 common-telemetry.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+headers.workspace = true
 humantime-serde.workspace = true
 rand.workspace = true
 serde.workspace = true

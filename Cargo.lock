@@ -1750,6 +1750,7 @@ dependencies = [
  "derive-new 0.5.9",
  "enum_dispatch",
  "futures-util",
+ "headers 0.3.9",
  "lazy_static",
  "moka",
  "parking_lot 0.12.3",
@@ -2013,10 +2014,13 @@ dependencies = [
 name = "common-error"
 version = "0.12.0"
 dependencies = [
+ "axum",
+ "headers 0.3.9",
  "http 0.2.12",
  "snafu 0.8.5",
  "strum 0.25.0",
  "tonic 0.11.0",
+ "unescaper",
 ]
 
 [[package]]
@@ -6440,6 +6444,7 @@ dependencies = [
  "datatypes",
  "futures",
  "futures-util",
+ "headers 0.3.9",
  "humantime-serde",
  "meta-srv",
  "rand",
@@ -13314,6 +13319,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b72f89f0ca32e4db1c04e2a72f5345d59796d4866a1ee0609084569f73683dc8"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "unescaper"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c878a167baa8afd137494101a688ef8c67125089ff2249284bd2b5f9bfedb815"
+dependencies = [
+ "thiserror 1.0.64",
 ]
 
 [[package]]
