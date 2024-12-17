@@ -31,7 +31,7 @@ pub use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::status_code::StatusCode;
 pub use common_query::{Output, OutputData, OutputMeta};
 pub use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
-use snafu::OptionExt;
+use snafu::{IntoError, OptionExt};
 
 pub use self::client::Client;
 #[cfg(feature = "testing")]
@@ -59,11 +59,11 @@ pub fn from_grpc_response(response: GreptimeResponse) -> Result<u32> {
             StatusCode::from_u32(status.status_code).context(IllegalDatabaseResponseSnafu {
                 err_msg: format!("invalid status: {:?}", status),
             })?;
-        ServerSnafu {
+        Err(ServerSnafu {
             code: status_code,
             msg: status.err_msg,
-            stack_errors: Vec::new(),
         }
-        .fail()
+        // TODO(discord9): pass stack errors in grpc proto
+        .into_error(vec![].into()))
     }
 }

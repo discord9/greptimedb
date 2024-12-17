@@ -30,6 +30,49 @@ pub static GREPTIME_DB_HEADER_ERROR_INFO: HeaderName =
     HeaderName::from_static(ERROR_INFO_HEADER_NAME);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RemoteStackError {
+    pub stack_error: Vec<String>,
+}
+
+impl RemoteStackError {
+    pub fn from_stack_error(err: &impl StackError) -> Self {
+        let mut buf = Vec::new();
+        err.debug_fmt(0, &mut buf);
+        let mut cur: &dyn StackError = err;
+        while let Some(nxt) = cur.next() {
+            cur.debug_fmt(0, &mut buf);
+            cur = nxt;
+        }
+        RemoteStackError { stack_error: buf }
+    }
+}
+
+impl std::fmt::Display for RemoteStackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.stack_error.join("\n"))
+    }
+}
+
+impl std::error::Error for RemoteStackError {}
+
+impl From<Vec<String>> for RemoteStackError {
+    fn from(value: Vec<String>) -> Self {
+        RemoteStackError { stack_error: value }
+    }
+}
+
+impl StackError for RemoteStackError {
+    fn debug_fmt(&self, _layer: usize, buf: &mut Vec<String>) {
+        buf.extend(self.stack_error.clone());
+    }
+
+    /// Remote stack error has no next as it's the "leaf error"
+    fn next(&self) -> Option<&dyn StackError> {
+        None
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ErrorInfoHeader {
     pub code: u32,
     pub msg: String,

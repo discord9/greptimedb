@@ -23,7 +23,7 @@ use api::v1::{
 };
 use arrow_flight::Ticket;
 use async_stream::stream;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::BoxedError;
 use common_grpc::flight::{FlightDecoder, FlightMessage};
 use common_query::Output;
 use common_recordbatch::error::ExternalSnafu;
@@ -38,7 +38,6 @@ use tonic::transport::Channel;
 
 use crate::error::{
     ConvertFlightDataSnafu, Error, FlightGetSnafu, IllegalFlightMessagesSnafu, InvalidAsciiSnafu,
-    ServerSnafu,
 };
 use crate::{from_grpc_response, Client, Result};
 
@@ -229,17 +228,7 @@ impl Database {
         let response = client.mut_inner().do_get(request).await.or_else(|e| {
             let tonic_code = e.code();
             let e: Error = e.into();
-            let code = e.status_code();
-            let msg = e.to_string();
-            let error = Err(BoxedError::new(
-                ServerSnafu {
-                    code,
-                    msg,
-                    stack_errors: Vec::new(),
-                }
-                .build(),
-            ))
-            .with_context(|_| FlightGetSnafu {
+            let error = Err(BoxedError::new(e)).with_context(|_| FlightGetSnafu {
                 addr: client.addr().to_string(),
                 tonic_code,
             });

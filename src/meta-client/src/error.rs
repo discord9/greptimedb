@@ -14,7 +14,7 @@
 
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
-use common_error::ErrorInfoHeader;
+use common_error::{ErrorInfoHeader, RemoteStackError};
 use common_macro::stack_trace_debug;
 use snafu::{Location, Snafu};
 use tonic::Status;
@@ -34,7 +34,8 @@ pub enum Error {
     MetaServer {
         code: StatusCode,
         msg: String,
-        stack_errors: Vec<String>,
+        #[snafu(source)]
+        stack_errors: RemoteStackError,
         tonic_code: tonic::Code,
     },
 
@@ -156,7 +157,7 @@ impl From<Status> for Error {
                 Self::MetaServer {
                     code,
                     msg,
-                    stack_errors: info.stack_errors,
+                    stack_errors: info.stack_errors.into(),
                     tonic_code: e.code(),
                 }
             }
@@ -170,7 +171,7 @@ impl From<Status> for Error {
                 Self::MetaServer {
                     code,
                     msg,
-                    stack_errors: Vec::new(),
+                    stack_errors: Vec::new().into(),
                     tonic_code: e.code(),
                 }
             }

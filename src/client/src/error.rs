@@ -16,7 +16,7 @@ use std::any::Any;
 
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
-use common_error::ErrorInfoHeader;
+use common_error::{ErrorInfoHeader, RemoteStackError};
 use common_macro::stack_trace_debug;
 use snafu::{location, Location, Snafu};
 use tonic::{Code, Status};
@@ -98,7 +98,8 @@ pub enum Error {
     Server {
         code: StatusCode,
         msg: String,
-        stack_errors: Vec<String>,
+        #[snafu(source)]
+        stack_errors: RemoteStackError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -159,7 +160,7 @@ impl From<Status> for Error {
                 Self::Server {
                     code,
                     msg,
-                    stack_errors: info.stack_errors,
+                    stack_errors: info.stack_errors.into(),
                     location: location!(),
                 }
             }
@@ -173,7 +174,7 @@ impl From<Status> for Error {
                 Self::Server {
                     code,
                     msg,
-                    stack_errors: Vec::new(),
+                    stack_errors: Vec::new().into(),
                     location: location!(),
                 }
             }

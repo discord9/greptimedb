@@ -242,11 +242,7 @@ macro_rules! define_into_tonic_status {
                 // (which is a very rare case), just ignore. Client will use Tonic status code and message.
                 let status_code = err.status_code();
                 let root_error = err.output_msg();
-                let error_info = ErrorInfoHeader {
-                    code: status_code as u32,
-                    msg: root_error.to_string(),
-                    stack_errors: from_stacked_errors_to_list(&err),
-                };
+                let error_info = ErrorInfoHeader::from_error(&err);
                 headers.typed_insert(error_info);
 
                 let metadata = MetadataMap::from_headers(headers);

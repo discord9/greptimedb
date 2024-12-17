@@ -30,6 +30,8 @@ use client::{
     Client, Database as DB, Error as ClientError, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME,
 };
 use common_error::ext::ErrorExt;
+use common_error::snafu::IntoError;
+use common_error::RemoteStackError;
 use common_query::{Output, OutputData};
 use common_recordbatch::RecordBatches;
 use datatypes::data_type::ConcreteDataType;
@@ -676,12 +678,11 @@ impl GreptimeDB {
                     Err(e) => {
                         let status_code = e.status_code();
                         let msg = e.output_msg();
-                        result = ServerSnafu {
+                        result = Err(ServerSnafu {
                             code: status_code,
                             msg,
-                            stack_errors: Vec::new(),
                         }
-                        .fail();
+                        .into_error(RemoteStackError::from_stack_error(&e)));
                     }
                 }
             }

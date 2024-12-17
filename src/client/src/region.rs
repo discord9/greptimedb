@@ -21,7 +21,7 @@ use arc_swap::ArcSwapOption;
 use arrow_flight::Ticket;
 use async_stream::stream;
 use async_trait::async_trait;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::BoxedError;
 use common_error::status_code::StatusCode;
 use common_grpc::flight::{FlightDecoder, FlightMessage};
 use common_meta::error::{self as meta_error, Result as MetaResult};
@@ -33,7 +33,7 @@ use common_telemetry::error;
 use common_telemetry::tracing_context::TracingContext;
 use prost::Message;
 use query::query_engine::DefaultSerializer;
-use snafu::{location, OptionExt, ResultExt};
+use snafu::{location, IntoError, OptionExt, ResultExt};
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use tokio_stream::StreamExt;
 
@@ -101,25 +101,17 @@ impl RegionRequester {
             .map_err(|e| {
                 let tonic_code = e.code();
                 let e: error::Error = e.into();
-                let code = e.status_code();
-                let msg = e.to_string();
-                let error = ServerSnafu {
-                    code,
-                    msg,
-                    stack_errors: Vec::new(),
-                }
-                .fail::<()>()
-                .map_err(BoxedError::new)
-                .with_context(|_| FlightGetSnafu {
-                    tonic_code,
-                    addr: flight_client.addr().to_string(),
-                })
-                .unwrap_err();
                 error!(
                     e; "Failed to do Flight get, addr: {}, code: {}",
                     flight_client.addr(),
                     tonic_code
                 );
+                let error = Err::<(), _>(BoxedError::new(e))
+                    .with_context(|_| FlightGetSnafu {
+                        tonic_code,
+                        addr: flight_client.addr().to_string(),
+                    })
+                    .unwrap_err();
                 error
             })?;
 
@@ -241,12 +233,12 @@ pub fn check_response_header(header: &Option<ResponseHeader>) -> Result<()> {
             StatusCode::from_u32(status.status_code).context(IllegalDatabaseResponseSnafu {
                 err_msg: format!("unknown server status: {:?}", status),
             })?;
-        ServerSnafu {
+        Err(ServerSnafu {
             code,
             msg: status.err_msg.clone(),
-            stack_errors: Vec::new(),
         }
-        .fail()
+        // TODO(discord9): pass stack errors in grpc proto
+        .into_error(vec![].into()))
     }
 }
 
