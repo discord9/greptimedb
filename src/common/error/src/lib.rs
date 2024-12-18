@@ -31,7 +31,7 @@ pub static GREPTIME_DB_HEADER_ERROR_INFO: HeaderName =
     HeaderName::from_static(ERROR_INFO_HEADER_NAME);
 
 /// Remote stack error, hold error stack from remote datanode/metasrv etc.
-/// can be carried in http header and is human readable
+/// can be carried in http header and is human-readable in header
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteStackError {
     pub code: StatusCode,
@@ -75,6 +75,7 @@ impl std::error::Error for RemoteStackError {}
 
 impl StackError for RemoteStackError {
     fn debug_fmt(&self, _layer: usize, buf: &mut Vec<String>) {
+        buf.extend([format!("RemoteStackError: {}", self)]);
         buf.extend(self.stack_error.clone());
     }
 
@@ -200,13 +201,6 @@ pub fn from_err_code_msg_stack_to_header(
 pub fn from_stacked_errors_to_list(err: &impl StackError) -> Vec<String> {
     let mut buf = Vec::new();
     err.debug_fmt(0, &mut buf);
-    let mut layer = 1;
-    let mut err: &dyn StackError = err;
-    while let Some(nxt) = err.next() {
-        err.debug_fmt(layer, &mut buf);
-        layer += 1;
-        err = nxt;
-    }
     buf
 }
 
