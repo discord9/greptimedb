@@ -34,8 +34,7 @@ pub enum Error {
     MetaServer {
         code: StatusCode,
         msg: String,
-        #[snafu(source)]
-        stack_errors: RemoteStackError,
+        source: RemoteStackError,
         tonic_code: tonic::Code,
     },
 
@@ -156,8 +155,8 @@ impl From<Status> for Error {
                 let msg = info.msg;
                 Self::MetaServer {
                     code,
-                    msg,
-                    stack_errors: info.stack_errors.into(),
+                    msg: msg.clone(),
+                    source: RemoteStackError::new(code, msg, info.stack_errors),
                     tonic_code: e.code(),
                 }
             }
@@ -170,8 +169,8 @@ impl From<Status> for Error {
                 );
                 Self::MetaServer {
                     code,
-                    msg,
-                    stack_errors: Vec::new().into(),
+                    msg: msg.clone(),
+                    source: RemoteStackError::new(code, msg, Vec::new()),
                     tonic_code: e.code(),
                 }
             }

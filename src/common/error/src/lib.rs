@@ -22,6 +22,7 @@ use ext::{ErrorExt, StackError};
 pub use headers::{self, Header, HeaderMapExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 pub use snafu;
+use status_code::StatusCode;
 use unescaper::unescape;
 
 pub const ERROR_INFO_HEADER_NAME: &str = "x-greptime-err-info";
@@ -29,13 +30,26 @@ pub const ERROR_INFO_HEADER_NAME: &str = "x-greptime-err-info";
 pub static GREPTIME_DB_HEADER_ERROR_INFO: HeaderName =
     HeaderName::from_static(ERROR_INFO_HEADER_NAME);
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Remote stack error, hold error stack from remote datanode/metasrv etc.
+/// can be carried in http header and is human readable
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteStackError {
+    pub code: StatusCode,
+    pub msg: String,
     pub stack_error: Vec<String>,
 }
 
 impl RemoteStackError {
-    pub fn from_stack_error(err: &impl StackError) -> Self {
+    pub fn new(code: StatusCode, msg: String, stack_error: Vec<String>) -> Self {
+        RemoteStackError {
+            code,
+            msg,
+            stack_error,
+        }
+    }
+    pub fn from_stack_error(err: &impl ErrorExt) -> Self {
+        let code = err.status_code();
+        let msg = err.output_msg();
         let mut buf = Vec::new();
         err.debug_fmt(0, &mut buf);
         let mut cur: &dyn StackError = err;
@@ -43,23 +57,21 @@ impl RemoteStackError {
             cur.debug_fmt(0, &mut buf);
             cur = nxt;
         }
-        RemoteStackError { stack_error: buf }
+        RemoteStackError {
+            code,
+            msg,
+            stack_error: buf,
+        }
     }
 }
 
 impl std::fmt::Display for RemoteStackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.stack_error.join("\n"))
+        write!(f, "{}", self.msg)
     }
 }
 
 impl std::error::Error for RemoteStackError {}
-
-impl From<Vec<String>> for RemoteStackError {
-    fn from(value: Vec<String>) -> Self {
-        RemoteStackError { stack_error: value }
-    }
-}
 
 impl StackError for RemoteStackError {
     fn debug_fmt(&self, _layer: usize, buf: &mut Vec<String>) {

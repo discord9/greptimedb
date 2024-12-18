@@ -23,6 +23,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use common_error::ext::BoxedError;
 use common_error::status_code::StatusCode;
+use common_error::RemoteStackError;
 use common_grpc::flight::{FlightDecoder, FlightMessage};
 use common_meta::error::{self as meta_error, Result as MetaResult};
 use common_meta::node_manager::Datanode;
@@ -238,7 +239,11 @@ pub fn check_response_header(header: &Option<ResponseHeader>) -> Result<()> {
             msg: status.err_msg.clone(),
         }
         // TODO(discord9): pass stack errors in grpc proto
-        .into_error(vec![].into()))
+        .into_error(RemoteStackError::new(
+            code,
+            status.err_msg.clone(),
+            Vec::new(),
+        )))
     }
 }
 

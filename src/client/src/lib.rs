@@ -29,6 +29,7 @@ use api::v1::greptime_response::Response;
 use api::v1::{AffectedRows, GreptimeResponse};
 pub use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::status_code::StatusCode;
+use common_error::RemoteStackError;
 pub use common_query::{Output, OutputData, OutputMeta};
 pub use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
 use snafu::{IntoError, OptionExt};
@@ -61,9 +62,13 @@ pub fn from_grpc_response(response: GreptimeResponse) -> Result<u32> {
             })?;
         Err(ServerSnafu {
             code: status_code,
-            msg: status.err_msg,
+            msg: status.err_msg.clone(),
         }
         // TODO(discord9): pass stack errors in grpc proto
-        .into_error(vec![].into()))
+        .into_error(RemoteStackError::new(
+            status_code,
+            status.err_msg,
+            Vec::new(),
+        )))
     }
 }

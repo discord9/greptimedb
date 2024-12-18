@@ -98,8 +98,7 @@ pub enum Error {
     Server {
         code: StatusCode,
         msg: String,
-        #[snafu(source)]
-        stack_errors: RemoteStackError,
+        source: RemoteStackError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -159,8 +158,8 @@ impl From<Status> for Error {
                 common_telemetry::info!("Code: {code}, Msg: {msg}");
                 Self::Server {
                     code,
-                    msg,
-                    stack_errors: info.stack_errors.into(),
+                    msg: msg.clone(),
+                    source: RemoteStackError::new(code, msg, info.stack_errors),
                     location: location!(),
                 }
             }
@@ -173,8 +172,8 @@ impl From<Status> for Error {
                 );
                 Self::Server {
                     code,
-                    msg,
-                    stack_errors: Vec::new().into(),
+                    msg: msg.clone(),
+                    source: RemoteStackError::new(code, msg, Vec::new()),
                     location: location!(),
                 }
             }
