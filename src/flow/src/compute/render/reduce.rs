@@ -549,6 +549,7 @@ fn reduce_batch_subgraph(
             let column_cnt = output_types.len();
             let row_cnt = all_output_dict.len();
 
+            // TODO(discord9): change to cleaner row-to-column impl once possible
             let mut output_builder = output_types
                 .into_iter()
                 .map(|t| t.create_mutable_vector(row_cnt))

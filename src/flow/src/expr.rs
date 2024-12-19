@@ -94,6 +94,8 @@ impl Batch {
             return Ok(Self::empty());
         }
         let len = rows.len();
+
+        // TODO(discord9): change to cleaner row-to-column impl once possible
         let mut builder = batch_datatypes
             .iter()
             .map(|ty| ty.create_mutable_vector(len))
@@ -244,6 +246,7 @@ impl Batch {
             dts
         };
 
+        // TODO(discord9): change to cleaner row-to-column impl once possible
         let batch_builders = dts
             .iter()
             .map(|dt| dt.create_mutable_vector(self.row_count() + other.row_count()))

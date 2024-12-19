@@ -135,6 +135,8 @@ impl DfScalarFunction {
             .enumerate()
         {
             let typ = typ.scalar_type();
+
+            // TODO(discord9): change to cleaner row-to-column impl once possible
             let mut array = typ.create_mutable_vector(1);
             array.push_value_ref(values[idx].as_value_ref());
             cols.push(array.to_vector().to_arrow_array());
