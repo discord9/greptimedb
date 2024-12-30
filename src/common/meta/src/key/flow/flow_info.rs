@@ -114,8 +114,16 @@ impl<'a> MetadataKey<'a, FlowInfoKeyInner> for FlowInfoKeyInner {
 pub struct FlowInfoValue {
     /// The source tables used by the flow.
     pub(crate) source_table_ids: Vec<TableId>,
+    /// The schema version of source table, used to detect altered table
+    /// separate from table id and have default value
+    /// for compatibility with old version
+    #[serde(default)]
+    pub(crate) source_table_versions: BTreeMap<TableId, u64>,
     /// The sink table used by the flow.
     pub(crate) sink_table_name: TableName,
+    /// The schema version of sink table, used to detect altered table
+    #[serde(default)]
+    pub(crate) sink_table_version: Option<u64>,
     /// Which flow nodes this flow is running on.
     pub(crate) flownode_ids: BTreeMap<FlowPartitionId, FlownodeId>,
     /// The catalog name.

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
 use snafu::OptionExt;
 
 use crate::ddl::create_flow::CreateFlowProcedure;
@@ -68,7 +70,46 @@ impl CreateFlowProcedure {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let source_table_versions: BTreeMap<_, _> = self
+            .context
+            .table_metadata_manager
+            .table_info_manager()
+            .batch_get(&source_table_ids)
+            .await?
+            .into_iter()
+            .map(|(table_id, table_info)| (table_id, table_info.version()))
+            .collect();
+        let sink_table_version = {
+            let sink_table_name = self.data.task.sink_table_name.clone();
+            let key = TableNameKey::new(
+                &sink_table_name.catalog_name,
+                &sink_table_name.schema_name,
+                &sink_table_name.table_name,
+            );
+            let sink_table_id = self
+                .context
+                .table_metadata_manager
+                .table_name_manager()
+                .get(key)
+                .await?
+                .with_context(|| error::TableNotFoundSnafu {
+                    table_name: sink_table_name.to_string(),
+                })?
+                .table_id();
+            self.context
+                .table_metadata_manager
+                .table_info_manager()
+                .get(sink_table_id)
+                .await?
+                .with_context(|| error::TableNotFoundSnafu {
+                    table_name: sink_table_name.to_string(),
+                })?
+                .version()
+        };
+
         self.data.source_table_ids = source_table_ids;
+        self.data.source_versions = source_table_versions;
+        self.data.sink_version = Some(sink_table_version);
         Ok(())
     }
 }

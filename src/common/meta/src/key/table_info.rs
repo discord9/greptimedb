@@ -92,6 +92,10 @@ impl TableInfoValue {
         }
     }
 
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub(crate) fn update(&self, new_table_info: RawTableInfo) -> Self {
         Self {
             table_info: new_table_info,

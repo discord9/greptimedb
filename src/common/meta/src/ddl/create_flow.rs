@@ -74,6 +74,8 @@ impl CreateFlowProcedure {
                 flow_id: None,
                 peers: vec![],
                 source_table_ids: vec![],
+                source_versions: BTreeMap::new(),
+                sink_version: None,
                 query_context,
                 state: CreateFlowState::Prepare,
                 prev_flow_info_value: None,
@@ -331,6 +333,10 @@ pub struct CreateFlowData {
     pub(crate) flow_id: Option<FlowId>,
     pub(crate) peers: Vec<Peer>,
     pub(crate) source_table_ids: Vec<TableId>,
+    /// The source table versions. For verifying if the source table is altered.
+    pub(crate) source_versions: BTreeMap<TableId, u64>,
+    /// The sink table version. For verifying if the sink table is altered.
+    pub(crate) sink_version: Option<u64>,
     pub(crate) query_context: QueryContext,
     /// For verify if prev value is consistent when need to update flow metadata.
     /// only set when `or_replace` is true.
@@ -389,7 +395,9 @@ impl From<&CreateFlowData> for (FlowInfoValue, Vec<(FlowPartitionId, FlowRouteVa
         (
             FlowInfoValue {
                 source_table_ids: value.source_table_ids.clone(),
+                source_table_versions: value.source_versions.clone(),
                 sink_table_name,
+                sink_table_version: value.sink_version,
                 flownode_ids,
                 catalog_name,
                 flow_name,

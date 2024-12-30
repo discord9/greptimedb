@@ -177,11 +177,13 @@ mod tests {
                 1024,
                 FlowInfoValue {
                     source_table_ids: vec![1024, 1025],
+                    source_table_versions: BTreeMap::from([(1024, 0), (1025, 0)]),
                     sink_table_name: TableName {
                         catalog_name: DEFAULT_CATALOG_NAME.to_string(),
                         schema_name: DEFAULT_SCHEMA_NAME.to_string(),
                         table_name: "sink_table".to_string(),
                     },
+                    sink_table_version: Some(0),
                     flownode_ids: BTreeMap::from([(0, 1), (1, 2), (2, 3)]),
                     catalog_name: DEFAULT_CATALOG_NAME.to_string(),
                     flow_name: "my_flow".to_string(),
