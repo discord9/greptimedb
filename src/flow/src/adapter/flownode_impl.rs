@@ -172,11 +172,25 @@ impl Flownode for FlowWorkerManager {
                 let ctx = self.node_context.read().await;
 
                 // TODO(discord9): also check schema version so that altered table can be reported
-                let table_schema = ctx
+                let (table_schema, version) = ctx
                     .table_source
                     .table_from_id(&table_id)
                     .await
                     .map_err(to_meta_err(snafu::location!()))?;
+
+                let old_version = ctx.source_versions.get(&table_id).copied();
+                if old_version != Some(version) {
+                    InternalSnafu {
+                        reason: format!(
+                            "Table id={} has been altered, old version={:?}, new version={}",
+                            table_id, old_version, version
+                        ),
+                    }
+                    .fail()
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?;
+                }
+
                 let table_col_names = table_schema.names;
                 let table_col_names = table_col_names
                     .iter().enumerate()

@@ -38,6 +38,8 @@ use crate::repr::{DiffRow, RelationDesc, BATCH_SIZE, BROADCAST_CAP, SEND_BUF_CAP
 pub struct FlownodeContext {
     /// mapping from source table to tasks, useful for schedule which task to run when a source table is updated
     pub source_to_tasks: BTreeMap<TableId, BTreeSet<FlowId>>,
+    /// mapping from source table to version, useful for checking if a source table is altered
+    pub source_versions: BTreeMap<TableId, u64>,
     /// mapping from task to sink table, useful for sending data back to the client when a task is done running
     pub flow_to_sink: BTreeMap<FlowId, TableName>,
     pub sink_to_flow: BTreeMap<TableName, FlowId>,
@@ -62,6 +64,7 @@ impl FlownodeContext {
     pub fn new(table_source: Box<dyn FlowTableSource>) -> Self {
         Self {
             source_to_tasks: Default::default(),
+            source_versions: Default::default(),
             flow_to_sink: Default::default(),
             sink_to_flow: Default::default(),
             source_sender: Default::default(),
@@ -308,7 +311,7 @@ impl FlownodeContext {
             .with_context(|| TableNotFoundSnafu {
                 name: name.join("."),
             })?;
-        let schema = self.table_source.table(name).await?;
+        let (schema, _version) = self.table_source.table(name).await?;
         Ok((id, schema))
     }
 

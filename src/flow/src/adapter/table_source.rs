@@ -34,12 +34,14 @@ pub trait FlowTableSource: Send + Sync + std::fmt::Debug {
     async fn table_name_from_id(&self, table_id: &TableId) -> Result<TableName, Error>;
     async fn table_id_from_name(&self, name: &TableName) -> Result<TableId, Error>;
 
-    /// Get the table schema by table name
-    async fn table(&self, name: &TableName) -> Result<RelationDesc, Error> {
+    /// Get the table schema by table name, also return the version of the table
+    async fn table(&self, name: &TableName) -> Result<(RelationDesc, u64), Error> {
         let id = self.table_id_from_name(name).await?;
         self.table_from_id(&id).await
     }
-    async fn table_from_id(&self, table_id: &TableId) -> Result<RelationDesc, Error>;
+
+    /// Get the table schema by table id, also return the version of the table
+    async fn table_from_id(&self, table_id: &TableId) -> Result<(RelationDesc, u64), Error>;
 }
 
 /// mapping of table name <-> table id should be query from tableinfo manager
@@ -52,16 +54,17 @@ pub struct KvBackendTableSource {
 
 #[async_trait::async_trait]
 impl FlowTableSource for KvBackendTableSource {
-    async fn table_from_id(&self, table_id: &TableId) -> Result<RelationDesc, Error> {
+    async fn table_from_id(&self, table_id: &TableId) -> Result<(RelationDesc, u64), Error> {
         let table_info_value = self
             .get_table_info_value(table_id)
             .await?
             .with_context(|| TableNotFoundSnafu {
                 name: format!("TableId = {:?}, Can't found table info", table_id),
             })?;
+        let ver = table_info_value.version();
         let desc = table_info_value_to_relation_desc(table_info_value)?;
 
-        Ok(desc)
+        Ok((desc, ver))
     }
     async fn table_name_from_id(&self, table_id: &TableId) -> Result<TableName, Error> {
         self.get_table_name(table_id).await
@@ -214,10 +217,10 @@ impl Default for FlowDummyTableSource {
 
 #[async_trait::async_trait]
 impl FlowTableSource for FlowDummyTableSource {
-    async fn table_from_id(&self, table_id: &TableId) -> Result<RelationDesc, Error> {
+    async fn table_from_id(&self, table_id: &TableId) -> Result<(RelationDesc, u64), Error> {
         for (id, _name, desc) in &self.id_names_to_desc {
             if id == table_id {
-                return Ok(desc.clone());
+                return Ok((desc.clone(), 0));
             }
         }
         TableNotFoundSnafu {
