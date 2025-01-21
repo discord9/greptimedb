@@ -129,6 +129,10 @@ impl flow_server::Flow for FlowService {
             .handle_inserts(request)
             .await
             .map(Response::new)
+            .map_err(|e| {
+                common_telemetry::error!(e; "Failed to handle mirror request");
+                e
+            })
             .map_err(to_status_with_last_err)
     }
 }
