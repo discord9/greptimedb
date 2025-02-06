@@ -167,6 +167,7 @@ impl RegionEngine for MetricEngine {
                 UnsupportedRegionRequestSnafu { request }.fail()
             }
             RegionRequest::Catchup(req) => self.inner.catchup_region(region_id, req).await,
+            RegionRequest::Sequences(seqs) => return self.get_region_sequences(seqs).await,
         };
 
         result.map_err(BoxedError::new).map(|rows| RegionResponse {
