@@ -14,6 +14,8 @@
 
 //! Run flow as recording rule which is time-window-aware normal query triggered every tick set by user
 
+mod frontend_client;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
