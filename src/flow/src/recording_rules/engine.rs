@@ -22,12 +22,12 @@ use datafusion_common::tree_node::TreeNode;
 use datatypes::value::Value;
 use query::QueryEngineRef;
 use session::context::QueryContextRef;
-use snafu::{OptionExt, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 
 use super::frontend_client::FrontendClient;
 use super::{df_plan_to_sql, AddFilterRewriter};
 use crate::adapter::{CreateFlowArgs, FlowId};
-use crate::error::{DatafusionSnafu, FlowNotFoundSnafu};
+use crate::error::{DatafusionSnafu, FlowNotFoundSnafu, UnexpectedSnafu};
 use crate::recording_rules::{find_plan_time_window_lower_bound, sql_to_df_plan};
 use crate::Error;
 
@@ -56,6 +56,13 @@ impl RecordingRuleEngine {
             flow_options,
             query_ctx,
         } = args;
+        let flow_type = flow_options.get(FlowType::FLOW_TYPE_KEY);
+        ensure!(
+            flow_type == Some(&FlowType::RecordingRule.to_string()),
+            UnexpectedSnafu {
+                reason: format!("Flow type is not RecordingRule, got {flow_type:?}")
+            }
+        );
         todo!()
     }
 
