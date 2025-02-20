@@ -14,19 +14,20 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use common_meta::ddl::create_flow::FlowType;
 use common_time::Timestamp;
 use datafusion_common::tree_node::TreeNode;
 use datatypes::value::Value;
 use query::QueryEngineRef;
 use session::context::QueryContextRef;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use super::frontend_client::FrontendClient;
 use super::{df_plan_to_sql, AddFilterRewriter};
-use crate::adapter::FlowId;
-use crate::error::DatafusionSnafu;
+use crate::adapter::{CreateFlowArgs, FlowId};
+use crate::error::{DatafusionSnafu, FlowNotFoundSnafu};
 use crate::recording_rules::{find_plan_time_window_lower_bound, sql_to_df_plan};
 use crate::Error;
 
@@ -39,7 +40,41 @@ pub struct RecordingRuleEngine {
     engine: QueryEngineRef,
 }
 
-impl RecordingRuleEngine {}
+const DEFAULT_REFRESH_DURATION: Duration = Duration::new(10, 0);
+
+impl RecordingRuleEngine {
+    pub async fn create_flow(&self, args: CreateFlowArgs) -> Result<Option<FlowId>, Error> {
+        let CreateFlowArgs {
+            flow_id,
+            sink_table_name,
+            source_table_ids,
+            create_if_not_exists,
+            or_replace,
+            expire_after,
+            comment,
+            sql,
+            flow_options,
+            query_ctx,
+        } = args;
+        todo!()
+    }
+
+    async fn gen_exec_query_for_flow(&self, flow_id: FlowId) -> Result<(), Error> {
+        let task = self
+            .rules
+            .get(&flow_id)
+            .context(FlowNotFoundSnafu { id: flow_id })?;
+        let state = self
+            .states
+            .get(&flow_id)
+            .context(FlowNotFoundSnafu { id: flow_id })?;
+        let new_query = task
+            .gen_query_with_time_window(self.engine.clone(), state.query_ctx.clone())
+            .await?;
+        self.frontend_client.sql(&new_query).await?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordingRuleTask {
@@ -47,6 +82,12 @@ pub struct RecordingRuleTask {
     /// in millisecond
     expire_after: Option<u64>,
     sink_table_name: [String; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingRuleState {
+    query_ctx: QueryContextRef,
+    last_update_time: Timestamp,
 }
 
 impl RecordingRuleTask {
@@ -102,10 +143,4 @@ impl RecordingRuleTask {
 
         Ok(new_sql)
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct RecordingRuleState {
-    query_ctx: QueryContextRef,
-    last_update_time: Timestamp,
 }
