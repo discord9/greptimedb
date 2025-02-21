@@ -39,6 +39,8 @@ use datatypes::vectors::{
     TimestampMicrosecondVector, TimestampMillisecondVector, TimestampNanosecondVector,
     TimestampSecondVector, Vector,
 };
+pub use engine::RecordingRuleEngine;
+pub use frontend_client::FrontendClient;
 use query::parser::QueryLanguageParser;
 use query::QueryEngineRef;
 use session::context::QueryContextRef;

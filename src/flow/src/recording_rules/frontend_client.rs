@@ -15,6 +15,7 @@
 //! Frontend client to run flow as recording rule which is time-window-aware normal query triggered every tick set by user
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use client::{Client, Database, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
@@ -33,7 +34,7 @@ use crate::Error;
 #[derive(Debug)]
 pub enum FrontendClient {
     Distributed {
-        meta_client: MetaClient,
+        meta_client: Arc<MetaClient>,
         /// list of frontend node and connection to it
         database_clients: Mutex<RoundRobinClients>,
     },
@@ -60,7 +61,7 @@ impl RoundRobinClients {
 }
 
 impl FrontendClient {
-    pub fn from_meta_client(meta_client: MetaClient) -> Self {
+    pub fn from_meta_client(meta_client: Arc<MetaClient>) -> Self {
         Self::Distributed {
             meta_client,
             database_clients: Default::default(),
