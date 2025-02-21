@@ -83,12 +83,12 @@ pub async fn sql_to_df_plan(
 /// 3. show up in GROUP BY clause
 ///
 /// note this plan should only contain one TableScan
-pub async fn find_plan_time_window_lower_bound(
+pub async fn find_plan_time_window_bound(
     plan: &LogicalPlan,
     current: Timestamp,
     query_ctx: QueryContextRef,
     engine: QueryEngineRef,
-) -> Result<Option<(String, Timestamp)>, Error> {
+) -> Result<(String, Option<Timestamp>, Option<Timestamp>), Error> {
     // TODO(discord9): find the expr that do time window
     let catalog_man = engine.engine_state().catalog_manager();
 
@@ -207,12 +207,13 @@ pub async fn find_plan_time_window_lower_bound(
 
     // if no time_window_expr is found, return None
     if let Some(time_window_expr) = time_window_expr {
-        Ok(
-            find_expr_time_window_lower_bound(&time_window_expr, &df_schema, new_current)?
-                .map(|ts| (ts_col_name, ts)),
-        )
+        let lower_bound =
+            find_expr_time_window_lower_bound(&time_window_expr, &df_schema, new_current)?;
+        let upper_bound =
+            find_expr_time_window_upper_bound(&time_window_expr, &df_schema, new_current)?;
+        Ok((ts_col_name, lower_bound, upper_bound))
     } else {
-        Ok(None)
+        Ok((ts_col_name, None, None))
     }
 }
 
@@ -325,6 +326,107 @@ fn find_expr_time_window_lower_bound(
     let final_lower_bound_for_time_window = common_time::Timestamp::new(low, output_unit);
 
     Ok(Some(final_lower_bound_for_time_window))
+}
+
+/// Find the upper bound for time window expression
+fn find_expr_time_window_upper_bound(
+    expr: &Expr,
+    df_schema: &DFSchema,
+    current: Timestamp,
+) -> Result<Option<Timestamp>, Error> {
+    use std::cmp::Ordering;
+
+    let phy_planner = DefaultPhysicalPlanner::default();
+
+    let phy_expr: PhysicalExprRef = phy_planner
+        .create_physical_expr(expr, df_schema, &SessionContext::new().state())
+        .with_context(|_e| DatafusionSnafu {
+            context: format!(
+                "Failed to create physical expression from {expr:?} using {df_schema:?}"
+            ),
+        })?;
+
+    let cur_time_window = eval_ts_to_ts(&phy_expr, df_schema, current)?;
+
+    // search to find the lower bound
+    let mut offset: i64 = 1;
+    let mut lower_bound = Some(current);
+    let upper_bound;
+    // first expontial probe to found a range for binary search
+    loop {
+        let Some(next_val) = current.value().checked_add(offset) else {
+            // no upper bound if overflow
+            return Ok(None);
+        };
+
+        let next_time_probe = common_time::Timestamp::new(next_val, current.unit());
+
+        let next_time_window = eval_ts_to_ts(&phy_expr, df_schema, next_time_probe)?;
+
+        match next_time_window.cmp(&cur_time_window) {
+            Ordering::Less => {UnexpectedSnafu {
+                reason: format!(
+                    "Unsupported time window expression, expect monotonic increasing for time window expression {expr:?}"
+                ),
+            }
+            .fail()?
+            }
+            Ordering::Equal => {
+                lower_bound = Some(next_time_probe);
+            }
+            Ordering::Greater => {
+                upper_bound = Some(next_time_probe);
+                break
+            }
+        }
+
+        let Some(new_offset) = offset.checked_mul(2) else {
+            // no upper bound if overflow
+            return Ok(None);
+        };
+        offset = new_offset;
+    }
+
+    // binary search for the exact upper bound
+
+    ensure!(lower_bound.map(|v|v.unit())==upper_bound.map(|v|v.unit()), UnexpectedSnafu{
+        reason: format!(" unit mismatch for time window expression {expr:?}, found {lower_bound:?} and {upper_bound:?}"),
+    });
+
+    let output_unit = upper_bound
+        .context(UnexpectedSnafu {
+            reason: "should have lower bound",
+        })?
+        .unit();
+
+    let mut low = lower_bound
+        .context(UnexpectedSnafu {
+            reason: "should have lower bound",
+        })?
+        .value();
+    let mut high = upper_bound
+        .context(UnexpectedSnafu {
+            reason: "should have upper bound",
+        })?
+        .value();
+    while low < high {
+        let mid = (low + high) / 2;
+        let mid_probe = common_time::Timestamp::new(mid, output_unit);
+        let mid_time_window = eval_ts_to_ts(&phy_expr, df_schema, mid_probe)?;
+
+        match mid_time_window.cmp(&cur_time_window) {
+            Ordering::Less => UnexpectedSnafu {
+                reason: format!("Binary search failed for time window expression {expr:?}"),
+            }
+            .fail()?,
+            Ordering::Equal => low = mid + 1,
+            Ordering::Greater => high = mid,
+        }
+    }
+
+    let final_upper_bound_for_time_window = common_time::Timestamp::new(high, output_unit);
+
+    Ok(Some(final_upper_bound_for_time_window))
 }
 
 fn eval_ts_to_ts(
@@ -517,58 +619,63 @@ mod test {
             (
                 "SELECT date_bin('5 minutes', ts) FROM numbers_with_ts;",
                 Timestamp::new(23, TimeUnit::Millisecond),
-                None,
+                ("ts".to_string(), None, None),
                 "SELECT date_bin('5 minutes', ts) FROM numbers_with_ts;"
             ),
             // time index
             (
                 "SELECT date_bin('5 minutes', ts) as time_window FROM numbers_with_ts GROUP BY time_window;",
                 Timestamp::new(23, TimeUnit::Nanosecond),
-                Some((
+                (
                     "ts".to_string(),
-                    Timestamp::new(0, TimeUnit::Millisecond),
-                )),
-                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE (ts > CAST('1970-01-01 00:00:00' AS TIMESTAMP)) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
+                    Some(Timestamp::new(0, TimeUnit::Millisecond)),
+                    Some(Timestamp::new(300000, TimeUnit::Millisecond)),
+                ),
+                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE ((ts >= CAST('1970-01-01 00:00:00' AS TIMESTAMP)) AND (ts <= CAST('1970-01-01 00:05:00' AS TIMESTAMP))) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
             ),
             // on spot
             (
                 "SELECT date_bin('5 minutes', ts) as time_window FROM numbers_with_ts GROUP BY time_window;",
                 Timestamp::new(0, TimeUnit::Nanosecond),
-                Some((
+                (
                     "ts".to_string(),
-                    Timestamp::new(0, TimeUnit::Millisecond),
-                )),
-                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE (ts > CAST('1970-01-01 00:00:00' AS TIMESTAMP)) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
+                    Some(Timestamp::new(0, TimeUnit::Millisecond)),
+                    Some(Timestamp::new(300000, TimeUnit::Millisecond)),
+                ),
+                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE ((ts >= CAST('1970-01-01 00:00:00' AS TIMESTAMP)) AND (ts <= CAST('1970-01-01 00:05:00' AS TIMESTAMP))) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
             ),
             // different time unit
             (
                 "SELECT date_bin('5 minutes', ts) as time_window FROM numbers_with_ts GROUP BY time_window;",
                 Timestamp::new(23_000_000, TimeUnit::Nanosecond),
-                Some((
+                (
                     "ts".to_string(),
-                    Timestamp::new(0, TimeUnit::Millisecond),
-                )),
-                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE (ts > CAST('1970-01-01 00:00:00' AS TIMESTAMP)) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
+                    Some(Timestamp::new(0, TimeUnit::Millisecond)),
+                    Some(Timestamp::new(300000, TimeUnit::Millisecond)),
+                ),
+                "SELECT date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE ((ts >= CAST('1970-01-01 00:00:00' AS TIMESTAMP)) AND (ts <= CAST('1970-01-01 00:05:00' AS TIMESTAMP))) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
             ),
             // time index with other fields
             (
                 "SELECT sum(number) as sum_up, date_bin('5 minutes', ts) as time_window FROM numbers_with_ts GROUP BY time_window;",
                 Timestamp::new(23, TimeUnit::Millisecond),
-                Some((
+                (
                     "ts".to_string(),
-                    Timestamp::new(0, TimeUnit::Millisecond),
-                )),
-                "SELECT sum(numbers_with_ts.number) AS sum_up, date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE (ts > CAST('1970-01-01 00:00:00' AS TIMESTAMP)) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
+                    Some(Timestamp::new(0, TimeUnit::Millisecond)),
+                    Some(Timestamp::new(300000, TimeUnit::Millisecond)),
+                ),
+                "SELECT sum(numbers_with_ts.number) AS sum_up, date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE ((ts >= CAST('1970-01-01 00:00:00' AS TIMESTAMP)) AND (ts <= CAST('1970-01-01 00:05:00' AS TIMESTAMP))) GROUP BY date_bin('5 minutes', numbers_with_ts.ts)"
             ),
             // time index with other pks
             (
                 "SELECT number, date_bin('5 minutes', ts) as time_window FROM numbers_with_ts GROUP BY time_window, number;",
                 Timestamp::new(23, TimeUnit::Millisecond),
-                Some((
+                (
                     "ts".to_string(),
-                    Timestamp::new(0, TimeUnit::Millisecond),
-                )),
-                "SELECT numbers_with_ts.number, date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE (ts > CAST('1970-01-01 00:00:00' AS TIMESTAMP)) GROUP BY date_bin('5 minutes', numbers_with_ts.ts), numbers_with_ts.number"
+                    Some(Timestamp::new(0, TimeUnit::Millisecond)),
+                    Some(Timestamp::new(300000, TimeUnit::Millisecond)),
+                ),
+                "SELECT numbers_with_ts.number, date_bin('5 minutes', numbers_with_ts.ts) AS time_window FROM numbers_with_ts WHERE ((ts >= CAST('1970-01-01 00:00:00' AS TIMESTAMP)) AND (ts <= CAST('1970-01-01 00:05:00' AS TIMESTAMP))) GROUP BY date_bin('5 minutes', numbers_with_ts.ts), numbers_with_ts.number"
             ),
         ];
 
@@ -577,23 +684,28 @@ mod test {
                 .await
                 .unwrap();
 
-            let real = find_plan_time_window_lower_bound(
-                &plan,
-                current,
-                ctx.clone(),
-                query_engine.clone(),
-            )
-            .await
-            .unwrap();
+            let real =
+                find_plan_time_window_bound(&plan, current, ctx.clone(), query_engine.clone())
+                    .await
+                    .unwrap();
             assert_eq!(real, expected);
 
             let plan = sql_to_df_plan(ctx.clone(), query_engine.clone(), sql, false)
                 .await
                 .unwrap();
-            let new_sql = if let Some((col_name, value)) = real {
-                let value = Value::from(value);
-                let value = value.try_to_scalar_value(&value.data_type()).unwrap();
-                let mut add_filter = AddFilterRewriter::new(col(col_name).gt(lit(value)));
+            let (col_name, lower, upper) = real;
+            let new_sql = if lower.is_some() {
+                let to_df_literal = |value| {
+                    let value = Value::from(value);
+
+                    value.try_to_scalar_value(&value.data_type()).unwrap()
+                };
+                let lower = to_df_literal(lower.unwrap());
+                let upper = to_df_literal(upper.unwrap());
+                let expr = col(&col_name)
+                    .gt_eq(lit(lower))
+                    .and(col(&col_name).lt_eq(lit(upper)));
+                let mut add_filter = AddFilterRewriter::new(expr);
                 let plan = plan.rewrite(&mut add_filter).unwrap().data;
                 df_plan_to_sql(&plan).unwrap()
             } else {
