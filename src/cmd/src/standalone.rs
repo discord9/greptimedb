@@ -537,7 +537,7 @@ impl StartCommand {
             ..Default::default()
         };
 
-        let fe_server_addr = fe_opts.grpc.server_addr.clone();
+        let fe_server_addr = fe_opts.grpc.bind_addr.clone();
         let frontend_client = FrontendClient::from_static_grpc_addr(fe_server_addr);
         let flow_builder = FlownodeBuilder::new(
             flownode_options,

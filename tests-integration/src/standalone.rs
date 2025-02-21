@@ -164,7 +164,7 @@ impl GreptimeDbStandaloneBuilder {
             Some(procedure_manager.clone()),
         );
 
-        let fe_server_addr = opts.frontend_options().grpc.server_addr.clone();
+        let fe_server_addr = opts.frontend_options().grpc.bind_addr.clone();
         let frontend_client = FrontendClient::from_static_grpc_addr(fe_server_addr);
         let flow_builder = FlownodeBuilder::new(
             Default::default(),

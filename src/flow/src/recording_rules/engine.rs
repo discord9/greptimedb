@@ -56,7 +56,7 @@ impl RecordingRuleEngine {
     }
 }
 
-const MAX_REFRESH_DURATION: Duration = Duration::new(100, 0);
+const MIN_REFRESH_DURATION: Duration = Duration::new(5, 0);
 
 impl RecordingRuleEngine {
     pub async fn create_flow(&self, args: CreateFlowArgs) -> Result<Option<FlowId>, Error> {
@@ -76,9 +76,9 @@ impl RecordingRuleEngine {
         let flow_type = flow_options.get(FlowType::FLOW_TYPE_KEY);
 
         ensure!(
-            flow_type == Some(&FlowType::RecordingRule.to_string()),
+            flow_type == Some(&FlowType::RecordingRule.to_string()) || flow_type.is_none(),
             UnexpectedSnafu {
-                reason: format!("Flow type is not RecordingRule, got {flow_type:?}")
+                reason: format!("Flow type is not RecordingRule nor None, got {flow_type:?}")
             }
         );
 
@@ -211,9 +211,18 @@ impl RecordingRuleTask {
         let mut is_first = true;
 
         loop {
+            // FIXME(discord9): test if need upper bound also works
             let new_query = self
-                .gen_query_with_time_window(engine.clone(), !is_first)
+                .gen_query_with_time_window(engine.clone(), false)
                 .await?;
+
+            let insert_into = format!(
+                "INSERT INTO {}.{}.{} {}",
+                self.sink_table_name[0],
+                self.sink_table_name[1],
+                self.sink_table_name[2],
+                new_query
+            );
 
             if is_first {
                 is_first = false;
@@ -221,13 +230,13 @@ impl RecordingRuleTask {
 
             let instant = Instant::now();
             let flow_id = self.flow_id;
-            info!("Executing flow {flow_id} with query {new_query}");
+            info!("Executing flow {flow_id} with query {insert_into}");
 
             let timer = METRIC_FLOW_RULE_ENGINE_QUERY_TIME
                 .with_label_values(&[flow_id.to_string().as_str()])
                 .start_timer();
 
-            let res = frontend_client.sql(&new_query).await;
+            let res = frontend_client.sql(&insert_into).await;
             drop(timer);
 
             let elapsed = instant.elapsed();
@@ -365,6 +374,7 @@ impl RecordingRuleState {
         let next_duration = max_timeout
             .unwrap_or(self.last_query_duration)
             .min(self.last_query_duration);
+        let next_duration = next_duration.max(MIN_REFRESH_DURATION);
 
         self.last_update_time + next_duration
     }

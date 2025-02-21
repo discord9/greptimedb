@@ -24,7 +24,7 @@ use common_meta::peer::Peer;
 use common_meta::rpc::store::RangeRequest;
 use common_query::Output;
 use meta_client::client::MetaClient;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use tokio::sync::Mutex;
 
 use crate::error::{ExternalSnafu, UnexpectedSnafu};
@@ -53,10 +53,13 @@ pub struct RoundRobinClients {
 }
 
 impl RoundRobinClients {
-    fn get_next_client(&mut self) -> Database {
+    fn get_next_client(&mut self) -> Option<Database> {
+        if self.clients.is_empty() {
+            return None;
+        }
         let idx = self.next % self.clients.len();
         self.next = (self.next + 1) % self.clients.len();
-        self.clients.iter().nth(idx).unwrap().1 .1.clone()
+        Some(self.clients.iter().nth(idx).unwrap().1 .1.clone())
     }
 }
 
@@ -126,6 +129,13 @@ impl FrontendClient {
                     let client = Client::with_urls(vec![peer.addr.clone()]);
                     *database = Database::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, client);
                 }
+            } else {
+                let peer = val.peer;
+                let client = Client::with_urls(vec![peer.addr.clone()]);
+                let database = Database::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, client);
+                clients
+                    .clients
+                    .insert(key.node_id, (peer.clone(), database.clone()));
             }
         }
         drop(clients);
@@ -142,7 +152,13 @@ impl FrontendClient {
                 database_clients,
             } => {
                 self.update_frontend_addr().await?;
-                Ok(database_clients.lock().await.get_next_client())
+                database_clients
+                    .lock()
+                    .await
+                    .get_next_client()
+                    .context(UnexpectedSnafu {
+                        reason: "Can't get any database client",
+                    })
             }
         }
     }
