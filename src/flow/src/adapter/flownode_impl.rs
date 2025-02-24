@@ -153,7 +153,7 @@ impl Flownode for FlowWorkerManager {
         }
     }
 
-    #[allow(unreachable_code)]
+    #[allow(unreachable_code, unused)]
     async fn handle_inserts(&self, request: InsertRequests) -> Result<FlowResponse> {
         return Ok(Default::default());
 
