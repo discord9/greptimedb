@@ -347,7 +347,7 @@ impl RegionFlushTask {
             }
 
             let max_sequence = mem.stats().max_sequence();
-            let iter = mem.iter(None, None, None)?;
+            let iter = mem.iter(None, None, Default::default())?;
             let source = Source::Iter(iter);
 
             // Flush to level 0.

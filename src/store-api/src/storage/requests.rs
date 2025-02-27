@@ -16,7 +16,7 @@ use common_recordbatch::OrderOption;
 use datafusion_expr::expr::Expr;
 use strum::Display;
 
-use crate::storage::SequenceNumber;
+use crate::storage::SequenceRange;
 
 /// A hint on how to select rows from a time-series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display)]
@@ -44,5 +44,5 @@ pub struct ScanRequest {
     /// Optional constraint on the sequence number of the rows to read.
     /// If set, only rows with a sequence number lesser or equal to this value
     /// will be returned.
-    pub sequence: Option<SequenceNumber>,
+    pub sequence: SequenceRange,
 }

@@ -346,18 +346,17 @@ impl Batch {
         let (first, last) = (self.first_sequence(), self.last_sequence());
         let new_lower_bound = match (lower_bound, first) {
             (Some(seq), Some(first)) => Some(seq.max(first)),
-            (Some(seq), None) | (None, Some(seq)) => Some(seq),
-            (None, None) => None,
+            _ => None,
         };
 
         let new_upper_bound = match (upper_bound, last) {
-            (Some(seq), Some(last)) => Some(seq.min(last)),
-            (Some(seq), None) | (None, Some(seq)) => Some(seq),
-            (None, None) => None,
+            (Some(seq), Some(last)) => Some(seq.min(last + 1)),
+            _ => None,
         };
 
         if let (Some(lower), Some(upper)) = (new_lower_bound, new_upper_bound) {
             if lower >= upper {
+                self.filter(&BooleanVector::from_vec(vec![false; self.num_rows()]))?;
                 return Ok(());
             }
         }
@@ -383,6 +382,7 @@ impl Batch {
                     datafusion_common::arrow::compute::and(&l, &u).context(ComputeArrowSnafu)?
                 }
                 (Some(v), None) | (None, Some(v)) => v,
+                // no lower or upper bound, return the same
                 _ => return Ok(()),
             }
         };
@@ -1332,6 +1332,112 @@ mod tests {
         let expect = batch.clone();
         batch.filter_deleted().unwrap();
         assert_eq!(expect, batch);
+    }
+
+    #[test]
+    fn test_filter_by_sequence_range() {
+        use pretty_assertions::assert_eq;
+        // Filters put only.
+        let batch = new_batch(
+            &[1, 2, 3, 4, 5, 6],
+            &[11, 12, 13, 14, 15, 16],
+            &[
+                OpType::Put,
+                OpType::Put,
+                OpType::Put,
+                OpType::Put,
+                OpType::Put,
+                OpType::Put,
+            ],
+            &[21, 22, 23, 24, 25, 26],
+        );
+
+        // seq >= 13
+        {
+            let mut batch = batch.clone();
+            let mut expect = batch.clone();
+            expect
+                .filter(&BooleanVector::from_vec(vec![
+                    false, false, true, true, true, true,
+                ]))
+                .unwrap();
+
+            batch.filter_by_seq_range(Some(13), None).unwrap();
+            assert_eq!(expect, batch);
+        }
+
+        // seq < 16
+        {
+            let mut batch = batch.clone();
+            let mut expect = batch.clone();
+            expect
+                .filter(&BooleanVector::from_vec(vec![
+                    true, true, true, true, true, false,
+                ]))
+                .unwrap();
+
+            batch.filter_by_seq_range(None, Some(16)).unwrap();
+            assert_eq!(expect, batch);
+        }
+
+        // 13 <= seq < 16
+        {
+            let mut batch = batch.clone();
+            let mut expect = batch.clone();
+            expect
+                .filter(&BooleanVector::from_vec(vec![
+                    false, false, true, true, true, false,
+                ]))
+                .unwrap();
+
+            batch.filter_by_seq_range(Some(13), Some(16)).unwrap();
+            assert_eq!(expect, batch);
+        }
+
+        {
+            // Filters to same.
+            let mut batch = batch.clone();
+            let expected = batch.clone();
+
+            batch.filter_by_seq_range(Some(0), Some(52)).unwrap();
+
+            assert_eq!(expected, batch);
+        }
+
+        {
+            // Filters to empty.
+            let mut batch = batch.clone();
+
+            batch.filter_by_seq_range(Some(42), Some(52)).unwrap();
+
+            assert!(batch.is_empty());
+        }
+
+        {
+            // Filters to empty.
+            let mut batch = batch.clone();
+
+            batch.filter_by_seq_range(None, Some(10)).unwrap();
+            assert!(batch.is_empty());
+        }
+
+        // None filter.
+        {
+            let mut batch = batch.clone();
+            let expect = batch.clone();
+            batch.filter_by_seq_range(None, None).unwrap();
+            assert_eq!(expect, batch);
+        }
+
+        // Filter a empty batch
+        let mut batch = new_batch(&[], &[], &[], &[]);
+        batch.filter_by_seq_range(None, Some(10)).unwrap();
+        assert!(batch.is_empty());
+
+        // Filter a empty batch with None
+        let mut batch = new_batch(&[], &[], &[], &[]);
+        batch.filter_by_seq_range(None, Some(10)).unwrap();
+        assert!(batch.is_empty());
     }
 
     #[test]

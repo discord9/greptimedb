@@ -337,7 +337,7 @@ impl MetadataRegion {
             output_ordering: None,
             limit: None,
             series_row_selector: None,
-            sequence: None,
+            sequence: Default::default(),
         }
     }
 
@@ -526,7 +526,7 @@ impl MetadataRegion {
             output_ordering: None,
             limit: None,
             series_row_selector: None,
-            sequence: None,
+            sequence: Default::default(),
         };
         let record_batch_stream = self
             .mito

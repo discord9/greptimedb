@@ -17,3 +17,19 @@
 /// Represents a sequence number of data in storage. The offset of logstore can be used
 /// as a sequence number.
 pub type SequenceNumber = u64;
+
+/// seqs should be greater or equal to `start` and lesser than `end`
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SequenceRange {
+    pub start: Option<SequenceNumber>,
+    pub end: Option<SequenceNumber>,
+}
+
+impl SequenceRange {
+    pub fn from_max_seq(seq: SequenceNumber) -> Self {
+        Self {
+            start: None,
+            end: Some(seq),
+        }
+    }
+}

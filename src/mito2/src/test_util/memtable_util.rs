@@ -26,7 +26,7 @@ use datatypes::scalars::ScalarVector;
 use datatypes::schema::ColumnSchema;
 use datatypes::vectors::TimestampMillisecondVector;
 use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
-use store_api::storage::{ColumnId, RegionId, SequenceNumber};
+use store_api::storage::{ColumnId, RegionId, SequenceNumber, SequenceRange};
 use table::predicate::Predicate;
 
 use crate::error::Result;
@@ -84,7 +84,7 @@ impl Memtable for EmptyMemtable {
         &self,
         _projection: Option<&[ColumnId]>,
         _filters: Option<Predicate>,
-        _sequence: Option<SequenceNumber>,
+        _sequence: SequenceRange,
     ) -> Result<BoxedBatchIterator> {
         Ok(Box::new(std::iter::empty()))
     }
@@ -93,7 +93,7 @@ impl Memtable for EmptyMemtable {
         &self,
         _projection: Option<&[ColumnId]>,
         _predicate: Option<Predicate>,
-        _sequence: Option<SequenceNumber>,
+        _sequence: SequenceRange,
     ) -> MemtableRanges {
         MemtableRanges::default()
     }

@@ -31,7 +31,7 @@ use datatypes::arrow::datatypes::SchemaRef;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::RegionEngineRef;
-use store_api::storage::{RegionId, ScanRequest, TimeSeriesRowSelector};
+use store_api::storage::{RegionId, ScanRequest, SequenceRange, TimeSeriesRowSelector};
 use table::table::scan::RegionScanExec;
 
 use crate::error::{GetRegionMetadataSnafu, Result};
@@ -234,8 +234,8 @@ impl DummyTableProvider {
         self.scan_request.lock().unwrap().series_row_selector = Some(selector);
     }
 
-    pub fn with_sequence(&self, sequence: u64) {
-        self.scan_request.lock().unwrap().sequence = Some(sequence);
+    pub fn with_sequence(&self, sequence: SequenceRange) {
+        self.scan_request.lock().unwrap().sequence = sequence;
     }
 
     /// Gets the scan request of the provider.
@@ -267,7 +267,7 @@ impl TableProviderFactory for DummyTableProviderFactory {
         let scan_request = ctx
             .and_then(|c| c.get_snapshot(region_id.as_u64()))
             .map(|seq| ScanRequest {
-                sequence: Some(seq),
+                sequence: SequenceRange::from_max_seq(seq),
                 ..Default::default()
             })
             .unwrap_or_default();

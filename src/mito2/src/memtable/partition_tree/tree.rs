@@ -28,7 +28,7 @@ use serde::Serialize;
 use snafu::{ensure, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{ColumnId, SequenceNumber};
+use store_api::storage::{ColumnId, SequenceRange};
 use table::predicate::Predicate;
 
 use crate::error::{
@@ -224,7 +224,7 @@ impl PartitionTree {
         &self,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
-        sequence: Option<SequenceNumber>,
+        sequence: SequenceRange,
     ) -> Result<BoxedBatchIterator> {
         let start = Instant::now();
         // Creates the projection set.
@@ -476,7 +476,7 @@ struct TreeIterMetrics {
 
 struct TreeIter {
     /// Optional Sequence number of the current reader which limit results batch to lower than this sequence number.
-    sequence: Option<SequenceNumber>,
+    sequence: SequenceRange,
     partitions: VecDeque<PartitionRef>,
     current_reader: Option<PartitionReader>,
     metrics: TreeIterMetrics,
@@ -546,7 +546,7 @@ impl TreeIter {
             self.metrics.rows_fetched += batch.num_rows();
             self.metrics.batches_fetched += 1;
             let mut batch = batch;
-            batch.filter_by_sequence(self.sequence)?;
+            batch.filter_by_seq_range(self.sequence.start, self.sequence.end)?;
             return Ok(Some(batch));
         }
 
@@ -558,7 +558,7 @@ impl TreeIter {
         self.metrics.rows_fetched += batch.num_rows();
         self.metrics.batches_fetched += 1;
         let mut batch = batch;
-        batch.filter_by_sequence(self.sequence)?;
+        batch.filter_by_seq_range(self.sequence.start, self.sequence.end)?;
         Ok(Some(batch))
     }
 }

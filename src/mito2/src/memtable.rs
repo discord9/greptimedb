@@ -23,7 +23,7 @@ pub use bulk::part::BulkPart;
 use common_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{ColumnId, SequenceNumber};
+use store_api::storage::{ColumnId, SequenceNumber, SequenceRange};
 use table::predicate::Predicate;
 
 use crate::config::MitoConfig;
@@ -147,7 +147,7 @@ pub trait Memtable: Send + Sync + fmt::Debug {
         &self,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
-        sequence: Option<SequenceNumber>,
+        sequence: SequenceRange,
     ) -> Result<BoxedBatchIterator>;
 
     /// Returns the ranges in the memtable.
@@ -156,7 +156,7 @@ pub trait Memtable: Send + Sync + fmt::Debug {
         &self,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
-        sequence: Option<SequenceNumber>,
+        sequence: SequenceRange,
     ) -> MemtableRanges;
 
     /// Returns true if the memtable is empty.
