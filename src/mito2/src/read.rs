@@ -345,11 +345,51 @@ impl Batch {
     ) -> Result<()> {
         let (first, last) = (self.first_sequence(), self.last_sequence());
         let new_lower_bound = match (lower_bound, first) {
-            (None, _) | (_, None) => None,
             (Some(seq), Some(first)) => Some(seq.max(first)),
-            _ => todo!(),
+            (Some(seq), None) | (None, Some(seq)) => Some(seq),
+            (None, None) => None,
         };
-        todo!()
+
+        let new_upper_bound = match (upper_bound, last) {
+            (Some(seq), Some(last)) => Some(seq.min(last)),
+            (Some(seq), None) | (None, Some(seq)) => Some(seq),
+            (None, None) => None,
+        };
+
+        if let (Some(lower), Some(upper)) = (new_lower_bound, new_upper_bound) {
+            if lower >= upper {
+                return Ok(());
+            }
+        }
+        let predicate = {
+            let seqs = self.sequences.as_arrow();
+            let lower_bound_scalar = new_lower_bound
+                .map(UInt64Array::new_scalar)
+                .map(|lower| {
+                    datafusion_common::arrow::compute::kernels::cmp::gt_eq(seqs, &lower)
+                        .context(ComputeArrowSnafu)
+                })
+                .transpose()?;
+            let upper_bound_scalar = new_upper_bound
+                .map(UInt64Array::new_scalar)
+                .map(|upper| {
+                    datafusion_common::arrow::compute::kernels::cmp::lt(&seqs, &upper)
+                        .context(ComputeArrowSnafu)
+                })
+                .transpose()?;
+
+            match (lower_bound_scalar, upper_bound_scalar) {
+                (Some(l), Some(u)) => {
+                    datafusion_common::arrow::compute::and(&l, &u).context(ComputeArrowSnafu)?
+                }
+                (Some(v), None) | (None, Some(v)) => v,
+                _ => return Ok(()),
+            }
+        };
+        let predicate = BooleanVector::from(predicate);
+        self.filter(&predicate)?;
+
+        Ok(())
     }
 
     /// Filters rows by the given `sequence`. Only preserves rows with sequence less than or equal to `sequence`.
