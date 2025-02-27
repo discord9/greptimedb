@@ -338,6 +338,20 @@ impl Batch {
         Ok(())
     }
 
+    pub fn filter_by_seq_range(
+        &mut self,
+        lower_bound: Option<SequenceNumber>,
+        upper_bound: Option<SequenceNumber>,
+    ) -> Result<()> {
+        let (first, last) = (self.first_sequence(), self.last_sequence());
+        let new_lower_bound = match (lower_bound, first) {
+            (None, _) | (_, None) => None,
+            (Some(seq), Some(first)) => Some(seq.max(first)),
+            _ => todo!(),
+        };
+        todo!()
+    }
+
     /// Filters rows by the given `sequence`. Only preserves rows with sequence less than or equal to `sequence`.
     pub fn filter_by_sequence(&mut self, sequence: Option<SequenceNumber>) -> Result<()> {
         let seq = match (sequence, self.last_sequence()) {
