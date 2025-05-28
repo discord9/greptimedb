@@ -38,7 +38,7 @@ lazy_static! {
     pub static ref METRIC_FLOW_BATCHING_ENGINE_SLOW_QUERY: HistogramVec = register_histogram_vec!(
         "greptime_flow_batching_engine_slow_query_secs",
         "flow batching engine slow query(seconds)",
-        &["flow_id", "sql", "peer"],
+        &["flow_id", "peer"],
         vec![60., 2. * 60., 3. * 60., 5. * 60., 10. * 60.]
     )
     .unwrap();
