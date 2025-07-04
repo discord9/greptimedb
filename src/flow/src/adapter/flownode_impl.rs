@@ -46,7 +46,7 @@ use crate::engine::FlowEngine;
 use crate::error::{
     CreateFlowSnafu, ExternalSnafu, FlowNotFoundSnafu, FlowNotRecoveredSnafu,
     IllegalCheckTaskStateSnafu, InsertIntoFlowSnafu, InternalSnafu, JoinTaskSnafu, ListFlowsSnafu,
-    NoAvailableFrontendSnafu, SyncCheckTaskSnafu, UnexpectedSnafu,
+    NoAvailableFrontendSnafu, SyncCheckTaskSnafu, UnexpectedSnafu, UnsupportedSnafu,
 };
 use crate::metrics::{METRIC_FLOW_ROWS, METRIC_FLOW_TASK_COUNT};
 use crate::repr::{self, DiffRow};
@@ -664,6 +664,15 @@ impl FlowEngine for FlowDualEngine {
         }
     }
 
+    async fn refill_flow(
+        &self,
+        flow_id: FlowId,
+        start: common_time::Timestamp,
+        end: common_time::Timestamp,
+    ) -> Result<usize, Error> {
+        todo!()
+    }
+
     async fn flow_exist(&self, flow_id: FlowId) -> Result<bool, Error> {
         let flow_type = self.src_table2flow.read().await.get_flow_type(flow_id);
         // not using `flow_type.is_some()` to make sure the flow is actually exist in the underlying engine
@@ -876,6 +885,18 @@ impl FlowEngine for StreamingEngine {
 
     async fn flush_flow(&self, flow_id: FlowId) -> Result<usize, Error> {
         self.flush_flow_inner(flow_id).await
+    }
+
+    async fn refill_flow(
+        &self,
+        flow_id: FlowId,
+        start: common_time::Timestamp,
+        end: common_time::Timestamp,
+    ) -> Result<usize, Error> {
+        UnsupportedSnafu {
+            reason: "Refill flow is not supported in streaming engine",
+        }
+        .fail()
     }
 
     async fn flow_exist(&self, flow_id: FlowId) -> Result<bool, Error> {

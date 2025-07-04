@@ -27,7 +27,7 @@ use common_meta::key::TableMetadataManagerRef;
 use common_runtime::JoinHandle;
 use common_telemetry::tracing::warn;
 use common_telemetry::{debug, info};
-use common_time::TimeToLive;
+use common_time::{TimeToLive, Timestamp};
 use query::QueryEngineRef;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{RegionId, TableId};
@@ -517,6 +517,27 @@ impl BatchingEngine {
         Ok(affected_rows)
     }
 
+    pub async fn refill_flow_inner(
+        &self,
+        flow_id: FlowId,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<usize, Error> {
+        let task = self.tasks.read().await.get(&flow_id).cloned();
+        let task = task.with_context(|| FlowNotFoundSnafu { id: flow_id })?;
+
+        let res = task
+            .gen_refill_exec_once(&self.query_engine, &self.frontend_client, start, end)
+            .await?;
+
+        let affected_rows = res.map(|(r, _)| r).unwrap_or_default() as usize;
+        debug!(
+            "Successfully refill flow {flow_id}, affected rows={}",
+            affected_rows
+        );
+        Ok(affected_rows)
+    }
+
     /// Determine if the batching mode flow task exists with given flow id
     pub async fn flow_exist_inner(&self, flow_id: FlowId) -> bool {
         self.tasks.read().await.contains_key(&flow_id)
@@ -532,6 +553,15 @@ impl FlowEngine for BatchingEngine {
     }
     async fn flush_flow(&self, flow_id: FlowId) -> Result<usize, Error> {
         self.flush_flow_inner(flow_id).await
+    }
+
+    async fn refill_flow(
+        &self,
+        flow_id: FlowId,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<usize, Error> {
+        self.refill_flow_inner(flow_id, start, end).await
     }
     async fn flow_exist(&self, flow_id: FlowId) -> Result<bool, Error> {
         Ok(self.flow_exist_inner(flow_id).await)

@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use api::v1::CreateTableExpr;
 use arrow_schema::Fields;
 use catalog::CatalogManagerRef;
+use chrono::TimeDelta;
 use common_error::ext::BoxedError;
 use common_query::logical_plan::breakup_insert_plan;
 use common_telemetry::tracing::warn;
@@ -58,7 +59,7 @@ use crate::batching_mode::{
 use crate::df_optimizer::apply_df_optimizer;
 use crate::error::{
     ConvertColumnSchemaSnafu, DatafusionSnafu, ExternalSnafu, InvalidQuerySnafu,
-    SubstraitEncodeLogicalPlanSnafu, UnexpectedSnafu,
+    SubstraitEncodeLogicalPlanSnafu, UnexpectedSnafu, UnsupportedSnafu,
 };
 use crate::metrics::{
     METRIC_FLOW_BATCHING_ENGINE_ERROR_CNT, METRIC_FLOW_BATCHING_ENGINE_QUERY_TIME,
@@ -222,6 +223,73 @@ impl BatchingTask {
         }
     }
 
+    fn get_ts_col_name(&self) -> Option<String> {
+        self.config
+            .time_window_expr
+            .as_ref()
+            .map(|expr| expr.column_name.clone())
+    }
+
+    fn get_window_size(&self) -> Option<std::time::Duration> {
+        self.config
+            .time_window_expr
+            .as_ref()
+            .and_then(|expr| expr.time_window_size().clone())
+    }
+
+    pub async fn gen_refill_exec_once(
+        &self,
+        engine: &QueryEngineRef,
+        frontend_client: &Arc<FrontendClient>,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<Option<(u32, Duration)>, Error> {
+        let (table, df_schema) = get_table_info_df_schema(
+            self.config.catalog_manager.clone(),
+            self.config.sink_table_name.clone(),
+        )
+        .await?;
+
+        let expr = {
+            let mut dirty = DirtyTimeWindows::default();
+            dirty.add_window(start, Some(end));
+            let col_name = self.get_ts_col_name().context(UnexpectedSnafu {
+                reason: "Time window expression is not set, can't generate refill query",
+            })?;
+
+            let window_size = self.get_window_size().context(UnexpectedSnafu {
+                reason: "Time window expression is not set, can't generate refill query",
+            })?;
+            let window_size = TimeDelta::from_std(window_size).map_err(|e| {
+                UnexpectedSnafu {
+                    reason: format!("Failed to convert window size to TimeDelta: {e}"),
+                }
+                .build()
+            })?;
+            dirty
+                .gen_filter_exprs(
+                    &col_name,
+                    None,
+                    window_size,
+                    None,
+                    self.config.flow_id,
+                    Some(self),
+                )?
+                .context(UnexpectedSnafu {
+                    reason: "Failed to generate filter expressions for refill query",
+                })?
+        };
+        let new_plan = self
+            .add_filter_exprs_to_query(engine.clone(), expr, &table.meta.schema)
+            .await?;
+        let insert_into = self.wrap_query_in_insert(new_plan, &df_schema)?;
+        debug!("Generate refill query: {}", insert_into);
+
+        self.execute_logical_plan(frontend_client, &insert_into)
+            .await
+    }
+
+    /// Generate insert plan for dirty time windows
     pub async fn gen_insert_plan(
         &self,
         engine: &QueryEngineRef,
@@ -238,42 +306,49 @@ impl BatchingTask {
             .await?;
 
         let insert_into = if let Some((new_query, _column_cnt)) = new_query {
-            // first check if all columns in input query exists in sink table
-            // since insert into ref to names in record batch generate by given query
-            let table_columns = df_schema
-                .columns()
-                .into_iter()
-                .map(|c| c.name)
-                .collect::<BTreeSet<_>>();
-            for column in new_query.schema().columns() {
-                ensure!(
-                    table_columns.contains(column.name()),
-                    InvalidQuerySnafu {
-                        reason: format!(
-                            "Column {} not found in sink table with columns {:?}",
-                            column, table_columns
-                        ),
-                    }
-                );
-            }
-            // update_at& time index placeholder (if exists) should have default value
-            LogicalPlan::Dml(DmlStatement::new(
-                datafusion_common::TableReference::Full {
-                    catalog: self.config.sink_table_name[0].clone().into(),
-                    schema: self.config.sink_table_name[1].clone().into(),
-                    table: self.config.sink_table_name[2].clone().into(),
-                },
-                df_schema,
-                WriteOp::Insert(datafusion_expr::dml::InsertOp::Append),
-                Arc::new(new_query),
-            ))
+            self.wrap_query_in_insert(new_query, &df_schema)?
         } else {
             return Ok(None);
         };
-        let insert_into = insert_into.recompute_schema().context(DatafusionSnafu {
-            context: "Failed to recompute schema",
-        })?;
         Ok(Some(insert_into))
+    }
+
+    /// Wrap the given query in an insert logical plan
+    fn wrap_query_in_insert(
+        &self,
+        query: LogicalPlan,
+        sink_schema: &DFSchemaRef,
+    ) -> Result<LogicalPlan, Error> {
+        // first check if all columns in input query exists in sink table
+        // since insert into ref to names in record batch generate by given query
+        let table_columns = sink_schema
+            .columns()
+            .into_iter()
+            .map(|c| c.name)
+            .collect::<BTreeSet<_>>();
+        for column in query.schema().columns() {
+            ensure!(
+                table_columns.contains(column.name()),
+                InvalidQuerySnafu {
+                    reason: format!(
+                        "Column {} not found in sink table with columns {:?}",
+                        column, table_columns
+                    ),
+                }
+            );
+        }
+        // update_at& time index placeholder (if exists) should have default value
+        let insert_into = LogicalPlan::Dml(DmlStatement::new(
+            datafusion_common::TableReference::Full {
+                catalog: self.config.sink_table_name[0].clone().into(),
+                schema: self.config.sink_table_name[1].clone().into(),
+                table: self.config.sink_table_name[2].clone().into(),
+            },
+            sink_schema.clone(),
+            WriteOp::Insert(datafusion_expr::dml::InsertOp::Append),
+            Arc::new(query),
+        ));
+        Ok(insert_into)
     }
 
     pub async fn create_table(
@@ -604,7 +679,7 @@ impl BatchingTask {
                 &col_name,
                 Some(l),
                 window_size,
-                max_window_cnt.unwrap_or(DirtyTimeWindows::MAX_FILTER_NUM),
+                Some(max_window_cnt.unwrap_or(DirtyTimeWindows::MAX_FILTER_NUM)),
                 self.config.flow_id,
                 Some(self),
             )?;
@@ -626,6 +701,20 @@ impl BatchingTask {
             return Ok(None);
         };
 
+        let new_plan = self
+            .add_filter_exprs_to_query(engine, expr, sink_table_schema)
+            .await?;
+        Ok(Some((new_plan, schema_len)))
+    }
+
+    async fn add_filter_exprs_to_query(
+        &self,
+        engine: QueryEngineRef,
+        expr: datafusion_expr::Expr,
+        sink_table_schema: &Arc<Schema>,
+    ) -> Result<LogicalPlan, Error> {
+        let query_ctx = self.state.read().unwrap().query_ctx.clone();
+
         let mut add_filter = AddFilterRewriter::new(expr);
         let mut add_auto_column = AddAutoColumnRewriter::new(sink_table_schema.clone());
 
@@ -641,8 +730,7 @@ impl BatchingTask {
             .data;
         // only apply optimize after complex rewrite is done
         let new_plan = apply_df_optimizer(rewrite).await?;
-
-        Ok(Some((new_plan, schema_len)))
+        Ok(new_plan)
     }
 }
 

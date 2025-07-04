@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use common_time::Timestamp;
 use session::context::QueryContext;
 use table::metadata::TableId;
 
@@ -83,6 +84,13 @@ pub trait FlowEngine {
     async fn remove_flow(&self, flow_id: FlowId) -> Result<(), Error>;
     /// Flush the flow, return the number of rows flushed
     async fn flush_flow(&self, flow_id: FlowId) -> Result<usize, Error>;
+    /// Refill the flow with data from the specified time range
+    async fn refill_flow(
+        &self,
+        flow_id: FlowId,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<usize, Error>;
     /// Check if the flow exists
     async fn flow_exist(&self, flow_id: FlowId) -> Result<bool, Error>;
     /// List all flows

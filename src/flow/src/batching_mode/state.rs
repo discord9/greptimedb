@@ -216,7 +216,7 @@ impl DirtyTimeWindows {
         col_name: &str,
         expire_lower_bound: Option<Timestamp>,
         window_size: chrono::Duration,
-        window_cnt: usize,
+        window_cnt: Option<usize>,
         flow_id: FlowId,
         task_ctx: Option<&BatchingTask>,
     ) -> Result<Option<datafusion_expr::Expr>, Error> {
@@ -262,7 +262,7 @@ impl DirtyTimeWindows {
         }
 
         // get the first `window_cnt` time windows
-        let max_time_range = window_size * window_cnt as i32;
+        let max_time_range = window_cnt.map(|cnt| window_size * cnt as i32);
 
         let mut to_be_query = BTreeMap::new();
         let mut new_windows = self.windows.clone();
@@ -274,23 +274,34 @@ impl DirtyTimeWindows {
             let end = end.unwrap_or(first_end);
 
             // if time range is too long, stop
-            if cur_time_range >= max_time_range {
+            if let Some(max_time_range) = max_time_range
+                && cur_time_range >= max_time_range
+            {
                 break;
             }
 
             // if we have enough time windows, stop
-            if idx >= window_cnt {
+            if let Some(window_cnt) = window_cnt
+                && idx >= window_cnt
+            {
                 break;
             }
 
             let Some(x) = end.sub(start) else {
                 continue;
             };
-            if cur_time_range + x <= max_time_range {
+            let is_full = {
+                if let Some(max) = max_time_range {
+                    cur_time_range + x > max
+                } else {
+                    false
+                }
+            };
+            if !is_full {
                 to_be_query.insert(*start, Some(end));
                 new_windows.remove(start);
                 cur_time_range += x;
-            } else {
+            } else if let Some(max_time_range) = max_time_range {
                 // too large a window, split it
                 // split at window_size * times
                 let surplus = max_time_range - cur_time_range;
@@ -311,6 +322,8 @@ impl DirtyTimeWindows {
                 new_windows.insert(split_at, Some(end));
                 cur_time_range += split_offset;
                 break;
+            } else {
+                unreachable!("max_time_range should be set if is_full can be true");
             }
         }
 
@@ -359,7 +372,7 @@ impl DirtyTimeWindows {
                     }
                     .fail()?
                 };
-                self.align_time_window(start, end, time_window_expr)?
+                Self::align_time_window(start, end, time_window_expr)?
             } else {
                 (start, end)
             };
@@ -385,8 +398,7 @@ impl DirtyTimeWindows {
         Ok(expr)
     }
 
-    fn align_time_window(
-        &self,
+    pub fn align_time_window(
         start: Timestamp,
         end: Option<Timestamp>,
         time_window_expr: &TimeWindowExpr,
@@ -674,7 +686,7 @@ mod test {
                     "ts",
                     expire_lower_bound,
                     window_size,
-                    DirtyTimeWindows::MAX_FILTER_NUM,
+                    Some(DirtyTimeWindows::MAX_FILTER_NUM),
                     0,
                     None,
                 )
@@ -733,11 +745,13 @@ mod test {
                 .unwrap()
                 .unwrap();
 
-            let dirty = DirtyTimeWindows::default();
             for (before_align, expected_after_align) in aligns {
-                let after_align = dirty
-                    .align_time_window(before_align.0, before_align.1, &time_window_expr)
-                    .unwrap();
+                let after_align = DirtyTimeWindows::align_time_window(
+                    before_align.0,
+                    before_align.1,
+                    &time_window_expr,
+                )
+                .unwrap();
                 assert_eq!(expected_after_align, after_align);
             }
         }
