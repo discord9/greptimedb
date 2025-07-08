@@ -59,7 +59,7 @@ use crate::batching_mode::{
 use crate::df_optimizer::apply_df_optimizer;
 use crate::error::{
     ConvertColumnSchemaSnafu, DatafusionSnafu, ExternalSnafu, InvalidQuerySnafu,
-    SubstraitEncodeLogicalPlanSnafu, UnexpectedSnafu, UnsupportedSnafu,
+    SubstraitEncodeLogicalPlanSnafu, UnexpectedSnafu,
 };
 use crate::metrics::{
     METRIC_FLOW_BATCHING_ENGINE_ERROR_CNT, METRIC_FLOW_BATCHING_ENGINE_QUERY_TIME,
@@ -234,7 +234,7 @@ impl BatchingTask {
         self.config
             .time_window_expr
             .as_ref()
-            .and_then(|expr| expr.time_window_size().clone())
+            .and_then(|expr| *expr.time_window_size())
     }
 
     pub async fn gen_refill_exec_once(

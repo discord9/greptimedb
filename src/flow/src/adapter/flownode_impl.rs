@@ -670,7 +670,19 @@ impl FlowEngine for FlowDualEngine {
         start: common_time::Timestamp,
         end: common_time::Timestamp,
     ) -> Result<usize, Error> {
-        todo!()
+        let flow_type = self.src_table2flow.read().await.get_flow_type(flow_id);
+        match flow_type {
+            Some(FlowType::Batching) => self.batching_engine.refill_flow(flow_id, start, end).await,
+            Some(FlowType::Streaming) => {
+                self.streaming_engine.refill_flow(flow_id, start, end).await
+            }
+            None => {
+                warn!(
+                    "Currently flow={flow_id} doesn't exist in flownode, ignore refill_flow request"
+                );
+                Ok(0)
+            }
+        }
     }
 
     async fn flow_exist(&self, flow_id: FlowId) -> Result<bool, Error> {
@@ -889,9 +901,9 @@ impl FlowEngine for StreamingEngine {
 
     async fn refill_flow(
         &self,
-        flow_id: FlowId,
-        start: common_time::Timestamp,
-        end: common_time::Timestamp,
+        _flow_id: FlowId,
+        _start: common_time::Timestamp,
+        _end: common_time::Timestamp,
     ) -> Result<usize, Error> {
         UnsupportedSnafu {
             reason: "Refill flow is not supported in streaming engine",
