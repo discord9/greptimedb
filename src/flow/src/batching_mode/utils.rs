@@ -403,7 +403,7 @@ impl TreeNodeRewriter for AddAutoColumnRewriter {
     }
 }
 
-/// Find out the `Filter` Node corresponding to innermost(deepest) `WHERE` and add a new filter expr to it
+/// Find out the `Filter` Node corresponding to innermost(deepest) `WHERE` and add a new filter expr to it, if no `WHERE` Filter is found,  add one above the `TableScan` Node.
 #[derive(Debug)]
 pub struct AddFilterRewriter {
     extra_filter: Expr,
