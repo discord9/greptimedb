@@ -367,3 +367,111 @@ impl GcRegionsHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common_meta::key::table_route::{TableRouteStorage, TableRouteValue};
+    use common_meta::kv_backend::TxnService;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::peer::Peer;
+    use common_meta::rpc::router::{Region, RegionRoute};
+    use store_api::storage::RegionId;
+
+    use super::GcRegionsHandler;
+    use crate::heartbeat::handler::HandlerContext;
+    use crate::tests::mock_region_server;
+
+    #[tokio::test]
+    async fn test_validate_missing_region_rejects_when_routed_elsewhere() {
+        let kv = Arc::new(MemoryKvBackend::new());
+        let table_id = 1001;
+        let region_id = RegionId::new(table_id, 1);
+
+        let route = RegionRoute {
+            region: Region {
+                id: region_id,
+                ..Default::default()
+            },
+            leader_peer: Some(Peer::empty(99)),
+            ..Default::default()
+        };
+        let storage = TableRouteStorage::new(kv.clone());
+        let table_route = TableRouteValue::physical(vec![route]);
+        let (txn, _) = storage.build_create_txn(table_id, &table_route).unwrap();
+        kv.txn(txn).await.unwrap();
+
+        let ctx = HandlerContext::new_for_test(mock_region_server(), kv);
+        let result =
+            GcRegionsHandler::validate_regions_not_routed_elsewhere(&ctx, table_id, &[region_id])
+                .await;
+
+        let err = result.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("routed to datanode 99"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_missing_region_rejects_when_route_has_no_leader() {
+        let kv = Arc::new(MemoryKvBackend::new());
+        let table_id = 1002;
+        let region_id = RegionId::new(table_id, 1);
+
+        let route = RegionRoute {
+            region: Region {
+                id: region_id,
+                ..Default::default()
+            },
+            leader_peer: None,
+            ..Default::default()
+        };
+        let storage = TableRouteStorage::new(kv.clone());
+        let table_route = TableRouteValue::physical(vec![route]);
+        let (txn, _) = storage.build_create_txn(table_id, &table_route).unwrap();
+        kv.txn(txn).await.unwrap();
+
+        let ctx = HandlerContext::new_for_test(mock_region_server(), kv);
+        let result =
+            GcRegionsHandler::validate_regions_not_routed_elsewhere(&ctx, table_id, &[region_id])
+                .await;
+
+        let err = result.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("has no leader in route table"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_missing_region_allows_when_not_in_route_table() {
+        let kv = Arc::new(MemoryKvBackend::new());
+        let table_id = 1003;
+        let existing_region = RegionId::new(table_id, 1);
+        let missing_region = RegionId::new(table_id, 2);
+
+        let route = RegionRoute {
+            region: Region {
+                id: existing_region,
+                ..Default::default()
+            },
+            leader_peer: Some(Peer::empty(1)),
+            ..Default::default()
+        };
+        let storage = TableRouteStorage::new(kv.clone());
+        let table_route = TableRouteValue::physical(vec![route]);
+        let (txn, _) = storage.build_create_txn(table_id, &table_route).unwrap();
+        kv.txn(txn).await.unwrap();
+
+        let ctx = HandlerContext::new_for_test(mock_region_server(), kv);
+        let result = GcRegionsHandler::validate_regions_not_routed_elsewhere(
+            &ctx,
+            table_id,
+            &[missing_region],
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+}

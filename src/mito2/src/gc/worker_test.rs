@@ -14,12 +14,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::v1::Rows;
 use common_telemetry::init_default_ut_logging;
+use common_time::Timestamp;
 use store_api::region_engine::RegionEngine as _;
 use store_api::region_request::{RegionCompactRequest, RegionRequest};
-use store_api::storage::{FileRef, FileRefsManifest, RegionId};
+use store_api::storage::{FileId, FileRef, FileRefsManifest, RegionId};
 
 use crate::config::MitoConfig;
 use crate::engine::MitoEngine;
@@ -27,6 +29,8 @@ use crate::engine::compaction_test::{delete_and_flush, put_and_flush};
 use crate::gc::{GcConfig, LocalGcWorker};
 use crate::manifest::action::RemovedFile;
 use crate::region::MitoRegionRef;
+use crate::sst::file::RegionFileId;
+use crate::sst::location;
 use crate::test_util::{
     CreateRequestBuilder, TestEnv, build_rows, flush_region, put_rows, rows_schema,
 };
@@ -418,4 +422,324 @@ async fn test_gc_worker_compact_with_ref() {
 
     assert_eq!(report.deleted_files.get(&region_id).unwrap().len(), 0);
     assert!(report.need_retry_regions.is_empty());
+}
+
+#[tokio::test]
+async fn test_gc_worker_fast_path_safety_filters_in_use_files() {
+    init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    env.log_store = Some(env.create_log_store().await);
+    env.object_store_manager = Some(Arc::new(env.create_in_memory_object_store_manager()));
+
+    let engine = env
+        .new_mito_engine(MitoConfig {
+            gc: GcConfig {
+                enable: true,
+                lingering_time: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let request = CreateRequestBuilder::new().build();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let region = engine.get_region(region_id).unwrap();
+    let version = region.manifest_ctx.manifest().await.manifest_version;
+    let regions = BTreeMap::from([(region_id, Some(region))]);
+    let file_ref_manifest = FileRefsManifest {
+        file_refs: Default::default(),
+        manifest_version: [(region_id, version)].into(),
+        cross_region_refs: HashMap::new(),
+    };
+    let gc_worker = create_gc_worker(&engine, regions, &file_ref_manifest, false).await;
+
+    let in_manifest_file = FileId::random();
+    let in_tmp_ref_file = FileId::random();
+    let deletable_file = FileId::random();
+    let in_manifest = HashMap::from([(in_manifest_file, None)]);
+    let in_tmp_ref = HashSet::from([(in_tmp_ref_file, None)]);
+    let recently_removed_files = BTreeMap::from([(
+        Timestamp::new_millisecond(1),
+        HashSet::from([
+            RemovedFile::File(in_manifest_file, None),
+            RemovedFile::File(in_tmp_ref_file, None),
+            RemovedFile::File(deletable_file, None),
+        ]),
+    )]);
+
+    let files_to_delete = gc_worker
+        .list_to_be_deleted_files(
+            region_id,
+            false,
+            &in_manifest,
+            &in_tmp_ref,
+            recently_removed_files,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(files_to_delete.len(), 1);
+    assert!(files_to_delete.contains(&RemovedFile::File(deletable_file, None)));
+}
+
+#[tokio::test]
+async fn test_gc_worker_manifest_version_mismatch_skips_deletion() {
+    init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    env.log_store = Some(env.create_log_store().await);
+    env.object_store_manager = Some(Arc::new(env.create_in_memory_object_store_manager()));
+
+    let engine = env
+        .new_mito_engine(MitoConfig {
+            gc: GcConfig {
+                enable: true,
+                lingering_time: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let request = CreateRequestBuilder::new().build();
+    let column_schemas = rows_schema(&request);
+    engine
+        .handle_request(region_id, RegionRequest::Create(request.clone()))
+        .await
+        .unwrap();
+
+    let rows = Rows {
+        schema: column_schemas,
+        rows: build_rows(0, 3),
+    };
+    put_rows(&engine, region_id, rows).await;
+    flush_region(&engine, region_id, None).await;
+
+    let region = engine.get_region(region_id).unwrap();
+    let manifest = region.manifest_ctx.manifest().await;
+    let file_id = *manifest.files.iter().next().unwrap().0;
+
+    engine
+        .handle_request(
+            region.region_id,
+            RegionRequest::Truncate(store_api::region_request::RegionTruncateRequest::All),
+        )
+        .await
+        .unwrap();
+
+    let manifest_after_truncate = region.manifest_ctx.manifest().await;
+    let actual_version = manifest_after_truncate.manifest_version;
+
+    let file_path = location::sst_file_path(
+        region.access_layer.table_dir(),
+        RegionFileId::new(region_id, file_id),
+        region.access_layer.path_type(),
+    );
+
+    let regions = BTreeMap::from([(region_id, Some(region.clone()))]);
+    let file_ref_manifest = FileRefsManifest {
+        file_refs: Default::default(),
+        manifest_version: [(region_id, actual_version.saturating_sub(1))].into(),
+        cross_region_refs: HashMap::new(),
+    };
+
+    let gc_worker = create_gc_worker(&engine, regions, &file_ref_manifest, true).await;
+    let report = gc_worker.run().await.unwrap();
+
+    assert!(report.deleted_files.get(&region_id).unwrap().is_empty());
+    assert!(
+        env.get_object_store()
+            .unwrap()
+            .exists(&file_path)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_gc_worker_unknown_files_not_deleted_for_non_dropped_region() {
+    init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    env.log_store = Some(env.create_log_store().await);
+    env.object_store_manager = Some(Arc::new(env.create_in_memory_object_store_manager()));
+
+    let engine = env
+        .new_mito_engine(MitoConfig {
+            gc: GcConfig {
+                enable: true,
+                lingering_time: None,
+                unknown_file_lingering_time: Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let request = CreateRequestBuilder::new().build();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let region = engine.get_region(region_id).unwrap();
+    let unknown_file_id = FileId::random();
+    let unknown_file_path = location::sst_file_path(
+        region.access_layer.table_dir(),
+        RegionFileId::new(region_id, unknown_file_id),
+        region.access_layer.path_type(),
+    );
+
+    env.get_object_store()
+        .unwrap()
+        .write(&unknown_file_path, vec![1_u8])
+        .await
+        .unwrap();
+
+    let version = region.manifest_ctx.manifest().await.manifest_version;
+    let regions = BTreeMap::from([(region_id, Some(region.clone()))]);
+    let file_ref_manifest = FileRefsManifest {
+        file_refs: Default::default(),
+        manifest_version: [(region_id, version)].into(),
+        cross_region_refs: HashMap::new(),
+    };
+
+    let gc_worker = create_gc_worker(&engine, regions, &file_ref_manifest, true).await;
+    let report = gc_worker.run().await.unwrap();
+
+    assert!(report.deleted_files.get(&region_id).unwrap().is_empty());
+    assert!(
+        env.get_object_store()
+            .unwrap()
+            .exists(&unknown_file_path)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_gc_worker_unknown_files_deleted_for_dropped_region() {
+    init_default_ut_logging();
+
+    let mut env = TestEnv::new().await;
+    env.log_store = Some(env.create_log_store().await);
+    env.object_store_manager = Some(Arc::new(env.create_in_memory_object_store_manager()));
+
+    let engine = env
+        .new_mito_engine(MitoConfig {
+            gc: GcConfig {
+                enable: true,
+                lingering_time: None,
+                unknown_file_lingering_time: Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let request = CreateRequestBuilder::new().build();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let region = engine.get_region(region_id).unwrap();
+    let unknown_file_id = FileId::random();
+    let unknown_file_path = location::sst_file_path(
+        region.access_layer.table_dir(),
+        RegionFileId::new(region_id, unknown_file_id),
+        region.access_layer.path_type(),
+    );
+    env.get_object_store()
+        .unwrap()
+        .write(&unknown_file_path, vec![1_u8])
+        .await
+        .unwrap();
+
+    let dropped_regions = BTreeMap::from([(region_id, None)]);
+    let file_ref_manifest = FileRefsManifest {
+        file_refs: Default::default(),
+        manifest_version: Default::default(),
+        cross_region_refs: HashMap::new(),
+    };
+    let gc_worker = LocalGcWorker::try_new(
+        region.access_layer.clone(),
+        Some(engine.cache_manager()),
+        dropped_regions,
+        engine.mito_config().gc.clone(),
+        file_ref_manifest,
+        &engine.gc_limiter(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let report = gc_worker.run().await.unwrap();
+
+    assert_eq!(
+        report.deleted_files.get(&region_id).unwrap(),
+        &vec![unknown_file_id]
+    );
+    assert!(
+        !env.get_object_store()
+            .unwrap()
+            .exists(&unknown_file_path)
+            .await
+            .unwrap()
+    );
 }

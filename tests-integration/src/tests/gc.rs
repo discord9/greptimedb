@@ -127,6 +127,11 @@ async fn test_gc_basic_different_store() {
 }
 
 async fn test_gc_basic(store_type: &StorageType) {
+    test_gc_basic_with_full_file_listing(store_type, false).await;
+    test_gc_basic_with_full_file_listing(store_type, true).await;
+}
+
+async fn test_gc_basic_with_full_file_listing(store_type: &StorageType, full_file_listing: bool) {
     let (test_context, _guard) = distributed_with_gc(store_type).await;
     let instance = test_context.frontend();
     let metasrv = test_context.metasrv();
@@ -209,7 +214,7 @@ async fn test_gc_basic(store_type: &StorageType) {
         metasrv.table_metadata_manager().clone(),
         metasrv.options().grpc.server_addr.clone(),
         regions.clone(),
-        false,                   // full_file_listing
+        full_file_listing,
         Duration::from_secs(10), // timeout
         Default::default(),
     );
@@ -268,5 +273,8 @@ async fn test_gc_basic(store_type: &StorageType) {
 
     // TODO: Add more specific assertions once we have proper file system access
     // For now, the test passes if the procedure executes without errors
-    info!("GC test completed successfully");
+    info!(
+        "GC test completed successfully, full_file_listing={}",
+        full_file_listing
+    );
 }

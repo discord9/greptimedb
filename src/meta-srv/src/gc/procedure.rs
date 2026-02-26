@@ -1005,3 +1005,400 @@ impl Procedure for BatchGcProcedure {
         LockKey::new(lock_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use api::v1::meta::MailboxMessage;
+    use api::v1::meta::mailbox_message::Payload;
+    use common_meta::instruction::{
+        GcRegions, GcRegionsReply, GetFileRefsReply, InstructionReply, SimpleReply,
+    };
+    use common_meta::key::table_route::TableRouteValue;
+    use common_meta::key::test_utils::new_test_table_info;
+    use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::peer::Peer;
+    use common_meta::rpc::router::{Region, RegionRoute};
+    use common_meta::sequence::SequenceBuilder;
+    use common_time::util::current_time_millis;
+    use store_api::storage::{FileId, FileRefsManifest, GcReport, RegionId};
+    use tokio::sync::{mpsc, oneshot, watch};
+
+    use super::{BatchGcProcedure, recv_gc_regions_reply, recv_get_file_refs_reply};
+    use crate::gc::Region2Peers;
+    use crate::procedure::test_util::{MailboxContext, send_mock_reply};
+    use crate::service::mailbox::{Channel, MailboxReceiver};
+
+    fn new_instruction_reply_message(id: u64, reply: InstructionReply) -> MailboxMessage {
+        MailboxMessage {
+            id,
+            subject: "mock".to_string(),
+            from: "datanode".to_string(),
+            to: "meta".to_string(),
+            timestamp_millis: current_time_millis(),
+            payload: Some(Payload::Json(serde_json::to_string(&reply).unwrap())),
+        }
+    }
+
+    fn new_mailbox_receiver_with_message(msg: MailboxMessage) -> MailboxReceiver {
+        let (tx, rx) = oneshot::channel();
+        let (deregister_tx, deregister_rx) = watch::channel(false);
+        tx.send(Ok(msg)).unwrap();
+        std::mem::forget(deregister_tx);
+        MailboxReceiver::new(1, rx, deregister_rx, Channel::Datanode(1))
+    }
+
+    async fn insert_table_routes(
+        table_metadata_manager: &TableMetadataManagerRef,
+        table_id: u32,
+        region_routes: Vec<RegionRoute>,
+    ) {
+        table_metadata_manager
+            .create_table_metadata(
+                new_test_table_info(table_id),
+                TableRouteValue::physical(region_routes),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn new_test_procedure(
+        mailbox: MailboxContext,
+        table_metadata_manager: TableMetadataManagerRef,
+        regions: Vec<RegionId>,
+        full_file_listing: bool,
+    ) -> BatchGcProcedure {
+        BatchGcProcedure::new(
+            mailbox.mailbox().clone(),
+            table_metadata_manager,
+            "127.0.0.1:3002".to_string(),
+            regions,
+            full_file_listing,
+            Duration::from_secs(3),
+            HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_recv_get_file_refs_reply_fail_fast_on_unexpected_reply_type() {
+        let peer = Peer::empty(1);
+        let msg = new_instruction_reply_message(
+            1,
+            InstructionReply::OpenRegions(SimpleReply {
+                result: true,
+                error: None,
+            }),
+        );
+        let rx = new_mailbox_receiver_with_message(msg);
+
+        let err = recv_get_file_refs_reply(&peer, rx).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Unexpected reply of the GetFileRefs instruction"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recv_gc_regions_reply_fail_fast_on_unexpected_reply_type() {
+        let peer = Peer::empty(1);
+        let region_id = RegionId::new(1, 1);
+        let gc_regions = GcRegions {
+            regions: vec![region_id],
+            file_refs_manifest: FileRefsManifest::default(),
+            full_file_listing: false,
+        };
+        let msg = new_instruction_reply_message(
+            1,
+            InstructionReply::GetFileRefs(GetFileRefsReply {
+                file_refs_manifest: FileRefsManifest::default(),
+                success: true,
+                error: None,
+            }),
+        );
+        let rx = new_mailbox_receiver_with_message(msg);
+
+        let err = recv_gc_regions_reply(&peer, &gc_regions, "Batch GC", rx)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Unexpected reply of the GcRegions instruction"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_related_regions_errors_on_missing_table_route_subset() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let mailbox_sequence = SequenceBuilder::new("test_gc_mailbox", kv_backend).build();
+        let mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let table_1 = 100_u32;
+        let table_2 = 200_u32;
+        let region_1 = RegionId::new(table_1, 1);
+        let region_2 = RegionId::new(table_2, 1);
+        insert_table_routes(
+            &table_metadata_manager,
+            table_1,
+            vec![RegionRoute {
+                region: Region::new_test(region_1),
+                leader_peer: Some(Peer::empty(1)),
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        let procedure = new_test_procedure(
+            mailbox_ctx,
+            table_metadata_manager,
+            vec![region_1, region_2],
+            false,
+        );
+
+        let err = procedure
+            .find_related_regions(&[region_1, region_2])
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Unexpected logical table route"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_references_fails_on_incomplete_region_route() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let mailbox_sequence = SequenceBuilder::new("test_gc_mailbox", kv_backend).build();
+        let mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let table_id = 300_u32;
+        let existing_region = RegionId::new(table_id, 1);
+        let missing_region = RegionId::new(table_id, 2);
+        insert_table_routes(
+            &table_metadata_manager,
+            table_id,
+            vec![RegionRoute {
+                region: Region::new_test(existing_region),
+                leader_peer: Some(Peer::empty(1)),
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        let mut procedure = new_test_procedure(
+            mailbox_ctx,
+            table_metadata_manager,
+            vec![missing_region],
+            false,
+        );
+
+        let err = procedure.get_file_references().await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("does not contain region_id"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_references_returns_error_when_any_peer_fails() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let mailbox_sequence = SequenceBuilder::new("test_gc_mailbox", kv_backend).build();
+        let mut mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let table_id = 400_u32;
+        let region_id = RegionId::new(table_id, 1);
+        let leader = Peer::empty(1);
+        let follower = Peer::empty(2);
+        insert_table_routes(
+            &table_metadata_manager,
+            table_id,
+            vec![RegionRoute {
+                region: Region::new_test(region_id),
+                leader_peer: Some(leader.clone()),
+                follower_peers: vec![follower.clone()],
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        let (leader_tx, leader_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(leader.id), leader_tx)
+            .await;
+        let (follower_tx, follower_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(follower.id), follower_tx)
+            .await;
+
+        let mailbox = mailbox_ctx.mailbox().clone();
+        send_mock_reply(mailbox.clone(), leader_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GetFileRefs(GetFileRefsReply {
+                    file_refs_manifest: FileRefsManifest::default(),
+                    success: true,
+                    error: None,
+                }),
+            ))
+        });
+        send_mock_reply(mailbox, follower_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GetFileRefs(GetFileRefsReply {
+                    file_refs_manifest: FileRefsManifest::default(),
+                    success: false,
+                    error: Some("injected peer failure".to_string()),
+                }),
+            ))
+        });
+
+        let mut procedure =
+            new_test_procedure(mailbox_ctx, table_metadata_manager, vec![region_id], false);
+        let err = procedure.get_file_references().await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Failed to get file references from datanode"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_gc_instructions_errors_on_partial_peer_failure() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let mailbox_sequence = SequenceBuilder::new("test_gc_mailbox", kv_backend).build();
+        let mut mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let region_1 = RegionId::new(500, 1);
+        let region_2 = RegionId::new(500, 2);
+        let peer_1 = Peer::empty(1);
+        let peer_2 = Peer::empty(2);
+
+        let (peer_1_tx, peer_1_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(peer_1.id), peer_1_tx)
+            .await;
+        let (peer_2_tx, peer_2_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(peer_2.id), peer_2_tx)
+            .await;
+
+        let mailbox = mailbox_ctx.mailbox().clone();
+        send_mock_reply(mailbox.clone(), peer_1_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GcRegions(GcRegionsReply {
+                    result: Ok(GcReport {
+                        deleted_files: HashMap::from([(region_1, vec![FileId::random()])]),
+                        deleted_indexes: HashMap::new(),
+                        need_retry_regions: HashSet::new(),
+                    }),
+                }),
+            ))
+        });
+        send_mock_reply(mailbox, peer_2_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GcRegions(GcRegionsReply {
+                    result: Err("injected gc failure".to_string()),
+                }),
+            ))
+        });
+
+        let mut procedure = new_test_procedure(
+            mailbox_ctx,
+            table_metadata_manager,
+            vec![region_1, region_2],
+            false,
+        );
+        procedure.data.region_routes = Region2Peers::from([
+            (region_1, (peer_1.clone(), Vec::new())),
+            (region_2, (peer_2.clone(), Vec::new())),
+        ]);
+        procedure.data.file_refs = FileRefsManifest::default();
+
+        let err = procedure.send_gc_instructions().await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("reported error during GC"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_gc_instructions_merges_need_retry_regions() {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        let mailbox_sequence = SequenceBuilder::new("test_gc_mailbox", kv_backend).build();
+        let mut mailbox_ctx = MailboxContext::new(mailbox_sequence);
+
+        let region_1 = RegionId::new(600, 1);
+        let region_2 = RegionId::new(600, 2);
+        let peer_1 = Peer::empty(1);
+        let peer_2 = Peer::empty(2);
+
+        let (peer_1_tx, peer_1_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(peer_1.id), peer_1_tx)
+            .await;
+        let (peer_2_tx, peer_2_rx) = mpsc::channel(8);
+        mailbox_ctx
+            .insert_heartbeat_response_receiver(Channel::Datanode(peer_2.id), peer_2_tx)
+            .await;
+
+        let mailbox = mailbox_ctx.mailbox().clone();
+        send_mock_reply(mailbox.clone(), peer_1_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GcRegions(GcRegionsReply {
+                    result: Ok(GcReport {
+                        deleted_files: HashMap::new(),
+                        deleted_indexes: HashMap::new(),
+                        need_retry_regions: HashSet::from([region_1]),
+                    }),
+                }),
+            ))
+        });
+        send_mock_reply(mailbox, peer_2_rx, move |id| {
+            Ok(new_instruction_reply_message(
+                id,
+                InstructionReply::GcRegions(GcRegionsReply {
+                    result: Ok(GcReport {
+                        deleted_files: HashMap::from([(region_2, vec![FileId::random()])]),
+                        deleted_indexes: HashMap::new(),
+                        need_retry_regions: HashSet::from([region_2]),
+                    }),
+                }),
+            ))
+        });
+
+        let mut procedure = new_test_procedure(
+            mailbox_ctx,
+            table_metadata_manager,
+            vec![region_1, region_2],
+            false,
+        );
+        procedure.data.region_routes = Region2Peers::from([
+            (region_1, (peer_1.clone(), Vec::new())),
+            (region_2, (peer_2.clone(), Vec::new())),
+        ]);
+        procedure.data.file_refs = FileRefsManifest::default();
+
+        let report = procedure.send_gc_instructions().await.unwrap();
+        assert!(report.deleted_files.contains_key(&region_2));
+        assert_eq!(report.need_retry_regions.len(), 1);
+        assert!(report.need_retry_regions.contains(&region_1));
+        assert!(!report.need_retry_regions.contains(&region_2));
+    }
+}
