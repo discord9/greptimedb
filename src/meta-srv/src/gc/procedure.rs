@@ -1035,6 +1035,7 @@ mod tests {
 
     fn new_instruction_reply_message(id: u64, reply: InstructionReply) -> MailboxMessage {
         MailboxMessage {
+            header: None,
             id,
             subject: "mock".to_string(),
             from: "datanode".to_string(),
