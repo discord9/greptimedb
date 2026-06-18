@@ -1,0 +1,6 @@
+seed=81
+flush_rounds=4
+full_file_listing=true
+compaction_wait_secs=2
+table_shape=multi_region
+scenario_kind=post_migration_admin_gc
