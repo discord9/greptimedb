@@ -35,6 +35,7 @@ struct TargetInput {
     pre_gc_protection: bool,
     admin_gc_dropped: bool,
     post_migration_gc: bool,
+    gc_idempotency: bool,
 }
 
 impl Arbitrary<'_> for TargetInput {
@@ -44,16 +45,26 @@ impl Arbitrary<'_> for TargetInput {
         let post_migration_gc_override = get_fuzz_override::<bool>("POST_MIGRATION_GC");
         let admin_gc_dropped_override = get_fuzz_override::<bool>("ADMIN_GC_DROPPED");
         let pre_gc_protection_override = get_fuzz_override::<bool>("PRE_GC_PROTECTION");
+        let gc_idempotency_override = get_fuzz_override::<bool>("GC_IDEMPOTENCY");
 
         let post_migration_gc = post_migration_gc_override.unwrap_or_else(|| {
             !admin_gc_dropped_override.unwrap_or(false)
                 && !pre_gc_protection_override.unwrap_or(false)
+                && !gc_idempotency_override.unwrap_or(false)
                 && rng.random_bool(0.10)
         });
-        let admin_gc_dropped = admin_gc_dropped_override
-            .unwrap_or_else(|| !post_migration_gc && rng.random_bool(0.12));
-        let pre_gc_protection = pre_gc_protection_override
-            .unwrap_or_else(|| !post_migration_gc && !admin_gc_dropped && rng.random_bool(0.20));
+        let admin_gc_dropped = admin_gc_dropped_override.unwrap_or_else(|| {
+            !post_migration_gc && !gc_idempotency_override.unwrap_or(false) && rng.random_bool(0.12)
+        });
+        let pre_gc_protection = pre_gc_protection_override.unwrap_or_else(|| {
+            !post_migration_gc
+                && !admin_gc_dropped
+                && !gc_idempotency_override.unwrap_or(false)
+                && rng.random_bool(0.20)
+        });
+        let gc_idempotency = gc_idempotency_override.unwrap_or_else(|| {
+            !post_migration_gc && !admin_gc_dropped && !pre_gc_protection && rng.random_bool(0.10)
+        });
 
         Ok(Self {
             seed,
@@ -72,6 +83,7 @@ impl Arbitrary<'_> for TargetInput {
             pre_gc_protection,
             admin_gc_dropped,
             post_migration_gc,
+            gc_idempotency,
         })
     }
 }
@@ -84,7 +96,7 @@ fuzz_target!(|input: TargetInput| {
         .unwrap()
         .block_on(phase3_harness::run_phase3_e2e_gc_cycle(Phase3E2eInput {
             seed: input.seed,
-            flush_rounds: if input.post_migration_gc {
+            flush_rounds: if input.post_migration_gc || input.gc_idempotency {
                 input.flush_rounds.max(4)
             } else {
                 input.flush_rounds
@@ -92,7 +104,8 @@ fuzz_target!(|input: TargetInput| {
             full_file_listing: input.full_file_listing
                 || input.pre_gc_protection
                 || input.admin_gc_dropped
-                || input.post_migration_gc,
+                || input.post_migration_gc
+                || input.gc_idempotency,
             compaction_wait_secs: input.compaction_wait_secs,
             table_shape: if input.multi_region
                 || input.pre_gc_protection
@@ -109,6 +122,8 @@ fuzz_target!(|input: TargetInput| {
                 Phase3E2eScenarioKind::RepartitionAdminGcDroppedRegion
             } else if input.post_migration_gc {
                 Phase3E2eScenarioKind::PostMigrationAdminGc
+            } else if input.gc_idempotency {
+                Phase3E2eScenarioKind::GcIdempotency
             } else if input.repartition_like && input.multi_region {
                 Phase3E2eScenarioKind::RepartitionLike
             } else if input.follower_like && input.multi_region {
