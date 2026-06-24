@@ -888,9 +888,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use api::v1::region::{
-        RemoteDynFilterPayload, RemoteDynFilterUnregister, RemoteDynFilterUpdate,
-    };
+    use api::v1::region::{RemoteDynFilterUnregister, RemoteDynFilterUpdate};
     use async_trait::async_trait;
     use common_query::request::QueryRequest;
     use datafusion::physical_plan::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
