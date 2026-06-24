@@ -1955,9 +1955,12 @@ mod tests {
     use std::sync::Arc;
 
     use common_time::timestamp::{TimeUnit, Timestamp};
-    use datafusion::physical_plan::expressions::lit as physical_lit;
+    use datafusion::physical_plan::PhysicalExpr;
+    use datafusion::physical_plan::expressions::{
+        Column as PhysicalColumn, binary as physical_binary, lit as physical_lit,
+    };
     use datafusion_common::ScalarValue;
-    use datafusion_expr::{col, lit};
+    use datafusion_expr::{Operator, col, lit};
     use datatypes::arrow::datatypes::{
         DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
     };
@@ -2054,6 +2057,23 @@ mod tests {
             },
             Arc::new(crate::sst::file_purger::NoopFilePurger),
         )
+    }
+
+    fn timestamp_dyn_filter_gt(threshold_ms: i64) -> Arc<DynamicFilterPhysicalExpr> {
+        let ts_column = Arc::new(PhysicalColumn::new("ts", 2)) as Arc<dyn PhysicalExpr>;
+        let dyn_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![ts_column.clone()],
+            physical_lit(true),
+        ));
+        let current_expr = physical_binary(
+            ts_column,
+            Operator::Gt,
+            physical_lit(ScalarValue::TimestampMillisecond(Some(threshold_ms), None)),
+            &ArrowSchema::empty(),
+        )
+        .unwrap();
+        dyn_filter.update(current_expr).unwrap();
+        dyn_filter
     }
 
     #[test]
@@ -2400,6 +2420,31 @@ mod tests {
             vec![],
             physical_lit(false),
         ))]);
+        let input = ScanInput::new(SchedulerEnv::new().await.access_layer.clone(), mapper)
+            .with_predicate(predicate_group);
+        let file = file_handle_with_time_range(
+            Timestamp::new_millisecond(0),
+            Timestamp::new_millisecond(1000),
+        );
+        let mut reader_metrics = ReaderMetrics::default();
+
+        let builder = input
+            .prune_file(&file, PreFilterMode::SkipFields, &mut reader_metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(1, reader_metrics.filter_metrics.files_time_range_pruned);
+        let mut ranges = SmallVec::new();
+        builder.build_ranges(-1, &mut ranges);
+        assert!(ranges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_level_pruning_with_timestamp_dyn_filter() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
+        let predicate_group = PredicateGroup::new(metadata.as_ref(), &[]).unwrap();
+        predicate_group.add_dyn_filters(vec![timestamp_dyn_filter_gt(1000)]);
         let input = ScanInput::new(SchedulerEnv::new().await.access_layer.clone(), mapper)
             .with_predicate(predicate_group);
         let file = file_handle_with_time_range(
