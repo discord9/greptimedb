@@ -986,7 +986,7 @@ mod tests {
         let children = vec![Arc::clone(&id_col)];
 
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new(vec![10u64, 20, 30].iter().enumerate()), 0);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
         let map = Arc::new(Map::HashMap(Box::new(hash_map)));
         let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
             vec![Arc::clone(&id_col)],
@@ -1046,7 +1046,7 @@ mod tests {
         let children = vec![Arc::clone(&id_col)];
 
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new(vec![10u64, 20, 30].iter().enumerate()), 0);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
         let map = Arc::new(Map::HashMap(Box::new(hash_map)));
         let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
             vec![Arc::clone(&id_col)],
@@ -1127,7 +1127,7 @@ mod tests {
         let children = vec![Arc::clone(&id_col)];
 
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new(vec![10u64, 20, 30].iter().enumerate()), 0);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
         let map = Arc::new(Map::HashMap(Box::new(hash_map)));
         let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
             vec![Arc::clone(&id_col)],
@@ -1216,7 +1216,7 @@ mod tests {
         let children = vec![Arc::clone(&id_col)];
 
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new(vec![10u64, 20, 30].iter().enumerate()), 0);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
         let map = Arc::new(Map::HashMap(Box::new(hash_map)));
         let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
             vec![Arc::clone(&id_col)],
@@ -1275,7 +1275,7 @@ mod tests {
         let children = vec![Arc::clone(&id_col)];
 
         let mut hash_map = JoinHashMapU32::with_capacity(3);
-        hash_map.update_from_iter(Box::new(vec![10u64, 20, 30].iter().enumerate()), 0);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
         let map = Arc::new(Map::HashMap(Box::new(hash_map)));
         let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
             vec![Arc::clone(&id_col)],
