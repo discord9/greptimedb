@@ -15,8 +15,10 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow_schema::Schema as ArrowSchema;
 use common_query::request::{
-    DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY, InitialDynFilterReg,
+    DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY,
+    INITIAL_REMOTE_DYN_FILTER_REGS_MAX_TOTAL_PROTO_BYTES, InitialDynFilterReg,
     InitialDynFilterRegs, InitialDynFilterSnapshot, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
 };
 use datafusion_common::Result;
@@ -33,6 +35,7 @@ pub(crate) struct CapturedDynFilter {
     filter_id: FilterId,
     initial_registration: InitialDynFilterReg,
     pub(crate) alive_dyn_filter: Arc<DynamicFilterPhysicalExpr>,
+    pub(crate) input_schema: arrow_schema::SchemaRef,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +48,7 @@ pub(crate) struct RemoteDynFilterPushdown {
 pub(crate) fn capture_remote_dyn_filters_for_pushdown(
     remote_dyn_filter_producer_id: RemoteDynFilterProducerId,
     parent_filters: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    input_schema: &ArrowSchema,
 ) -> RemoteDynFilterPushdown {
     let mut pushed_down = Vec::with_capacity(parent_filters.len());
     let mut captured_dyn_filters = Vec::new();
@@ -59,6 +63,7 @@ pub(crate) fn capture_remote_dyn_filters_for_pushdown(
             remote_dyn_filter_producer_id,
             producer_local_ordinal,
             alive_dyn_filter,
+            input_schema,
         ) {
             Ok(captured_dyn_filter) => {
                 pushed_down.push(true);
@@ -102,6 +107,7 @@ pub(crate) fn register_dyn_filters_for_region(
         let _ = registry.register_remote_dyn_filter(
             captured_dyn_filter.filter_id.clone(),
             captured_dyn_filter.alive_dyn_filter.clone(),
+            captured_dyn_filter.input_schema.clone(),
         );
         let _ = registry
             .register_subscriber(&captured_dyn_filter.filter_id, Subscriber::new(region_id));
@@ -112,6 +118,7 @@ fn build_captured_dyn_filter(
     remote_dyn_filter_producer_id: RemoteDynFilterProducerId,
     producer_local_ordinal: usize,
     alive_dyn_filter: Arc<DynamicFilterPhysicalExpr>,
+    input_schema: &ArrowSchema,
 ) -> Result<CapturedDynFilter> {
     let children = alive_dyn_filter
         .children()
@@ -128,8 +135,14 @@ fn build_captured_dyn_filter(
 
     Ok(CapturedDynFilter {
         filter_id,
-        initial_registration: attach_initial_snapshot(initial_registration, &alive_dyn_filter),
+        initial_registration: attach_initial_snapshot(
+            initial_registration,
+            &alive_dyn_filter,
+            &children,
+            input_schema,
+        ),
         alive_dyn_filter,
+        input_schema: Arc::new(input_schema.clone()),
     })
 }
 
@@ -146,8 +159,12 @@ fn validate_initial_registrations_for_pushdown(
 fn attach_initial_snapshot(
     initial_registration: InitialDynFilterReg,
     alive_dyn_filter: &DynamicFilterPhysicalExpr,
+    registered_children: &[Arc<dyn PhysicalExpr>],
+    input_schema: &ArrowSchema,
 ) -> InitialDynFilterReg {
-    let Some(initial_snapshot) = initial_snapshot(alive_dyn_filter) else {
+    let Some(initial_snapshot) =
+        initial_snapshot(alive_dyn_filter, registered_children, input_schema)
+    else {
         return initial_registration;
     };
 
@@ -156,6 +173,8 @@ fn attach_initial_snapshot(
 
 fn initial_snapshot(
     alive_dyn_filter: &DynamicFilterPhysicalExpr,
+    registered_children: &[Arc<dyn PhysicalExpr>],
+    input_schema: &ArrowSchema,
 ) -> Option<InitialDynFilterSnapshot> {
     let generation = alive_dyn_filter.snapshot_generation();
     let current = match alive_dyn_filter.current() {
@@ -166,9 +185,11 @@ fn initial_snapshot(
         }
     };
 
-    let payload = match DynFilterPayload::from_datafusion_expr(
+    let payload = match DynFilterPayload::from_datafusion_expr_with_registered_children(
         &current,
-        REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+        registered_children,
+        INITIAL_REMOTE_DYN_FILTER_REGS_MAX_TOTAL_PROTO_BYTES,
+        input_schema,
     ) {
         Ok(payload) => payload,
         Err(error) => {
@@ -232,6 +253,8 @@ mod tests {
     use std::hash::{Hash, Hasher};
 
     use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
+    use datafusion::physical_plan::joins::{HashTableLookupExpr, Map, SeededRandomState};
     use datafusion_common::ScalarValue;
     use datafusion_expr::ColumnarValue;
     use datafusion_physical_expr::expressions::{Column, lit};
@@ -313,6 +336,15 @@ mod tests {
         RemoteDynFilterProducerId::new(value)
     }
 
+    fn test_arrow_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            arrow_schema::Field::new("service", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("host", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("zone", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("pod", arrow_schema::DataType::Utf8, true),
+        ])
+    }
+
     fn test_captured_dyn_filter(
         remote_dyn_filter_producer_id: RemoteDynFilterProducerId,
         producer_local_ordinal: usize,
@@ -326,6 +358,7 @@ mod tests {
                 vec![Arc::new(Column::new(column_name, column_index)) as Arc<_>],
                 lit(true) as _,
             )),
+            &test_arrow_schema(),
         )
         .unwrap()
     }
@@ -345,6 +378,18 @@ mod tests {
         dyn_filter
     }
 
+    fn test_lookup_expr(child: Arc<dyn PhysicalExpr>, hashes: Vec<u64>) -> Arc<dyn PhysicalExpr> {
+        let mut hash_map = JoinHashMapU32::with_capacity(hashes.len().max(1));
+        hash_map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+        let map = Arc::new(Map::HashMap(Box::new(hash_map)));
+        Arc::new(HashTableLookupExpr::new(
+            vec![child],
+            SeededRandomState::with_seeds(1, 2, 3, 4),
+            map,
+            "lookup".to_string(),
+        ))
+    }
+
     #[test]
     fn capture_remote_dyn_filters_for_pushdown_preserves_parent_filter_ordinals() {
         let parent_filters = vec![
@@ -361,9 +406,12 @@ mod tests {
         ];
 
         let remote_dyn_filter_producer_id = test_remote_dyn_filter_producer_id(42);
-        let captured =
-            capture_remote_dyn_filters_for_pushdown(remote_dyn_filter_producer_id, parent_filters)
-                .captured_dyn_filters;
+        let captured = capture_remote_dyn_filters_for_pushdown(
+            remote_dyn_filter_producer_id,
+            parent_filters,
+            &test_arrow_schema(),
+        )
+        .captured_dyn_filters;
 
         assert_eq!(captured.len(), 2);
         assert_eq!(
@@ -390,8 +438,11 @@ mod tests {
         ];
 
         let remote_dyn_filter_producer_id = test_remote_dyn_filter_producer_id(42);
-        let pushdown =
-            capture_remote_dyn_filters_for_pushdown(remote_dyn_filter_producer_id, parent_filters);
+        let pushdown = capture_remote_dyn_filters_for_pushdown(
+            remote_dyn_filter_producer_id,
+            parent_filters,
+            &test_arrow_schema(),
+        );
 
         assert_eq!(pushdown.pushed_down, vec![false, true, false]);
         assert_eq!(pushdown.captured_dyn_filters.len(), 1);
@@ -426,6 +477,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert_eq!(pushdown.pushed_down, vec![false]);
@@ -443,6 +495,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert_eq!(pushdown.pushed_down, vec![true]);
@@ -466,6 +519,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert_eq!(pushdown.pushed_down, vec![true]);
@@ -483,6 +537,39 @@ mod tests {
     }
 
     #[test]
+    fn capture_remote_dyn_filters_for_pushdown_can_attach_bloom_initial_snapshot() {
+        let host = Arc::new(Column::new("host", 1)) as Arc<dyn PhysicalExpr>;
+        let dyn_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&host)],
+            lit(true) as _,
+        ));
+        dyn_filter
+            .update(test_lookup_expr(Arc::clone(&host), vec![10, 20, 30]))
+            .unwrap();
+        let parent_filters = vec![dyn_filter as Arc<dyn datafusion::physical_plan::PhysicalExpr>];
+
+        let pushdown = capture_remote_dyn_filters_for_pushdown(
+            test_remote_dyn_filter_producer_id(42),
+            parent_filters,
+            &test_arrow_schema(),
+        );
+
+        assert_eq!(pushdown.pushed_down, vec![true]);
+        let snapshot = pushdown.captured_dyn_filters[0]
+            .initial_registration
+            .initial_snapshot
+            .as_ref()
+            .unwrap();
+        match &snapshot.payload {
+            DynFilterPayload::JoinHashBloom(bloom) => {
+                assert_eq!(bloom.join_key_child_indices, vec![0]);
+                assert_ne!(bloom.hash_compat_fingerprint, 0);
+            }
+            other => panic!("expected Bloom initial snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn capture_remote_dyn_filters_for_pushdown_rejects_oversized_snapshots() {
         let oversized_total_snapshot_bytes = REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES * 3 / 5;
         let parent_filters = vec![
@@ -495,6 +582,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert_eq!(pushdown.pushed_down, vec![false, false]);
@@ -515,6 +603,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert!(pushdown.captured_dyn_filters.is_empty());
@@ -537,6 +626,7 @@ mod tests {
         let pushdown = capture_remote_dyn_filters_for_pushdown(
             test_remote_dyn_filter_producer_id(42),
             parent_filters,
+            &test_arrow_schema(),
         );
 
         assert!(pushdown.captured_dyn_filters.is_empty());
