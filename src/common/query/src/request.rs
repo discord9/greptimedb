@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 use api::v1::region::RegionRequestHeader;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::{Column, InListExpr, lit};
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, InListExpr, lit};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::joins::HashTableLookupExpr;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{DataFusionError, Result as DataFusionResult};
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{LogicalPlan, Operator};
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
@@ -43,7 +43,7 @@ pub use self::initial_remote_dyn_filter_reg::{
 pub use self::join_hash_bloom::{
     BLOOM_ENCODER_BITS_PER_HASH, BLOOM_ENCODER_MAX_NUM_BITS_BUDGET, BLOOM_ENCODER_MIN_NUM_BITS,
     BLOOM_ENCODER_NUM_PROBES, BLOOM_PROTO_ENVELOPE_OVERHEAD_ESTIMATE, JOIN_HASH_BLOOM_VERSION,
-    JoinHashBloomPayload, MAX_BLOOM_NUM_PROBES, MAX_BLOOM_RESIDUAL_BYTES,
+    JoinHashBloomPayload, JoinHashBloomProbeExpr, MAX_BLOOM_NUM_PROBES, MAX_BLOOM_RESIDUAL_BYTES,
 };
 use crate::error::{DynFilterPayloadTooLargeSnafu, Error as CommonQueryError};
 
@@ -189,6 +189,148 @@ impl DynFilterPayload {
             }
         }
     }
+
+    /// Decodes this payload into a single DataFusion physical expression using
+    /// the registered dynamic-filter children for context.
+    ///
+    /// This is a convenience wrapper around [`Self::decode_placement_aware`] that
+    /// combines pushdown and exact expressions with AND for callers that do not
+    /// need placement-aware splitting (e.g. legacy tests or single-filter usage).
+    pub fn decode_expr_with_registered_children(
+        &self,
+        task_ctx: &TaskContext,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+        registered_children: &[Arc<dyn PhysicalExpr>],
+        max_payload_bytes: usize,
+    ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let decoded = self.decode_placement_aware(
+            task_ctx,
+            input_schema,
+            registered_children,
+            max_payload_bytes,
+        )?;
+        match decoded.exact_expr {
+            Some(exact) => Ok(Arc::new(BinaryExpr::new(
+                decoded.pushdown_expr,
+                Operator::And,
+                exact,
+            ))),
+            None => Ok(decoded.pushdown_expr),
+        }
+    }
+
+    /// Decodes this payload into placement-aware parts.
+    ///
+    /// See [`DecodedDynFilterExprs`] for semantics.
+    pub fn decode_placement_aware(
+        &self,
+        task_ctx: &TaskContext,
+        input_schema: &datafusion::arrow::datatypes::Schema,
+        registered_children: &[Arc<dyn PhysicalExpr>],
+        max_payload_bytes: usize,
+    ) -> DataFusionResult<DecodedDynFilterExprs> {
+        match self {
+            Self::Datafusion(_) => {
+                let pushdown_expr =
+                    self.decode_datafusion_expr(task_ctx, input_schema, max_payload_bytes)?;
+                Ok(DecodedDynFilterExprs {
+                    pushdown_expr,
+                    exact_expr: None,
+                })
+            }
+            Self::JoinHashBloom(bloom) => {
+                bloom.validate()?;
+
+                let encoded_bytes = self.encoded_payload_bytes();
+                validate_payload_size(encoded_bytes, max_payload_bytes)
+                    .map_err(DataFusionError::from)?;
+
+                let num_registered = registered_children.len();
+                for &child_index in &bloom.join_key_child_indices {
+                    if child_index as usize >= num_registered {
+                        return Err(DataFusionError::Plan(format!(
+                            "JoinHashBloomPayload: join key child index {} out of range (registered children: {})",
+                            child_index, num_registered
+                        )));
+                    }
+                }
+
+                // Decode residual DataFusion expression
+                let residual_expr = decode_physical_expr_from_bytes(
+                    &bloom.residual_datafusion_physical_expr,
+                    task_ctx,
+                    input_schema,
+                    max_payload_bytes,
+                )?;
+
+                // Ensure residual is Boolean-typed
+                let residual_dt = residual_expr.data_type(input_schema)?;
+                if residual_dt != datafusion::arrow::datatypes::DataType::Boolean {
+                    return Err(DataFusionError::Plan(format!(
+                        "JoinHashBloomPayload: residual expression has type {:?}, expected Boolean",
+                        residual_dt
+                    )));
+                }
+
+                // Select probe children from registered_children by join-key child index
+                let probe_children: Vec<Arc<dyn PhysicalExpr>> = bloom
+                    .join_key_child_indices
+                    .iter()
+                    .map(|&child_index| Arc::clone(&registered_children[child_index as usize]))
+                    .collect();
+
+                // Recompute fingerprint; zero/mismatch/recompute-error yields lit(true) exact.
+                let exact_expr: Arc<dyn PhysicalExpr> = if bloom.hash_compat_fingerprint == 0 {
+                    lit(true)
+                } else {
+                    match crate::request::join_hash_bloom::compute_hash_compat_fingerprint(
+                        &probe_children,
+                        input_schema,
+                        (
+                            bloom.df_seed0,
+                            bloom.df_seed1,
+                            bloom.df_seed2,
+                            bloom.df_seed3,
+                        ),
+                    ) {
+                        Ok(local_fp) if local_fp == bloom.hash_compat_fingerprint => {
+                            Arc::new(JoinHashBloomProbeExpr::try_new(
+                                probe_children,
+                                std::sync::Arc::new(bloom.clone()),
+                            )?) as Arc<dyn PhysicalExpr>
+                        }
+                        _ => lit(true),
+                    }
+                };
+
+                Ok(DecodedDynFilterExprs {
+                    pushdown_expr: residual_expr,
+                    exact_expr: Some(exact_expr),
+                })
+            }
+        }
+    }
+}
+
+/// Placement-aware decoded dynamic filter expressions.
+///
+/// Splits a decoded payload so DataNode can install the `pushdown_expr` into a
+/// normal [`DynamicFilterPhysicalExpr`] that Mito scan can push down, while the
+/// optional `exact_expr` is wrapped in a non-pushdown marker that stays in
+/// [`FilterExec`] for row-level evaluation only.
+///
+/// - `Datafusion` payload: `pushdown_expr = decode_datafusion_expr(...)`,
+///   `exact_expr = None`.
+/// - `JoinHashBloom` payload: `pushdown_expr = residual_expr`,
+///   `exact_expr = Some(bloom_probe_expr)` when fingerprint matches;
+///   `exact_expr = Some(lit(true))` on zero/mismatch/recompute error
+///   (valid-payload degradation that disables exact Bloom safely).
+///
+/// [`DynamicFilterPhysicalExpr`]: datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr
+#[derive(Debug, Clone)]
+pub struct DecodedDynFilterExprs {
+    pub pushdown_expr: Arc<dyn PhysicalExpr>,
+    pub exact_expr: Option<Arc<dyn PhysicalExpr>>,
 }
 
 fn encode_physical_expr_to_bytes(expr: &Arc<dyn PhysicalExpr>) -> DataFusionResult<Vec<u8>> {
