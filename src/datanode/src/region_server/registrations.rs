@@ -451,7 +451,12 @@ impl RegisteredDynFilter {
             }
 
             if generation == pending.generation {
-                pending.is_complete |= is_complete;
+                if is_complete && !pending.is_complete {
+                    if payload != &pending.payload {
+                        return RemoteDynFilterUpdateOutcome::DecodeFailed;
+                    }
+                    pending.is_complete = true;
+                }
                 return RemoteDynFilterUpdateOutcome::Idempotent;
             }
 
@@ -1330,6 +1335,79 @@ mod tests {
             &regs_by_query,
             &query_id,
             &RemoteDynFilterId::new("filter-complete"),
+            &bloom_payload,
+            2,
+            false,
+        );
+        assert_eq!(valid_outcome, RemoteDynFilterUpdateOutcome::Applied);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+    }
+
+    #[test]
+    fn pending_same_generation_mismatched_complete_does_not_mark_buffer_complete() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let schema = one_column_arrow_schema();
+        let id_col = Arc::new(Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let children = vec![Arc::clone(&id_col)];
+
+        let mut hash_map = JoinHashMapU32::with_capacity(3);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
+        let map = Arc::new(Map::HashMap(Box::new(hash_map)));
+        let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
+            vec![Arc::clone(&id_col)],
+            SeededRandomState::with_seeds(1, 2, 3, 4),
+            map,
+            "lookup".to_string(),
+        ));
+
+        let bloom_payload = DynFilterPayload::from_datafusion_expr_with_registered_children(
+            &lookup,
+            &children,
+            REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+            &schema,
+        )
+        .unwrap();
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-pending", &children)
+            .unwrap()
+            .with_initial_snapshot(InitialDynFilterSnapshot::new(
+                bloom_payload.clone(),
+                1,
+                false,
+            ));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+
+        // Runtime filters do not exist yet, so this exercises the buffered
+        // pending-update path rather than RemoteDynFilterState::apply_update().
+        let garbage = DynFilterPayload::Datafusion(vec![0, 1, 2, 3]);
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-pending"),
+            &garbage,
+            1,
+            true,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::DecodeFailed);
+
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let pushdown = pushdown_dyn_filter(&exprs[0]);
+        let exact_dynamic = exact_dyn_filter(&exprs[1]);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let valid_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-pending"),
             &bloom_payload,
             2,
             false,
