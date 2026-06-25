@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use common_query::request::{
-    DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY,
-    INITIAL_REMOTE_DYN_FILTER_REGS_MAX_TOTAL_PROTO_BYTES, InitialDynFilterReg,
+    DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY, InitialDynFilterReg,
     InitialDynFilterRegs, InitialDynFilterSnapshot, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
 };
 use datafusion_common::Result;
@@ -188,7 +187,7 @@ fn initial_snapshot(
     let payload = match DynFilterPayload::from_datafusion_expr_with_registered_children(
         &current,
         registered_children,
-        INITIAL_REMOTE_DYN_FILTER_REGS_MAX_TOTAL_PROTO_BYTES,
+        REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
         input_schema,
     ) {
         Ok(payload) => payload,
@@ -198,8 +197,7 @@ fn initial_snapshot(
         }
     };
 
-    // Current DataFusion exposes `wait_complete()`, but no non-blocking completion getter.
-    let is_complete = false;
+    let is_complete = alive_dyn_filter.is_complete();
     Some(InitialDynFilterSnapshot::new(
         payload,
         generation,
@@ -534,6 +532,31 @@ mod tests {
             snapshot.payload,
             DynFilterPayload::Datafusion(ref bytes) if !bytes.is_empty()
         ));
+    }
+
+    #[test]
+    fn capture_remote_dyn_filters_for_pushdown_preserves_initial_snapshot_completion() {
+        let dyn_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("host", 1)) as Arc<_>],
+            lit(true) as _,
+        ));
+        dyn_filter.update(lit(false) as _).unwrap();
+        dyn_filter.mark_complete();
+        let parent_filters = vec![dyn_filter as Arc<dyn datafusion::physical_plan::PhysicalExpr>];
+
+        let pushdown = capture_remote_dyn_filters_for_pushdown(
+            test_remote_dyn_filter_producer_id(42),
+            parent_filters,
+            &test_arrow_schema(),
+        );
+
+        let snapshot = pushdown.captured_dyn_filters[0]
+            .initial_registration
+            .initial_snapshot
+            .as_ref()
+            .unwrap();
+        assert_eq!(snapshot.generation, 2);
+        assert!(snapshot.is_complete);
     }
 
     #[test]

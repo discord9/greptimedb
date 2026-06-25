@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use api::v1::region::{RemoteDynFilterUnregister, RemoteDynFilterUpdate};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use common_query::request::{DynFilterPayload, REMOTE_DYN_FILTER_UPDATE_PAYLOAD_MAX_BYTES};
+use common_query::request::{DynFilterPayload, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES};
 use common_runtime::spawn_global;
 use common_telemetry::{debug, warn};
 use datafusion_physical_expr::PhysicalExpr;
@@ -29,10 +29,7 @@ use store_api::storage::RegionId;
 use tokio::sync::{Notify, watch};
 
 use crate::dist_plan::FilterId;
-use crate::metrics::{
-    REMOTE_DYN_FILTER_ENCODE_TOTAL, REMOTE_DYN_FILTER_PAYLOAD_BYTES,
-    REMOTE_DYN_FILTER_UPDATE_RPC_TOTAL,
-};
+use crate::metrics::REMOTE_DYN_FILTER_UPDATE_RPC_TOTAL;
 use crate::region_query::RegionQueryHandlerRef;
 
 const REMOTE_DYN_FILTER_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -393,6 +390,19 @@ struct EncodedRemoteDynFilterUpdate {
     legacy_payload: Vec<u8>,
 }
 
+fn encode_legacy_datafusion_payload(expr: &Arc<dyn PhysicalExpr>) -> Option<Vec<u8>> {
+    match DynFilterPayload::from_datafusion_expr(expr, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES) {
+        Ok(DynFilterPayload::Datafusion(bytes)) => Some(bytes),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn encode_legacy_datafusion_or_true(current: &Arc<dyn PhysicalExpr>) -> Option<Vec<u8>> {
+    encode_legacy_datafusion_payload(current).or_else(|| {
+        encode_legacy_datafusion_payload(&(physical_lit(true) as Arc<dyn PhysicalExpr>))
+    })
+}
+
 fn encode_remote_dyn_filter_update(
     current: &Arc<dyn PhysicalExpr>,
     filter: &DynamicFilterPhysicalExpr,
@@ -403,7 +413,7 @@ fn encode_remote_dyn_filter_update(
     let typed = match DynFilterPayload::from_datafusion_expr_with_registered_children(
         current,
         &children,
-        REMOTE_DYN_FILTER_UPDATE_PAYLOAD_MAX_BYTES,
+        REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
         entry.input_schema.as_ref(),
     ) {
         Ok(typed) => typed,
@@ -418,37 +428,11 @@ fn encode_remote_dyn_filter_update(
         DynFilterPayload::JoinHashBloom(_) => {
             // Build a safe legacy fallback for old DNs that cannot parse JoinHashBloom.
             // Try Datafusion encoding first; if that fails, use lit(true).
-            match DynFilterPayload::from_datafusion_expr(
-                current,
-                REMOTE_DYN_FILTER_UPDATE_PAYLOAD_MAX_BYTES,
-            ) {
-                Ok(DynFilterPayload::Datafusion(bytes)) => bytes,
-                Ok(_) => {
-                    // Unsupported variant from from_datafusion_expr — fallback to lit(true).
-                    match DynFilterPayload::from_datafusion_expr(
-                        &(physical_lit(true) as Arc<dyn PhysicalExpr>),
-                        REMOTE_DYN_FILTER_UPDATE_PAYLOAD_MAX_BYTES,
-                    ) {
-                        Ok(DynFilterPayload::Datafusion(bytes)) => bytes,
-                        _ => {
-                            warn!("Failed to encode legacy fallback payload for old DNs");
-                            return None;
-                        }
-                    }
-                }
-                Err(_) => {
-                    match DynFilterPayload::from_datafusion_expr(
-                        &(physical_lit(true) as Arc<dyn PhysicalExpr>),
-                        REMOTE_DYN_FILTER_UPDATE_PAYLOAD_MAX_BYTES,
-                    ) {
-                        Ok(DynFilterPayload::Datafusion(bytes)) => bytes,
-                        _ => {
-                            warn!("Failed to encode legacy fallback payload for old DNs");
-                            return None;
-                        }
-                    }
-                }
-            }
+            let Some(bytes) = encode_legacy_datafusion_or_true(current) else {
+                warn!("Failed to encode legacy fallback payload for old DNs");
+                return None;
+            };
+            bytes
         }
         _ => {
             warn!("Unsupported DynFilterPayload variant for fanout");

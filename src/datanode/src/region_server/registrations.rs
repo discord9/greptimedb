@@ -564,7 +564,7 @@ pub(super) fn apply_remote_dyn_filter_update(
         return outcome;
     }
 
-    REMOTE_DYN_FILTER_PAYLOAD_BYTES.observe(payload.len() as f64);
+    REMOTE_DYN_FILTER_PAYLOAD_BYTES.observe(payload.encoded_payload_bytes() as f64);
 
     let Some(query_regs) = regs_by_query.get_query(query_id) else {
         warn!(
