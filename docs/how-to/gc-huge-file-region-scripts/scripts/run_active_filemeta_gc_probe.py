@@ -101,9 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Rate
     g = p.add_argument_group("rate")
     g.add_argument("--progress-every", type=int, default=1000,
-                   help="Print progress every N INSERTs (default: 1000)")
+                   help="Print progress every N INSERT statements (default: 1000)")
     g.add_argument("--stats-every", type=int, default=1000,
-                   help="Sample region stats every N INSERTs (default: 1000)")
+                   help="Sample region stats every N INSERT statements (default: 1000)")
     g.add_argument("--logs-since", default="6h",
                    help="kubectl logs --since duration (default: 6h)")
     g.add_argument("--http-timeout", type=float, default=600.0,
@@ -704,7 +704,7 @@ def main() -> None:
                     samples_f.flush()
 
         insert_flush_elapsed = time.perf_counter() - start_time
-        print(f"  done: {insert_count} INSERTs, {flush_count} FLUSHes "
+        print(f"  done: {insert_count} INSERT statements, {flush_count} FLUSH statements "
               f"in {insert_flush_elapsed:.2f}s")
         write_text(str(out_dir / "insert-flush-elapsed-seconds.txt"),
                    f"{insert_flush_elapsed}\n")
