@@ -1,0 +1,37 @@
+# Helm chart: oci://registry-1.docker.io/bitnamicharts/etcd
+# Mirrors the repository CI action pattern, reduced to a single replica.
+# Do not apply without review.
+
+replicaCount: 1
+
+auth:
+  rbac:
+    create: false
+    token:
+      enabled: false
+
+persistence:
+  enabled: true
+  storageClass: local-path
+  size: 2Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 1500m
+    memory: 2Gi
+
+global:
+  security:
+    allowInsecureImages: true
+
+image:
+  registry: docker.io
+  repository: greptime/etcd
+  tag: 3.6.1-debian-12-r3
+
+podLabels:
+  app.kubernetes.io/part-of: greptimedb-gc-lab
+  purpose: gc-huge-file-stress

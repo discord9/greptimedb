@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gc-stress-test
+  labels:
+    app.kubernetes.io/name: gc-huge-file-stress
+    app.kubernetes.io/part-of: greptimedb-gc-lab
+    purpose: gc-huge-file-stress
+    owner: manual-review-required
+  annotations:
+    greptime.io/lab-note: "Dedicated namespace for GreptimeDB GC huge-file stress testing. Created only after user approval."
+    greptime.io/cleanup-after: "manual-review-required"

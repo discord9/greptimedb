@@ -9,6 +9,10 @@ default-run = "greptime"
 name = "greptime"
 path = "src/bin/greptime.rs"
 
+[[bin]]
+name = "gc_synthetic_manifest"
+path = "src/bin/gc_synthetic_manifest.rs"
+
 [features]
 default = [
     "servers/pprof",

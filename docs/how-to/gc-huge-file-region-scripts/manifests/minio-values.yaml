@@ -1,0 +1,50 @@
+# Helm chart: oci://greptime-registry.cn-hangzhou.cr.aliyuncs.com/charts/minio
+# Chart version: 16.0.10 (Bitnami MinIO chart mirrored in the Greptime registry)
+# Install command is documented in commands.md. Do not apply without review.
+
+global:
+  security:
+    allowInsecureImages: true
+
+image:
+  registry: greptime-registry.cn-hangzhou.cr.aliyuncs.com
+  repository: bitnami/minio
+  tag: 2025.4.22-debian-12-r1
+
+mode: standalone
+
+auth:
+  rootUser: rootuser
+  # Lab-only placeholder. Replace before installing or use Helm --set/secret injection.
+  rootPassword: CHANGE_ME_GC_STRESS_MINIO_ROOT_PASSWORD
+
+defaultBuckets: gc-stress-bucket
+
+persistence:
+  enabled: true
+  storageClass: local-path
+  size: 500Gi
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+
+service:
+  type: ClusterIP
+  ports:
+    api: 9000
+    console: 9001
+
+podLabels:
+  app.kubernetes.io/part-of: greptimedb-gc-lab
+  purpose: gc-huge-file-stress
+
+# local-path is WaitForFirstConsumer and not storage-free-space aware. Pin the
+# MinIO pod/PVC to the node with the lowest currently requested local-path PV
+# total observed during read-only planning. Reconfirm before applying.
+nodeSelector:
+  kubernetes.io/hostname: minipc-6

@@ -1,0 +1,102 @@
+# Helm chart: greptime/greptimedb-cluster
+# Minimal non-HA lab cluster for GC huge-file stress testing.
+# Do not apply without review.
+
+frontend:
+  replicas: 1
+  configData: |-
+    [runtime]
+    global_rt_size = 4
+
+    [meta_client]
+    ddl_timeout = "120s"
+
+datanode:
+  replicas: 1
+  storage:
+    storageClassName: local-path
+    storageSize: 20Gi
+  configData: |-
+    [runtime]
+    global_rt_size = 4
+    compact_rt_size = 2
+
+    [[region_engine]]
+    [region_engine.mito]
+    [region_engine.mito.gc]
+    enable = true
+    lingering_time = "0s"
+    unknown_file_lingering_time = "0s"
+
+meta:
+  replicas: 1
+  enableRegionFailover: false
+  backendStorage:
+    etcd:
+      endpoints:
+        - etcd.gc-stress-test.svc.cluster.local:2379
+  configData: |-
+    [runtime]
+    global_rt_size = 4
+
+    [datanode]
+    [datanode.client]
+    timeout = "120s"
+
+    [gc]
+    enable = true
+
+flownode:
+  enabled: false
+
+objectStorage:
+  s3:
+    bucket: gc-stress-bucket
+    region: us-west-2
+    root: gc-hf-lab
+    endpoint: http://minio.gc-stress-test.svc.cluster.local:9000
+  credentials:
+    accessKeyId: rootuser
+    secretAccessKey: CHANGE_ME_GC_STRESS_MINIO_ROOT_PASSWORD
+
+monitoring:
+  enabled: true
+  standalone:
+    base:
+      main:
+        resources:
+          requests:
+            cpu: "200m"
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+    datanodeStorage:
+      fs:
+        storageClassName: local-path
+        storageSize: 20Gi
+  vector:
+    registry: greptime-registry.cn-hangzhou.cr.aliyuncs.com
+    repository: timberio/vector
+    tag: 0.49.0-debian
+    resources:
+      requests:
+        cpu: "100m"
+        memory: 256Mi
+      limits:
+        cpu: "500m"
+        memory: 512Mi
+
+grafana:
+  enabled: false
+
+base:
+  podTemplate:
+    main:
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          cpu: "4"
+          memory: 8Gi

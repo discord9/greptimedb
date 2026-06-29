@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gc-stress-test-limits
+  namespace: gc-stress-test
+  labels:
+    app.kubernetes.io/name: gc-huge-file-stress
+    app.kubernetes.io/part-of: greptimedb-gc-lab
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 256Mi
+      default:
+        cpu: "2"
+        memory: 4Gi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 500Gi
+      min:
+        storage: 1Gi

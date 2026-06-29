@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gc-stress-test-quota
+  namespace: gc-stress-test
+  labels:
+    app.kubernetes.io/name: gc-huge-file-stress
+    app.kubernetes.io/part-of: greptimedb-gc-lab
+spec:
+  hard:
+    requests.cpu: "12"
+    requests.memory: 48Gi
+    limits.cpu: "30"
+    limits.memory: 96Gi
+    requests.storage: 700Gi
+    persistentvolumeclaims: "6"
+    pods: "16"
