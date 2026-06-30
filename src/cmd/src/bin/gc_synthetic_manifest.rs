@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -183,6 +184,12 @@ fn main() {
         return;
     }
 
+    // Ensure out-dir exists before writing any output.
+    fs::create_dir_all(&args.out_dir).unwrap_or_else(|e| {
+        eprintln!("ERROR: cannot create out-dir {:?}: {e}", args.out_dir);
+        std::process::exit(1);
+    });
+
     // ------------------------------------------------------------------
     // 3. Build synthetic files
     // ------------------------------------------------------------------
@@ -217,6 +224,45 @@ fn main() {
     }
 
     // ------------------------------------------------------------------
+    // 3b. Emit active file reference list (for C2b object materialization)
+    // ------------------------------------------------------------------
+    let files_jsonl_path = args.out_dir.join("files.jsonl");
+    {
+        let f = fs::File::create(&files_jsonl_path).unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: cannot create files.jsonl {:?}: {e}",
+                files_jsonl_path
+            );
+            std::process::exit(1);
+        });
+        let mut writer = BufWriter::new(f);
+        for file_id in new_files.keys() {
+            let line = serde_json::json!({
+                "file_id": file_id.to_string(),
+                "region_id": region_id.as_u64(),
+            });
+            writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&line).unwrap_or_else(|e| {
+                    eprintln!("ERROR: JSON encode failed for file_id {}: {e}", file_id);
+                    std::process::exit(1);
+                })
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: write files.jsonl failed: {e}");
+                std::process::exit(1);
+            });
+        }
+        // Buffer will flush on drop.
+    }
+    println!(
+        "  wrote {} file refs → {}",
+        args.count,
+        files_jsonl_path.display()
+    );
+
+    // ------------------------------------------------------------------
     // 4. Build new manifest
     // ------------------------------------------------------------------
     let new_manifest = RegionManifest {
@@ -242,10 +288,6 @@ fn main() {
     // ------------------------------------------------------------------
     // 5. Encode and write
     // ------------------------------------------------------------------
-    fs::create_dir_all(&args.out_dir).unwrap_or_else(|e| {
-        eprintln!("ERROR: cannot create out-dir {:?}: {e}", args.out_dir);
-        std::process::exit(1);
-    });
 
     let checkpoint_bytes = new_checkpoint.encode().unwrap_or_else(|e| {
         eprintln!("ERROR: checkpoint encode failed: {e}");
@@ -302,6 +344,8 @@ fn main() {
         "seed_last_version": seed_last_version,
         "output_checkpoint": checkpoint_path.to_string_lossy(),
         "output_last_checkpoint": last_checkpoint_path.to_string_lossy(),
+        "output_files_jsonl": files_jsonl_path.to_string_lossy(),
+        "files_jsonl_count": args.count,
         "est_memory_mb": format!("{:.1}", estimate_mb),
     });
     let summary_bytes = serde_json::to_vec_pretty(&summary).unwrap_or_else(|e| {
@@ -318,6 +362,8 @@ fn main() {
     println!("Wrote checkpoint: {}", checkpoint_path.display());
     println!("  bytes: {}", checkpoint_bytes.len());
     println!("Wrote last_checkpoint: {}", last_checkpoint_path.display());
+    println!("Wrote files.jsonl: {}", files_jsonl_path.display());
+    println!("  entries: {}", args.count);
     println!("Wrote summary: {}", summary_path.display());
     println!("Done.");
 }

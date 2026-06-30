@@ -13,6 +13,10 @@ path = "src/bin/greptime.rs"
 name = "gc_synthetic_manifest"
 path = "src/bin/gc_synthetic_manifest.rs"
 
+[[bin]]
+name = "gc_cross_region_ref_fixture"
+path = "src/bin/gc_cross_region_ref_fixture.rs"
+
 [features]
 default = [
     "servers/pprof",

@@ -423,7 +423,89 @@ Interpretation: C2a checkpoint-only validates manifest decode/load, synthetic
 `FileMeta` in-memory state, region open, and GC set construction through 2M
 active `FileMeta` entries with an `840.9MB` manifest checkpoint in this lab. It
 does **not** exercise reads/compaction or full-listing over matching synthetic
-object bodies; those remain separate C2b/hybrid concerns.
+object bodies.
+
+### Observed C2b matching-object results
+
+C2b extends the same synthetic manifest fixture by materializing tiny placeholder
+`.parquet` objects with the exact generated `FileMeta.file_id` names under the
+region prefix while the datanode is offline. These placeholder objects are **not
+readable SSTs**; no reads or compaction are allowed. This only tests GC
+full-listing/filter protection for active known file names.
+
+- C2b 100 smoke:
+  - evidence `/tmp/opencode/gc-test-c2b-match-100/`;
+  - table `gc_hf_test_c2b_match_100`, `table_id=1044`,
+    `region_id=4483945857024`;
+  - materialized `100` placeholder active objects;
+  - after swap/fast/full GC, counts stayed `total=105/parquet=101/manifest=4`;
+  - `sst_num=100`; full GC `0.0318s`; GC report deleted 0; cluster Running.
+- C2b 1k smoke:
+  - evidence `/tmp/opencode/gc-test-c2b-match-1k/`;
+  - table `gc_hf_test_c2b_match_1k`, `table_id=1045`,
+    `region_id=4488240824320`;
+  - materialized `1000` placeholder active objects;
+  - after swap/fast/full GC, counts stayed `total=1005/parquet=1001/manifest=4`;
+  - `sst_num=1000`; full GC `0.0694s`; GC report deleted 0; cluster Running.
+- C2b 10k smoke:
+  - evidence `/tmp/opencode/gc-test-c2b-match-10k/`;
+  - table `gc_hf_test_c2b_match_10k`, `table_id=1049`,
+    `region_id=4505420693504`;
+  - materialized `10000` placeholder active objects in `175.58s`;
+  - checkpoint version `1000000`, `manifest_size=4,180,132`, `sst_num=10000`;
+  - after swap/fast/full GC, counts stayed `total=10005/parquet=10001/manifest=4`;
+  - fast/full GC HTTP `200`, elapsed `0.041s`/`2.173s`; GC report deleted 0;
+    cluster Running.
+- C2b 100k smoke:
+  - evidence `/tmp/opencode/gc-test-c2b-match-100k/`;
+  - table `gc_hf_test_c2b_match_100k`, `table_id=1050`,
+    `region_id=4509715660800`;
+  - materialized `100000` placeholder active objects in `1776.24s`;
+  - checkpoint version `1000000`, `manifest_size=41,890,137`, `sst_num=100000`;
+  - after swap/fast/full GC, counts stayed `total=100005/parquet=100001/manifest=4`;
+  - fast/full GC HTTP `200`, elapsed `0.072s`/`39.594s`; GC report deleted 0;
+    cluster Running.
+
+Interpretation: matching active object materialization and full-listing
+active-known protection are validated through 100k scale. This still does not
+cover readable SST bodies, parquet footer recovery, reads, or compaction.
+
+### Observed cross-region reference smoke results
+
+The cross-region smoke uses a fresh same-table two-region setup to validate that
+fast GC of source region A does not delete a file that is removed from A but
+still active in related region B with `FileMeta.region_id = A`.
+
+Fixture shape:
+
+- create a fresh table with `PARTITION ON COLUMNS (host) (host < 'm', host >=
+  'm')` so metasrv has real same-table related regions;
+- region A checkpoint: `files = {}`, `removed_files = X ∪ Y` with old timestamps;
+- region B checkpoint: `files = X`, with each protected `FileMeta.region_id = A`;
+- materialize placeholder objects for both protected X and unprotected Y under
+  region A's prefix;
+- datanode offline for checkpoint swap; PUT checkpoints before `_last_checkpoint`;
+- run fast `ADMIN GC_REGIONS(region_a)` only; no reads or compaction.
+
+Successful 10+10 run:
+
+- evidence `/tmp/opencode/gc-xref-smoke-10-10-20260629c/`;
+- table `gc_hf_xref_smoke_20260629c`, `table_id=1048`;
+- region A `4501125726208`, region B `4501125726209`;
+- checkpoint version `1000000`;
+- datanode Ready after swap in `20.55s`, cluster phase `Running`;
+- fast `ADMIN GC_REGIONS(4501125726208)` returned HTTP `200` and completed in
+  `0.0529s` (`execution_time_ms=29`);
+- region A S3 counts changed from `total=23/parquet=21/manifest=2` before GC to
+  `total=15/parquet=11/manifest=4` after GC;
+- protected X objects: `10/10` present, `0/10` missing;
+- unprotected Y objects: `0/10` present, `10/10` missing.
+
+Interpretation: the tiny same-table cross-region fixture validates the intended
+`FileRefsManifest`/`is_in_tmp_ref` fast-GC protection path for source-region
+files still referenced by another same-table region, while still deleting
+expired unprotected removed files. This remains a placeholder-object smoke, not
+a readable-SST or real repartition workload test.
 
 ### Pass/fail signals
 
@@ -619,6 +701,12 @@ Test C synthetic manifest/FileMeta harness:
 
 Test C synthetic checkpoint generator:
 `src/cmd/src/bin/gc_synthetic_manifest.rs` (`cargo run -p cmd --bin gc_synthetic_manifest -- ...`)
+
+Cross-region reference smoke harness:
+`docs/how-to/gc-huge-file-region-scripts/scripts/run_cross_region_ref_gc_smoke.py`
+
+Cross-region reference fixture generator:
+`src/cmd/src/bin/gc_cross_region_ref_fixture.rs` (`cargo run -p cmd --bin gc_cross_region_ref_fixture -- ...`)
 
 Use the Test B harness for repeatable insert+flush+compact+GC runs. It captures
 object counts, Prometheus before/after snapshots, pod snapshots, logs,

@@ -1,6 +1,6 @@
 # GreptimeDB GC huge-file 压测问题清单
 
-更新时间：2026-06-26
+更新时间：2026-06-29
 
 ## 背景
 
@@ -15,6 +15,11 @@
 - **Test B：real removed_files 删除/report 压力**
   - 100k insert+flush 后 `parquet=174823`，GC 删除 `174819` parquet，耗时 `48.472s`。
   - object count `174840 -> 21`，second GC no-op，cluster 保持 `Running`，restarts 未增加。
+- **Test C：manifest / FileMeta 压力与 xref smoke**
+  - C1 SQL+flush active `FileMeta` 到 100k，未触发 restart/OOM 或明显 open 慢问题。
+  - C2a synthetic checkpoint-only 到 2M active `FileMeta`，840.9MB checkpoint，fast/full GC 均约 1-2s。
+  - C2b matching placeholder active objects 通过 100/1k/10k/100k，验证 full-listing active-known 保护但不验证 readable SST。
+  - cross-region same-table fast-GC smoke 10+10 通过：protected 10/10 保留，unprotected 10/10 删除。
 
 ## 1. SQL `ADMIN GC_REGIONS` 固定 60s timeout
 
@@ -76,7 +81,7 @@
 
 ## 4. Test C：manifest / `FileMeta` metadata 压力
 
-- **状态**：C1 真实 SQL/flush 路径已完成到 100k active `FileMeta`；C2 lab-only synthetic checkpoint fixture 已完成到 2M checkpoint-only。
+- **状态**：C1 真实 SQL/flush 路径已完成到 100k active `FileMeta`；C2a lab-only synthetic checkpoint fixture 已完成到 2M checkpoint-only；C2b matching active placeholder objects 已完成到 100k。
 - **原因**：Test A dummy unknown files 主要压 object-store full listing/filter，不会制造真实 manifest `FileMeta` 压力，也不会放大 `manifest.files.len()`。
 - **执行方式**：
   - 新表 `gc_hf_test_c`，`table_id=1035`，`region_id=4445291151360`。
@@ -103,7 +108,40 @@
   - 1M：`table_id=1042`，checkpoint `419,890,130` bytes，Ready `15.54s`，fast/full GC `1.10s`/`0.83s`。
   - 2M：`table_id=1043`，checkpoint `840,890,130` bytes，Ready `25.80s`，fast/full GC `1.63s`/`1.68s`。
   - 所有 C2a runs：`sst_num` 符合预期，GC report 删除 0，S3 counts 始终 `total=5/parquet=1/manifest=4`，cluster `Running` 且无 restart 增加。
-- **剩余未覆盖**：C2a 只覆盖 checkpoint decode/load、in-memory `FileMeta`、region open、GC set construction；仍未覆盖 reads/compaction，也未覆盖 matching active object bodies 的 full-listing/filter（需要 C2b/hybrid）。
+- **C2b matching-object smoke**：
+  - harness：同一个 `run_synthetic_filemeta_manifest_probe.py`，新增 `--materialize-active-objects`；generator `gc_synthetic_manifest` 输出 `files.jsonl`。
+  - C2b 100：`table_id=1044`，`region_id=4483945857024`，materialized `100` placeholder parquet；fast/full GC 后 counts 保持 `total=105/parquet=101/manifest=4`，GC 删除 0。
+  - C2b 1k：`table_id=1045`，`region_id=4488240824320`，materialized `1000` placeholder parquet；fast/full GC 后 counts 保持 `total=1005/parquet=1001/manifest=4`，GC 删除 0。
+  - C2b 10k：`table_id=1049`，`region_id=4505420693504`，materialized `10000` placeholder parquet in `175.58s`；`sst_num=10000`，`manifest_size=4,180,132`；fast/full GC HTTP `200`，耗时 `0.041s`/`2.173s`；counts 保持 `total=10005/parquet=10001/manifest=4`，GC 删除 0。
+  - C2b 100k：`table_id=1050`，`region_id=4509715660800`，materialized `100000` placeholder parquet in `1776.24s`；`sst_num=100000`，`manifest_size=41,890,137`；fast/full GC HTTP `200`，耗时 `0.072s`/`39.594s`；counts 保持 `total=100005/parquet=100001/manifest=4`，GC 删除 0。
+  - 结论：full-listing active-known 保护在 matching placeholder object 下通过到 100k；placeholder 不是 readable SST，仍禁止 reads/compaction。
+- **剩余未覆盖**：C2a/C2b 仍未覆盖 readable SST bodies、parquet footer recovery、reads/compaction、真实 repartition workload、index/puffin extra-file 压力。
+
+## 5. Cross-region reference / repartition-like fast GC smoke
+
+- **状态**：tiny same-table xref smoke 已通过；不是产品问题，目前作为覆盖证明和后续压力基线。
+- **测试目标**：验证 source region A 中已进入 `removed_files` 的文件 X，如果仍被同表 related region B 作为 active `FileMeta { region_id: A, file_id: X }` 引用，fast GC A 时会通过 `FileRefsManifest` / `is_in_tmp_ref` 保护 X，不会把它当作 expired removed file 删除。
+- **关键 fixture 形状**：
+  - fresh 2-partition table：`PARTITION ON COLUMNS (host) (host < 'm', host >= 'm')`。
+  - A checkpoint：`files = {}`，`removed_files = X ∪ Y`，timestamp 0。
+  - B checkpoint：`files = X`，且每个 X 的 `FileMeta.region_id = A`。
+  - X/Y placeholder `.parquet` 都写在 A prefix 下；datanode offline 时 PUT checkpoint，再 PUT `_last_checkpoint`。
+  - 只跑 fast `ADMIN GC_REGIONS(A)`；不跑 reads/compaction。
+- **成功结果**：
+  - evidence：`/tmp/opencode/gc-xref-smoke-10-10-20260629c/`。
+  - table `gc_hf_xref_smoke_20260629c`，`table_id=1048`；A `4501125726208`，B `4501125726209`。
+  - checkpoint version `1000000`；datanode swap 后 Ready `20.55s`，cluster `Running`。
+  - fast GC HTTP `200`，耗时 `0.0529s`，SQL `execution_time_ms=29`。
+  - A counts `total=23/parquet=21/manifest=2 -> total=15/parquet=11/manifest=4`。
+  - protected X：`10/10` present；unprotected Y：`10/10` missing。
+- **修过的 harness 问题**：
+  - 第一次尝试在 datanode scale-down 后用 jsonpath 查空 pod list 导致失败；已改为解析 pod-list JSON 并允许 expected-empty。
+  - 第二次尝试因变量 shadowing 把 datanode label selector 覆盖成 `A`/`B`，Ready wait 查错 label；已改为 `datanode_label` / `region_label`。
+- **代码线索**：
+  - fast GC deletion guard：`src/mito2/src/gc.rs:62-80`、`:932-949`。
+  - cross-region refs snapshot：`src/mito2/src/sst/file_ref.rs:get_snapshot_of_file_refs()`。
+  - remap/repartition 保留 source `FileMeta.region_id`：`src/mito2/src/remap_manifest.rs`。
+  - metasrv related-region/file-ref orchestration：`src/meta-srv/src/gc/procedure.rs`。
 
 ## 非问题 / 已澄清
 

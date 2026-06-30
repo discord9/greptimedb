@@ -20,14 +20,18 @@
 """
 run_synthetic_filemeta_manifest_probe.py
 Test C2 harness: synthetic checkpoint manifest (checkpoint or delta-only) probe.
+C2b extension: optional active-object materialization (placeholder .parquet).
 
 Flow:
 1. Create seed table + insert one row → flush to generate a real manifest checkpoint.
 2. Backup existing manifest objects from S3.
 3. Download seed checkpoint (or delta JSON files), run Rust generator locally to
    produce synthetic manifest with `count` active FileMeta entries.
-4. Scale datanode to 0, PUT generated checkpoint + _last_checkpoint, scale back.
-5. Verify region_statistics.sst_num, run fast/full GC probes expecting 0 deletes,
+4. [C2b opt-in] Write tiny placeholder .parquet objects matching every generated
+   active FileMeta (NOT readable SSTs).  These exercise the GC full-listing/filter
+   path and the active-known deletion guard.
+5. Scale datanode to 0, PUT generated checkpoint + _last_checkpoint, scale back.
+6. Verify region_statistics.sst_num, run fast/full GC probes expecting 0 deletes,
    capture evidence, and write concise summary.
 
 Seed can be a checkpoint or delta-only files:
@@ -130,6 +134,19 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--generator-bin", default=None,
                    help="Path or command for Rust generator "
                         "(default: cargo run -p cmd --bin gc_synthetic_manifest --)")
+
+    # C2b: object materialization (placeholder .parquet matching manifest)
+    g = p.add_argument_group("c2b-materialize")
+    g.add_argument("--materialize-active-objects", action="store_true", default=False,
+                   help="Write tiny placeholder .parquet objects for every generated "
+                        "FileMeta (C2b active-object protection test). "
+                        "These are NOT readable SSTs; only used for full-listing/filter "
+                        "and active-known protection testing.")
+    g.add_argument("--placeholder-object-bytes", type=int, default=1,
+                   help="Size in bytes of each placeholder .parquet object (default: 1)")
+    g.add_argument("--max-materialize-count", type=int, default=1000,
+                   help="Safety cap: refuse to materialize if generated count exceeds "
+                        "this value unless --allow-large is also set (default: 1000)")
 
     return p
 
@@ -549,12 +566,15 @@ def dry_run_plan(args: argparse.Namespace) -> None:
     print("  6. find seed: checkpoint (if _last_checkpoint exists) or delta-only")
     print("  7. download seed checkpoint (checkpoint path) or prepare delta dir")
     print("  8. run Rust generator (dry-run then real)")
-    print("  9. scale datanode → 0")
-    print(" 10. PUT generated checkpoint + _last_checkpoint")
-    print(" 11. scale datanode → 1, wait Ready")
-    print(" 12. verify region_statistics.sst_num")
-    print(" 13. fast/full GC probes (expect 0 deletes)")
-    print(" 14. write evidence + concise summary")
+    print("  9. baseline cluster capture")
+    print(" 10. scale datanode → 0")
+    print(" 10b.[if --materialize-active-objects] write placeholder .parquet objects")
+    print(" 11. PUT generated checkpoint + _last_checkpoint")
+    print(" 12. scale datanode → 1, wait Ready")
+    print(" 13. verify region_statistics.sst_num")
+    print(" 14. fast/full GC probes (expect 0 deletes)")
+    print(" 14b.[if materialized] verify active objects not deleted by full GC")
+    print(" 15. write evidence + concise summary")
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +932,72 @@ def main() -> None:
         print(f"  datanode offline")
         scale_down_elapsed = time.perf_counter() - (time.perf_counter() - 0)  # placeholder
 
+        # ---- 10.5 Materialize active placeholder objects (C2b) -------------
+        # C2b: write tiny placeholder .parquet objects whose paths match the
+        # generated active FileMeta entries.  These are NOT readable SSTs;
+        # they only exist so that GC full listing sees them as active region
+        # files and exercises the active-known protection path.
+        materialized_parquet_count = 0
+        pre_materialize_parquet_count = 0
+        if args.materialize_active_objects:
+            print(f"\n[{now_iso()}] materializing active placeholder .parquet objects...")
+
+            # Safety caps: only with --execute, count must not exceed cap
+            # unless --allow-large is explicitly set.
+            if args.count > args.max_materialize_count and not args.allow_large:
+                fail(
+                    f"Refusing to materialize {args.count} objects: exceeds "
+                    f"--max-materialize-count {args.max_materialize_count}. "
+                    f"Use --allow-large to override."
+                )
+
+            # Read files.jsonl from generator output
+            files_jsonl = generated_dir / "files.jsonl"
+            if not files_jsonl.exists():
+                fail(f"files.jsonl not found in generated dir: {files_jsonl}")
+
+            # Count existing parquet objects before materialization
+            pre_obj_counts = count_s3_objects(transport, args.bucket, region_prefix)
+            write_json(str(out_dir / "s3-counts-before-materialize.json"), pre_obj_counts)
+            pre_parquet = pre_obj_counts["parquet"]
+            pre_materialize_parquet_count = pre_parquet
+            print(f"  parquet before materialize: {pre_parquet}")
+
+            # Write placeholder objects
+            placeholder = bytes(args.placeholder_object_bytes)
+            written = 0
+            t0 = time.perf_counter()
+            with open(files_jsonl, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ref = json.loads(line)
+                    file_id = ref["file_id"]
+                    parquet_key = f"{region_prefix}{file_id}.parquet"
+                    transport.put_object(args.bucket, parquet_key, placeholder)
+                    written += 1
+                    if written % 100 == 0:
+                        print(f"  materialized {written}/{args.count} objects...")
+
+            mat_elapsed = time.perf_counter() - t0
+            elapsed["materialize_objects"] = mat_elapsed
+            materialized_parquet_count = written
+            print(f"  materialized {written} placeholder objects in {mat_elapsed:.2f}s")
+
+            # Count after materialization
+            post_obj_counts = count_s3_objects(transport, args.bucket, region_prefix)
+            write_json(str(out_dir / "s3-counts-after-materialize.json"), post_obj_counts)
+            post_parquet = post_obj_counts["parquet"]
+            print(f"  parquet after materialize: {post_parquet} (delta: {post_parquet - pre_parquet})")
+
+            if post_parquet - pre_parquet != args.count:
+                print(
+                    f"WARNING: expected {args.count} new parquet objects, "
+                    f"got {post_parquet - pre_parquet}",
+                    file=sys.stderr,
+                )
+
         # ---- 11. PUT generated checkpoint + _last_checkpoint -------------
         print(f"\n[{now_iso()}] PUTting generated checkpoint...")
         ck_file = generated_dir / f"{target_checkpoint_version:020}.checkpoint"
@@ -936,6 +1022,8 @@ def main() -> None:
             "checkpoint_bytes": len(ck_bytes),
             "last_checkpoint_key": last_ck_s3_key,
             "last_checkpoint_bytes": len(last_ck_bytes),
+            "materialized_active_objects": args.materialize_active_objects,
+            "materialized_parquet_count": materialized_parquet_count,
         })
 
         # ---- 12. Scale datanode back to 1 --------------------------------
@@ -1105,6 +1193,29 @@ def main() -> None:
             if after_full_gc["parquet"] < comparison_base["parquet"]:
                 print(f"\n[{now_iso()}] FAIL: parquet decreased after full GC", file=sys.stderr)
                 gate_status = "failed"
+
+            # C2b: if materialized placeholder objects were written, verify
+            # they survived full GC (active-object protection).  The
+            # expected minimum post-GC parquet count is the pre-existing
+            # count plus the materialized placeholder count.
+            if args.materialize_active_objects and materialized_parquet_count > 0:
+                expected_min = pre_materialize_parquet_count + materialized_parquet_count
+                actual = after_full_gc["parquet"]
+                if actual < expected_min:
+                    print(
+                        f"\n[{now_iso()}] FAIL: materialized parquet objects "
+                        f"may have been deleted by full GC: "
+                        f"expected >= {expected_min}, got {actual} "
+                        f"(pre_existing={pre_materialize_parquet_count}, "
+                        f"materialized={materialized_parquet_count})",
+                        file=sys.stderr,
+                    )
+                    gate_status = "failed"
+                else:
+                    print(
+                        f"  C2b active-object check PASSED: "
+                        f"parquet after full GC ({actual}) >= expected min ({expected_min})"
+                    )
             od_count = full_delta.get("opendal_s3_delete_count", {}).get("changed_or_new", [])
             for c in od_count:
                 if c.get("delta", 0) > 0:
