@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::print_stderr, clippy::print_stdout)]
+
 //! Offline readable SST fixture generator for GC lab testing.
 //!
 //! Uses real [`mito2::sst::parquet::writer::ParquetWriter`] to write
@@ -480,10 +482,10 @@ fn load_seed(
 ) -> Option<SeedResult> {
     if let Some(dir) = delta_dir {
         Some(replay_delta_dir(dir, region_id))
-    } else if let Some(ck) = checkpoint {
-        Some(load_seed_checkpoint(ck, region_id))
     } else {
-        None
+        checkpoint
+            .as_ref()
+            .map(|ck| load_seed_checkpoint(ck, region_id))
     }
 }
 

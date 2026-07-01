@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::print_stderr, clippy::print_stdout)]
+
 //! Offline synthetic checkpoint generator for Test C2 (active-filemeta lab).
 //!
 //! Reads a seed checkpoint **or** replays delta JSON files,

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::print_stderr, clippy::print_stdout)]
+
 //! Offline cross-region-reference GC fixture generator.
 //!
 //! Generates coordinated synthetic checkpoints for two regions (A and B)
@@ -28,7 +30,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use mito2::manifest::action::{
@@ -449,7 +451,7 @@ fn write_region_checkpoint(
     manifest: &RegionManifest,
     version: u64,
     compacted_actions: usize,
-    dir: &PathBuf,
+    dir: &Path,
 ) {
     let checkpoint = RegionCheckpoint {
         last_version: version,
