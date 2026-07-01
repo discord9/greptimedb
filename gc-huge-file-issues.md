@@ -1,6 +1,6 @@
 # GreptimeDB GC huge-file 压测问题清单
 
-更新时间：2026-06-29
+更新时间：2026-06-30
 
 ## 背景
 
@@ -19,6 +19,7 @@
   - C1 SQL+flush active `FileMeta` 到 100k，未触发 restart/OOM 或明显 open 慢问题。
   - C2a synthetic checkpoint-only 到 2M active `FileMeta`，840.9MB checkpoint，fast/full GC 均约 1-2s。
   - C2b matching placeholder active objects 通过 100/1k/10k/100k，验证 full-listing active-known 保护但不验证 readable SST。
+  - Phase 3 readable SST fixture 已可用，lab cluster smoke 已通过 1/10/100 个真实 readable Flat SST；SQL `COUNT(*)` 符合预期，fast/full GC 后 generated SST 全部保留。
   - cross-region same-table fast-GC smoke 10+10 通过：protected 10/10 保留，unprotected 10/10 删除。
 
 ## 1. SQL `ADMIN GC_REGIONS` 固定 60s timeout
@@ -116,6 +117,36 @@
   - C2b 100k：`table_id=1050`，`region_id=4509715660800`，materialized `100000` placeholder parquet in `1776.24s`；`sst_num=100000`，`manifest_size=41,890,137`；fast/full GC HTTP `200`，耗时 `0.072s`/`39.594s`；counts 保持 `total=100005/parquet=100001/manifest=4`，GC 删除 0。
   - 结论：full-listing active-known 保护在 matching placeholder object 下通过到 100k；placeholder 不是 readable SST，仍禁止 reads/compaction。
 - **剩余未覆盖**：C2a/C2b 仍未覆盖 readable SST bodies、parquet footer recovery、reads/compaction、真实 repartition workload、index/puffin extra-file 压力。
+
+## 4.1 Phase 3 readable SST fixture foundation / cluster smokes
+
+- **状态**：本地 self-contained MVP 已实现并通过 readback smoke；lab cluster readable-SST checkpoint swap / SQL read / GC no-delete smoke 已通过 1/10/100 SST。尚未覆盖 compaction、read-heavy、100+ readable-SST scale、真实 repartition workload、index/puffin extra-file 压力。
+- **工具**：`src/cmd/src/bin/gc_readable_sst_fixture.rs`，bin `gc_readable_sst_fixture`。
+- **cluster harness**：`docs/how-to/gc-huge-file-region-scripts/scripts/run_readable_sst_gc_smoke.py`。
+- **行为**：
+  - 使用 Mito `ParquetWriter::new_with_object_store()` 写真实 readable SST parquet 到本地 FS object-store。
+  - 从 `SstInfo` 构建匹配 `FileMeta`，生成 checkpoint 和 `_last_checkpoint`。
+  - 使用 `ParquetReaderBuilder` 读回验证行数。
+  - 支持 `--seed-checkpoint` / `--seed-delta-dir` 读取真实 seed manifest metadata；当前只接受固定兼容 schema（dense PK、`tag_0`/`tag_1`/`field_0`/`ts`），并保持 seed manifest 的 `sst_format`（`Flat` 或 `PrimaryKey`）。
+  - `--table-dir` 必须是 table-level dir；region dir 由 Mito path helper 自动追加，误传 region-level dir 会 fail。
+- **本地验证**：
+  - `cargo check -p cmd --bin gc_readable_sst_fixture` 通过。
+  - 1-SST readback smoke：`/tmp/opencode/gc-readable-sst-fixture-smoke-correct-1/`，`10` rows。
+  - 3-SST readback smoke：`/tmp/opencode/gc-readable-sst-fixture-smoke-correct-3/`，`21` rows。
+  - seed checkpoint chain：step1 生成 version `42` checkpoint，step2 用该 checkpoint seed 生成 2 个 readable SST 并读回 `12` rows。
+  - seed guard：低于 seed last_version 的 checkpoint version、同时指定两种 seed source 都会 fail before writes。
+- **cluster smoke 结果**：
+  - evidence：`/tmp/opencode/gc-readable-sst-cluster-smoke-1sst-20260630b/`。
+  - table `gc_hf_readable_sst_smoke_20260630b`，`table_id=1052`，`region_id=4518305595392`。
+  - seed manifest replay `sst_format=Flat`；fixture 生成 1 个 matching Flat readable SST，本地 readback `10` rows。
+  - datanode offline 时 PUT one `.parquet`、checkpoint `00000000000001000000.checkpoint`（`1680` bytes）和 `_last_checkpoint`。
+  - reopen 后 SQL `SELECT COUNT(*)`：expected `10`，actual `10`。
+  - fast/full `ADMIN GC_REGIONS(4518305595392)` 耗时 `0.043s`/`0.023s`；generated SST `1/1` present，`0/1` missing；`GATE_STATUS passed`，cluster `Running`。
+  - 10-SST evidence：`/tmp/opencode/gc-readable-sst-cluster-smoke-10sst-20260630c/`；`table_id=1053`，`region_id=4522600562688`；checkpoint `5497` bytes；SQL `100/100`；generated SST `10/10` present；fast/full GC `0.023s`/`0.028s`；`GATE_STATUS passed`。
+  - 100-SST evidence：`/tmp/opencode/gc-readable-sst-cluster-smoke-100sst-20260630d/`；`table_id=1054`，`region_id=4526895529984`；checkpoint `43838` bytes；SQL `1000/1000`；generated SST `100/100` present；fast/full GC `0.030s`/`0.035s`；`GATE_STATUS passed`。
+- **下一步**：考虑 1k readable SST 或进入 compaction/read-heavy 压力；继续保持 fresh-table/new-prefix safety。
+
+- **剩余未覆盖**：当前 Phase 3 只覆盖 1/10/100 SST SQL read + GC no-delete；仍未覆盖 compaction、read-heavy/更大 readable-SST scale、真实 repartition workload、index/puffin extra-file 压力。
 
 ## 5. Cross-region reference / repartition-like fast GC smoke
 

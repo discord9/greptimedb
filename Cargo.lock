@@ -2073,6 +2073,7 @@ dependencies = [
  "meta-client",
  "meta-srv",
  "metric-engine",
+ "mito-codec",
  "mito2",
  "moka",
  "object-store",

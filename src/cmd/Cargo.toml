@@ -17,6 +17,10 @@ path = "src/bin/gc_synthetic_manifest.rs"
 name = "gc_cross_region_ref_fixture"
 path = "src/bin/gc_cross_region_ref_fixture.rs"
 
+[[bin]]
+name = "gc_readable_sst_fixture"
+path = "src/bin/gc_readable_sst_fixture.rs"
+
 [features]
 default = [
     "servers/pprof",
@@ -32,6 +36,7 @@ vector_index = ["mito2/vector_index", "query/vector_index"]
 workspace = true
 
 [dependencies]
+api.workspace = true
 async-trait.workspace = true
 auth.workspace = true
 base64.workspace = true
@@ -79,6 +84,7 @@ log-store.workspace = true
 meta-client.workspace = true
 meta-srv.workspace = true
 metric-engine.workspace = true
+mito-codec.workspace = true
 mito2.workspace = true
 moka.workspace = true
 object-store.workspace = true
@@ -113,7 +119,6 @@ pprof = { version = "0.14", features = [
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
-api.workspace = true
 client = { workspace = true, features = ["testing"] }
 common-test-util.workspace = true
 common-version.workspace = true

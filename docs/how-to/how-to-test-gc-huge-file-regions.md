@@ -507,6 +507,73 @@ files still referenced by another same-table region, while still deleting
 expired unprotected removed files. This remains a placeholder-object smoke, not
 a readable-SST or real repartition workload test.
 
+### Phase 3 readable SST fixture foundation
+
+The first readable-SST foundation is a local-only fixture generator:
+`src/cmd/src/bin/gc_readable_sst_fixture.rs`.
+
+This tool does **not** contact Kubernetes or MinIO. It writes to a local
+filesystem object-store under `--out-dir/object-store/`, uses Mito's real
+`ParquetWriter` to produce readable SST parquet files, builds matching
+`FileMeta`, writes a checkpoint plus `_last_checkpoint`, and validates readback
+with Mito's parquet reader.
+
+It supports two metadata modes:
+
+- synthetic mode (default): builds a fixed compatible schema locally;
+- seed mode (`--seed-checkpoint` or `--seed-delta-dir`): loads real region
+  metadata from a seed manifest, validates it matches the fixed generator schema,
+  preserves the seed SST format (`Flat` or `PrimaryKey`), guards checkpoint
+  version against seed replay, and records that generated files replace seed
+  files while seed `removed_files` are discarded for MVP safety.
+
+Key path rule: `--table-dir` is the table-level directory, not the region
+directory. For `region_id=4398046511104` (`1024_0000000000`), pass
+`--table-dir data/greptime/public/1024/`; the region directory is appended by
+Mito path helpers.
+
+Local validation so far:
+
+- `cargo check -p cmd --bin gc_readable_sst_fixture` passed.
+- Existing GC fixture bins still compile:
+  - `cargo check -p cmd --bin gc_synthetic_manifest`;
+  - `cargo check -p cmd --bin gc_cross_region_ref_fixture`.
+- 1 SST smoke passed with readback:
+  `/tmp/opencode/gc-readable-sst-fixture-smoke-correct-1/`, `10` rows.
+- 3 SST smoke passed with readback:
+  `/tmp/opencode/gc-readable-sst-fixture-smoke-correct-3/`, `21` rows.
+- Region-directory misuse is rejected before writes.
+- Seed checkpoint chain smoke passed:
+  `/tmp/opencode/gc-readable-sst-seed-chain-step1/` generated a checkpoint at
+  version `42`; `/tmp/opencode/gc-readable-sst-seed-chain-step2/` used that
+  checkpoint as seed, generated `2` readable SST files, and read back `12` rows.
+- Seed guards passed: lower checkpoint version than seed and specifying both seed
+  sources are rejected before writes.
+
+Lab-cluster readable SST validation ladder:
+
+- harness: `docs/how-to/gc-huge-file-region-scripts/scripts/run_readable_sst_gc_smoke.py`;
+- each run used a fresh table, replayed seed deltas from a real flush, found
+  `sst_format=Flat`, generated matching Flat readable SSTs, validated local
+  readback, stopped the datanode, PUT generated `.parquet` files plus checkpoint
+  `00000000000001000000.checkpoint` and `_last_checkpoint`, reopened the
+  datanode, validated SQL `COUNT(*)`, then ran fast and full
+  `ADMIN GC_REGIONS(region_id)` and checked generated object survival.
+
+| Scale | Evidence | Table / region | Checkpoint bytes | SQL count | Survival | Datanode Ready | Fast GC | Full GC |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 SST | `/tmp/opencode/gc-readable-sst-cluster-smoke-1sst-20260630b/` | `table_id=1052`, `region_id=4518305595392` | `1,680` | `10/10` | `1/1` | `25.93s` | `0.043s` | `0.023s` |
+| 10 SST | `/tmp/opencode/gc-readable-sst-cluster-smoke-10sst-20260630c/` | `table_id=1053`, `region_id=4522600562688` | `5,497` | `100/100` | `10/10` | `20.67s` | `0.023s` | `0.028s` |
+| 100 SST | `/tmp/opencode/gc-readable-sst-cluster-smoke-100sst-20260630d/` | `table_id=1054`, `region_id=4526895529984` | `43,838` | `1000/1000` | `100/100` | `25.99s` | `0.030s` | `0.035s` |
+
+All runs reported `GATE_STATUS passed`; cluster phase stayed `Running`.
+
+Interpretation: this validates the readable-SST writer/readback foundation, path
+semantics, seed metadata loading, a tiny datanode-offline checkpoint swap, SQL
+readability, and GC active-known no-delete behavior for a real SST body. It still
+does **not** cover compaction, read-heavy workloads, readable-SST scale beyond
+100 SSTs, real repartition workload, or index/puffin extra-file pressure.
+
 ### Pass/fail signals
 
 Pass:
@@ -707,6 +774,12 @@ Cross-region reference smoke harness:
 
 Cross-region reference fixture generator:
 `src/cmd/src/bin/gc_cross_region_ref_fixture.rs` (`cargo run -p cmd --bin gc_cross_region_ref_fixture -- ...`)
+
+Readable SST local fixture generator:
+`src/cmd/src/bin/gc_readable_sst_fixture.rs` (`cargo run -p cmd --bin gc_readable_sst_fixture -- ...`)
+
+Readable SST cluster smoke harness:
+`docs/how-to/gc-huge-file-region-scripts/scripts/run_readable_sst_gc_smoke.py`
 
 Use the Test B harness for repeatable insert+flush+compact+GC runs. It captures
 object counts, Prometheus before/after snapshots, pod snapshots, logs,
