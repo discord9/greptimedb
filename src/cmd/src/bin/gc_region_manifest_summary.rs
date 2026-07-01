@@ -30,7 +30,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mito2::manifest::action::{
-    RegionCheckpoint, RegionManifest, RegionManifestBuilder, RegionMetaAction, RegionMetaActionList,
+    RegionCheckpoint, RegionManifest, RegionManifestBuilder, RegionMetaAction,
+    RegionMetaActionList, RemovedFile,
 };
 use store_api::storage::RegionId;
 
@@ -86,8 +87,44 @@ fn load_seed_checkpoint(seed_path: &PathBuf, region_id: u64) -> RegionManifest {
     manifest.clone()
 }
 
+fn parse_manifest_version(path: &std::path::Path, suffix: &str) -> u64 {
+    let fname = path.file_name().unwrap_or_default().to_string_lossy();
+    let version_str = fname.trim_end_matches(suffix);
+    version_str.parse().unwrap_or_else(|_| {
+        eprintln!("ERROR: cannot parse version from manifest filename '{fname}'");
+        std::process::exit(1);
+    })
+}
+
+fn apply_action(
+    builder: &mut RegionManifestBuilder,
+    delta_version: u64,
+    path: &PathBuf,
+    action: RegionMetaAction,
+) {
+    match action {
+        RegionMetaAction::Change(change) => {
+            builder.apply_change(delta_version, change);
+        }
+        RegionMetaAction::PartitionExprChange(change) => {
+            builder.apply_partition_expr_change(delta_version, change);
+        }
+        RegionMetaAction::Edit(edit) => {
+            builder.apply_edit(delta_version, edit);
+        }
+        RegionMetaAction::Truncate(truncate) => {
+            builder.apply_truncate(delta_version, truncate);
+        }
+        RegionMetaAction::Remove(_) => {
+            eprintln!("ERROR: delta {:?} contains Remove — unsupported", path);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn replay_delta_dir(dir: &PathBuf, region_id: u64) -> RegionManifest {
     let mut delta_paths: Vec<PathBuf> = Vec::new();
+    let mut checkpoint_paths: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(dir).unwrap_or_else(|e| {
         eprintln!("ERROR: cannot read delta dir {:?}: {e}", dir);
         std::process::exit(1);
@@ -100,6 +137,8 @@ fn replay_delta_dir(dir: &PathBuf, region_id: u64) -> RegionManifest {
         let fname = path.file_name().unwrap_or_default().to_string_lossy();
         if path.is_file() && fname.ends_with(".json") && !fname.ends_with(".json.gz") {
             delta_paths.push(path);
+        } else if path.is_file() && fname.ends_with(".checkpoint") {
+            checkpoint_paths.push(path);
         } else if fname.ends_with(".json.gz") {
             eprintln!(
                 "ERROR: gzip-compressed delta found ({}) — .json.gz not supported",
@@ -108,21 +147,28 @@ fn replay_delta_dir(dir: &PathBuf, region_id: u64) -> RegionManifest {
             std::process::exit(1);
         }
     }
-    if delta_paths.is_empty() {
-        eprintln!("ERROR: no .json delta files found in {:?}", dir);
+    if delta_paths.is_empty() && checkpoint_paths.is_empty() {
+        eprintln!(
+            "ERROR: no .json delta files or .checkpoint files found in {:?}",
+            dir
+        );
         std::process::exit(1);
     }
     delta_paths.sort();
+    checkpoint_paths.sort_by_key(|path| parse_manifest_version(path, ".checkpoint"));
 
-    let mut builder = RegionManifestBuilder::default();
-    let mut last_version: u64 = 0;
+    let checkpoint_manifest = checkpoint_paths
+        .last()
+        .map(|path| load_seed_checkpoint(path, region_id));
+    let checkpoint_version = checkpoint_manifest
+        .as_ref()
+        .map(|manifest| manifest.manifest_version);
+    let mut builder = RegionManifestBuilder::with_checkpoint(checkpoint_manifest);
     for path in &delta_paths {
-        let fname = path.file_name().unwrap_or_default().to_string_lossy();
-        let version_str = fname.trim_end_matches(".json");
-        let delta_version: u64 = version_str.parse().unwrap_or_else(|_| {
-            eprintln!("ERROR: cannot parse version from delta filename '{fname}'");
-            std::process::exit(1);
-        });
+        let delta_version = parse_manifest_version(path, ".json");
+        if checkpoint_version.is_some_and(|version| delta_version <= version) {
+            continue;
+        }
         let raw = fs::read(path).unwrap_or_else(|e| {
             eprintln!("ERROR: cannot read delta file {:?}: {e}", path);
             std::process::exit(1);
@@ -132,26 +178,8 @@ fn replay_delta_dir(dir: &PathBuf, region_id: u64) -> RegionManifest {
             std::process::exit(1);
         });
         for action in action_list.actions {
-            match action {
-                RegionMetaAction::Change(change) => {
-                    builder.apply_change(delta_version, change);
-                }
-                RegionMetaAction::PartitionExprChange(change) => {
-                    builder.apply_partition_expr_change(delta_version, change);
-                }
-                RegionMetaAction::Edit(edit) => {
-                    builder.apply_edit(delta_version, edit);
-                }
-                RegionMetaAction::Truncate(truncate) => {
-                    builder.apply_truncate(delta_version, truncate);
-                }
-                RegionMetaAction::Remove(_) => {
-                    eprintln!("ERROR: delta {:?} contains Remove — unsupported", path);
-                    std::process::exit(1);
-                }
-            }
+            apply_action(&mut builder, delta_version, path, action);
         }
-        last_version = last_version.max(delta_version);
     }
     if !builder.contains_metadata() {
         eprintln!("ERROR: after replaying deltas, metadata is still not set");
@@ -201,7 +229,7 @@ fn main() {
     let current_region_id = manifest.metadata.region_id.as_u64();
     let mut file_region_id_counts: HashMap<String, u64> = HashMap::new();
     let mut cross_region_file_count: u64 = 0;
-    let mut files_array: Vec<serde_json::Value> = Vec::new();
+    let mut files_array: Vec<(String, Option<u64>, serde_json::Value)> = Vec::new();
 
     for (file_id, meta) in &manifest.files {
         let origin_region = meta.region_id.as_u64();
@@ -212,8 +240,13 @@ fn main() {
             cross_region_file_count += 1;
         }
 
-        files_array.push(serde_json::json!({
+        let index_version = meta.index_version();
+        files_array.push((
+            file_id.to_string(),
+            index_version,
+            serde_json::json!({
             "file_id": file_id.to_string(),
+            "index_version": index_version,
             "file_region_id": origin_region,
             "current_region_id": current_region_id,
             "is_cross_region": origin_region != current_region_id,
@@ -223,8 +256,57 @@ fn main() {
             "num_rows": meta.num_rows,
             "num_row_groups": meta.num_row_groups,
             "level": meta.level,
-        }));
+            }),
+        ));
     }
+    files_array.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+    let files_array: Vec<_> = files_array.into_iter().map(|(_, _, value)| value).collect();
+
+    let mut removed_file_count: u64 = 0;
+    let mut removed_index_count: u64 = 0;
+    let mut removed_files_array: Vec<(String, Option<u64>, &'static str, i64, serde_json::Value)> =
+        Vec::new();
+    for removed_files in &manifest.removed_files.removed_files {
+        for removed in &removed_files.files {
+            let (kind, index_version) = match removed {
+                RemovedFile::File(_, index_version) => {
+                    removed_file_count += 1;
+                    ("File", *index_version)
+                }
+                RemovedFile::Index(_, index_version) => {
+                    removed_index_count += 1;
+                    ("Index", Some(*index_version))
+                }
+            };
+            let file_id = removed.file_id().to_string();
+            removed_files_array.push((
+                file_id.clone(),
+                index_version,
+                kind,
+                removed_files.removed_at,
+                serde_json::json!({
+                    "kind": kind,
+                    "file_id": file_id,
+                    "index_version": index_version,
+                    "removed_at": removed_files.removed_at,
+                    "manifest_region_id": current_region_id,
+                }),
+            ));
+        }
+    }
+    removed_files_array.sort_by(|left, right| {
+        (left.0.as_str(), left.1, left.2, left.3).cmp(&(
+            right.0.as_str(),
+            right.1,
+            right.2,
+            right.3,
+        ))
+    });
+    let removed_files_array: Vec<_> = removed_files_array
+        .into_iter()
+        .map(|(_, _, _, _, value)| value)
+        .collect();
+    let removed_count = removed_file_count + removed_index_count;
 
     let summary = serde_json::json!({
         "manifest_version": manifest.manifest_version,
@@ -233,7 +315,11 @@ fn main() {
         "file_count": manifest.files.len(),
         "file_region_id_counts": file_region_id_counts,
         "cross_region_file_count": cross_region_file_count,
+        "removed_file_count": removed_file_count,
+        "removed_index_count": removed_index_count,
+        "removed_count": removed_count,
         "files": files_array,
+        "removed_files": removed_files_array,
     });
 
     let output_json = serde_json::to_string_pretty(&summary).unwrap();

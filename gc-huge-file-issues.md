@@ -22,6 +22,7 @@
   - Phase 3 readable SST fixture 已可用，lab cluster smoke 已通过 1/10/100 个真实 readable Flat SST；SQL `COUNT(*)` 符合预期，fast/full GC 后 generated SST 全部保留。
   - cross-region same-table fast-GC smoke 10+10 通过：protected 10/10 保留，unprotected 10/10 删除。
   - real repartition correctness smoke 通过：真实 `SPLIT PARTITION` 后 destination manifest 出现 source `FileMeta.region_id`，fast GC source 后 referenced source SST `1/1` 仍存在，SQL reads 正常；但这还不证明 source SST 已成为 `removed_files` deletion candidate 时会被 real repartition lifecycle 保护。
+  - real repartition lifecycle deletion-candidate smoke 通过：source-only compaction 后 `referenced_removed = R ∩ D = 3`，fast GC 后 referenced removed SST `3/3` 保留，unreferenced removed SST `1/1` 删除，SQL reads 正常。
 
 ## 1. SQL `ADMIN GC_REGIONS` 固定 60s timeout
 
@@ -202,7 +203,36 @@
   - custom DB 的 S3 storage path 是 `greptime/<db>`，例如 `gc-hf-lab/data/greptime/metrics_gc_repart_smoke_20260701c/1059/...`，不是 `greptime/public`。
   - 当前 harness 备份并重放本 smoke 中的 uncompressed data-manifest delta JSON；`gc_region_manifest_summary` 可手动读取 uncompressed checkpoint，但 harness 还不支持 checkpoint+later deltas 合并，也不支持 `.json.gz` delta。
 - **解释边界**：该结果验证 real repartition remap path、destination cross-region `FileMeta.region_id`、fast GC 调用后 referenced object 仍存在、以及 SQL readability；由于本次 split 复用 source region 作为一个 child，source SST 可能仍是该 child 的 active file，因此还不能证明“source SST 已进入 `removed_files` 且 eligible for deletion 时仍被 destination ref 保护”。
-- **剩余未覆盖**：real repartition + lifecycle deletion-candidate smoke、full V2 loader / 30-way split、merge、compaction、full-GC lifecycle、大规模 readable SST repartition 压力、index/puffin 额外文件压力。
+- **剩余未覆盖**：full V2 loader / 30-way split、merge、full-GC lifecycle、大规模 readable SST repartition 压力、index/puffin 额外文件压力。
+
+### 5.2 Real repartition lifecycle deletion-candidate smoke
+
+- **状态**：通过；这是 tiny correctness smoke，不是规模压力测试。
+- **工具**：
+  - harness：`docs/how-to/gc-huge-file-region-scripts/scripts/run_repartition_gc_lifecycle_smoke.py`。
+  - scanner：`src/cmd/src/bin/gc_region_manifest_summary.rs`，新增 active `index_version`、`removed_files[]`、removed counts，并支持 manifest dir 中 latest checkpoint + later JSON deltas。
+- **执行方式**：
+  - fresh DB `metrics_gc_repart_lifecycle_20260701c`。
+  - physical metric table `greptime_physical_table`，logical metric table `gc_repart_lifecycle_logical`。
+  - pre-split 每次 flush 都写 `a_host` 和 `h_host`，split `host < 'm'` into `host < 'g'` and `host >= 'g' AND host < 'm'`。
+  - split 后只向 reused source child 写入/flush，再跑 source-only `ADMIN COMPACT_REGION(source_region_id)`。
+  - 从 source/destination manifests 计算：`R=source removed File`、`S=source active files`、`D=destination active files with file_region_id=source_region_id`；要求 `R ∩ D` 非空且不在 `S`。
+  - 跑 fast `ADMIN GC_REGIONS(source_region_id)` 后检查 referenced removed SST HEAD、unreferenced removed SST HEAD、logical SQL reads。
+- **成功结果**：
+  - evidence：`/tmp/opencode/gc-repartition-lifecycle-smoke-20260701c/`。
+  - physical `table_id=1065`，logical `table_id=1066`。
+  - source region `4574140170240`；destination `[4574140170242]`。
+  - candidate attempts `1`；`INCONCLUSIVE false`。
+  - `R=4`，`S=3`，`D=3`；`referenced_removed = R ∩ D = 3`；`referenced_removed ∩ S = ∅`；`unreferenced_removed = 1`。
+  - fast GC source HTTP `200`，`execution_time_ms=24`。
+  - referenced removed SST：`3/3` present after GC；unreferenced removed SST：`1/1` deleted。该即时删除符合本实验 values 中 `region_engine.mito.gc.lingering_time = "0s"`。
+  - SQL `COUNT(*)` `9/9`；targeted counts `a_host=6`、`h_host=3`；cluster `Running`；`GATE_STATUS passed`。
+- **修过的 harness/scanner 问题**：
+  - 第一次 lifecycle run `20260701a` 在 GC 前 fail closed：source manifest after compact 已 checkpoint 到 version 10，scanner delta-only replay 没有 metadata 起点。
+  - 第二次 run `20260701b` 在 GC 前 fail closed：无 checkpoint 的 destination manifest 含 `000...00.json`，scanner 误把 version 0 当作 checkpoint baseline 跳过。
+  - 修复：scanner 在 manifest dir 中有 checkpoint 时从最高 checkpoint 起步并只跳过 `<= checkpoint_version` 的 deltas；无 checkpoint 时不跳过 version 0。
+- **解释边界**：该结果验证 real metric repartition + source-only compaction + fast GC 对 referenced removed source SST 的保护，并在同 run 观察到 unreferenced removed source SST 删除；仍不是 full V2 loader/30-way split、merge、full-GC lifecycle 或大规模 readable SST repartition 压测。
+- **剩余未覆盖**：full V2 loader / 30-way split、merge、full-GC lifecycle、大规模 readable SST repartition 压力、index/puffin 额外文件压力。
 
 ## 非问题 / 已澄清
 

@@ -637,6 +637,58 @@ also remains a tiny correctness smoke, not a pressure result: it does **not**
 cover the full V2 loader/30-way split workflow, compaction, full-GC after
 lifecycle churn, or large readable-SST counts under repartition.
 
+### Observed real repartition lifecycle deletion-candidate smoke result
+
+This follow-up smoke closes the deletion-eligibility gap from the previous tiny
+repartition run. It uses the same real metric repartition path, then compacts
+only the reused source child with `ADMIN COMPACT_REGION(source_region_id)` so old
+source SSTs enter `removed_files` while the destination child still has active
+`FileMeta.region_id = source_region_id` references.
+
+Additional tooling:
+
+- `gc_region_manifest_summary` now emits active file `index_version`, sorted
+  `removed_files[]`, removed counts, and can load a manifest directory containing
+  a latest uncompressed checkpoint plus later uncompressed JSON deltas;
+- harness:
+  `docs/how-to/gc-huge-file-region-scripts/scripts/run_repartition_gc_lifecycle_smoke.py`.
+
+Candidate gates:
+
+- `R`: source manifest `removed_files` where `kind == File`, keyed by
+  `(file_id,index_version)`;
+- `S`: source active files;
+- `D`: destination active files with `file_region_id == source_region_id`;
+- require `referenced_removed = R ∩ D` non-empty and
+  `referenced_removed ∩ S` empty before running GC.
+
+Successful run:
+
+- evidence: `/tmp/opencode/gc-repartition-lifecycle-smoke-20260701c/`;
+- table: `metrics_gc_repart_lifecycle_20260701c.greptime_physical_table`,
+  physical `table_id=1065`; logical table `gc_repart_lifecycle_logical`,
+  `table_id=1066`;
+- source region `4574140170240`; destination region `[4574140170242]`;
+- expected/logical SQL count after GC `9/9`; targeted counts `a_host=6`,
+  `h_host=3`;
+- candidate attempts `1`; `INCONCLUSIVE false`;
+- `R=4`, `S=3`, `D=3`;
+- `referenced_removed = R ∩ D = 3`; `referenced_removed ∩ S = ∅`;
+- `unreferenced_removed = R - D - S = 1`;
+- fast `ADMIN GC_REGIONS(4574140170240)` returned HTTP `200`
+  (`execution_time_ms=24`);
+- referenced removed source SSTs: `3/3` still present after GC;
+- unreferenced removed source SSTs: `1/1` deleted after GC. This immediate
+  deletion matches the lab cluster values where `region_engine.mito.gc` sets
+  `lingering_time = "0s"`;
+- cluster phase `Running`; `GATE_STATUS passed`.
+
+Interpretation: this validates the real fast-GC protection path for referenced
+removed files after real metric repartition plus source-only compaction, and also
+observed deletion of an unreferenced removed source SST in the same run. It is
+still a tiny correctness smoke, not a V2 30-way split/loader pressure test, merge
+test, or large readable-SST repartition scale test.
+
 ### Pass/fail signals
 
 Pass:
