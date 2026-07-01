@@ -574,6 +574,69 @@ readability, and GC active-known no-delete behavior for a real SST body. It stil
 does **not** cover compaction, read-heavy workloads, readable-SST scale beyond
 100 SSTs, real repartition workload, or index/puffin extra-file pressure.
 
+### Observed real repartition correctness smoke result
+
+This smoke uses GreptimeDB's real repartition/remap path instead of synthetic
+cross-region manifests. The harness is
+`docs/how-to/gc-huge-file-region-scripts/scripts/run_repartition_gc_correctness_smoke.py`;
+the manifest scanner is `src/cmd/src/bin/gc_region_manifest_summary.rs`.
+
+Fixture shape:
+
+- create a fresh metric physical table partitioned on `namespace` with V2/e2e
+  table options (`sst_format=flat`, `memtable.type=partition_tree`, sparse PK,
+  inverted index);
+- create a logical metric table on that physical table and write five
+  deterministic namespace/value rows through the logical table;
+- flush the physical table;
+- split `namespace >= 'app-1' AND namespace < 'app-2'` into
+  `app-1..app-10` and `app-10..app-2`;
+- scan the new destination data-region manifest and verify it contains
+  `FileMeta.region_id` pointing to the source region;
+- run fast `ADMIN GC_REGIONS(source_region)` and verify both referenced source
+  SST existence and SQL reads.
+
+Successful run:
+
+- evidence: `/tmp/opencode/gc-repartition-correctness-smoke-20260701c/`;
+- table: `metrics_gc_repart_smoke_20260701c.greptime_physical_table`, physical
+  `table_id=1059`; logical table `gc_repart_logical`, `table_id=1060`;
+- source region `4548370366465`;
+- split children `[4548370366465, 4548370366467]`; GreptimeDB reused the source
+  region for one child range and created one non-source destination region
+  `4548370366467`;
+- partitions `3 -> 4`; SQL `COUNT(*)` stayed `5 -> 5`;
+- destination manifest scan found `1` cross-region file with
+  `FileMeta.region_id = 4548370366465`;
+- fast `ADMIN GC_REGIONS(4548370366465)` elapsed `0.027s`;
+- referenced source SST still existed `1/1`; source region parquet count stayed
+  `2 -> 2`; targeted reads for `app-1`, `app-10`, and `app-15` each returned one
+  row after GC; cluster phase `Running`; `GATE_STATUS passed`.
+
+Operational gotchas learned:
+
+- use `information_schema.partitions.partition_description` for range matching;
+  `partition_name` is only `p0/p1/p2/...`;
+- do not assume both split children are new region ids; one child may reuse the
+  source region id;
+- for custom databases, the storage path is `greptime/<db>` (for example
+  `gc-hf-lab/data/greptime/metrics_gc_repart_smoke_20260701c/1059/...`), not
+  `greptime/public`;
+- the current harness scanner path backs up and replays uncompressed data-manifest
+  delta JSON files for this smoke. `gc_region_manifest_summary` can also decode a
+  supplied uncompressed checkpoint, but the harness does not yet combine a
+  checkpoint with later deltas or handle `.json.gz` deltas.
+
+Interpretation: this validates the actual repartition remap-manifest path,
+destination cross-region `FileMeta.region_id` references, referenced-object
+survival after a fast GC call, and post-GC SQL readability. It is not yet proof
+that fast GC protects a source SST that is already a `removed_files` deletion
+candidate in the real repartition lifecycle, because the observed split reused
+the source region for one child and the source SST may still be active there. It
+also remains a tiny correctness smoke, not a pressure result: it does **not**
+cover the full V2 loader/30-way split workflow, compaction, full-GC after
+lifecycle churn, or large readable-SST counts under repartition.
+
 ### Pass/fail signals
 
 Pass:

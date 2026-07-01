@@ -1,6 +1,6 @@
 # GreptimeDB GC huge-file 压测问题清单
 
-更新时间：2026-06-30
+更新时间：2026-07-01
 
 ## 背景
 
@@ -21,6 +21,7 @@
   - C2b matching placeholder active objects 通过 100/1k/10k/100k，验证 full-listing active-known 保护但不验证 readable SST。
   - Phase 3 readable SST fixture 已可用，lab cluster smoke 已通过 1/10/100 个真实 readable Flat SST；SQL `COUNT(*)` 符合预期，fast/full GC 后 generated SST 全部保留。
   - cross-region same-table fast-GC smoke 10+10 通过：protected 10/10 保留，unprotected 10/10 删除。
+  - real repartition correctness smoke 通过：真实 `SPLIT PARTITION` 后 destination manifest 出现 source `FileMeta.region_id`，fast GC source 后 referenced source SST `1/1` 仍存在，SQL reads 正常；但这还不证明 source SST 已成为 `removed_files` deletion candidate 时会被 real repartition lifecycle 保护。
 
 ## 1. SQL `ADMIN GC_REGIONS` 固定 60s timeout
 
@@ -148,9 +149,9 @@
 
 - **剩余未覆盖**：当前 Phase 3 只覆盖 1/10/100 SST SQL read + GC no-delete；仍未覆盖 compaction、read-heavy/更大 readable-SST scale、真实 repartition workload、index/puffin extra-file 压力。
 
-## 5. Cross-region reference / repartition-like fast GC smoke
+## 5. Cross-region reference / repartition fast GC smokes
 
-- **状态**：tiny same-table xref smoke 已通过；不是产品问题，目前作为覆盖证明和后续压力基线。
+- **状态**：tiny same-table xref smoke 已通过；real repartition correctness smoke 已通过；都不是产品问题，目前作为覆盖证明和后续压力基线。注意 real repartition smoke 只证明 remap/cross-region ref/GC 后对象仍在/SQL readable，不等价于已证明 real lifecycle 中 eligible removed-file 的删除保护。
 - **测试目标**：验证 source region A 中已进入 `removed_files` 的文件 X，如果仍被同表 related region B 作为 active `FileMeta { region_id: A, file_id: X }` 引用，fast GC A 时会通过 `FileRefsManifest` / `is_in_tmp_ref` 保护 X，不会把它当作 expired removed file 删除。
 - **关键 fixture 形状**：
   - fresh 2-partition table：`PARTITION ON COLUMNS (host) (host < 'm', host >= 'm')`。
@@ -173,6 +174,35 @@
   - cross-region refs snapshot：`src/mito2/src/sst/file_ref.rs:get_snapshot_of_file_refs()`。
   - remap/repartition 保留 source `FileMeta.region_id`：`src/mito2/src/remap_manifest.rs`。
   - metasrv related-region/file-ref orchestration：`src/meta-srv/src/gc/procedure.rs`。
+
+### 5.1 Real repartition correctness smoke
+
+- **状态**：通过；这是 tiny correctness smoke，不是规模压力测试。
+- **工具**：
+  - harness：`docs/how-to/gc-huge-file-region-scripts/scripts/run_repartition_gc_correctness_smoke.py`。
+  - manifest scanner：`src/cmd/src/bin/gc_region_manifest_summary.rs`。
+- **执行方式**：
+  - fresh DB `metrics_gc_repart_smoke_20260701c`。
+  - physical metric table `greptime_physical_table`，logical metric table `gc_repart_logical`。
+  - 通过 logical table 写 5 行固定 namespace/value：`app-0`、`app-1`、`app-2`、`app-10`、`app-15`；timestamp 使用 wall clock；flush physical table。
+  - split `namespace >= 'app-1' AND namespace < 'app-2'` into `app-1..app-10` and `app-10..app-2`。
+  - 扫 destination data manifest，确认 `FileMeta.region_id` 指向 source region。
+  - 跑 fast `ADMIN GC_REGIONS(source_region)`，再检查 referenced source SST HEAD 和 SQL reads。
+- **成功结果**：
+  - evidence：`/tmp/opencode/gc-repartition-correctness-smoke-20260701c/`。
+  - physical `table_id=1059`，logical `table_id=1060`。
+  - source region `4548370366465`。
+  - split children `[4548370366465, 4548370366467]`；实际行为是 source region 复用为一个 child，只新增 destination region `4548370366467`。
+  - partitions `3 -> 4`；SQL `COUNT(*)` `5 -> 5`。
+  - destination manifest scan：`CROSS_REF_FOUND True`，1 个 file 的 `FileMeta.region_id = 4548370366465`。
+  - fast GC source 耗时 `0.027s`；referenced source files `1/1` 仍存在；source parquet count `2 -> 2`；`app-1`/`app-10`/`app-15` targeted reads 均返回 1 row；cluster `Running`；`GATE_STATUS passed`。
+- **修过的 harness 问题 / gotchas**：
+  - `information_schema.partitions.partition_name` 只是 `p0/p1/p2/...`，范围表达式在 `partition_description`。
+  - 不能假设 split 两个 child 都是新 region；需要按 `partition_description` 找 child，再只扫描非 source child 的 cross-region refs。
+  - custom DB 的 S3 storage path 是 `greptime/<db>`，例如 `gc-hf-lab/data/greptime/metrics_gc_repart_smoke_20260701c/1059/...`，不是 `greptime/public`。
+  - 当前 harness 备份并重放本 smoke 中的 uncompressed data-manifest delta JSON；`gc_region_manifest_summary` 可手动读取 uncompressed checkpoint，但 harness 还不支持 checkpoint+later deltas 合并，也不支持 `.json.gz` delta。
+- **解释边界**：该结果验证 real repartition remap path、destination cross-region `FileMeta.region_id`、fast GC 调用后 referenced object 仍存在、以及 SQL readability；由于本次 split 复用 source region 作为一个 child，source SST 可能仍是该 child 的 active file，因此还不能证明“source SST 已进入 `removed_files` 且 eligible for deletion 时仍被 destination ref 保护”。
+- **剩余未覆盖**：real repartition + lifecycle deletion-candidate smoke、full V2 loader / 30-way split、merge、compaction、full-GC lifecycle、大规模 readable SST repartition 压力、index/puffin 额外文件压力。
 
 ## 非问题 / 已澄清
 

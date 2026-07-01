@@ -21,6 +21,10 @@ path = "src/bin/gc_cross_region_ref_fixture.rs"
 name = "gc_readable_sst_fixture"
 path = "src/bin/gc_readable_sst_fixture.rs"
 
+[[bin]]
+name = "gc_region_manifest_summary"
+path = "src/bin/gc_region_manifest_summary.rs"
+
 [features]
 default = [
     "servers/pprof",
