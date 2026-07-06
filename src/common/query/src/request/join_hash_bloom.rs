@@ -21,6 +21,7 @@
 //! Bloom probe expression via `AND` to obtain the final predicate.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use datafusion_common::{DataFusionError, Result as DataFusionResult};
 use serde::{Deserialize, Serialize};
@@ -385,6 +386,225 @@ impl JoinHashBloomPayload {
     }
 }
 
+/// DataFusion [`PhysicalExpr`] that probes a join-hash Bloom filter against
+/// probe-side columns.
+///
+/// Owns the child expressions selected by the payload's `join_key_child_indices` and
+/// an immutable, already-validated [`JoinHashBloomPayload`].
+///
+/// During evaluation, a DataFusion [`HashExpr`](datafusion::physical_plan::joins::HashExpr)
+/// computes the join-hash `u64` values from the serialized seeds, and the
+/// Bloom bitset is probed for each row. The result is a non-nullable
+/// `BooleanArray` with false-positive-only semantics.
+#[derive(Clone, Debug, Eq)]
+pub struct JoinHashBloomProbeExpr {
+    children: Vec<std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    bloom: std::sync::Arc<JoinHashBloomPayload>,
+}
+
+impl JoinHashBloomProbeExpr {
+    /// Creates a new probe expression **without validation**.
+    ///
+    /// This constructor panics via `try_new` if the arguments are invalid.
+    /// Prefer [`Self::try_new`] in production code paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bloom payload fails validation, children are empty, or
+    /// `children.len()` does not match `bloom.join_key_child_indices.len()`.
+    pub fn new(
+        children: Vec<std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+        bloom: std::sync::Arc<JoinHashBloomPayload>,
+    ) -> Self {
+        Self::try_new(children, bloom)
+            .expect("JoinHashBloomProbeExpr::new called with invalid state")
+    }
+
+    /// Fallible constructor that validates the bloom payload and
+    /// children against the payload's `join_key_child_indices`.
+    ///
+    /// Errors:
+    /// - bloom payload validation fails (version, bitset len, num_bits, etc.)
+    /// - `children` is empty
+    /// - `children.len() != bloom.join_key_child_indices.len()`
+    pub fn try_new(
+        children: Vec<std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+        bloom: std::sync::Arc<JoinHashBloomPayload>,
+    ) -> DataFusionResult<Self> {
+        bloom.validate()?;
+
+        if children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "JoinHashBloomProbeExpr: children is empty".to_string(),
+            ));
+        }
+
+        if children.len() != bloom.join_key_child_indices.len() {
+            return Err(DataFusionError::Plan(format!(
+                "JoinHashBloomProbeExpr: children.len() {} != bloom.join_key_child_indices.len() {}",
+                children.len(),
+                bloom.join_key_child_indices.len()
+            )));
+        }
+
+        Ok(Self { children, bloom })
+    }
+
+    /// Runtime validation guard for [`Self::evaluate`].
+    ///
+    /// Catches stale / mutated payloads that may have bypassed construction-time
+    /// checks. This is a defense-in-depth measure.
+    fn guard(&self) -> DataFusionResult<()> {
+        if self.children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "JoinHashBloomProbeExpr::evaluate: children is empty".to_string(),
+            ));
+        }
+        if self.children.len() != self.bloom.join_key_child_indices.len() {
+            return Err(DataFusionError::Plan(format!(
+                "JoinHashBloomProbeExpr::evaluate: children.len() {} != bloom.join_key_child_indices.len() {}",
+                self.children.len(),
+                self.bloom.join_key_child_indices.len()
+            )));
+        }
+        // Re-validate the bloom payload to catch invalid bitset lengths,
+        // zero num_bits / num_probes, etc. before indexing into the bitset.
+        self.bloom.validate()?;
+        Ok(())
+    }
+
+    /// Returns a reference to the underlying Bloom payload.
+    pub fn bloom_payload(&self) -> &JoinHashBloomPayload {
+        &self.bloom
+    }
+}
+
+impl std::hash::Hash for JoinHashBloomProbeExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for child in &self.children {
+            child.dyn_hash(state);
+        }
+        self.bloom.hash(state);
+    }
+}
+
+impl PartialEq for JoinHashBloomProbeExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.children == other.children && self.bloom == other.bloom
+    }
+}
+
+impl std::fmt::Display for JoinHashBloomProbeExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cols = self
+            .children
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let seeds = (
+            self.bloom.df_seed0,
+            self.bloom.df_seed1,
+            self.bloom.df_seed2,
+            self.bloom.df_seed3,
+        );
+        write!(f, "bloom_probe({cols}, seeds={seeds:?})")
+    }
+}
+
+impl datafusion::physical_plan::PhysicalExpr for JoinHashBloomProbeExpr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn data_type(
+        &self,
+        _input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> datafusion_common::Result<datafusion::arrow::datatypes::DataType> {
+        Ok(datafusion::arrow::datatypes::DataType::Boolean)
+    }
+
+    fn nullable(
+        &self,
+        _input_schema: &datafusion::arrow::datatypes::Schema,
+    ) -> datafusion_common::Result<bool> {
+        Ok(false)
+    }
+
+    fn children(&self) -> Vec<&std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>> {
+        self.children.iter().collect()
+    }
+
+    fn with_new_children(
+        self: std::sync::Arc<Self>,
+        children: Vec<std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    ) -> datafusion_common::Result<std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>>
+    {
+        if children.len() != self.children.len() {
+            return Err(datafusion_common::DataFusionError::Plan(format!(
+                "JoinHashBloomProbeExpr::with_new_children: expected {} children, got {}",
+                self.children.len(),
+                children.len()
+            )));
+        }
+        Ok(std::sync::Arc::new(Self {
+            children,
+            bloom: std::sync::Arc::clone(&self.bloom),
+        }))
+    }
+
+    fn evaluate(
+        &self,
+        batch: &datafusion::arrow::record_batch::RecordBatch,
+    ) -> datafusion_common::Result<datafusion_expr::ColumnarValue> {
+        // Runtime guard: reject invalid/stale payload before probing
+        self.guard()?;
+
+        let num_rows = batch.num_rows();
+        let seeds = (
+            self.bloom.df_seed0,
+            self.bloom.df_seed1,
+            self.bloom.df_seed2,
+            self.bloom.df_seed3,
+        );
+        let hash_expr = datafusion::physical_plan::joins::HashExpr::new(
+            self.children.clone(),
+            datafusion::physical_plan::joins::SeededRandomState::with_seeds(
+                seeds.0, seeds.1, seeds.2, seeds.3,
+            ),
+            "join_hash_bloom_probe_hash".to_string(),
+        );
+        let hashes = datafusion::physical_plan::PhysicalExpr::evaluate(&hash_expr, batch)?
+            .into_array(num_rows)?;
+        let hashes = hashes
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "JoinHashBloomProbeExpr: HashExpr did not return UInt64Array".to_string(),
+                )
+            })?;
+
+        let num_bits = self.bloom.num_bits;
+        let num_probes = self.bloom.num_probes;
+        let bitset: &[u8] = &self.bloom.bitset; // borrow, don't clone
+
+        let bools: Vec<bool> = hashes
+            .iter()
+            .map(|hash| hash.is_some_and(|h| bloom_contains(h, bitset, num_bits, num_probes)))
+            .collect();
+
+        let array = datafusion::arrow::array::BooleanArray::from(bools);
+        Ok(datafusion_expr::ColumnarValue::Array(std::sync::Arc::new(
+            array,
+        )))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
 /// `ceil(n / 8)` without floating point.
 #[inline]
 fn num_bits_ceil_bytes(num_bits: usize) -> usize {
@@ -462,6 +682,310 @@ fn bloom_insert_many(
         }
     }
     distinct
+}
+
+/// Compute a deterministic cross-platform hash-compatibility fingerprint.
+///
+/// Evaluates a DataFusion `HashExpr` with the given children and seeds over a
+/// canonical `RecordBatch` built from `input_schema`, then digests the output
+/// `UInt64Array` with FNV-1a (over little-endian bytes) finalized with
+/// SplitMix64. The digest also includes deterministic tags for the seeds and
+/// child output data types, because DataFusion may intentionally hash equal
+/// values of different integer widths to the same `u64`. The canonical batch
+/// has fixed-size rows with column-index-dependent values so child order is
+/// reflected in the `HashExpr` output sequence.
+///
+/// Returns `Ok(nonzero_u64)` on success or `Err(DataFusionError::Plan)` for
+/// unsupported input types.
+pub(crate) fn compute_hash_compat_fingerprint(
+    children: &[std::sync::Arc<dyn datafusion::physical_plan::PhysicalExpr>],
+    input_schema: &datafusion::arrow::datatypes::Schema,
+    seeds: (u64, u64, u64, u64),
+) -> DataFusionResult<u64> {
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::joins::{HashExpr, SeededRandomState};
+
+    if children.is_empty() {
+        return Err(DataFusionError::Plan(
+            "fingerprint: empty children list".to_string(),
+        ));
+    }
+
+    let mut fnv: u64 = 0xcbf29ce484222325;
+    digest_bytes(&mut fnv, b"greptimedb-join-hash-bloom-compat-v1");
+    digest_u64(&mut fnv, seeds.0);
+    digest_u64(&mut fnv, seeds.1);
+    digest_u64(&mut fnv, seeds.2);
+    digest_u64(&mut fnv, seeds.3);
+    digest_u64(&mut fnv, children.len() as u64);
+    for child in children {
+        let data_type = child.data_type(input_schema)?;
+        digest_data_type(&mut fnv, &data_type)?;
+    }
+
+    // Build canonical batch — 3 rows with column-index-distinct values.
+    // Unsupported non-key columns are represented as typed null arrays in
+    // `build_canonical_batch`; unsupported key child types fail above.
+    let batch = build_canonical_batch(input_schema)?;
+    let hash_expr = HashExpr::new(
+        children.to_vec(),
+        SeededRandomState::with_seeds(seeds.0, seeds.1, seeds.2, seeds.3),
+        "join_hash_bloom_hash_compat".to_string(),
+    );
+
+    let result = hash_expr.evaluate(&batch)?;
+    let array = result
+        .into_array(batch.num_rows())
+        .map_err(|e| DataFusionError::Plan(format!("fingerprint: cannot convert to array: {e}")))?;
+    let hashes = array
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Plan("fingerprint: HashExpr did not produce UInt64Array".to_string())
+        })?;
+
+    // FNV-1a over little-endian bytes of each u64 hash, with a null marker for
+    // completeness even though HashExpr normally returns a non-null UInt64Array.
+    for h in hashes.iter() {
+        match h {
+            Some(h) => {
+                digest_u8(&mut fnv, 1);
+                digest_u64(&mut fnv, h);
+            }
+            None => {
+                digest_u8(&mut fnv, 0);
+            }
+        }
+    }
+
+    // Finalize with SplitMix64 to avalanche bits; prevent accidental zero output
+    let mut fp = splitmix64(fnv);
+    if fp == 0 {
+        fp = 1;
+    }
+    Ok(fp)
+}
+
+fn digest_u8(state: &mut u64, value: u8) {
+    *state ^= value as u64;
+    *state = state.wrapping_mul(0x100000001b3);
+}
+
+fn digest_u64(state: &mut u64, value: u64) {
+    digest_bytes(state, &value.to_le_bytes());
+}
+
+fn digest_bytes(state: &mut u64, bytes: &[u8]) {
+    digest_u64_lenless(state, bytes.len() as u64);
+    for &byte in bytes {
+        digest_u8(state, byte);
+    }
+}
+
+fn digest_u64_lenless(state: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        digest_u8(state, byte);
+    }
+}
+
+fn digest_data_type(
+    state: &mut u64,
+    data_type: &datafusion::arrow::datatypes::DataType,
+) -> DataFusionResult<()> {
+    use datafusion::arrow::datatypes::DataType;
+
+    match data_type {
+        DataType::Boolean => digest_u64(state, 1),
+        DataType::Int8 => digest_u64(state, 2),
+        DataType::Int16 => digest_u64(state, 3),
+        DataType::Int32 => digest_u64(state, 4),
+        DataType::Int64 => digest_u64(state, 5),
+        DataType::UInt8 => digest_u64(state, 6),
+        DataType::UInt16 => digest_u64(state, 7),
+        DataType::UInt32 => digest_u64(state, 8),
+        DataType::UInt64 => digest_u64(state, 9),
+        DataType::Float32 => digest_u64(state, 10),
+        DataType::Float64 => digest_u64(state, 11),
+        DataType::Utf8 => digest_u64(state, 12),
+        DataType::LargeUtf8 => digest_u64(state, 13),
+        DataType::Binary => digest_u64(state, 14),
+        DataType::LargeBinary => digest_u64(state, 15),
+        DataType::Date32 => digest_u64(state, 16),
+        DataType::Date64 => digest_u64(state, 17),
+        DataType::Timestamp(unit, timezone) => {
+            digest_u64(state, 18);
+            digest_time_unit(state, unit);
+            match timezone {
+                Some(timezone) => {
+                    digest_u8(state, 1);
+                    digest_bytes(state, timezone.as_bytes());
+                }
+                None => digest_u8(state, 0),
+            }
+        }
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "fingerprint: unsupported child data type {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn digest_time_unit(state: &mut u64, unit: &datafusion::arrow::datatypes::TimeUnit) {
+    use datafusion::arrow::datatypes::TimeUnit;
+
+    let tag = match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 2,
+        TimeUnit::Microsecond => 3,
+        TimeUnit::Nanosecond => 4,
+    };
+    digest_u64(state, tag);
+}
+
+/// Canonical batch with 3 rows. Each column gets column-index-distinct scalar values
+/// so the fingerprint is sensitive to column types and ordering.
+fn build_canonical_batch(
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> DataFusionResult<datafusion::arrow::record_batch::RecordBatch> {
+    use datafusion::arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, new_null_array,
+    };
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+    let column_values: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, field)| {
+            let idx = col_idx as i64;
+            Ok(match field.data_type() {
+                DataType::Boolean => Arc::new(BooleanArray::from(vec![
+                    idx % 2 == 0,
+                    idx % 3 != 0,
+                    idx % 2 != 0,
+                ])) as ArrayRef,
+                DataType::Int8 => Arc::new(Int8Array::from(vec![
+                    (idx + 1) as i8,
+                    (idx + 2) as i8,
+                    (idx + 3) as i8,
+                ])),
+                DataType::Int16 => Arc::new(Int16Array::from(vec![
+                    (idx + 1) as i16,
+                    (idx + 2) as i16,
+                    (idx + 3) as i16,
+                ])),
+                DataType::Int32 => Arc::new(Int32Array::from(vec![
+                    (idx + 1) as i32,
+                    (idx + 2) as i32,
+                    (idx + 3) as i32,
+                ])),
+                DataType::Int64 => Arc::new(Int64Array::from(vec![idx + 1, idx + 2, idx + 3])),
+                DataType::UInt8 => Arc::new(UInt8Array::from(vec![
+                    (idx + 1) as u8,
+                    (idx + 2) as u8,
+                    (idx + 3) as u8,
+                ])),
+                DataType::UInt16 => Arc::new(UInt16Array::from(vec![
+                    (idx + 1) as u16,
+                    (idx + 2) as u16,
+                    (idx + 3) as u16,
+                ])),
+                DataType::UInt32 => Arc::new(UInt32Array::from(vec![
+                    (idx + 1) as u32,
+                    (idx + 2) as u32,
+                    (idx + 3) as u32,
+                ])),
+                DataType::UInt64 => Arc::new(UInt64Array::from(vec![
+                    (idx + 1) as u64,
+                    (idx + 2) as u64,
+                    (idx + 3) as u64,
+                ])),
+                DataType::Float32 => Arc::new(Float32Array::from(vec![
+                    (idx + 1) as f32,
+                    (idx + 2) as f32,
+                    (idx + 3) as f32,
+                ])),
+                DataType::Float64 => Arc::new(Float64Array::from(vec![
+                    (idx + 1) as f64,
+                    (idx + 2) as f64,
+                    (idx + 3) as f64,
+                ])),
+                DataType::Utf8 => Arc::new(StringArray::from(vec![
+                    format!("c{idx}_0"),
+                    format!("c{idx}_1"),
+                    format!("c{idx}_2"),
+                ])),
+                DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![
+                    format!("c{idx}_0"),
+                    format!("c{idx}_1"),
+                    format!("c{idx}_2"),
+                ])),
+                DataType::Binary => {
+                    let v0: Vec<u8> = format!("b{idx}_0").into_bytes();
+                    let v1: Vec<u8> = format!("b{idx}_1").into_bytes();
+                    let v2: Vec<u8> = format!("b{idx}_2").into_bytes();
+                    Arc::new(BinaryArray::from_iter_values([&v0[..], &v1[..], &v2[..]]))
+                }
+                DataType::LargeBinary => {
+                    let v0: Vec<u8> = format!("b{idx}_0").into_bytes();
+                    let v1: Vec<u8> = format!("b{idx}_1").into_bytes();
+                    let v2: Vec<u8> = format!("b{idx}_2").into_bytes();
+                    Arc::new(LargeBinaryArray::from_iter_values([
+                        &v0[..],
+                        &v1[..],
+                        &v2[..],
+                    ]))
+                }
+                DataType::Date32 => Arc::new(Date32Array::from(vec![
+                    (idx + 1) as i32,
+                    (idx + 2) as i32,
+                    (idx + 3) as i32,
+                ])),
+                DataType::Date64 => Arc::new(Date64Array::from(vec![idx + 1, idx + 2, idx + 3])),
+                DataType::Timestamp(TimeUnit::Second, _) => {
+                    Arc::new(TimestampSecondArray::from(vec![idx + 1, idx + 2, idx + 3]))
+                }
+                DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                    Arc::new(TimestampMillisecondArray::from(vec![
+                        idx + 1,
+                        idx + 2,
+                        idx + 3,
+                    ]))
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        idx + 1,
+                        idx + 2,
+                        idx + 3,
+                    ]))
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        idx + 1,
+                        idx + 2,
+                        idx + 3,
+                    ]))
+                }
+                other => new_null_array(other, 3),
+            })
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+
+    let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        column_values,
+    )
+    .map_err(|e| {
+        DataFusionError::Plan(format!("fingerprint: failed to build canonical batch: {e}"))
+    })?;
+
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -602,6 +1126,25 @@ mod tests {
     }
 
     #[test]
+    fn expected_bitset_bytes_table_driven() {
+        let base = minimal_valid_payload();
+        for (num_bits, expected_bytes) in [(1024, 128), (1025, 129)] {
+            let p = JoinHashBloomPayload {
+                num_bits,
+                bitset: vec![0u8; expected_bytes],
+                ..base.clone()
+            };
+            assert_eq!(
+                p.expected_bitset_bytes(),
+                expected_bytes,
+                "num_bits={num_bits}"
+            );
+        }
+    }
+
+    // ── Bloom bitset / SplitMix64 tests ──────────────────────────
+
+    #[test]
     fn bloom_insert_contains_no_false_negatives() {
         let hashes: Vec<u64> = (0..100).map(|i| i * 7 + 13).collect();
         let payload = JoinHashBloomPayload::build_from_hashes(
@@ -662,5 +1205,223 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── JoinHashBloomProbeExpr tests ────────────────────────────
+
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::PhysicalExpr;
+
+    #[test]
+    fn probe_expr_evaluates_non_null_boolean_array() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let col = simple_col("id", 0);
+
+        // Build a Bloom with some sample hashes
+        let hashes = vec![100u64, 200, 300];
+        let bloom = Arc::new(JoinHashBloomPayload::build_from_hashes(
+            hashes,
+            512,
+            2,
+            (1, 2, 3, 4),
+            vec![0],
+            vec![1],
+        ));
+
+        let probe = JoinHashBloomProbeExpr::new(vec![Arc::clone(&col)], bloom);
+
+        // Create a batch with some values
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(datafusion::arrow::array::Int32Array::from(vec![
+                10, 20, 30, 40, 50,
+            ]))],
+        )
+        .unwrap();
+
+        let result = probe.evaluate(&batch).unwrap();
+        match result {
+            datafusion_expr::ColumnarValue::Array(arr) => {
+                let bool_arr = arr
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+                    .unwrap();
+                assert_eq!(bool_arr.len(), 5);
+                // No nulls
+                assert_eq!(bool_arr.null_count(), 0);
+                // All should be boolean (either true or false)
+                for i in 0..5 {
+                    assert!(!bool_arr.is_null(i));
+                }
+            }
+            _ => panic!("expected array result"),
+        }
+    }
+
+    #[test]
+    fn probe_expr_uses_datafusion_hash_expr_hashes_without_false_negatives() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let col = simple_col("id", 0);
+        let seeds = (1, 2, 3, 4);
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int32Array::from(vec![
+                10, 20, 30, 40, 50,
+            ]))],
+        )
+        .unwrap();
+
+        let hash_expr = datafusion::physical_plan::joins::HashExpr::new(
+            vec![Arc::clone(&col)],
+            datafusion::physical_plan::joins::SeededRandomState::with_seeds(
+                seeds.0, seeds.1, seeds.2, seeds.3,
+            ),
+            "test_hash".to_string(),
+        );
+        let hashes = hash_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let hashes = hashes
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        let inserted_hashes = hashes.iter().map(|hash| hash.unwrap()).collect::<Vec<_>>();
+
+        let bloom = Arc::new(JoinHashBloomPayload::build_from_hashes(
+            inserted_hashes,
+            512,
+            2,
+            seeds,
+            vec![0],
+            vec![1],
+        ));
+        let probe = JoinHashBloomProbeExpr::new(vec![Arc::clone(&col)], bloom);
+
+        let result = probe.evaluate(&batch).unwrap();
+        let datafusion_expr::ColumnarValue::Array(arr) = result else {
+            panic!("expected array result");
+        };
+        let bool_arr = arr
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+            .unwrap();
+
+        assert_eq!(bool_arr.len(), batch.num_rows());
+        assert!(bool_arr.iter().all(|value| value == Some(true)));
+    }
+
+    #[test]
+    fn probe_expr_children_and_with_new_children() {
+        let col_a = simple_col("a", 0);
+        let col_b = simple_col("b", 1);
+        let bloom = Arc::new(JoinHashBloomPayload::build_from_hashes(
+            vec![1u64],
+            64,
+            2,
+            (0, 0, 0, 0),
+            vec![0, 1],
+            vec![1],
+        ));
+
+        let probe = Arc::new(JoinHashBloomProbeExpr::new(
+            vec![Arc::clone(&col_a), Arc::clone(&col_b)],
+            bloom,
+        ));
+
+        let children = probe.children();
+        assert_eq!(children.len(), 2);
+
+        // with_new_children with correct count succeeds
+        let new_probe = Arc::clone(&probe)
+            .with_new_children(vec![Arc::clone(&col_b), Arc::clone(&col_a)])
+            .unwrap();
+        assert_eq!(new_probe.children().len(), 2);
+
+        // with_new_children with wrong count fails
+        let err = Arc::clone(&probe)
+            .with_new_children(vec![Arc::clone(&col_a)])
+            .unwrap_err();
+        assert!(err.to_string().contains("expected 2 children"));
+    }
+
+    // ── Hardening tests ──────────────────────────────────────
+
+    /// Create a bloom with minimal valid parameters and a simple integer column.
+    fn make_simple_bloom(
+        num_bits: u64,
+        num_probes: u32,
+        join_key_indices: Vec<u32>,
+    ) -> JoinHashBloomPayload {
+        JoinHashBloomPayload::build_from_hashes(
+            vec![10u64],
+            num_bits,
+            num_probes,
+            (0, 0, 0, 0),
+            join_key_indices,
+            vec![1],
+        )
+    }
+
+    fn simple_col(name: &str, index: usize) -> Arc<dyn PhysicalExpr> {
+        Arc::new(datafusion::physical_expr::expressions::Column::new(
+            name, index,
+        ))
+    }
+
+    #[test]
+    fn try_new_rejects_empty_children() {
+        let bloom = Arc::new(make_simple_bloom(64, 2, vec![0]));
+        let err = JoinHashBloomProbeExpr::try_new(vec![], bloom).unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)));
+        assert!(err.to_string().contains("children is empty"));
+    }
+
+    #[test]
+    fn try_new_rejects_child_count_mismatch() {
+        let col = simple_col("a", 0);
+        let bloom = Arc::new(make_simple_bloom(64, 2, vec![0, 1]));
+        let err = JoinHashBloomProbeExpr::try_new(vec![Arc::clone(&col)], bloom).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bloom.join_key_child_indices.len()")
+        );
+    }
+
+    #[test]
+    fn probe_try_new_rejects_corrupted_bloom_table_driven() {
+        let col = simple_col("id", 0);
+
+        #[track_caller]
+        fn case(
+            col: Arc<dyn PhysicalExpr>,
+            mutate: impl FnOnce(&mut JoinHashBloomPayload),
+            expected_substr: &str,
+        ) {
+            let mut bloom = make_simple_bloom(64, 2, vec![0]);
+            mutate(&mut bloom);
+            let err = JoinHashBloomProbeExpr::try_new(vec![Arc::clone(&col)], Arc::new(bloom))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(expected_substr),
+                "expected error containing '{expected_substr}', got: {}",
+                err
+            );
+        }
+
+        case(Arc::clone(&col), |b| b.num_bits = 0, "num_bits is zero");
+        case(Arc::clone(&col), |b| b.num_probes = 0, "num_probes is zero");
+        case(
+            Arc::clone(&col),
+            |b| {
+                b.num_bits = 128;
+                // bitset is still 8 bytes (wrong for 128 bits)
+            },
+            "bitset length",
+        );
     }
 }
