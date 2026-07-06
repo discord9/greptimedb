@@ -12,22 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use common_query::request::{
-    DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY, InitialDynFilterReg,
-    InitialDynFilterRegs, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+    DecodedDynFilterExprs, DynFilterPayload, INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY,
+    InitialDynFilterReg, InitialDynFilterRegs, REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
 };
 use common_telemetry::warn;
 use dashmap::DashMap;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::{DynamicFilterPhysicalExpr, lit};
 use datafusion_common::Result as DataFusionResult;
+use datafusion_expr::ColumnarValue;
+use prost::Message;
 use session::context::QueryContextRef;
 use session::query_id::QueryId;
 use store_api::storage::RegionId;
@@ -37,6 +41,84 @@ use crate::metrics::{
     REMOTE_DYN_FILTER_UNREGISTER_TOTAL, REMOTE_DYN_FILTER_UPDATE_DROP_TOTAL,
     REMOTE_DYN_FILTER_UPDATE_OUTCOME_TOTAL,
 };
+
+const REMOTE_DYN_FILTER_EXPR_LOG_CHARS: usize = 512;
+
+/// A [`PhysicalExpr`] wrapper that prevents Mito scan from downcasting the
+/// inner expression as a [`DynamicFilterPhysicalExpr`].
+///
+/// Mito scan pushes filters into its predicate by downcasting each
+/// `PhysicalExpr` to `DynamicFilterPhysicalExpr`.  This wrapper ensures
+/// the inner exact filter (e.g. a Bloom probe) stays in the [`FilterExec`]
+/// for row-level evaluation only, while the separately-constructed pushdown
+/// `DynamicFilterPhysicalExpr` is pushed into scan for pruning.
+///
+/// [`PhysicalExpr`]: datafusion::physical_plan::PhysicalExpr
+/// [`DynamicFilterPhysicalExpr`]: datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr
+#[derive(Debug, Clone)]
+struct NonPushdownDynFilterExpr {
+    inner: Arc<dyn PhysicalExpr>,
+}
+
+impl NonPushdownDynFilterExpr {
+    fn new(inner: Arc<dyn PhysicalExpr>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Display for NonPushdownDynFilterExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "non_pushdown({})", self.inner)
+    }
+}
+
+impl std::hash::Hash for NonPushdownDynFilterExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.inner.dyn_hash(state);
+    }
+}
+
+impl PartialEq for NonPushdownDynFilterExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.dyn_eq(other.inner.as_any())
+    }
+}
+
+impl Eq for NonPushdownDynFilterExpr {}
+
+impl PhysicalExpr for NonPushdownDynFilterExpr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn data_type(&self, input_schema: &Schema) -> DataFusionResult<DataType> {
+        self.inner.data_type(input_schema)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> DataFusionResult<bool> {
+        self.inner.nullable(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DataFusionResult<ColumnarValue> {
+        self.inner.evaluate(batch)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        self.inner.children()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let new_inner = self.inner.clone().with_new_children(children)?;
+        Ok(Arc::new(Self { inner: new_inner }))
+    }
+
+    fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "non_pushdown({})", self.inner)
+    }
+}
 
 type QueryRemoteDynFilterRegs = HashMap<RemoteDynFilterId, RegisteredDynFilter>;
 
@@ -182,11 +264,14 @@ impl PendingDynFilterUpdate {
 struct RemoteDynFilterEpochState {
     generation: Option<u64>,
     is_complete: bool,
+    payload: Option<DynFilterPayload>,
 }
 
 #[derive(Debug)]
 struct RemoteDynFilterState {
-    filter: Arc<DynamicFilterPhysicalExpr>,
+    filter_id: RemoteDynFilterId,
+    pushdown_filter: Arc<DynamicFilterPhysicalExpr>,
+    exact_filter: Arc<DynamicFilterPhysicalExpr>,
     input_schema: SchemaRef,
     registered_children: Vec<Arc<dyn PhysicalExpr>>,
     epoch: Mutex<RemoteDynFilterEpochState>,
@@ -194,23 +279,53 @@ struct RemoteDynFilterState {
 
 impl RemoteDynFilterState {
     fn new(
-        filter: Arc<DynamicFilterPhysicalExpr>,
+        filter_id: RemoteDynFilterId,
+        pushdown_filter: Arc<DynamicFilterPhysicalExpr>,
+        exact_filter: Arc<DynamicFilterPhysicalExpr>,
         input_schema: SchemaRef,
         registered_children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
         Self {
-            filter,
+            filter_id,
+            pushdown_filter,
+            exact_filter,
             input_schema,
             registered_children,
             epoch: Mutex::new(RemoteDynFilterEpochState {
                 generation: None,
                 is_complete: false,
+                payload: None,
             }),
         }
     }
 
-    fn filter(&self) -> Arc<DynamicFilterPhysicalExpr> {
-        self.filter.clone()
+    fn pushdown_filter(&self) -> Arc<DynamicFilterPhysicalExpr> {
+        self.pushdown_filter.clone()
+    }
+
+    fn exact_filter(&self) -> Arc<DynamicFilterPhysicalExpr> {
+        self.exact_filter.clone()
+    }
+
+    fn decode_update_payload(
+        &self,
+        payload: &DynFilterPayload,
+    ) -> std::result::Result<DecodedDynFilterExprs, RemoteDynFilterUpdateOutcome> {
+        if !validate_update_payload_size(payload) {
+            return Err(RemoteDynFilterUpdateOutcome::PayloadTooLarge);
+        }
+
+        payload
+            .decode_placement_aware(
+                remote_dyn_filter_task_context(),
+                self.input_schema.as_ref(),
+                &self.registered_children,
+                REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+            )
+            .map_err(|error| {
+                warn!(error; "Failed to decode remote dynamic filter update payload");
+                RemoteDynFilterUpdateOutcome::DecodeFailed
+            })
     }
 
     fn apply_update(
@@ -219,10 +334,6 @@ impl RemoteDynFilterState {
         generation: u64,
         is_complete: bool,
     ) -> RemoteDynFilterUpdateOutcome {
-        if !validate_update_payload_size(payload) {
-            return RemoteDynFilterUpdateOutcome::PayloadTooLarge;
-        }
-
         let mut epoch = self.epoch.lock().unwrap();
         if let Some(current_generation) = epoch.generation {
             if generation < current_generation {
@@ -231,7 +342,26 @@ impl RemoteDynFilterState {
 
             if generation == current_generation {
                 if is_complete && !epoch.is_complete {
-                    self.filter.mark_complete();
+                    let Some(installed_payload) = epoch.payload.as_ref() else {
+                        warn!(
+                            "Missing installed remote dynamic filter payload for same-generation complete update, filter_id: {}, generation: {}",
+                            self.filter_id, generation
+                        );
+                        return RemoteDynFilterUpdateOutcome::DecodeFailed;
+                    };
+                    if payload != installed_payload {
+                        warn_mismatched_complete_payload(
+                            &self.filter_id,
+                            generation,
+                            installed_payload,
+                            payload,
+                            Some(self.pushdown_filter.as_ref()),
+                            Some(self.exact_filter.as_ref()),
+                        );
+                        return RemoteDynFilterUpdateOutcome::DecodeFailed;
+                    }
+                    self.pushdown_filter.mark_complete();
+                    self.exact_filter.mark_complete();
                     epoch.is_complete = true;
                     return RemoteDynFilterUpdateOutcome::Applied;
                 }
@@ -243,27 +373,30 @@ impl RemoteDynFilterState {
             return RemoteDynFilterUpdateOutcome::AlreadyComplete;
         }
 
-        let expr = match payload.decode_expr_with_registered_children(
-            remote_dyn_filter_task_context(),
-            self.input_schema.as_ref(),
-            &self.registered_children,
-            REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
-        ) {
-            Ok(expr) => expr,
-            Err(error) => {
-                warn!(error; "Failed to decode remote dynamic filter update payload");
-                return RemoteDynFilterUpdateOutcome::DecodeFailed;
-            }
+        // Decode placement-aware parts before mutating state
+        let decoded = match self.decode_update_payload(payload) {
+            Ok(decoded) => decoded,
+            Err(outcome) => return outcome,
         };
 
-        if let Err(error) = self.filter.update(expr) {
-            warn!(error; "Failed to apply remote dynamic filter update");
+        // Update pushdown wrapper first, then exact wrapper second.
+        // Generation is only advanced after both succeed.
+        if let Err(error) = self.pushdown_filter.update(decoded.pushdown_expr) {
+            warn!(error; "Failed to apply pushdown remote dynamic filter update");
+            return RemoteDynFilterUpdateOutcome::DecodeFailed;
+        }
+
+        let exact_expr = decoded.exact_expr.unwrap_or_else(|| lit(true));
+        if let Err(error) = self.exact_filter.update(exact_expr) {
+            warn!(error; "Failed to apply exact remote dynamic filter update");
             return RemoteDynFilterUpdateOutcome::DecodeFailed;
         }
 
         epoch.generation = Some(generation);
+        epoch.payload = Some(payload.clone());
         if is_complete {
-            self.filter.mark_complete();
+            self.pushdown_filter.mark_complete();
+            self.exact_filter.mark_complete();
             epoch.is_complete = true;
         }
 
@@ -337,23 +470,36 @@ impl RegisteredDynFilter {
         generation: u64,
         is_complete: bool,
     ) -> RemoteDynFilterUpdateOutcome {
-        if !validate_update_payload_size(payload) {
-            return RemoteDynFilterUpdateOutcome::PayloadTooLarge;
-        }
-
         if let Some(pending) = self.pending_update.as_mut() {
             if generation < pending.generation {
                 return RemoteDynFilterUpdateOutcome::Stale;
             }
 
             if generation == pending.generation {
-                pending.is_complete |= is_complete;
+                if is_complete && !pending.is_complete {
+                    if payload != &pending.payload {
+                        warn_mismatched_complete_payload(
+                            &self.filter_id,
+                            generation,
+                            &pending.payload,
+                            payload,
+                            None,
+                            None,
+                        );
+                        return RemoteDynFilterUpdateOutcome::DecodeFailed;
+                    }
+                    pending.is_complete = true;
+                }
                 return RemoteDynFilterUpdateOutcome::Idempotent;
             }
 
             if pending.is_complete {
                 return RemoteDynFilterUpdateOutcome::AlreadyComplete;
             }
+        }
+
+        if !validate_update_payload_size(payload) {
+            return RemoteDynFilterUpdateOutcome::PayloadTooLarge;
         }
 
         self.pending_update = Some(PendingDynFilterUpdate {
@@ -392,7 +538,7 @@ impl RegisteredDynFilter {
         )
     }
 
-    fn dyn_filter(&mut self, input_schema: &Schema) -> Option<Arc<dyn PhysicalExpr>> {
+    fn dyn_filters(&mut self, input_schema: &Schema) -> Option<Vec<Arc<dyn PhysicalExpr>>> {
         let children = match self.decode_children(input_schema) {
             Ok(children) => children,
             Err(error) => {
@@ -404,9 +550,14 @@ impl RegisteredDynFilter {
         let runtime = match &self.runtime {
             Some(runtime) => runtime.clone(),
             None => {
-                let filter = Arc::new(DynamicFilterPhysicalExpr::new(children.clone(), lit(true)));
+                let pushdown_filter =
+                    Arc::new(DynamicFilterPhysicalExpr::new(children.clone(), lit(true)));
+                let exact_filter =
+                    Arc::new(DynamicFilterPhysicalExpr::new(children.clone(), lit(true)));
                 let runtime = Arc::new(RemoteDynFilterState::new(
-                    filter,
+                    self.filter_id.clone(),
+                    pushdown_filter,
+                    exact_filter,
                     Arc::new(input_schema.clone()),
                     children.clone(),
                 ));
@@ -428,18 +579,37 @@ impl RegisteredDynFilter {
             }
         };
 
-        match runtime.filter().with_new_children(children) {
-            Ok(expr) => Some(expr),
+        let pushdown_expr = match runtime
+            .pushdown_filter()
+            .with_new_children(children.clone())
+        {
+            Ok(expr) => expr,
             Err(error) => {
-                warn!(error; "Failed to remap remote dynamic filter children for scan");
-                None
+                warn!(error; "Failed to remap pushdown dyn filter children for scan");
+                return None;
             }
-        }
+        };
+
+        let exact_inner = match runtime.exact_filter().with_new_children(children) {
+            Ok(expr) => expr,
+            Err(error) => {
+                warn!(error; "Failed to remap exact dyn filter children for scan");
+                return None;
+            }
+        };
+
+        // Wrap the exact filter in a non-pushdown marker so Mito scan cannot
+        // downcast it as DynamicFilterPhysicalExpr and push it into scan.
+        let exact_non_pushdown: Arc<dyn PhysicalExpr> =
+            Arc::new(NonPushdownDynFilterExpr::new(exact_inner));
+
+        Some(vec![pushdown_expr, exact_non_pushdown])
     }
 
     fn deactivate(&self) {
         if let Some(runtime) = &self.runtime {
-            runtime.filter.mark_complete();
+            runtime.pushdown_filter.mark_complete();
+            runtime.exact_filter.mark_complete();
         }
     }
 }
@@ -538,8 +708,9 @@ pub(super) fn remote_dyn_filter_exprs_for_initial_regs(
         .filter_map(|reg| {
             let filter_id = RemoteDynFilterId::new(reg.filter_id.clone());
             let registered = query_regs.get_mut(&filter_id)?;
-            registered.dyn_filter(input_schema)
+            registered.dyn_filters(input_schema)
         })
+        .flatten()
         .collect()
 }
 
@@ -679,6 +850,69 @@ fn validate_update_payload_size(payload: &DynFilterPayload) -> bool {
     payload.encoded_payload_bytes() <= REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES
 }
 
+fn payload_kind(payload: &DynFilterPayload) -> &'static str {
+    match payload {
+        DynFilterPayload::Datafusion(_) => "Datafusion",
+        DynFilterPayload::JoinHashBloom(_) => "JoinHashBloom",
+        _ => "Unknown",
+    }
+}
+
+fn payload_digest(payload: &DynFilterPayload) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    payload
+        .to_region_proto_payload()
+        .encode_to_vec()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn truncate_log_text(text: String) -> String {
+    if text.chars().count() <= REMOTE_DYN_FILTER_EXPR_LOG_CHARS {
+        return text;
+    }
+
+    let mut truncated = text
+        .chars()
+        .take(REMOTE_DYN_FILTER_EXPR_LOG_CHARS)
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn dynamic_filter_expr_summary(filter: &DynamicFilterPhysicalExpr) -> String {
+    match filter.current() {
+        Ok(expr) => truncate_log_text(expr.to_string()),
+        Err(error) => truncate_log_text(format!("<failed to read current expr: {error}>")),
+    }
+}
+
+fn warn_mismatched_complete_payload(
+    filter_id: &RemoteDynFilterId,
+    generation: u64,
+    installed_payload: &DynFilterPayload,
+    incoming_payload: &DynFilterPayload,
+    installed_pushdown_filter: Option<&DynamicFilterPhysicalExpr>,
+    installed_exact_filter: Option<&DynamicFilterPhysicalExpr>,
+) {
+    let installed_pushdown_expr = installed_pushdown_filter.map(dynamic_filter_expr_summary);
+    let installed_exact_expr = installed_exact_filter.map(dynamic_filter_expr_summary);
+
+    warn!(
+        "Mismatched same-generation remote dynamic filter complete update rejected, filter_id: {}, generation: {}, installed_kind: {}, incoming_kind: {}, installed_payload_bytes: {}, incoming_payload_bytes: {}, installed_payload_digest: {:016x}, incoming_payload_digest: {:016x}, installed_pushdown_expr: {:?}, installed_exact_expr: {:?}",
+        filter_id,
+        generation,
+        payload_kind(installed_payload),
+        payload_kind(incoming_payload),
+        installed_payload.encoded_payload_bytes(),
+        incoming_payload.encoded_payload_bytes(),
+        payload_digest(installed_payload),
+        payload_digest(incoming_payload),
+        installed_pushdown_expr,
+        installed_exact_expr,
+    );
+}
+
 fn remote_dyn_filter_task_context() -> &'static TaskContext {
     static TASK_CONTEXT: OnceLock<TaskContext> = OnceLock::new();
 
@@ -694,6 +928,14 @@ fn remote_dyn_filter_task_context() -> &'static TaskContext {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use common_query::request::InitialDynFilterSnapshot;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::physical_expr::expressions::{Column, lit};
+    use datafusion::physical_plan::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
+    use datafusion::physical_plan::joins::{HashTableLookupExpr, Map, SeededRandomState};
+
     use super::*;
 
     #[test]
@@ -749,5 +991,531 @@ mod tests {
         assert_eq!(registered.subscriber_regions.len(), 2);
         assert!(registered.subscriber_regions.contains(&first_region_id));
         assert!(registered.subscriber_regions.contains(&second_region_id));
+    }
+
+    // ── NonPushdownDynFilterExpr tests ──────────────────────────────
+
+    fn empty_arrow_schema() -> ::datafusion::arrow::datatypes::Schema {
+        ::datafusion::arrow::datatypes::Schema::empty()
+    }
+
+    #[test]
+    fn non_pushdown_wrapper_hides_dynamic_filter_and_delegates() {
+        let inner =
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true))) as Arc<dyn PhysicalExpr>;
+        let wrapper: Arc<dyn PhysicalExpr> = Arc::new(NonPushdownDynFilterExpr::new(inner));
+
+        let any = Arc::clone(&wrapper) as Arc<dyn std::any::Any + Send + Sync>;
+        assert!(any.downcast_ref::<DynamicFilterPhysicalExpr>().is_none());
+        assert!(any.downcast_ref::<NonPushdownDynFilterExpr>().is_some());
+
+        let schema = empty_arrow_schema();
+        assert_eq!(wrapper.data_type(&schema).unwrap(), DataType::Boolean);
+        assert!(!wrapper.nullable(&schema).unwrap());
+        assert_eq!(wrapper.children().len(), 0);
+
+        let display = format!("{}", wrapper);
+        assert!(
+            display.starts_with("non_pushdown("),
+            "expected non_pushdown prefix, got: {display}"
+        );
+    }
+
+    // ── dyn_filters returns two exprs for Datafusion payload ───────
+
+    fn test_remote_query_id() -> QueryId {
+        QueryId::new()
+    }
+
+    #[test]
+    fn dyn_filters_returns_two_exprs_for_datafusion_initial_snapshot() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+
+        let payload = DynFilterPayload::from_datafusion_expr(&lit(true), 1024).unwrap();
+        let regs = InitialDynFilterRegs::new(vec![
+            InitialDynFilterReg::new("filter-df", vec![])
+                .with_initial_snapshot(InitialDynFilterSnapshot::new(payload, 1, false)),
+        ]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs = remote_dyn_filter_exprs_for_initial_regs(
+            &regs_by_query,
+            &query_id,
+            &regs,
+            &empty_arrow_schema(),
+        );
+
+        // Two exprs: pushdown (DynamicFilterPhysicalExpr) + exact non-pushdown
+        assert_eq!(exprs.len(), 2);
+
+        let _ = pushdown_dyn_filter(&exprs[0]);
+        let _ = exact_dyn_filter(&exprs[1]);
+    }
+
+    // ── Bloom placement-aware decode test ───────────────────────────
+
+    fn pushdown_dyn_filter(expr: &Arc<dyn PhysicalExpr>) -> Arc<DynamicFilterPhysicalExpr> {
+        let any = Arc::clone(expr) as Arc<dyn std::any::Any + Send + Sync>;
+        any.downcast::<DynamicFilterPhysicalExpr>()
+            .expect("pushdown must be DynamicFilterPhysicalExpr")
+    }
+
+    fn exact_dyn_filter(expr: &Arc<dyn PhysicalExpr>) -> Arc<DynamicFilterPhysicalExpr> {
+        let any = Arc::clone(expr) as Arc<dyn std::any::Any + Send + Sync>;
+        assert!(any.downcast_ref::<DynamicFilterPhysicalExpr>().is_none());
+        let wrapper = any
+            .downcast_ref::<NonPushdownDynFilterExpr>()
+            .expect("exact must be NonPushdownDynFilterExpr");
+        let inner = Arc::clone(&wrapper.inner) as Arc<dyn std::any::Any + Send + Sync>;
+        inner
+            .downcast::<DynamicFilterPhysicalExpr>()
+            .expect("exact wrapper must contain DynamicFilterPhysicalExpr")
+    }
+
+    /// Creates a one-column (`id` Int32) Arrow schema, children expressions
+    /// (`Column("id")`), and a JoinHashBloom payload containing a
+    /// `HashTableLookupExpr` over the values [10, 20, 30].
+    ///
+    /// Returns `(schema, children, bloom_payload)`.
+    fn make_bloom_payload() -> (SchemaRef, Vec<Arc<dyn PhysicalExpr>>, DynFilterPayload) {
+        let schema = Arc::new(::datafusion::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let id_col = Arc::new(Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let children = vec![Arc::clone(&id_col)];
+
+        let mut hash_map = JoinHashMapU32::with_capacity(3);
+        hash_map.update_from_iter(Box::new([10u64, 20, 30].iter().enumerate()), 0);
+        let map = Arc::new(Map::HashMap(Box::new(hash_map)));
+        let lookup: Arc<dyn PhysicalExpr> = Arc::new(HashTableLookupExpr::new(
+            vec![Arc::clone(&id_col)],
+            SeededRandomState::with_seeds(1, 2, 3, 4),
+            map,
+            "lookup".to_string(),
+        ));
+
+        let payload = DynFilterPayload::from_datafusion_expr_with_registered_children(
+            &lookup,
+            &children,
+            REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+            &schema,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(payload, DynFilterPayload::JoinHashBloom(_)),
+            "make_bloom_payload must produce JoinHashBloom"
+        );
+
+        (schema, children, payload)
+    }
+
+    /// Convenience for `InitialDynFilterSnapshot::new(payload.clone(), 1, false)`.
+    fn test_bloom_snapshot(payload: &DynFilterPayload) -> InitialDynFilterSnapshot {
+        InitialDynFilterSnapshot::new(payload.clone(), 1, false)
+    }
+
+    /// Extracts the pushdown [`DynamicFilterPhysicalExpr`] and (non-pushdown)
+    /// exact [`DynamicFilterPhysicalExpr`] from a two-element exprs slice.
+    ///
+    /// Panics if the exprs do not have the expected types.
+    fn decode_bloom_parts(
+        exprs: &[Arc<dyn PhysicalExpr>],
+    ) -> (
+        Arc<DynamicFilterPhysicalExpr>,
+        Arc<DynamicFilterPhysicalExpr>,
+    ) {
+        let pushdown = pushdown_dyn_filter(&exprs[0]);
+        let exact_dynamic = exact_dyn_filter(&exprs[1]);
+        (pushdown, exact_dynamic)
+    }
+
+    #[test]
+    fn bloom_dyn_filters_pushdown_is_dynamic_filter_and_exact_contains_bloom_probe() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-bloom", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+
+        assert_eq!(exprs.len(), 2);
+
+        // Pushdown wrapper: DynamicFilterPhysicalExpr with residual (lit(true) for lookup-only)
+        let pushdown = pushdown_dyn_filter(&exprs[0]);
+        let pushdown_current = format!("{}", pushdown.current().unwrap());
+        assert!(
+            pushdown_current.contains("true"),
+            "pushdown should be residual (lit(true) for lookup-only), got: {pushdown_current}"
+        );
+
+        // Exact wrapper: NonPushdownDynFilterExpr containing bloom_probe
+        let _ = exact_dyn_filter(&exprs[1]);
+        let exact_display = format!("{}", exprs[1]);
+        assert!(
+            exact_display.contains("bloom_probe"),
+            "exact wrapper display must contain bloom_probe, got: {exact_display}"
+        );
+        assert!(
+            exact_display.contains("non_pushdown("),
+            "exact wrapper display must have non_pushdown prefix, got: {exact_display}"
+        );
+    }
+
+    #[test]
+    fn datafusion_update_after_bloom_clears_exact_to_true() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-x", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+
+        // Install wrappers
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let (pushdown, exact_dynamic) = decode_bloom_parts(&exprs);
+
+        // Assert bloom is installed
+        let exact_display = format!("{}", exprs[1]);
+        assert!(
+            exact_display.contains("bloom_probe"),
+            "pre-update: exact should contain bloom_probe"
+        );
+
+        // Now send a Datafusion payload update (higher generation)
+        let df_payload = DynFilterPayload::from_datafusion_expr(&lit(true), 1024).unwrap();
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-x"),
+            &df_payload,
+            2, // higher generation
+            false,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::Applied);
+
+        // Pushdown should now be the Datafusion expression
+        let pushdown_current = format!("{}", pushdown.current().unwrap());
+        assert!(
+            pushdown_current.contains("true"),
+            "post-DF-update: pushdown should be true, got: {pushdown_current}"
+        );
+
+        // Re-fetch exprs to check exact was cleared to true
+        let exprs_after =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs_after.len(), 2);
+        let exact_after_display = format!("{}", exprs_after[1]);
+        assert!(
+            !exact_after_display.contains("bloom_probe"),
+            "post-DF-update: exact must NOT contain bloom_probe, got: {exact_after_display}"
+        );
+        assert_eq!(format!("{}", exact_dynamic.current().unwrap()), "true");
+    }
+
+    #[test]
+    fn oversized_update_after_bloom_does_not_mutate_state() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-oversized", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let exact_dynamic = exact_dyn_filter(&exprs[1]);
+        let pre_oversized = format!("{}", exact_dynamic.current().unwrap());
+        assert!(
+            pre_oversized.contains("bloom_probe"),
+            "pre-oversized: exact should contain bloom_probe, got: {pre_oversized}"
+        );
+
+        // Send oversized update — must NOT mutate state
+        let oversized =
+            DynFilterPayload::Datafusion(vec![0; REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES + 1]);
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-oversized"),
+            &oversized,
+            2,
+            false,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::PayloadTooLarge);
+
+        // Exact should still contain bloom_probe (not cleared)
+        let post_oversized = format!("{}", exact_dynamic.current().unwrap());
+        assert!(
+            post_oversized.contains("bloom_probe"),
+            "post-oversized: exact must still contain bloom_probe, got: {post_oversized}"
+        );
+
+        // The oversized generation must not become the runtime watermark.
+        let valid_gen1_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-oversized"),
+            &bloom_payload,
+            1, // same as installed
+            false,
+        );
+        assert_eq!(valid_gen1_outcome, RemoteDynFilterUpdateOutcome::Idempotent);
+
+        let stale_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-oversized"),
+            &bloom_payload,
+            0,
+            false,
+        );
+        assert_eq!(stale_outcome, RemoteDynFilterUpdateOutcome::Stale);
+    }
+
+    #[test]
+    fn decode_failed_update_does_not_mutate_state() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-decode-fail", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let exact_dynamic = exact_dyn_filter(&exprs[1]);
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        // Send an undecodable Datafusion payload (garbage bytes)
+        let garbage = DynFilterPayload::Datafusion(vec![0, 1, 2, 3]);
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-decode-fail"),
+            &garbage,
+            2,
+            false,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::DecodeFailed);
+
+        // Exact should NOT be cleared — state is unchanged
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+    }
+
+    #[test]
+    fn same_generation_invalid_complete_update_does_not_mark_complete() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-complete", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let (pushdown, exact_dynamic) = decode_bloom_parts(&exprs);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let garbage = DynFilterPayload::Datafusion(vec![0, 1, 2, 3]);
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-complete"),
+            &garbage,
+            1,
+            true,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::DecodeFailed);
+
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let valid_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-complete"),
+            &bloom_payload,
+            2,
+            false,
+        );
+        assert_eq!(valid_outcome, RemoteDynFilterUpdateOutcome::Applied);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+    }
+
+    #[test]
+    fn same_generation_mismatched_decodable_complete_update_does_not_mark_complete() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children(
+            "filter-decodable-complete",
+            &children,
+        )
+        .unwrap()
+        .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let (pushdown, exact_dynamic) = decode_bloom_parts(&exprs);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let mismatched_payload = DynFilterPayload::from_datafusion_expr(
+            &(lit(false) as Arc<dyn PhysicalExpr>),
+            REMOTE_DYN_FILTER_PAYLOAD_MAX_BYTES,
+        )
+        .unwrap();
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-decodable-complete"),
+            &mismatched_payload,
+            1,
+            true,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::DecodeFailed);
+
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let valid_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-decodable-complete"),
+            &bloom_payload,
+            2,
+            false,
+        );
+        assert_eq!(valid_outcome, RemoteDynFilterUpdateOutcome::Applied);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+    }
+
+    #[test]
+    fn pending_same_generation_mismatched_complete_does_not_mark_buffer_complete() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let (schema, children, bloom_payload) = make_bloom_payload();
+
+        let reg = InitialDynFilterReg::from_filter_id_and_children("filter-pending", &children)
+            .unwrap()
+            .with_initial_snapshot(test_bloom_snapshot(&bloom_payload));
+        let regs = InitialDynFilterRegs::new(vec![reg]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+
+        // Runtime filters do not exist yet, so this exercises the buffered
+        // pending-update path rather than RemoteDynFilterState::apply_update().
+        let garbage = DynFilterPayload::Datafusion(vec![0, 1, 2, 3]);
+        let outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-pending"),
+            &garbage,
+            1,
+            true,
+        );
+        assert_eq!(outcome, RemoteDynFilterUpdateOutcome::DecodeFailed);
+
+        let exprs =
+            remote_dyn_filter_exprs_for_initial_regs(&regs_by_query, &query_id, &regs, &schema);
+        assert_eq!(exprs.len(), 2);
+
+        let (pushdown, exact_dynamic) = decode_bloom_parts(&exprs);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+        assert!(format!("{}", exact_dynamic.current().unwrap()).contains("bloom_probe"));
+
+        let valid_outcome = apply_remote_dyn_filter_update(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-pending"),
+            &bloom_payload,
+            2,
+            false,
+        );
+        assert_eq!(valid_outcome, RemoteDynFilterUpdateOutcome::Applied);
+        assert!(!pushdown.is_complete());
+        assert!(!exact_dynamic.is_complete());
+    }
+
+    #[test]
+    fn deactivate_marks_both_pushdown_and_exact_filters_complete() {
+        let regs_by_query = RemoteDynFilterRegistry::new();
+        let query_id = test_remote_query_id();
+        let region_id = RegionId::new(1024, 7);
+        let regs = InitialDynFilterRegs::new(vec![InitialDynFilterReg::new("filter-d", vec![])]);
+
+        register_initial_dyn_filter_regs(&regs_by_query, &query_id, region_id, &regs);
+        let exprs = remote_dyn_filter_exprs_for_initial_regs(
+            &regs_by_query,
+            &query_id,
+            &regs,
+            &empty_arrow_schema(),
+        );
+        assert_eq!(exprs.len(), 2);
+
+        let (pushdown, exact_dynamic) = decode_bloom_parts(&exprs);
+
+        // Deactivate (via drop of RegisteredDynFilter)
+        let _ = unregister_remote_dyn_filter(
+            &regs_by_query,
+            &query_id,
+            &RemoteDynFilterId::new("filter-d"),
+        );
+
+        // After deactivation, the filter registration should be gone.
+        assert!(regs_by_query.get_query(&query_id).is_none());
+        assert!(pushdown.is_complete());
+        assert!(exact_dynamic.is_complete());
     }
 }
