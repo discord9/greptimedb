@@ -108,6 +108,7 @@ fn validate_remote_schema(
             continue;
         }
 
+        // Intentionally mirrors Arrow Field equality properties, except timezone.
         let timezone_only_difference = matches!(
             (expected_field.data_type(), actual_field.data_type()),
             (
@@ -115,11 +116,9 @@ fn validate_remote_schema(
                 ArrowDataType::Timestamp(actual_unit, actual_timezone),
             ) if expected_unit == actual_unit
                 && expected_timezone != actual_timezone
-                && actual_field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(expected_field.data_type().clone())
-                    == expected_field.as_ref().clone()
+                && expected_field.name() == actual_field.name()
+                && expected_field.is_nullable() == actual_field.is_nullable()
+                && expected_field.metadata() == actual_field.metadata()
         );
         if !timezone_only_difference {
             return Err(remote_schema_mismatch(format!(
@@ -481,9 +480,10 @@ impl MergeScanExec {
                         MERGE_SCAN_ERRORS_TOTAL.inc();
                         DataFusionError::External(Box::new(e))
                     })?;
+                let advertised_schema = stream.schema().arrow_schema().clone();
                 validate_remote_schema(
                     arrow_schema.as_ref(),
-                    stream.schema().arrow_schema().as_ref(),
+                    advertised_schema.as_ref(),
                     "advertised remote stream",
                 )
                 .inspect_err(|_| MERGE_SCAN_ERRORS_TOTAL.inc())?;
@@ -509,12 +509,14 @@ impl MergeScanExec {
 
                     let batch = batch.map_err(|e| DataFusionError::External(Box::new(e)))?;
                     let df_batch = batch.into_df_record_batch();
-                    validate_remote_schema(
-                        arrow_schema.as_ref(),
-                        df_batch.schema().as_ref(),
-                        "remote record batch",
-                    )
-                    .inspect_err(|_| MERGE_SCAN_ERRORS_TOTAL.inc())?;
+                    if !Arc::ptr_eq(&advertised_schema, df_batch.schema_ref()) {
+                        validate_remote_schema(
+                            arrow_schema.as_ref(),
+                            df_batch.schema_ref().as_ref(),
+                            "remote record batch",
+                        )
+                        .inspect_err(|_| MERGE_SCAN_ERRORS_TOTAL.inc())?;
+                    }
                     let batch =
                         patch_batch_timezone(arrow_schema.clone(), df_batch.columns().to_vec())?;
                     metric.record_output_batch_rows(batch.num_rows());
@@ -1479,6 +1481,10 @@ mod tests {
         let timestamp = TimestampMillisecondVector::try_from_arrow_array(timestamp_array)
             .expect("timezone timestamp array must build a vector");
         let batch = record_batch(remote_schema, vec![Arc::new(timestamp) as _]);
+        assert!(Arc::ptr_eq(
+            batch.schema.arrow_schema(),
+            batch.df_record_batch().schema_ref()
+        ));
         let expected_schema = ArrowSchema::new(vec![Field::new(
             "ts",
             TestArrowDataType::Timestamp(TimeUnit::Millisecond, Some("Asia/Shanghai".into())),
@@ -1612,8 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_scan_remote_schema_identity_rejects_timestamp_unit_and_timezone_plus_other_field_mismatch()
-     {
+    fn merge_scan_remote_schema_identity_rejects_timestamp_timezone_plus_field_mismatches() {
         let expected = ArrowSchema::new(vec![Field::new(
             "ts",
             TestArrowDataType::Timestamp(TimeUnit::Millisecond, Some("Asia/Shanghai".into())),
@@ -1624,14 +1629,32 @@ mod tests {
             TestArrowDataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
             false,
         )]);
+        let different_name = ArrowSchema::new(vec![Field::new(
+            "other",
+            TestArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        )]);
         let timezone_plus_nullability = ArrowSchema::new(vec![Field::new(
             "ts",
             TestArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
             true,
         )]);
+        let timezone_plus_field_metadata = ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                TestArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            )
+            .with_metadata(StdHashMap::from([(
+                "remote".to_string(),
+                "different".to_string(),
+            )])),
+        ]);
 
         assert!(validate_remote_schema(&expected, &different_unit, "test").is_err());
+        assert!(validate_remote_schema(&expected, &different_name, "test").is_err());
         assert!(validate_remote_schema(&expected, &timezone_plus_nullability, "test").is_err());
+        assert!(validate_remote_schema(&expected, &timezone_plus_field_metadata, "test").is_err());
     }
 
     #[test]
@@ -1722,6 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn merge_scan_remote_schema_identity_rejects_advertised_schema_inner_batch_mismatch() {
         let region_id = RegionId::new(1024, 1);
+        let advertised_schema = int64_schema(&["a", "b"]);
         let inner_batch = record_batch(
             int64_schema(&["b", "a"]),
             vec![
@@ -1730,19 +1754,67 @@ mod tests {
             ],
         )
         .into_df_record_batch();
-        let batch = RecordBatch::from_df_record_batch(int64_schema(&["a", "b"]), inner_batch);
+        let inner_schema = inner_batch.schema_ref().clone();
+        let batch = RecordBatch::from_df_record_batch(advertised_schema.clone(), inner_batch);
+        assert!(Arc::ptr_eq(
+            advertised_schema.arrow_schema(),
+            batch.schema.arrow_schema()
+        ));
+        assert!(!Arc::ptr_eq(
+            advertised_schema.arrow_schema(),
+            &inner_schema
+        ));
         let exec = merge_scan_exec_with_handler(
             vec![region_id],
             expected_int64_schema(),
             Arc::new(TestRegionQueryHandler::with_responses(vec![(
                 region_id,
-                int64_schema(&["a", "b"]),
+                advertised_schema,
                 vec![batch],
             )])),
             1,
         );
 
         assert!(collect_merge_scan(exec).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merge_scan_remote_schema_identity_validates_structurally_equal_distinct_batch_schema()
+    {
+        let region_id = RegionId::new(1024, 1);
+        let advertised_schema = int64_schema(&["a", "b"]);
+        let inner_schema = Arc::new(
+            Schema::try_from(Arc::new(advertised_schema.arrow_schema().as_ref().clone())).unwrap(),
+        );
+        let inner_batch = record_batch(
+            inner_schema,
+            vec![
+                Arc::new(Int64Vector::from_slice([11])) as _,
+                Arc::new(Int64Vector::from_slice([12])) as _,
+            ],
+        )
+        .into_df_record_batch();
+        assert_eq!(advertised_schema.arrow_schema(), inner_batch.schema_ref());
+        assert!(!Arc::ptr_eq(
+            advertised_schema.arrow_schema(),
+            inner_batch.schema_ref()
+        ));
+        let batch = RecordBatch::from_df_record_batch(advertised_schema.clone(), inner_batch);
+        let batches = collect_merge_scan(merge_scan_exec_with_handler(
+            vec![region_id],
+            expected_int64_schema(),
+            Arc::new(TestRegionQueryHandler::with_responses(vec![(
+                region_id,
+                advertised_schema,
+                vec![batch],
+            )])),
+            1,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_int64_batch(&batches[0], (11, 12));
     }
 
     #[test]
