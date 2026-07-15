@@ -102,11 +102,9 @@ impl UserDefinedLogicalNodeCore for MergeSortLogicalPlan {
         exprs: Vec<datafusion::prelude::Expr>,
         inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        let [input] = inputs.as_slice() else {
-            return Err(DataFusionError::Internal(
-                "Expected exactly one input with MergeSort".to_string(),
-            ));
-        };
+        let [input] = inputs.try_into().map_err(|_| {
+            DataFusionError::Internal("Expected exactly one input with MergeSort".to_string())
+        })?;
 
         let mut zelf = self.clone();
         zelf.expr = zelf
@@ -115,7 +113,7 @@ impl UserDefinedLogicalNodeCore for MergeSortLogicalPlan {
             .zip(exprs)
             .map(|(sort, expr)| sort.with_expr(expr))
             .collect();
-        zelf.input = Arc::new(input.clone());
+        zelf.input = Arc::new(input);
         Ok(zelf)
     }
 }
