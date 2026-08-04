@@ -19,6 +19,18 @@ on:
         description: Pass --allow-large-fixture to runner
         type: boolean
         default: true
+      kube_context:
+        description: Optional Kubernetes context for explicit workload_scheduler_distributed case
+        required: false
+        default: ""
+      namespace_prefix:
+        description: Owned Kubernetes namespace prefix for explicit scheduler case
+        required: false
+        default: query-regression-scheduler
+      base_image:
+        description: Cached sleeping tool image for explicit scheduler case
+        required: false
+        default: docker.io/greptime/greptime-tool:20250606-04e3c7d
       http_timeout:
         description: Runner HTTP timeout seconds
         required: true
@@ -532,6 +544,9 @@ jobs:
           BASE_BIN: ${{ github.workspace }}/query-regression-bins/base/greptime
           CANDIDATE_BIN: ${{ github.workspace }}/query-regression-bins/candidate/greptime
           FIXTURE_GENERATOR: ${{ github.workspace }}/query-regression-bins/candidate/query_perf_fixture
+          KUBE_CONTEXT: ${{ github.event_name == 'workflow_dispatch' && inputs.kube_context || '' }}
+          QUERY_REGRESSION_NAMESPACE_PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.namespace_prefix || 'query-regression-scheduler' }}
+          QUERY_REGRESSION_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.base_image || 'docker.io/greptime/greptime-tool:20250606-04e3c7d' }}
         run: >-
           uv run --no-project python src/.github/scripts/query-regression-run.py
           --base-src src
@@ -560,6 +575,9 @@ jobs:
             query-regression-work/**/base/report.json
             query-regression-work/**/candidate/report.json
             query-regression-work/**/logs/**
+            query-regression-work/**/manifests/**
+            query-regression-work/**/metrics/**
+            query-regression-work/**/samples/**
             query-regression-summary.md
           if-no-files-found: warn
           retention-days: 7

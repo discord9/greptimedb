@@ -106,24 +106,39 @@ pub async fn run() {
 fn run_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     let case_text = fs::read_to_string(&args.case)?;
     let mut case: CaseFile = toml::from_str(&case_text)?;
-    if let Scenario::PromRemoteWriteThenQuery(s) = &mut case.scenario
-        && let Some(storage) = &mut s.remote_write.storage
-    {
-        storage.populate_planned_thresholds();
-        if storage.inspect {
-            let mut rb = s.remote_write.read_bench.clone().unwrap_or_default();
-            if rb.enabled && rb.projection.is_empty() {
-                rb.projection = vec![storage.column.clone()];
+    match &mut case.scenario {
+        Scenario::PromRemoteWriteThenQuery(s) => {
+            if let Some(storage) = &mut s.remote_write.storage {
+                storage.populate_planned_thresholds();
+                if storage.inspect {
+                    let mut rb = s.remote_write.read_bench.clone().unwrap_or_default();
+                    if rb.enabled && rb.projection.is_empty() {
+                        rb.projection = vec![storage.column.clone()];
+                    }
+                    s.remote_write.read_bench = Some(rb);
+                } else if s
+                    .remote_write
+                    .read_bench
+                    .as_ref()
+                    .is_some_and(|rb| rb.enabled)
+                {
+                    return Err("scenario.remote_write.read_bench requires scenario.remote_write.storage.inspect = true".into());
+                }
             }
-            s.remote_write.read_bench = Some(rb);
-        } else if s
-            .remote_write
-            .read_bench
-            .as_ref()
-            .is_some_and(|rb| rb.enabled)
-        {
-            return Err("scenario.remote_write.read_bench requires scenario.remote_write.storage.inspect = true".into());
         }
+        Scenario::WorkloadScheduler(s) => {
+            s.validate()
+                .map_err(|e| format!("workload_scheduler validation failed:\n  - {}", e))?;
+        }
+        Scenario::WorkloadSchedulerDistributed(s) => {
+            s.validate().map_err(|e| {
+                format!(
+                    "workload_scheduler_distributed validation failed:\n  - {}",
+                    e
+                )
+            })?;
+        }
+        Scenario::DirectReadableSst(_) => {}
     }
     println!(
         "{}",

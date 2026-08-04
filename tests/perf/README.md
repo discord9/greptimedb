@@ -11,53 +11,297 @@ encoding experiments that explicitly compare `plain`/dictionary,
 
 ## Workload scheduler benchmark
 
+The primary scheduler conclusion is the explicit `workload_scheduler_distributed` case: a Kubernetes E2E concurrent read/write A/B/B/A run with one frontend, one metasrv, three independently pinned datanodes, and a separate load-generator where capacity permits. Scheduler mechanism gates are evaluated **per datanode** from endpoint-scoped 1-second scrapes; cluster aggregates are diagnostics only. `workload_scheduler_benchmark.py` remains an optional standalone microbenchmark and must not be used as the primary distributed conclusion.
+
+Manual current-cluster scheduler-only A/B (the candidate binary is injected for both targets; it changes only the datanode scheduler flag):
+
+```bash
+uv run --no-project python .github/scripts/query-regression-run.py \
+  --cases tests/perf/query_cases/workload_scheduler_distributed/case.toml \
+  --base-src . --candidate-src . --base-bin /path/to/candidate/greptime \
+  --candidate-bin /path/to/candidate/greptime \
+  --fixture-generator /path/to/query_perf_fixture --same-binary-ab \
+  --kube-context "$KUBE_CONTEXT" --namespace-prefix query-regression-manual
+```
+
+
+
 `workload_scheduler_benchmark.py` measures the experimental query/write
-scheduler against an otherwise identical scheduler-disabled standalone server:
+scheduler against an otherwise identical scheduler-disabled standalone server.
+It consumes only normalized JSON from the Rust planner
+(``query_perf_fixture plan --case``); there is no Python-side TOML or default
+authority for runtime parameters.
+
+### Built-in case
+
+The default case is ``tests/perf/query_cases/workload_scheduler_2_8/case.toml``.
+It exercises four phases (query_only, write_only, light_write, saturated) with
+3 iterations of 60-second measurement windows preceded by 10-second warmup
+periods. The scheduler implements a fixed 2:8 query/write acceptance weight
+ratio (``catio`` pin ``ddcd3e9e5a5fdd1e58866ed4e6dbbc2062bae44a``). The
+scheduler uses stride-based and per-class FIFO ordering with work-conserving
+borrowing. **The benchmark does not verify FIFO ordering** — that requires
+latency-distribution analysis outside Phase A's scope.
+
+### Planner-driven CLI
 
 ```bash
 cargo build --release -p cmd --bin greptime
-python3 tests/perf/workload_scheduler_benchmark.py \
-  --output /tmp/greptime-workload-scheduler.json
+cargo build --release -p cmd --bin query_perf_fixture --features dev-tools
+
+uv run --no-project tests/perf/workload_scheduler_benchmark.py \
+  --fixture-generator target/release/query_perf_fixture \
+  --binary target/release/greptime \
+  --work-dir /tmp/ws-bench
 ```
 
-Each sample starts a fresh server and separate, equivalently seeded query and
-write tables. Baseline and scheduled modes are interleaved for three iterations,
-with four warmup seconds followed by eight measured seconds. The default
-4-worker workload covers query-only, write-only, light-write, and saturated
-phases. Client-to-response mean, p50, and p95 latency and successful request
-throughput are reported alongside scheduler poll shares. In
-`scheduled_vs_baseline_percent`, positive throughput is an improvement while
-positive latency is a regression.
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| ``--case`` | No | Built-in ``workload_scheduler_2_8/case.toml`` | Path to TOML case file |
+| ``--fixture-generator`` | Yes | — | Path to ``query_perf_fixture`` binary |
+| ``--binary`` | Yes | — | Path to ``greptime`` binary |
+| ``--work-dir`` | Yes | — | Working directory for artifacts and report |
+| ``--output`` | No | ``<work-dir>/report.json`` | Path for the JSON report |
+| ``--dry-run`` | No | — | Invoke planner, validate, print plan, exit 0 |
+| ``--no-gate`` | No | — | Diagnostic mode: run without evaluation gates |
+| ``--reuse-work-dir`` | No | — | Allow nonempty work-dir; creates fresh run subdirectory |
 
-Query and write requests do not represent equal work, so the raw sum of their
-request rates is not used as the overhead check. The report calibrates each
-iteration with its scheduler-disabled query-only and write-only capacities, then
-computes:
+#### ``--dry-run``
+
+Invokes the planner (``query_perf_fixture plan --case <case>``), validates the
+scenario kind is ``workload_scheduler``, and prints the deterministic execution
+matrix and configuration overlay plan. No server or process is created. No
+binary existence requirement. Exits 0 with status ``planned``.
+
+#### ``--no-gate`` (diagnostic)
+
+Runs the full A/B experiment but skips all request/mechanism/performance
+evaluation gates. The report is written with status ``passed`` and exit 0. Use
+for data collection or debugging.
+
+### Deterministic A/B interleaving
+
+Within each iteration, baseline and scheduled targets are ordered by ``(iteration_index + phase_index) % 2``:
+
+- **Even**: baseline → scheduled
+- **Odd**: scheduled → baseline
+
+Each sample starts a fresh standalone server with its own data directory, log
+directory, config, and ports. Nothing is shared across samples. The two targets
+differ only in the scheduler enable flag (scheduled receives the exact
+normalized 2:8 ``max_concurrent_polls`` limit from the case).
+
+### Artifact layout
+
+```
+<work-dir>/
+  report.json
+  runs/
+    iteration-01/
+      query_only/
+        baseline/
+          config.toml        # server configuration
+          process.log        # server stdout/stderr
+          sample.json        # phase result dictionary
+          requests.jsonl     # token-sorted terminal request events
+          metrics/
+            scrape-NNN.prom  # /metrics Prometheus text
+            scrapes.jsonl    # scrape metadata
+          data/              # standalone data home
+          logs/              # standalone logs
+        scheduled/
+          ...
+      write_only/
+        ...
+      light_write/
+        ...
+      saturated/
+        ...
+    iteration-02/
+    iteration-03/
+```
+
+``requests.jsonl`` contains immutable terminal ``RequestEvent`` records sorted
+by token. Both targets scrape ``/metrics`` identically at a 1-second interval.
+The benchmark does not discard any raw files.
+
+### Request and drain semantics
+
+Every measured request falls within ``[measurement_start, deadline)`` at
+submission time. Outstanding requests may complete during the drain window
+(``[deadline, deadline + drain_timeout)``). Completions after the drain deadline
+are treated as timeouts. A ``RequestWindow`` with thread-safe accounting and
+condition-based waiting governs admission and freeze. The runner produces a
+token-sorted immutable event list per workload.
+
+### Evaluation gates
+
+The report has unified sections: ``status``, ``exit_code``,
+``request_evaluation``, ``mechanism_evaluation``, ``performance_evaluations``,
+``samples``, ``artifacts``, and ``config``. Status precedence: ``error`` (exit 3)
+> ``invalid`` (exit 2) > ``failed`` (exit 1) > ``passed`` (exit 0). ``dry-run``
+and ``--no-gate`` exit 0. Missing check sections in gated mode may never exit 0.
+
+#### Request validity (every sample, every workload)
+
+1. At least one measured request started and completed.
+2. Failure fraction strictly below 1% (``gates.max_failure_rate``).
+3. No outstanding requests after drain.
+4. Raw ``requests`` count equals ``started`` count.
+5. Malformed or missing raw evidence ⇒ ``invalid`` status.
+
+#### Mechanism verification (scheduled targets only, last iteration)
+
+Run independently on each iteration's scheduled samples (no median pass):
+
+1. **All four phases** present with required scheduler metrics.
+2. **Exact expected scrape count** from plan.
+3. **Required metrics** (``polls``, ``queued``, ``active``) in every scrape.
+4. **No counter resets**.
+5. **Active polls** ≤ ``scheduler.max_concurrent_polls`` in every phase.
+6. **Single-class purity**: ``query_only`` query whole-window poll share ≥ 99%;
+   ``write_only`` write whole-window poll share ≥ 99%. Renamed from
+   ``single_class_borrowing`` to ``single_class_purity`` because it is not
+   proof of work conservation.
+7. **Light-write**: both query and write classes show poll progress; query
+   whole-window share strictly > 20%.
+8. **Saturated**: strict endpoint-positive dual-backlog interval fraction ≥ 80%;
+   each class dual-backlog polls ≥ 100; dual-backlog write share in **[0.78,
+   0.82]**. Whole-window saturated share is diagnostic only.
+
+   The 78–82% meaning: when both classes are continuously backlogged, the
+   scheduler should admit approximately 80% write polls. A share below 78% or
+   above 82% indicates the admission weights (2:8) are not being respected under
+   true contention.
+
+#### Performance (every paired iteration, worst is gate)
+
+Capacities are the scheduler-disabled ``query_only`` query successful RPS and
+``write_only`` write successful RPS from the same iteration. For each mixed
+phase compute:
 
 ```text
-capacity_normalized_work_rate =
-    query_rps / baseline_query_capacity
-    + write_rps / baseline_write_capacity
+normalized_rate = query_rps / query_capacity + write_rps / write_capacity
 ```
 
-The scheduled and baseline mixed samples are compared using the capacities from
-the same iteration. `paired_capacity_normalized.within_five_percent` verifies
-that every paired sample stays within the 5% regression budget; the top-level
-`verification` object combines that check with the saturated 80% write-poll
-share check. This normalization prevents a policy-driven shift between
-differently priced request types from being reported as scheduler overhead.
+Both baseline and scheduled samples are normalized against the same baseline
+capacities. Require every ``scheduled_vs_baseline`` change ≥ `-5%`
+(``max_capacity_normalized_regression_pct``). The **minimum** (worst) change
+across all phases and iterations is the gate; the median is reported for
+diagnostics. Latency is diagnostic only.
 
-The saturated defaults are calibrated to keep both classes runnable on a
-32-logical-CPU development host. Adjust `--query-workers` and `--write-workers`
-when the output's minimum write poll share shows that a different host did not
-reach saturation. `workload_scheduler_runner.py` is the shorter correctness
-runner for checking the 80/20 share and work-conserving borrowing against an
-already-running server.
+### Legacy verification removed
 
-When `max_concurrent_polls` is left at zero in GreptimeDB configuration, the
-scheduler uses four times `global_rt_size`. The benchmark resolves the same
-default explicitly. This keeps Tokio's worker queues fed while retaining a
-bounded admission window.
+The old ``saturation_verified``, ``>= 0.799``, and nullable pass logic from the
+first benchmark implementation have been removed. Report generation is now the
+sole gate authority.
+
+### Pure helper APIs
+
+Both ``workload_scheduler_report.py`` and the runner export pure functions and
+dataclasses that can be tested with synthetic dictionaries without file I/O or
+process execution. ``evaluate_scheduler_report``, ``evaluate_request_validity``,
+``evaluate_performance``, ``summarize_scheduler_metrics``,
+``validate_sample_artifacts``, and ``parse_scheduler_metrics`` operate solely on
+in-memory data.
+
+### Persisted evidence is authoritative
+
+The benchmark writes durable artifacts once per sample, then the report loads and
+validates from those persisted files:
+
+- **``requests.jsonl``**: token-sorted immutable terminal events, sorted
+  deterministically by ``(token, workload)``. Each event is uniquely identified
+  by ``(workload, token)``; tokens are unique within a phase across query and
+  write request windows. The runner validates uniqueness, terminal status,
+  workload, and counts against summaries.
+- **``scrapes.jsonl``**: one record per scheduled scrape offset with status,
+  HTTP status, raw body text, and .prom artifact path. The report cross-checks
+  sample summaries against persisted files.
+- **``sample.json``**: finalized only after the benchmark attaches iteration,
+  sample, phase, target/mode, actual artifact directory, and all summary metadata.
+  The runner writes this **after** ``run_phase`` returns so the sample dict
+  contains the ``mode`` and ``sample`` fields.
+
+A file-level ``artifacts`` index lists every collected artifact by its relative
+path. Completed samples require ``requests.jsonl``, ``scrapes.jsonl``,
+``scrape-NNN.prom``, and ``sample.json``. Missing required files produce a
+``missing_required`` entry that affects the report status — it is not warning-only.
+The artifact parser functions are pure; the benchmark calls them after loading
+persisted data.
+
+### Every-iteration gating
+
+Mechanism evaluation runs independently on each iteration's scheduled samples
+across all four phases. The aggregate status is computed by retaining **every**
+per-iteration evaluation. Any invalid/error/failure in any iteration propagates
+by precedence:
+
+1. Per-phase per-iteration scrape validation (exact expected count, unique ordered
+   offsets, status success, HTTP status, body/path present, required scheduler
+   metrics complete).
+2. Per-iteration mechanism gates using the configured thresholds.
+3. Performance evaluation: exactly one baseline and one scheduled sample for each
+   ``(iteration, phase)``. Finite numeric successful RPS required; positive
+   same-iteration baseline capacities required. ``iterations * phase_count``
+   paired normalized comparisons are built. Every pair uses the configured
+   ``max_regression_pct``; the worst gates, median is diagnostic. Missing/
+   malformed cell/capacity/change → invalid (never skipped or ``passed=True``
+   with ``None``).
+
+### Exact scrape count validation
+
+For every scheduled sample, the planner provides ``expected_scrape_count``
+(``= duration / scrape_interval + 1``). The report validates:
+
+- Exact ``expected_scrape_count`` scrape records present.
+- Scrape offsets are unique, ordered, and exactly match the planned
+  ``0, interval, ..., duration`` sequence.
+- Every scrape has status ``success``, no error, HTTP status < 400, and raw body
+  text and .prom artifact path present.
+- All required scheduler metrics (``polls``, ``queued``, ``active``) are complete
+  in every scrape snapshot.
+
+A missed or errored scrape makes the iteration invalid.
+
+### Reuse creates a fresh subtree
+
+When ``--reuse-work-dir`` is used with a nonempty work-dir, the benchmark creates
+a unique subdirectory ``runs/reuse-<microsecond_timestamp>/`` and writes all new
+samples under that subtree. All artifact indexing, sample paths, and report
+relative paths use the **actual** active run subtree or the saved ``artifact_dir``
+field — never a reconstructed path under the old root. The ``config`` section of
+the report includes ``reuse_subtree`` pointing to the fresh subtree.
+
+### Normalized case ownership
+
+The Rust ``query_perf_fixture plan --case`` subcommand owns all case defaults:
+iterations, timing, runtime sizes, scheduler parameters, targets (name and
+``scheduler_enabled``), data (shards, seed rows, timestamps), table names and
+partitions, query SQL, write batch size, phase configurations, and gate
+thresholds. The Python benchmark is a pure orchestrator consuming normalized
+JSON; it has no Python-side TOML or default authority for runtime parameters.
+
+Phases no longer accept a ``query_share_fraction`` field — it was removed as
+redundant. The explicit per-phase ``write_delay_seconds`` (set to 0.1 for
+light_write) owns pacing. The Rust planner validates all constraints and rejects
+any unknown or derived fields in TOML input.
+
+### Unchanged Phase A / Phase B limits
+
+This benchmark is a **local standalone Phase A** regression case. It does not
+deploy to Kubernetes, measure cluster throughput, or claim FIFO verification.
+Controlled Kubernetes conclusions (distributed scheduler isolation, resource
+pools, overcommit) are deferred to Phase B. Case, runner, planner, gate
+thresholds, and artifact format are considered Phase A scope; no Phase B
+requirements affect the current implementation.
+
+### Prior invalid results
+
+The earlier forced A/B benchmark produced invalid results because it ran on a
+heavily loaded host with full swap activity. Those results are not reproducible
+under the controlled ``--work-dir`` / per-sample isolation introduced here.
+
 
 ## Phase 1: direct readable SST fixtures
 

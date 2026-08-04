@@ -21,6 +21,7 @@ import argparse
 import os
 import re
 import subprocess
+import json
 from pathlib import Path
 
 
@@ -91,17 +92,28 @@ def append_step_summary(summary: Path) -> None:
         out.write(summary.read_text())
 
 
+def normalized_kind(args: argparse.Namespace, case_path: Path, fixture_generator: Path) -> str:
+    result = subprocess.run([str(fixture_generator), "plan", "--case", str(case_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        raise RuntimeError(f"query_perf_fixture plan failed for {case_path}: {result.stderr[-2000:]}")
+    plan = json.loads(result.stdout)
+    kind = plan.get("scenario", {}).get("kind")
+    if not isinstance(kind, str):
+        raise RuntimeError(f"normalized plan has no scenario kind for {case_path}")
+    return kind
+
+
 def run_case(args: argparse.Namespace, case_path: Path, work_dir: Path) -> int:
     target_dir = profile_dir(args.cargo_profile)
     base_bin = args.base_bin or args.base_src / "target" / target_dir / "greptime"
     candidate_bin = args.candidate_bin or args.candidate_src / "target" / target_dir / "greptime"
     fixture_generator = args.fixture_generator or args.candidate_src / "target" / target_dir / "query_perf_fixture"
+    kind = normalized_kind(args, case_path, fixture_generator)
+    runner = (args.candidate_src / "tests/perf/workload_scheduler_distributed_runner.py"
+              if kind == "workload_scheduler_distributed"
+              else args.candidate_src / "tests/perf/query_regression_runner.py")
     cmd = [
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        str(args.candidate_src / "tests/perf/query_regression_runner.py"),
+        "uv", "run", "--no-project", "python", str(runner),
         "--case",
         str(case_path),
         "--base-bin",
@@ -115,7 +127,15 @@ def run_case(args: argparse.Namespace, case_path: Path, work_dir: Path) -> int:
         "--http-timeout",
         str(args.http_timeout),
     ]
-    if parse_bool(args.allow_large_fixture):
+    if kind == "workload_scheduler_distributed":
+        if args.kube_context:
+            cmd.extend(["--context", args.kube_context])
+        cmd.extend(["--kubectl", args.kubectl, "--namespace-prefix", args.namespace_prefix, "--base-image", args.base_image])
+        if args.same_binary_ab:
+            cmd.append("--same-binary-ab")
+        if args.keep_namespace_on_failure:
+            cmd.append("--keep-namespace-on-failure")
+    elif parse_bool(args.allow_large_fixture):
         cmd.append("--allow-large-fixture")
 
     print(f"::group::Query regression case: {case_path}", flush=True)
@@ -173,6 +193,12 @@ def main() -> int:
     parser.add_argument("--base-ref", default=os.environ.get("BASE_REF", ""))
     parser.add_argument("--candidate-ref", default=os.environ.get("CANDIDATE_REF", ""))
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    parser.add_argument("--kubectl", default=os.environ.get("KUBECTL", "kubectl"))
+    parser.add_argument("--kube-context", default=os.environ.get("KUBE_CONTEXT"))
+    parser.add_argument("--namespace-prefix", default=os.environ.get("QUERY_REGRESSION_NAMESPACE_PREFIX", "query-regression-scheduler"))
+    parser.add_argument("--base-image", default=os.environ.get("QUERY_REGRESSION_BASE_IMAGE", "docker.io/greptime/greptime-tool:20250606-04e3c7d"))
+    parser.add_argument("--same-binary-ab", action="store_true", default=parse_bool(os.environ.get("SAME_BINARY_AB", "false")))
+    parser.add_argument("--keep-namespace-on-failure", action="store_true")
     args = parser.parse_args()
     try:
         cases = split_cases(args.cases or [os.environ.get("CASE_PATHS", "all")])

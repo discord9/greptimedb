@@ -161,7 +161,11 @@ def scenario(case: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("case requires [scenario] with kind = 'direct_readable_sst' or 'prom_remote_write_then_query'")
     kind = value.get("kind")
     if kind not in ("direct_readable_sst", "prom_remote_write_then_query"):
-        raise ValueError(f"unsupported scenario kind {kind!r}; supported: 'direct_readable_sst', 'prom_remote_write_then_query'")
+        raise ValueError(
+            f"unsupported scenario kind {kind!r}; "
+            "supported: 'direct_readable_sst', 'prom_remote_write_then_query'. "
+            "workload_scheduler is a separate benchmark, not a regression-runner scenario"
+        )
     return value
 
 

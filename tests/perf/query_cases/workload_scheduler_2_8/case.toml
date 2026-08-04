@@ -1,0 +1,87 @@
+[case]
+name = "workload_scheduler_2_8"
+description = "Local standalone A/B mechanism/overhead regression only"
+
+[scenario]
+kind = "workload_scheduler"
+database = "public"
+iterations = 3
+warmup_seconds = 10
+duration_seconds = 60
+drain_timeout_seconds = 30
+
+[scenario.runtime]
+global = 4
+compact = 1
+query = 4
+ingest = 4
+
+[scenario.scheduler]
+max_concurrent_polls = 16
+query_weight = 2
+write_weight = 8
+
+[[scenario.targets]]
+name = "baseline"
+scheduler_enabled = false
+
+[[scenario.targets]]
+name = "scheduled"
+scheduler_enabled = true
+
+[scenario.data]
+shards = 64
+seed_rows = 10000
+seed_batch_size = 500
+seed_timestamp_millis = 1700000000000
+write_sequence_start_millis = 1800000000000
+
+[scenario.tables.query]
+name = "catio_scheduler_query_load"
+partitions = 32
+
+[scenario.tables.write]
+name = "catio_scheduler_write_load"
+partitions = 64
+
+[scenario.query]
+sql = "SELECT count(*) FROM catio_scheduler_query_load WHERE ts > 0"
+
+[scenario.write]
+batch_size = 32
+
+[[scenario.phases]]
+name = "query_only"
+query_workers = 2
+write_workers = 0
+write_delay_seconds = 0
+
+[[scenario.phases]]
+name = "write_only"
+query_workers = 0
+write_workers = 1152
+write_delay_seconds = 0
+
+[[scenario.phases]]
+name = "light_write"
+query_workers = 2
+write_workers = 1
+write_delay_seconds = 0.1
+
+[[scenario.phases]]
+name = "saturated"
+query_workers = 2
+write_workers = 1152
+write_delay_seconds = 0
+
+[scenario.gates]
+max_failure_rate = 0.01
+max_outstanding_requests = 0
+dual_backlog_lower = 0.78
+dual_backlog_upper = 0.82
+min_dual_backlog_interval_fraction = 0.80
+min_dual_backlog_polls_per_class = 100
+min_single_class_active_purity = 0.99
+min_light_write_query_share = 0.20
+active_within_scheduler_limit = true
+max_capacity_normalized_regression_pct = 5.0
