@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "common-runtime-bin"
 path = "src/bin.rs"
 
+[[bin]]
+name = "workload-scheduler-micro-bench"
+path = "src/micro_bench.rs"
+
 [lints]
 workspace = true
 
