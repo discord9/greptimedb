@@ -37,7 +37,6 @@ use datafusion_expr::LogicalPlan;
 use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
 use snafu::{OptionExt, ResultExt, ensure};
 use snap::raw::{Decoder, Encoder};
-use table::TableRef;
 
 use crate::error::{self, Result};
 use crate::row_writer::{self, MultiTableData};
@@ -134,41 +133,6 @@ pub fn extract_schema_from_query(query: &Query) -> Option<String> {
             is_database_selection_label(&matcher.name) && matcher.r#type == MatcherType::Eq as i32
         })
         .map(|matcher| matcher.value.clone())
-}
-
-/// Resolve the timestamp and value column names used by a prometheus remote
-/// read against `table`.
-///
-/// This mirrors how the remote write path accommodates an existing table whose
-/// timestamp and single value column use names different from the process-wide
-/// defaults (`Inserter::get_alter_table_expr_on_demand` in
-/// `src/operator/src/insert.rs`): the timestamp is the table's time index
-/// column and the value is the table's single field column. It falls back to
-/// the default `greptime_timestamp`/`greptime_value` names when the table
-/// doesn't provide such columns.
-pub fn resolve_read_column_names(table: &TableRef) -> (String, String) {
-    let table_schema = table.schema();
-    let ts_col_name = table_schema
-        .timestamp_column()
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| greptime_timestamp().to_string());
-
-    let mut field_col_name = None;
-    let mut multiple_field_cols = false;
-    table.field_columns().for_each(|col| {
-        if field_col_name.is_none() {
-            field_col_name = Some(col.name.clone());
-        } else {
-            multiple_field_cols = true;
-        }
-    });
-    let value_col_name = if multiple_field_cols {
-        greptime_value().to_string()
-    } else {
-        field_col_name.unwrap_or_else(|| greptime_value().to_string())
-    };
-
-    (ts_col_name, value_col_name)
 }
 
 /// Create a DataFrame from a remote Query
@@ -1095,7 +1059,10 @@ mod tests {
         .unwrap();
 
         let table = MemTable::table("test", recordbatch);
-        let (ts_col_name, value_col_name) = resolve_read_column_names(&table);
+        // Column-name resolution for remote reads lives in the frontend
+        // (`resolve_column_names`, tested there); here we feed the resolved
+        // custom names through the servers-side planning and conversion paths.
+        let (ts_col_name, value_col_name) = ("ts".to_string(), "val".to_string());
         assert_eq!("ts", ts_col_name);
         assert_eq!("val", value_col_name);
 
