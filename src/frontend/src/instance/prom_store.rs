@@ -32,7 +32,7 @@ use common_catalog::{format_full_table_name, parse_optional_catalog_and_schema_f
 use common_error::ext::BoxedError;
 use common_meta::rpc::ddl::TriggerReason;
 use common_query::Output;
-use common_query::prelude::{GREPTIME_PHYSICAL_TABLE, greptime_value};
+use common_query::prelude::GREPTIME_PHYSICAL_TABLE;
 use common_recordbatch::RecordBatches;
 use common_telemetry::{debug, tracing};
 use operator::insert::{
@@ -54,13 +54,12 @@ use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
 use store_api::metric_engine_consts::{METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY};
 use store_api::mito_engine_options::SST_FORMAT_KEY;
-use table::TableRef;
 use table::table_reference::TableReference;
 use tracing::instrument;
 
 use crate::error::{
-    AmbiguousValueColumnSnafu, CatalogSnafu, ColumnNotFoundSnafu, ExecLogicalPlanSnafu,
-    PromStoreRemoteQueryPlanSnafu, ReadTableSnafu, Result, TableNotFoundSnafu,
+    CatalogSnafu, ExecLogicalPlanSnafu, PromStoreRemoteQueryPlanSnafu, ReadTableSnafu, Result,
+    TableNotFoundSnafu,
 };
 use crate::instance::Instance;
 
@@ -171,32 +170,6 @@ async fn to_query_result(
     })
 }
 
-fn resolve_column_names(table_name: &str, table: &TableRef) -> Result<String> {
-    let columns = table
-        .field_columns()
-        .map(|column| column.name)
-        .collect::<Vec<_>>();
-
-    match columns.as_slice() {
-        [] => ColumnNotFoundSnafu {
-            msg: format!("value field in table '{table_name}'"),
-        }
-        .fail(),
-
-        [only] => Ok(only.clone()),
-
-        columns if columns.iter().any(|name| name == greptime_value()) => {
-            Ok(greptime_value().to_string())
-        }
-
-        columns => AmbiguousValueColumnSnafu {
-            table_name: table_name.to_string(),
-            field_columns: columns.to_vec(),
-        }
-        .fail(),
-    }
-}
-
 impl Instance {
     #[tracing::instrument(skip_all)]
     async fn handle_remote_query(
@@ -216,16 +189,10 @@ impl Instance {
                 table_name: format_full_table_name(catalog_name, schema_name, table_name),
             })?;
 
-        let timestamp_column_name = table
-            .schema()
-            .timestamp_column()
-            .with_context(|| ColumnNotFoundSnafu {
-                msg: format!("time index in table '{table_name}'"),
-            })?
-            .name
-            .clone();
-
-        let value_column_name = resolve_column_names(table_name, &table)?;
+        // Resolve the actual timestamp and value column names from the table
+        // schema so that tables with custom column names are read correctly.
+        let (timestamp_column_name, value_column_name) =
+            prom_store::resolve_read_column_names(&table);
 
         let dataframe = self
             .query_engine

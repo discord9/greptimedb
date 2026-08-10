@@ -37,6 +37,7 @@ use datafusion_expr::LogicalPlan;
 use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
 use snafu::{OptionExt, ResultExt, ensure};
 use snap::raw::{Decoder, Encoder};
+use table::TableRef;
 
 use crate::error::{self, Result};
 use crate::row_writer::{self, MultiTableData};
@@ -133,6 +134,41 @@ pub fn extract_schema_from_query(query: &Query) -> Option<String> {
             is_database_selection_label(&matcher.name) && matcher.r#type == MatcherType::Eq as i32
         })
         .map(|matcher| matcher.value.clone())
+}
+
+/// Resolve the timestamp and value column names used by a prometheus remote
+/// read against `table`.
+///
+/// This mirrors how the remote write path accommodates an existing table whose
+/// timestamp and single value column use names different from the process-wide
+/// defaults (`Inserter::get_alter_table_expr_on_demand` in
+/// `src/operator/src/insert.rs`): the timestamp is the table's time index
+/// column and the value is the table's single field column. It falls back to
+/// the default `greptime_timestamp`/`greptime_value` names when the table
+/// doesn't provide such columns.
+pub fn resolve_read_column_names(table: &TableRef) -> (String, String) {
+    let table_schema = table.schema();
+    let ts_col_name = table_schema
+        .timestamp_column()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| greptime_timestamp().to_string());
+
+    let mut field_col_name = None;
+    let mut multiple_field_cols = false;
+    table.field_columns().for_each(|col| {
+        if field_col_name.is_none() {
+            field_col_name = Some(col.name.clone());
+        } else {
+            multiple_field_cols = true;
+        }
+    });
+    let value_col_name = if multiple_field_cols {
+        greptime_value().to_string()
+    } else {
+        field_col_name.unwrap_or_else(|| greptime_value().to_string())
+    };
+
+    (ts_col_name, value_col_name)
 }
 
 /// Create a DataFrame from a remote Query
@@ -1033,6 +1069,111 @@ mod tests {
             ],
             rows
         );
+    }
+
+    #[tokio::test]
+    async fn remote_read_honors_custom_timestamp_and_value_column_names() {
+        // A table whose timestamp and value columns use names different from
+        // the process-wide defaults, e.g. created by prometheus remote write
+        // into an existing table with `ts`/`val` columns.
+        let schema = Arc::new(Schema::new(vec![
+            ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                true,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("val", ConcreteDataType::float64_datatype(), true),
+        ]));
+        let recordbatch = RecordBatch::new(
+            schema,
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000])) as _,
+                Arc::new(Float64Vector::from_vec(vec![1.0, 2.0])) as _,
+            ],
+        )
+        .unwrap();
+
+        let table = MemTable::table("test", recordbatch);
+        let (ts_col_name, value_col_name) = resolve_read_column_names(&table);
+        assert_eq!("ts", ts_col_name);
+        assert_eq!("val", value_col_name);
+
+        let q = Query {
+            start_timestamp_ms: 1000,
+            end_timestamp_ms: 2000,
+            matchers: vec![LabelMatcher {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "test".to_string(),
+                r#type: EQ_TYPE,
+            }],
+            ..Default::default()
+        };
+
+        let ctx = SessionContext::new();
+        let table_provider = Arc::new(DfTableProviderAdapter::new(table));
+        let dataframe = ctx.read_table(table_provider).unwrap();
+        let plan = query_to_plan(dataframe, &q, &ts_col_name).unwrap();
+        let df = ctx.execute_logical_plan(plan).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let recordbatches = batches
+            .into_iter()
+            .map(|batch| {
+                let schema = Arc::new(Schema::try_from(batch.schema()).unwrap());
+                RecordBatch::from_df_record_batch(schema, batch)
+            })
+            .collect::<Vec<_>>();
+        let recordbatches =
+            RecordBatches::try_new(recordbatches[0].schema.clone(), recordbatches).unwrap();
+
+        let timeseries =
+            recordbatches_to_timeseries("test", &ts_col_name, &value_col_name, recordbatches)
+                .unwrap();
+        assert_eq!(1, timeseries.len());
+        assert_eq!(
+            vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "test".to_string(),
+            }],
+            timeseries[0].labels
+        );
+        assert_eq!(
+            vec![
+                Sample {
+                    value: 1.0,
+                    timestamp: 1000,
+                },
+                Sample {
+                    value: 2.0,
+                    timestamp: 2000,
+                },
+            ],
+            timeseries[0].samples
+        );
+
+        // A tag column must not be treated as the value column.
+        let schema_with_label = Arc::new(Schema::new(vec![
+            ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                true,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("val", ConcreteDataType::float64_datatype(), true),
+            ColumnSchema::new("instance", ConcreteDataType::string_datatype(), true),
+        ]));
+        let recordbatch_with_label = RecordBatch::new(
+            schema_with_label,
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1000])) as _,
+                Arc::new(Float64Vector::from_vec(vec![3.0])) as _,
+                Arc::new(StringVector::from(vec!["host1"])) as _,
+            ],
+        )
+        .unwrap();
+        let label_columns = label_columns(&recordbatch_with_label, "ts", "val").unwrap();
+        assert_eq!(1, label_columns.len());
+        assert_eq!("instance", label_columns[0].name);
     }
 
     #[test]
