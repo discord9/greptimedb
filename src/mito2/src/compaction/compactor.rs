@@ -445,6 +445,18 @@ impl SstMerger for DefaultSstMerger {
             .map(|f| f.meta_ref().sequence)
             .max()
             .flatten();
+        // The compaction output can only preserve per-row sequences when the
+        // region option is enabled AND every input file carries the
+        // preserved-sequence marker. Otherwise a legacy (unmarked) input would
+        // be laundered into a trusted output and exact sequence-range scans
+        // would silently skip or wrongly filter its normalized sequences.
+        let output_preserves_sequence = compaction_region
+            .region_options
+            .experimental_preserve_row_sequence
+            && output
+                .inputs
+                .iter()
+                .all(|f| f.meta_ref().preserve_row_sequence);
         let builder = CompactionSstReaderBuilder {
             metadata: compaction_region.region_metadata.clone(),
             sst_layer: compaction_region.access_layer.clone(),
@@ -474,6 +486,7 @@ impl SstMerger for DefaultSstMerger {
                     } else {
                         FormatType::PrimaryKey
                     },
+                    preserve_row_sequence: output_preserves_sequence,
                     index_options,
                     index_config,
                     inverted_index_config,
@@ -527,6 +540,7 @@ impl SstMerger for DefaultSstMerger {
                     num_series: sst_info.num_series,
                     primary_key_min,
                     primary_key_max,
+                    preserve_row_sequence: output_preserves_sequence,
                 }
             })
             .collect::<Vec<_>>();
