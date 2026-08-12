@@ -43,6 +43,10 @@ use common_meta::cache_invalidator::Context;
 use common_meta::ddl::create_flow::{
     DEFER_ON_MISSING_SOURCE_KEY, FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY, FlowType,
 };
+#[cfg(feature = "enterprise")]
+use common_meta::ddl::create_flow::{
+    INCREMENTAL_FLOW_KEY, INCREMENTAL_PERCENTILE_KEY, INCREMENTAL_RESULT_VIEW_KEY,
+};
 use common_meta::instruction::CacheIdent;
 #[cfg(feature = "enterprise")]
 use common_meta::key::TableMetadataManagerRef;
@@ -130,9 +134,15 @@ struct DdlSubmitOptions {
     timeout: Duration,
 }
 
-const ALLOWED_FLOW_OPTIONS: [&str; 2] = [
+const ALLOWED_FLOW_OPTIONS: &[&str] = &[
     DEFER_ON_MISSING_SOURCE_KEY,
     FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY,
+    #[cfg(feature = "enterprise")]
+    INCREMENTAL_FLOW_KEY,
+    #[cfg(feature = "enterprise")]
+    INCREMENTAL_RESULT_VIEW_KEY,
+    #[cfg(feature = "enterprise")]
+    INCREMENTAL_PERCENTILE_KEY,
 ];
 
 fn build_procedure_id_output(procedure_id: Vec<u8>) -> Result<Output> {
@@ -206,7 +216,7 @@ fn validate_and_normalize_flow_options(
         .fail();
     }
 
-    options
+    let normalized = options
         .into_iter()
         .map(|(key, value)| {
             if key == FlowType::FLOW_TYPE_KEY {
@@ -220,6 +230,13 @@ fn validate_and_normalize_flow_options(
                 DEFER_ON_MISSING_SOURCE_KEY | FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY => {
                     normalize_flow_bool_option(&key, &value)?
                 }
+                #[cfg(feature = "enterprise")]
+                INCREMENTAL_FLOW_KEY => normalize_flow_bool_option(&key, &value)?,
+                // Handler-private options are extracted by the enterprise
+                // `IncrementalFlowDdlManager` before the underlying flow is
+                // submitted; pass them through untouched here.
+                #[cfg(feature = "enterprise")]
+                INCREMENTAL_RESULT_VIEW_KEY | INCREMENTAL_PERCENTILE_KEY => value,
                 _ => {
                     return InvalidSqlSnafu {
                         err_msg: format!(
@@ -233,7 +250,24 @@ fn validate_and_normalize_flow_options(
 
             Ok((key, normalized_value))
         })
-        .collect()
+        .collect::<Result<HashMap<String, String>>>()?;
+
+    // Handler-private options are only meaningful for incremental flows.
+    #[cfg(feature = "enterprise")]
+    {
+        let is_incremental =
+            normalized.get(INCREMENTAL_FLOW_KEY).map(String::as_str) == Some("true");
+        for key in [INCREMENTAL_RESULT_VIEW_KEY, INCREMENTAL_PERCENTILE_KEY] {
+            if normalized.contains_key(key) && !is_incremental {
+                return InvalidSqlSnafu {
+                    err_msg: format!("flow option '{key}' requires incremental='true'"),
+                }
+                .fail();
+            }
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn determine_flow_type_for_source_state(
@@ -3268,6 +3302,110 @@ mod test {
         assert!(
             err.to_string()
                 .contains("invalid flow option 'defer_on_missing_source': 'not-a-bool'")
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "enterprise"))]
+    fn test_incremental_flow_option_rejected_in_non_enterprise_build() {
+        let err = validate_and_normalize_flow_options(
+            HashMap::from([("incremental".to_string(), "true".to_string())]),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unknown flow option 'incremental'")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_incremental_flow_option_accept_and_normalize() {
+        let options = HashMap::from([(INCREMENTAL_FLOW_KEY.to_string(), " TRUE ".to_string())]);
+
+        assert_eq!(
+            validate_and_normalize_flow_options(options, None).unwrap(),
+            HashMap::from([(INCREMENTAL_FLOW_KEY.to_string(), "true".to_string())])
+        );
+
+        let options = HashMap::from([(INCREMENTAL_FLOW_KEY.to_string(), "False".to_string())]);
+        assert_eq!(
+            validate_and_normalize_flow_options(options, None).unwrap(),
+            HashMap::from([(INCREMENTAL_FLOW_KEY.to_string(), "false".to_string())])
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_incremental_flow_option_invalid_bool_rejected() {
+        let err = validate_and_normalize_flow_options(
+            HashMap::from([(INCREMENTAL_FLOW_KEY.to_string(), "not-a-bool".to_string())]),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("invalid flow option 'incremental': 'not-a-bool'")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_flow_option_incremental_private_requires_incremental_true() {
+        // Private keys without `incremental` at all.
+        for key in [INCREMENTAL_RESULT_VIEW_KEY, INCREMENTAL_PERCENTILE_KEY] {
+            let err = validate_and_normalize_flow_options(
+                HashMap::from([(key.to_string(), "some_value".to_string())]),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("flow option '{key}' requires incremental='true'")),
+                "unexpected error for {key}: {err}"
+            );
+        }
+
+        // Private keys with `incremental=false`.
+        let err = validate_and_normalize_flow_options(
+            HashMap::from([
+                (INCREMENTAL_FLOW_KEY.to_string(), "false".to_string()),
+                (
+                    INCREMENTAL_RESULT_VIEW_KEY.to_string(),
+                    "sink_result".to_string(),
+                ),
+            ]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires incremental='true'"));
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_flow_option_incremental_private_options_accepted_with_incremental_true() {
+        let options = HashMap::from([
+            (INCREMENTAL_FLOW_KEY.to_string(), "true".to_string()),
+            (
+                INCREMENTAL_RESULT_VIEW_KEY.to_string(),
+                "sink_result".to_string(),
+            ),
+            (INCREMENTAL_PERCENTILE_KEY.to_string(), "0.99".to_string()),
+        ]);
+
+        assert_eq!(
+            validate_and_normalize_flow_options(options, None).unwrap(),
+            HashMap::from([
+                (INCREMENTAL_FLOW_KEY.to_string(), "true".to_string()),
+                (
+                    INCREMENTAL_RESULT_VIEW_KEY.to_string(),
+                    "sink_result".to_string(),
+                ),
+                (INCREMENTAL_PERCENTILE_KEY.to_string(), "0.99".to_string()),
+            ])
         );
     }
 

@@ -465,6 +465,33 @@ pub fn get_flow_type_from_options(flow_task: &CreateFlowTask) -> Result<FlowType
 /// The flow option key for creating pending flow metadata when source tables do not exist.
 pub const DEFER_ON_MISSING_SOURCE_KEY: &str = "defer_on_missing_source";
 
+/// The flow option key for creating an incremental flow.
+///
+/// Only accepted in enterprise builds; the option travels through
+/// `CreateFlowTask.flow_options` and is routed to the injected
+/// `IncrementalFlowDdlManager` hook in `DdlManager` instead of the regular
+/// `CreateFlowProcedure`.
+#[cfg(feature = "enterprise")]
+pub const INCREMENTAL_FLOW_KEY: &str = "incremental";
+
+/// Handler-private option consumed by the enterprise
+/// [`IncrementalFlowDdlManager`] before the underlying flow is submitted:
+/// the name of the finalize result view (default `<sink>_result`).
+///
+/// Only accepted in enterprise builds; the OSS layers pass it through
+/// untouched.
+#[cfg(feature = "enterprise")]
+pub const INCREMENTAL_RESULT_VIEW_KEY: &str = "incremental_result_view";
+
+/// Handler-private option consumed by the enterprise
+/// [`IncrementalFlowDdlManager`]: the percentile queried from the UDDSketch
+/// state via `uddsketch_calc` (default `0.99`).
+///
+/// Only accepted in enterprise builds; the OSS layers pass it through
+/// untouched.
+#[cfg(feature = "enterprise")]
+pub const INCREMENTAL_PERCENTILE_KEY: &str = "incremental_percentile";
+
 /// Internal transient key used to pass the serialized `FlowScheduleConfig` from
 /// meta to flownode through `CreateRequest.flow_options`. This key must never
 /// be accepted as a user-provided option and must never be persisted into
@@ -504,6 +531,24 @@ pub fn defer_on_missing_source(flow_task: &CreateFlowTask) -> Result<bool> {
         .map(|value| value.unwrap_or(false))
 }
 
+/// Parses a flow option value as a strict boolean.
+///
+/// Accepts only `true` or `false` (case-insensitive, surrounding whitespace
+/// trimmed); any other value is rejected.
+#[cfg(feature = "enterprise")]
+pub fn parse_flow_bool_option(key: &str, value: &str) -> Result<bool> {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .parse::<bool>()
+        .map_err(|_| {
+            error::UnexpectedSnafu {
+                err_msg: format!("Invalid flow option '{key}': {value}"),
+            }
+            .build()
+        })
+}
+
 pub fn validate_flow_options(flow_task: &CreateFlowTask) -> Result<()> {
     // Reject non-positive eval_interval_secs (zero or negative).
     if let Some(secs) = flow_task.eval_interval_secs
@@ -520,6 +565,8 @@ pub fn validate_flow_options(flow_task: &CreateFlowTask) -> Result<()> {
             DEFER_ON_MISSING_SOURCE_KEY
             | FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY
             | FlowType::FLOW_TYPE_KEY => {}
+            #[cfg(feature = "enterprise")]
+            INCREMENTAL_FLOW_KEY | INCREMENTAL_RESULT_VIEW_KEY | INCREMENTAL_PERCENTILE_KEY => {}
             unknown => {
                 return UnexpectedSnafu {
                     err_msg: format!(
@@ -533,6 +580,22 @@ pub fn validate_flow_options(flow_task: &CreateFlowTask) -> Result<()> {
 
     defer_on_missing_source(flow_task)?;
     get_flow_type_from_options(flow_task)?;
+    #[cfg(feature = "enterprise")]
+    {
+        let is_incremental = match flow_task.flow_options.get(INCREMENTAL_FLOW_KEY) {
+            Some(value) => parse_flow_bool_option(INCREMENTAL_FLOW_KEY, value)?,
+            None => false,
+        };
+        // Handler-private options are only meaningful for incremental flows.
+        for key in [INCREMENTAL_RESULT_VIEW_KEY, INCREMENTAL_PERCENTILE_KEY] {
+            if flow_task.flow_options.contains_key(key) && !is_incremental {
+                return UnexpectedSnafu {
+                    err_msg: format!("flow option '{key}' requires incremental='true'"),
+                }
+                .fail();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -837,5 +900,139 @@ impl From<&CreateFlowData> for (FlowInfoValue, Vec<(FlowPartitionId, FlowRouteVa
         };
 
         (flow_info, flow_routes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use table::table_name::TableName;
+
+    use super::validate_flow_options;
+    #[cfg(feature = "enterprise")]
+    use super::{
+        INCREMENTAL_FLOW_KEY, INCREMENTAL_PERCENTILE_KEY, INCREMENTAL_RESULT_VIEW_KEY,
+        parse_flow_bool_option,
+    };
+    use crate::rpc::ddl::CreateFlowTask;
+
+    fn test_create_flow_task() -> CreateFlowTask {
+        CreateFlowTask {
+            catalog_name: "greptime".to_string(),
+            flow_name: "flow".to_string(),
+            source_table_names: vec![],
+            sink_table_name: TableName::new("greptime", "public", "sink"),
+            or_replace: false,
+            create_if_not_exists: false,
+            expire_after: None,
+            eval_interval_secs: None,
+            comment: String::new(),
+            sql: "select 1".to_string(),
+            flow_options: HashMap::new(),
+            eval_schedule: None,
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "enterprise"))]
+    fn test_validate_flow_options_rejects_incremental_in_non_enterprise_build() {
+        let mut task = test_create_flow_task();
+        task.flow_options
+            .insert("incremental".to_string(), "true".to_string());
+
+        let err = validate_flow_options(&task).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown flow option 'incremental'")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_validate_flow_options_accepts_incremental_in_enterprise_build() {
+        for value in ["true", "false"] {
+            let mut task = test_create_flow_task();
+            task.flow_options
+                .insert(INCREMENTAL_FLOW_KEY.to_string(), value.to_string());
+            validate_flow_options(&task).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_validate_flow_options_rejects_invalid_incremental_bool() {
+        let mut task = test_create_flow_task();
+        task.flow_options
+            .insert(INCREMENTAL_FLOW_KEY.to_string(), "not-a-bool".to_string());
+
+        let err = validate_flow_options(&task).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid flow option 'incremental': not-a-bool")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_validate_flow_options_rejects_private_option_without_incremental_true() {
+        for (key, value) in [
+            (INCREMENTAL_RESULT_VIEW_KEY, "sink_result"),
+            (INCREMENTAL_PERCENTILE_KEY, "0.99"),
+        ] {
+            // Private key without `incremental` at all.
+            let mut task = test_create_flow_task();
+            task.flow_options.insert(key.to_string(), value.to_string());
+            let err = validate_flow_options(&task).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("flow option '{key}' requires incremental='true'")),
+                "unexpected error for {key}: {err}"
+            );
+
+            // Private key with `incremental=false`.
+            let mut task = test_create_flow_task();
+            task.flow_options
+                .insert(INCREMENTAL_FLOW_KEY.to_string(), "false".to_string());
+            task.flow_options.insert(key.to_string(), value.to_string());
+            let err = validate_flow_options(&task).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("flow option '{key}' requires incremental='true'")),
+                "unexpected error for {key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_validate_flow_options_accepts_private_option_with_incremental_true() {
+        let mut task = test_create_flow_task();
+        task.flow_options
+            .insert(INCREMENTAL_FLOW_KEY.to_string(), "true".to_string());
+        task.flow_options.insert(
+            INCREMENTAL_RESULT_VIEW_KEY.to_string(),
+            "sink_result".to_string(),
+        );
+        task.flow_options
+            .insert(INCREMENTAL_PERCENTILE_KEY.to_string(), "0.99".to_string());
+        validate_flow_options(&task).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn test_parse_flow_bool_option_strict() {
+        assert!(parse_flow_bool_option("incremental", "true").unwrap());
+        assert!(parse_flow_bool_option("incremental", " TRUE ").unwrap());
+        assert!(!parse_flow_bool_option("incremental", "false").unwrap());
+
+        for value in ["1", "0", "yes", "no", "on", "not-a-bool", ""] {
+            let err = parse_flow_bool_option("incremental", value).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid flow option 'incremental'"),
+                "expected {value:?} to be rejected, got {err}"
+            );
+        }
     }
 }
