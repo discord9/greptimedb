@@ -91,6 +91,9 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
 
     let mut measurements = Vec::new();
     let mut query_measurements = Vec::new();
+    // Fairness-gate entries (`min_write_poll_share`) collected per target and
+    // merged into the report thresholds so they feed the final failed verdict.
+    let mut scheduler_poll_share_checks = Vec::new();
     for target_name in ["base", "candidate"] {
         let binary = if target_name == "base" {
             args.base_bin.clone()
@@ -197,11 +200,22 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
         }
         if let Some(mix) = mix {
             target_report["mix"] = serde_json::to_value(mix)?;
-            target_report["scheduler_poll_deltas"] =
-                match (&scheduler_polls_after, &scheduler_polls_before) {
-                    (Some(after), Some(before)) => scheduler_poll_deltas(after, before),
-                    _ => json!({"status": "planned"}),
-                };
+            match (&scheduler_polls_after, &scheduler_polls_before) {
+                (Some(after), Some(before)) => {
+                    let poll_deltas = scheduler_poll_deltas(after, before);
+                    target_report["scheduler_poll_deltas"] = poll_deltas.clone();
+                    // Fairness gate: the candidate's write poll share must not
+                    // fall below min_write_poll_share, or write polls are
+                    // considered starved by query polls and the run fails.
+                    if let Some(share_report) =
+                        scheduler_poll_share_report(target_name, scheduler.as_ref(), &poll_deltas)
+                    {
+                        target_report["scheduler_poll_share"] = share_report.clone();
+                        scheduler_poll_share_checks.push(share_report);
+                    }
+                }
+                _ => target_report["scheduler_poll_deltas"] = json!({"status": "planned"}),
+            }
         }
         let flushes_ok = target_report["flushes"].as_array().is_some_and(|flushes| {
             flushes
@@ -265,7 +279,7 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
         target.stop_all();
     }
 
-    let thresholds = if args.dry_run {
+    let mut thresholds = if args.dry_run {
         let mut planned = planned_write_throughput_thresholds(&write_measure);
         if let Some(mix) = &write_measure.mix {
             planned.extend(planned_mix_query_thresholds(mix));
@@ -283,6 +297,9 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
         }
         enforced
     };
+    // Dry runs scrape no scheduler polls, so `scheduler_poll_share_checks` is
+    // empty there; real runs merge the per-target fairness entries in.
+    thresholds.extend(scheduler_poll_share_checks);
     report["thresholds"] = json!(thresholds);
     let failed = report["thresholds"]
         .as_array()
@@ -1358,6 +1375,82 @@ fn scheduler_poll_deltas(after: &Value, before: &Value) -> Value {
     Value::Object(result)
 }
 
+/// Fairness gate for the mixed read/write measurement: the scheduler-enabled
+/// target's write polls must keep at least `min_write_poll_share` of all
+/// admitted scheduler polls, otherwise the write path is considered starved by
+/// query polls and the run fails.
+///
+/// Only applies to the scheduler-enabled target (`candidate`) when the case
+/// sets `min_write_poll_share > 0.0`; every other combination (no scheduler
+/// section, base target, disabled gate) yields `None` and no report entry.
+///
+/// The share is `write_delta / (write_delta + query_delta)` from the already
+/// scraped poll deltas. When the deltas cannot be verified the entry reports
+/// `status = "skipped"` instead of failing — the run is never failed on
+/// unverifiable data:
+/// - a null delta (counter missing in either snapshot or reset) means the
+///   share is unknown;
+/// - a zero total (no poll activity at all) makes the share undefined.
+fn scheduler_poll_share_report(
+    target_name: &str,
+    scheduler: Option<&crate::query_regression_runner::model::WorkloadSchedulerConfig>,
+    deltas: &Value,
+) -> Option<Value> {
+    let scheduler = scheduler?;
+    let min_share = scheduler.min_write_poll_share;
+    if target_name != "candidate" || min_share <= 0.0 {
+        return None;
+    }
+    let Some(write_delta) = deltas.get("write").and_then(Value::as_u64) else {
+        return Some(json!({
+            "target": target_name,
+            "threshold": "min_write_poll_share",
+            "status": "skipped",
+            "reason": "write poll delta unavailable",
+            "limit": min_share,
+        }));
+    };
+    let Some(query_delta) = deltas.get("query").and_then(Value::as_u64) else {
+        return Some(json!({
+            "target": target_name,
+            "threshold": "min_write_poll_share",
+            "status": "skipped",
+            "reason": "query poll delta unavailable",
+            "limit": min_share,
+        }));
+    };
+    let total = write_delta as u128 + query_delta as u128;
+    if total == 0 {
+        return Some(json!({
+            "target": target_name,
+            "threshold": "min_write_poll_share",
+            "status": "skipped",
+            "reason": "no scheduler poll activity (write and query deltas are both zero)",
+            "write_delta": write_delta,
+            "query_delta": query_delta,
+            "limit": min_share,
+        }));
+    }
+    let write_share = write_delta as f64 / total as f64;
+    let passed = write_share >= min_share;
+    let mut report = json!({
+        "target": target_name,
+        "threshold": "min_write_poll_share",
+        "status": if passed { "passed" } else { "failed" },
+        "actual_share": write_share,
+        "write_delta": write_delta,
+        "query_delta": query_delta,
+        "limit": min_share,
+    });
+    if !passed {
+        report["message"] = json!(format!(
+            "write poll share {:.2} below min {:.2}",
+            write_share, min_share
+        ));
+    }
+    Some(report)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1731,6 +1824,7 @@ mod tests {
             max_concurrent_polls: 16,
             query_weight: 2,
             write_weight: 8,
+            min_write_poll_share: 0.0,
         };
         let base_env = scheduler_env(false, Some(&scheduler)).unwrap();
         assert_eq!(
@@ -1771,6 +1865,7 @@ mod tests {
             max_concurrent_polls: 16,
             query_weight: 2,
             write_weight: 8,
+            min_write_poll_share: 0.0,
         };
         assert_eq!(
             scheduler_report_entry("base", Some(&scheduler)),
@@ -2015,6 +2110,83 @@ mod tests {
             scheduler_poll_deltas(&after, &before),
             json!({ "query": Value::Null, "write": Value::Null })
         );
+    }
+
+    fn share_scheduler(min_write_poll_share: f64) -> WorkloadSchedulerConfig {
+        WorkloadSchedulerConfig {
+            enable: false,
+            max_concurrent_polls: 16,
+            query_weight: 2,
+            write_weight: 8,
+            min_write_poll_share,
+        }
+    }
+
+    #[test]
+    fn scheduler_poll_share_ignored_when_not_applicable() {
+        let scheduler = share_scheduler(0.5);
+        let deltas = json!({ "query": 50, "write": 50 });
+        // Base target never runs with the scheduler enabled.
+        assert!(scheduler_poll_share_report("base", Some(&scheduler), &deltas).is_none());
+        // No scheduler section at all.
+        assert!(scheduler_poll_share_report("candidate", None, &deltas).is_none());
+        // Gate disabled (min_write_poll_share == 0.0).
+        assert!(
+            scheduler_poll_share_report("candidate", Some(&share_scheduler(0.0)), &deltas)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scheduler_poll_share_skips_when_unverifiable() {
+        let scheduler = share_scheduler(0.5);
+        // No poll activity at all: the share is undefined, so skip instead of
+        // failing (nothing can be starved when nothing ran).
+        let report = scheduler_poll_share_report(
+            "candidate",
+            Some(&scheduler),
+            &json!({ "query": 0, "write": 0 }),
+        )
+        .unwrap();
+        assert_eq!(report["status"], "skipped");
+        assert_eq!(report["threshold"], "min_write_poll_share");
+        // Missing/reset write counter: delta unknown, skip.
+        let report = scheduler_poll_share_report(
+            "candidate",
+            Some(&scheduler),
+            &json!({ "query": 80, "write": Value::Null }),
+        )
+        .unwrap();
+        assert_eq!(report["status"], "skipped");
+    }
+
+    #[test]
+    fn scheduler_poll_share_passes_at_or_above_minimum() {
+        let scheduler = share_scheduler(0.5);
+        let report = scheduler_poll_share_report(
+            "candidate",
+            Some(&scheduler),
+            &json!({ "query": 50, "write": 50 }),
+        )
+        .unwrap();
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["actual_share"], 0.5);
+        assert_eq!(report["limit"], 0.5);
+    }
+
+    #[test]
+    fn scheduler_poll_share_fails_below_minimum() {
+        let scheduler = share_scheduler(0.5);
+        let report = scheduler_poll_share_report(
+            "candidate",
+            Some(&scheduler),
+            &json!({ "query": 58, "write": 42 }),
+        )
+        .unwrap();
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["message"], "write poll share 0.42 below min 0.50");
+        assert_eq!(report["write_delta"], 42);
+        assert_eq!(report["query_delta"], 58);
     }
 
     #[test]
