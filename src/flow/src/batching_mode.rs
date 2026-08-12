@@ -30,6 +30,23 @@ mod task;
 mod time_window;
 pub(crate) mod utils;
 
+/// Incremental read mode for a batching flow.
+///
+/// Serialized in configuration as `memtable_only` (default) or
+/// `sequence_range`, mirroring the flow option values of
+/// [`common_meta::ddl::create_flow::FLOW_INCREMENTAL_MODE_KEY`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncrementalMode {
+    /// Historical incremental delta: read only memtables newer than the
+    /// checkpoint, skipping SSTs entirely.
+    #[default]
+    MemtableOnly,
+    /// Exact row-level sequence delta `(C, H]` across memtables and all SST
+    /// files.
+    SequenceRange,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchingModeOptions {
     /// The default batching engine query timeout is 10 minutes
@@ -59,6 +76,11 @@ pub struct BatchingModeOptions {
     ///
     /// When disabled, batching flows always execute full-snapshot queries.
     pub experimental_enable_incremental_read: bool,
+    /// Incremental read mode for this flow: `memtable_only` (default) or
+    /// `sequence_range`. Can be overridden per flow with the
+    /// `experimental_incremental_mode` flow option; see
+    /// [`common_meta::ddl::create_flow::FLOW_INCREMENTAL_MODE_KEY`].
+    pub experimental_incremental_mode: IncrementalMode,
     /// Read preference of the Frontend client.
     pub read_preference: ReadPreference,
     /// TLS option for client connections to frontends.
@@ -77,8 +99,42 @@ impl Default for BatchingModeOptions {
             experimental_max_filter_num_per_query: 20,
             experimental_time_window_merge_threshold: 3,
             experimental_enable_incremental_read: false,
+            experimental_incremental_mode: IncrementalMode::default(),
             read_preference: Default::default(),
             frontend_tls: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IncrementalMode;
+
+    #[test]
+    fn test_incremental_mode_serde_roundtrip() {
+        assert_eq!(
+            serde_json::to_string(&IncrementalMode::MemtableOnly).unwrap(),
+            "\"memtable_only\""
+        );
+        assert_eq!(
+            serde_json::from_str::<IncrementalMode>("\"memtable_only\"").unwrap(),
+            IncrementalMode::MemtableOnly
+        );
+        assert_eq!(
+            serde_json::to_string(&IncrementalMode::SequenceRange).unwrap(),
+            "\"sequence_range\""
+        );
+        assert_eq!(
+            serde_json::from_str::<IncrementalMode>("\"sequence_range\"").unwrap(),
+            IncrementalMode::SequenceRange
+        );
+    }
+
+    #[test]
+    fn test_incremental_mode_rejects_unknown_value() {
+        // The old (wrong) lowercase spelling must no longer deserialize.
+        assert!(serde_json::from_str::<IncrementalMode>("\"memtableonly\"").is_err());
+        assert!(serde_json::from_str::<IncrementalMode>("\"sequencerange\"").is_err());
+        assert!(serde_json::from_str::<IncrementalMode>("\"foo\"").is_err());
     }
 }

@@ -41,7 +41,8 @@ use common_error::ext::BoxedError;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::cache_invalidator::Context;
 use common_meta::ddl::create_flow::{
-    DEFER_ON_MISSING_SOURCE_KEY, FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY, FlowType,
+    DEFER_ON_MISSING_SOURCE_KEY, FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY,
+    FLOW_INCREMENTAL_MODE_KEY, FlowType,
 };
 use common_meta::instruction::CacheIdent;
 #[cfg(feature = "enterprise")]
@@ -130,9 +131,10 @@ struct DdlSubmitOptions {
     timeout: Duration,
 }
 
-const ALLOWED_FLOW_OPTIONS: [&str; 2] = [
+const ALLOWED_FLOW_OPTIONS: [&str; 3] = [
     DEFER_ON_MISSING_SOURCE_KEY,
     FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY,
+    FLOW_INCREMENTAL_MODE_KEY,
 ];
 
 fn build_procedure_id_output(procedure_id: Vec<u8>) -> Result<Output> {
@@ -220,6 +222,10 @@ fn validate_and_normalize_flow_options(
                 DEFER_ON_MISSING_SOURCE_KEY | FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY => {
                     normalize_flow_bool_option(&key, &value)?
                 }
+                // `experimental_incremental_mode` is a non-boolean enum-ish
+                // value (memtable_only | sequence_range); pass it through
+                // untouched — the flow crate validates it strictly.
+                FLOW_INCREMENTAL_MODE_KEY => value,
                 _ => {
                     return InvalidSqlSnafu {
                         err_msg: format!(
