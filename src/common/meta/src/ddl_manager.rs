@@ -36,6 +36,10 @@ use crate::ddl::alter_table::{AlterTableProcedure, RegionRouteChanged, only_enab
 use crate::ddl::comment_on::CommentOnProcedure;
 use crate::ddl::create_database::{CreateDatabaseMetadataCommitterRef, CreateDatabaseProcedure};
 use crate::ddl::create_flow::CreateFlowProcedure;
+#[cfg(feature = "enterprise")]
+use crate::ddl::create_flow::{
+    INCREMENTAL_FLOW_KEY, parse_flow_bool_option, validate_flow_options,
+};
 use crate::ddl::create_logical_tables::CreateLogicalTablesProcedure;
 use crate::ddl::create_table::CreateTableProcedure;
 use crate::ddl::create_view::CreateViewProcedure;
@@ -109,6 +113,8 @@ pub struct DdlManager {
     repartition_procedure_factory: RepartitionProcedureFactoryRef,
     #[cfg(feature = "enterprise")]
     trigger_ddl_manager: Option<TriggerDdlManagerRef>,
+    #[cfg(feature = "enterprise")]
+    incremental_flow_ddl_manager: Option<IncrementalFlowDdlManagerRef>,
 }
 
 /// This trait is responsible for handling DDL tasks about triggers. e.g.,
@@ -137,6 +143,25 @@ pub trait TriggerDdlManager: Send + Sync {
 
 #[cfg(feature = "enterprise")]
 pub type TriggerDdlManagerRef = Arc<dyn TriggerDdlManager>;
+
+/// This trait is responsible for handling DDL tasks about incremental flows.
+/// e.g., create incremental flow, etc.
+#[cfg(feature = "enterprise")]
+#[async_trait::async_trait]
+pub trait IncrementalFlowDdlManager: Send + Sync {
+    async fn create_incremental_flow(
+        &self,
+        create_flow_task: CreateFlowTask,
+        procedure_manager: ProcedureManagerRef,
+        ddl_context: DdlContext,
+        query_context: QueryContext,
+    ) -> Result<SubmitDdlTaskResponse>;
+
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+#[cfg(feature = "enterprise")]
+pub type IncrementalFlowDdlManagerRef = Arc<dyn IncrementalFlowDdlManager>;
 
 macro_rules! procedure_loader_entry {
     ($procedure:ident) => {
@@ -232,12 +257,23 @@ impl DdlManager {
             repartition_procedure_factory,
             #[cfg(feature = "enterprise")]
             trigger_ddl_manager: None,
+            #[cfg(feature = "enterprise")]
+            incremental_flow_ddl_manager: None,
         }
     }
 
     #[cfg(feature = "enterprise")]
     pub fn with_trigger_ddl_manager(mut self, trigger_ddl_manager: TriggerDdlManagerRef) -> Self {
         self.trigger_ddl_manager = Some(trigger_ddl_manager);
+        self
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub fn with_incremental_flow_ddl_manager(
+        mut self,
+        incremental_flow_ddl_manager: IncrementalFlowDdlManagerRef,
+    ) -> Self {
+        self.incremental_flow_ddl_manager = Some(incremental_flow_ddl_manager);
         self
     }
 
@@ -1295,6 +1331,39 @@ async fn handle_create_flow_task(
     query_context: QueryContext,
     event_context: PersistentEventContext,
 ) -> Result<SubmitDdlTaskResponse> {
+    #[cfg(feature = "enterprise")]
+    if let Some(value) = create_flow_task.flow_options.get(INCREMENTAL_FLOW_KEY) {
+        let is_incremental = parse_flow_bool_option(INCREMENTAL_FLOW_KEY, value)?;
+        if is_incremental {
+            // Direct DDL submissions bypass the operator layer, so validate and
+            // canonicalize the options here before handing the task to the
+            // injected handler.
+            validate_flow_options(&create_flow_task)?;
+            let mut create_flow_task = create_flow_task;
+            create_flow_task
+                .flow_options
+                .insert(INCREMENTAL_FLOW_KEY.to_string(), is_incremental.to_string());
+
+            let Some(m) = ddl_manager.incremental_flow_ddl_manager.as_ref() else {
+                use crate::error::UnsupportedSnafu;
+
+                return UnsupportedSnafu {
+                    operation: "create incremental flow",
+                }
+                .fail();
+            };
+
+            return m
+                .create_incremental_flow(
+                    create_flow_task,
+                    ddl_manager.procedure_manager.clone(),
+                    ddl_manager.ddl_context.clone(),
+                    query_context,
+                )
+                .await;
+        }
+    }
+
     let (id, output) = ddl_manager
         .submit_create_flow_task(create_flow_task.clone(), query_context, event_context)
         .await?;
@@ -1438,7 +1507,12 @@ async fn handle_comment_on_task(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
+    #[cfg(feature = "enterprise")]
+    use std::sync::Mutex;
+    #[cfg(feature = "enterprise")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use common_error::ext::BoxedError;
@@ -1448,37 +1522,51 @@ mod tests {
     use common_error::status_code::StatusCode;
     use common_procedure::local::LocalManager;
     use common_procedure::test_util::InMemoryPoisonStore;
-    use common_procedure::{BoxedProcedure, ProcedureManagerRef};
+    use common_procedure::{BoxedProcedure, ProcedureManager, ProcedureManagerRef};
     use store_api::storage::TableId;
     use table::table_name::TableName;
 
     use super::DdlManager;
+    #[cfg(feature = "enterprise")]
+    use super::{IncrementalFlowDdlManager, IncrementalFlowDdlManagerRef};
     use crate::cache_invalidator::DummyCacheInvalidator;
     use crate::ddl::alter_table::AlterTableProcedure;
     use crate::ddl::create_database::{
         AtomicCreateOutcome, CreateDatabaseMetadataCommitter, CreateDatabaseProcedure,
     };
+    #[cfg(feature = "enterprise")]
+    use crate::ddl::create_flow::INCREMENTAL_FLOW_KEY;
     use crate::ddl::create_table::CreateTableProcedure;
     use crate::ddl::drop_table::DropTableProcedure;
     use crate::ddl::flow_meta::FlowMetadataAllocator;
     use crate::ddl::table_meta::TableMetadataAllocator;
+    #[cfg(feature = "enterprise")]
+    use crate::ddl::test_util::flownode_handler::NaiveFlownodeHandler;
     use crate::ddl::truncate_table::TruncateTableProcedure;
     use crate::ddl::{DdlContext, NoopRegionFailureDetectorControl};
     use crate::ddl_manager::{RepartitionProcedureFactory, RepartitionSource};
+    #[cfg(feature = "enterprise")]
+    use crate::error::Result as MetaResult;
     use crate::key::TableMetadataManager;
     use crate::key::flow::FlowMetadataManager;
     use crate::kv_backend::memory::MemoryKvBackend;
     use crate::node_manager::{DatanodeManager, DatanodeRef, FlownodeManager, FlownodeRef};
     use crate::peer::Peer;
-    #[cfg(not(feature = "enterprise"))]
     use crate::procedure_executor::ExecutorContext;
     use crate::region_keeper::MemoryRegionKeeper;
     use crate::region_registry::LeaderRegionRegistry;
-    use crate::rpc::ddl::{CreatorGrantIntent, PersistentEventContext, UndropTableTask};
     #[cfg(not(feature = "enterprise"))]
-    use crate::rpc::ddl::{DdlTask, PurgeDroppedTableTask, QueryContext, SubmitDdlTaskRequest};
+    use crate::rpc::ddl::PurgeDroppedTableTask;
+    #[cfg(feature = "enterprise")]
+    use crate::rpc::ddl::{CreateFlowTask, SubmitDdlTaskResponse};
+    use crate::rpc::ddl::{
+        CreatorGrantIntent, DdlTask, PersistentEventContext, QueryContext, SubmitDdlTaskRequest,
+        UndropTableTask,
+    };
     use crate::sequence::SequenceBuilder;
     use crate::state_store::KvStateStore;
+    #[cfg(feature = "enterprise")]
+    use crate::test_util::MockFlownodeManager;
     use crate::test_util::{MockDatanodeManager, new_ddl_context};
     use crate::wal_provider::WalProvider;
 
@@ -1737,5 +1825,154 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, crate::error::Error::Unsupported { .. }));
         }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[derive(Default)]
+    struct MockIncrementalFlowDdlManager {
+        calls: Arc<AtomicUsize>,
+        last_task: Arc<Mutex<Option<CreateFlowTask>>>,
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[async_trait::async_trait]
+    impl IncrementalFlowDdlManager for MockIncrementalFlowDdlManager {
+        async fn create_incremental_flow(
+            &self,
+            create_flow_task: CreateFlowTask,
+            _procedure_manager: ProcedureManagerRef,
+            _ddl_context: DdlContext,
+            _query_context: QueryContext,
+        ) -> MetaResult<SubmitDdlTaskResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_task.lock().unwrap() = Some(create_flow_task);
+            Ok(SubmitDdlTaskResponse::default())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn incremental_flow_test_task(or_replace: bool, create_if_not_exists: bool) -> CreateFlowTask {
+        CreateFlowTask {
+            catalog_name: "greptime".to_string(),
+            flow_name: "incremental_flow".to_string(),
+            source_table_names: vec![],
+            sink_table_name: TableName::new("greptime", "public", "sink"),
+            or_replace,
+            create_if_not_exists,
+            expire_after: None,
+            eval_interval_secs: None,
+            comment: String::new(),
+            sql: "select 1".to_string(),
+            flow_options: HashMap::new(),
+            eval_schedule: None,
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn build_incremental_flow_test_ddl_manager(
+        handler: Option<IncrementalFlowDdlManagerRef>,
+    ) -> DdlManager {
+        let state_store = Arc::new(KvStateStore::new(Arc::new(MemoryKvBackend::new())));
+        let poison_manager = Arc::new(InMemoryPoisonStore::default());
+        let procedure_manager = Arc::new(LocalManager::new(
+            Default::default(),
+            state_store,
+            poison_manager,
+            None,
+            None,
+        ));
+        // The ordinary `CreateFlowProcedure` path submits through the procedure
+        // manager, so it must be started before any DDL task is executed.
+        procedure_manager.start().await.unwrap();
+
+        let ddl_manager = DdlManager::new(
+            new_ddl_context(Arc::new(MockFlownodeManager::new(NaiveFlownodeHandler))),
+            procedure_manager,
+            Arc::new(DummyRepartitionProcedureFactory),
+        );
+
+        match handler {
+            Some(handler) => ddl_manager.with_incremental_flow_ddl_manager(handler),
+            None => ddl_manager,
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn test_incremental_flow_true_without_handler_fails_closed() {
+        let ddl_manager = build_incremental_flow_test_ddl_manager(None).await;
+        let mut task = incremental_flow_test_task(false, false);
+        task.flow_options
+            .insert(INCREMENTAL_FLOW_KEY.to_string(), "true".to_string());
+
+        let err = ddl_manager
+            .submit_ddl_task(
+                &ExecutorContext::default(),
+                SubmitDdlTaskRequest::new(QueryContext::default(), DdlTask::new_create_flow(task)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn test_incremental_flow_false_goes_normal_path_without_handler() {
+        let handler = Arc::new(MockIncrementalFlowDdlManager::default());
+        let ddl_manager = build_incremental_flow_test_ddl_manager(Some(handler.clone())).await;
+        let mut task = incremental_flow_test_task(false, false);
+        task.flow_options
+            .insert(INCREMENTAL_FLOW_KEY.to_string(), "false".to_string());
+
+        let resp = ddl_manager
+            .submit_ddl_task(
+                &ExecutorContext::default(),
+                SubmitDdlTaskRequest::new(QueryContext::default(), DdlTask::new_create_flow(task)),
+            )
+            .await
+            .unwrap();
+
+        // The ordinary `CreateFlowProcedure` path must run and the injected
+        // handler must not be invoked.
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+        assert!(handler.last_task.lock().unwrap().is_none());
+        assert!(!resp.key.is_empty());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn test_incremental_flow_handler_receives_task_with_or_replace_and_if_not_exists() {
+        let handler = Arc::new(MockIncrementalFlowDdlManager::default());
+        let ddl_manager = build_incremental_flow_test_ddl_manager(Some(handler.clone())).await;
+        let mut task = incremental_flow_test_task(true, true);
+        task.flow_options
+            .insert(INCREMENTAL_FLOW_KEY.to_string(), "true".to_string());
+
+        let resp = ddl_manager
+            .submit_ddl_task(
+                &ExecutorContext::default(),
+                SubmitDdlTaskRequest::new(QueryContext::default(), DdlTask::new_create_flow(task)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        let received = handler.last_task.lock().unwrap().take().unwrap();
+        assert!(received.or_replace);
+        assert!(received.create_if_not_exists);
+        assert_eq!(
+            received
+                .flow_options
+                .get(INCREMENTAL_FLOW_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        // The mock handler returns a default response, unlike the normal path
+        // which would fill in a procedure id.
+        assert!(resp.key.is_empty());
     }
 }
