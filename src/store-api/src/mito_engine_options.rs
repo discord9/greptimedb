@@ -72,6 +72,13 @@ pub const SST_FORMAT_KEY: &str = "sst_format";
 pub const MAX_ROW_GROUP_ROW_COUNT: &str = "max_row_group_row_count";
 /// Upper bound for [`MAX_ROW_GROUP_ROW_COUNT`].
 pub const MAX_ROW_GROUP_ROW_COUNT_LIMIT: usize = 10 * 1024 * 1024;
+/// Option key for preserving per-row sequence numbers through flush and compaction.
+///
+/// When enabled (append-only tables only), every row keeps its exact sequence
+/// number in memtables, flushed SSTs and compacted SSTs, so incremental scans
+/// can apply exact `(checkpoint, upper_bound]` row-level sequence filtering on
+/// SST data instead of relying on file-level sequence metadata alone.
+pub const EXPERIMENTAL_PRESERVE_ROW_SEQUENCE: &str = "experimental_preserve_row_sequence";
 // Note: Adding new options here should also check if this option should be removed in [metric_engine::engine::create::region_options_for_metadata_region].
 
 /// Returns true if the `key` is a valid option key for the mito engine.
@@ -104,6 +111,7 @@ pub fn is_mito_engine_option_key(key: &str) -> bool {
         MERGE_MODE_KEY,
         SST_FORMAT_KEY,
         MAX_ROW_GROUP_ROW_COUNT,
+        EXPERIMENTAL_PRESERVE_ROW_SEQUENCE,
     ]
     .contains(&key)
 }
@@ -151,6 +159,9 @@ mod tests {
         ));
         assert!(is_mito_engine_option_key("append_mode"));
         assert!(is_mito_engine_option_key("max_row_group_row_count"));
+        assert!(is_mito_engine_option_key(
+            "experimental_preserve_row_sequence"
+        ));
         assert!(!is_mito_engine_option_key("foo"));
     }
 }
