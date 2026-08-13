@@ -31,14 +31,15 @@ use datatypes::vectors::{
 };
 use pretty_assertions::assert_eq;
 use query::options::{
-    FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY, FLOW_SCHEDULED_TIME_MILLIS,
-    QueryOptions,
+    FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE, FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY,
+    FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE, FLOW_SCHEDULED_TIME_MILLIS, QueryOptions,
 };
 use session::context::QueryContext;
 use snafu::ResultExt;
 use table::test_util::MemTable;
 
 use super::*;
+use crate::batching_mode::IncrementalMode;
 use crate::batching_mode::checkpoint::{
     CHECKPOINT_DECISION_ADVANCE, CHECKPOINT_DECISION_FALLBACK, CHECKPOINT_REASON_NONE,
     FlowCheckpointDecision, FlowQueryFallbackReason,
@@ -1727,6 +1728,116 @@ async fn test_build_flow_query_extensions_switches_with_checkpoint_mode() {
             .iter()
             .any(|(key, _)| *key == FLOW_INCREMENTAL_AFTER_SEQS)
     );
+}
+
+// The `sequence_range` incremental mode option must flow from batch options
+// into the emitted query extensions: with checkpoints present the scan request
+// carries `FLOW_INCREMENTAL_MODE=sequence_range` (which the query layer turns
+// into `skip_sst_files=false, exact_sequence_range=true`), while the default
+// mode keeps today's byte-identical `memtable_only` extensions.
+#[tokio::test]
+async fn test_build_flow_query_extensions_sequence_range_mode() {
+    let (task, _) = new_test_task_engine_and_plan_with_query_and_opts(
+        "SELECT number, ts FROM numbers_with_ts",
+        "numbers_with_ts",
+        Arc::new(BatchingModeOptions {
+            experimental_enable_incremental_read: true,
+            experimental_incremental_mode: IncrementalMode::SequenceRange,
+            ..Default::default()
+        }),
+    )
+    .await
+    .into_task_and_plan();
+
+    // No checkpoints yet: no incremental extensions are emitted either way.
+    let extensions = task.build_flow_query_extensions(true, true).await.unwrap();
+    assert!(
+        !extensions
+            .iter()
+            .any(|(key, _)| *key == FLOW_INCREMENTAL_MODE)
+    );
+
+    task.state
+        .write()
+        .unwrap()
+        .advance_checkpoints(HashMap::from([(1_u64, 10_u64)]));
+
+    let extensions = task.build_flow_query_extensions(true, true).await.unwrap();
+    assert!(extensions.contains(&(
+        FLOW_INCREMENTAL_MODE,
+        FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE.to_string()
+    )));
+    assert!(extensions.contains(&(
+        FLOW_INCREMENTAL_AFTER_SEQS,
+        serde_json::json!({"1": 10}).to_string(),
+    )));
+    assert!(
+        !extensions
+            .iter()
+            .any(|(key, value)| *key == FLOW_INCREMENTAL_MODE
+                && value == FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY)
+    );
+
+    // The default mode still emits `memtable_only` byte-identically to today.
+    let (default_task, _) = new_test_task_engine_and_plan_with_query(
+        "SELECT number, ts FROM numbers_with_ts",
+        "numbers_with_ts",
+    )
+    .await
+    .into_task_and_plan();
+    default_task
+        .state
+        .write()
+        .unwrap()
+        .advance_checkpoints(HashMap::from([(1_u64, 10_u64)]));
+    let default_extensions = default_task
+        .build_flow_query_extensions(true, true)
+        .await
+        .unwrap();
+    assert!(default_extensions.contains(&(
+        FLOW_INCREMENTAL_MODE,
+        FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY.to_string()
+    )));
+}
+
+// A source lacking the exact-sequence capability surfaces as a structured
+// `Unsupported` error (mito's `SequenceRangeUnsupported`); an incremental
+// delta must classify it through the lane's existing explicit fallback to full
+// snapshot, never silently approximate.
+#[test]
+fn test_query_failure_reason_sequence_range_unsupported_falls_back_to_full_snapshot() {
+    let err = flow_error_with_status(StatusCode::Unsupported);
+
+    assert_eq!(
+        BatchingTask::query_failure_reason(&err, &QueryCoverage::IncrementalDelta),
+        FlowQueryFallbackReason::IncrementalQueryFailure
+    );
+    assert_ne!(
+        BatchingTask::query_failure_reason(&err, &QueryCoverage::IncrementalDelta),
+        FlowQueryFallbackReason::StaleCursor
+    );
+
+    // The failure transition resets incremental mode to full snapshot.
+    let query_ctx = QueryContext::arc();
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let mut state = TaskState::new(query_ctx, rx);
+    state.advance_checkpoints(HashMap::from([(1_u64, 10_u64)]));
+    assert_eq!(state.checkpoint_mode(), CheckpointMode::Incremental);
+
+    let decision = BatchingTask::apply_query_failure_to_state(
+        &mut state,
+        std::time::Duration::from_millis(1),
+        &QueryCoverage::IncrementalDelta,
+        FlowQueryFallbackReason::IncrementalQueryFailure,
+    );
+    assert_eq!(
+        decision,
+        Some(FlowCheckpointDecision::FallbackToFullSnapshot {
+            previous_mode: CheckpointMode::Incremental,
+            reason: FlowQueryFallbackReason::IncrementalQueryFailure,
+        })
+    );
+    assert_eq!(state.checkpoint_mode(), CheckpointMode::FullSnapshot);
 }
 
 #[tokio::test]

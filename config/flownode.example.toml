@@ -30,6 +30,11 @@ node_id = 14
 ## When disabled, batching flows always execute full-snapshot queries.
 ## Can be overridden per flow with WITH (experimental_enable_incremental_read = 'true').
 #+experimental_enable_incremental_read=false
+## Incremental read mode for batching flows: `memtable_only` (default) or `sequence_range`.
+## `memtable_only` reads only memtables newer than the checkpoint; `sequence_range` reads an
+## exact row-level sequence delta (C, H] across memtables and SSTs.
+## Can be overridden per flow with WITH (experimental_incremental_mode = 'sequence_range').
+#+experimental_incremental_mode="memtable_only"
 ## Read preference of the Frontend client.
 #+read_preference="Leader"
 [flow.batching_mode.frontend_tls]

@@ -26,7 +26,8 @@ use catalog::CatalogManager;
 use common_base::Plugins;
 use common_error::ext::BoxedError;
 use common_meta::ddl::create_flow::{
-    FlowType, INTERNAL_EVAL_SCHEDULE_KEY, effective_eval_schedule_from_flow_info,
+    FLOW_INCREMENTAL_MODE_KEY, FlowType, INTERNAL_EVAL_SCHEDULE_KEY,
+    effective_eval_schedule_from_flow_info,
 };
 use common_meta::error::Result as MetaResult;
 use common_meta::key::flow::FlowMetadataManager;
@@ -663,6 +664,26 @@ impl SrcTableToFlow {
     }
 }
 
+/// Reject flow options that the streaming engine would silently ignore.
+///
+/// `experimental_incremental_mode` only affects batching flows; the streaming
+/// engine discards `flow_options` entirely, so accepting the option there would
+/// silently change nothing for the user.
+fn validate_flow_options_for_engine(
+    flow_type: FlowType,
+    flow_options: &HashMap<String, String>,
+) -> Result<(), Error> {
+    if flow_type == FlowType::Streaming && flow_options.contains_key(FLOW_INCREMENTAL_MODE_KEY) {
+        return UnsupportedSnafu {
+            reason: format!(
+                "flow option '{FLOW_INCREMENTAL_MODE_KEY}' is only supported for batching flows"
+            ),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
 impl FlowEngine for FlowDualEngine {
     async fn create_flow(&self, args: CreateFlowArgs) -> Result<Option<FlowId>, Error> {
         let flow_type = args
@@ -681,6 +702,8 @@ impl FlowEngine for FlowDualEngine {
                 .fail();
             }
         };
+
+        validate_flow_options_for_engine(flow_type, &args.flow_options)?;
 
         let flow_id = args.flow_id;
         let src_table_ids = args.source_table_ids.clone();
@@ -1164,9 +1187,11 @@ impl StreamingEngine {
 mod tests {
     use std::collections::HashMap;
 
-    use common_meta::ddl::create_flow::INTERNAL_EVAL_SCHEDULE_KEY;
+    use common_meta::ddl::create_flow::{
+        FLOW_INCREMENTAL_MODE_KEY, FlowType, INTERNAL_EVAL_SCHEDULE_KEY,
+    };
 
-    use super::decode_internal_eval_schedule;
+    use super::{decode_internal_eval_schedule, validate_flow_options_for_engine};
     use crate::error::Error;
 
     #[test]
@@ -1184,5 +1209,50 @@ mod tests {
                 if reason.contains("Invalid internal eval schedule payload")
         ));
         assert!(!flow_options.contains_key(INTERNAL_EVAL_SCHEDULE_KEY));
+    }
+
+    #[test]
+    fn test_streaming_flow_rejects_incremental_mode_option() {
+        let mut flow_options = HashMap::new();
+        flow_options.insert(
+            FlowType::FLOW_TYPE_KEY.to_string(),
+            FlowType::STREAMING.to_string(),
+        );
+        flow_options.insert(
+            FLOW_INCREMENTAL_MODE_KEY.to_string(),
+            "sequence_range".to_string(),
+        );
+
+        let err = validate_flow_options_for_engine(FlowType::Streaming, &flow_options).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Unsupported { reason, .. } if reason.contains(FLOW_INCREMENTAL_MODE_KEY)
+        ));
+    }
+
+    #[test]
+    fn test_streaming_flow_without_incremental_mode_option_succeeds() {
+        let mut flow_options = HashMap::new();
+        flow_options.insert(
+            FlowType::FLOW_TYPE_KEY.to_string(),
+            FlowType::STREAMING.to_string(),
+        );
+
+        validate_flow_options_for_engine(FlowType::Streaming, &flow_options).unwrap();
+    }
+
+    #[test]
+    fn test_batching_flow_accepts_incremental_mode_option() {
+        let mut flow_options = HashMap::new();
+        flow_options.insert(
+            FlowType::FLOW_TYPE_KEY.to_string(),
+            FlowType::BATCHING.to_string(),
+        );
+        flow_options.insert(
+            FLOW_INCREMENTAL_MODE_KEY.to_string(),
+            "sequence_range".to_string(),
+        );
+
+        validate_flow_options_for_engine(FlowType::Batching, &flow_options).unwrap();
     }
 }

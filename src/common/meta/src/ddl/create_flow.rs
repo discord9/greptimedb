@@ -519,11 +519,12 @@ pub fn validate_flow_options(flow_task: &CreateFlowTask) -> Result<()> {
         match key.as_str() {
             DEFER_ON_MISSING_SOURCE_KEY
             | FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY
+            | FLOW_INCREMENTAL_MODE_KEY
             | FlowType::FLOW_TYPE_KEY => {}
             unknown => {
                 return UnexpectedSnafu {
                     err_msg: format!(
-                        "Unknown flow option '{unknown}', supported user options: {DEFER_ON_MISSING_SOURCE_KEY}, {FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY}"
+                        "Unknown flow option '{unknown}', supported user options: {DEFER_ON_MISSING_SOURCE_KEY}, {FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY}, {FLOW_INCREMENTAL_MODE_KEY}"
                     ),
                 }
                 .fail();
@@ -671,6 +672,8 @@ pub enum FlowType {
 
 pub const FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY: &str =
     "experimental_enable_incremental_read";
+
+pub const FLOW_INCREMENTAL_MODE_KEY: &str = "experimental_incremental_mode";
 
 impl FlowType {
     pub const BATCHING: &str = "batching";

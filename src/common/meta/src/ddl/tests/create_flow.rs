@@ -25,9 +25,9 @@ use table::table_name::TableName;
 use crate::ddl::DdlContext;
 use crate::ddl::create_flow::{
     CreateFlowData, CreateFlowProcedure, CreateFlowState, DEFER_ON_MISSING_SOURCE_KEY,
-    FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY, FlowType, defer_on_missing_source,
-    effective_eval_schedule_from_flow_info, resolve_schedule_defaults_into_task,
-    validate_flow_options,
+    FLOW_EXPERIMENTAL_ENABLE_INCREMENTAL_READ_KEY, FLOW_INCREMENTAL_MODE_KEY, FlowType,
+    defer_on_missing_source, effective_eval_schedule_from_flow_info,
+    resolve_schedule_defaults_into_task, validate_flow_options,
 };
 use crate::ddl::test_util::create_table::test_create_table_task;
 use crate::ddl::test_util::flownode_handler::NaiveFlownodeHandler;
@@ -323,6 +323,25 @@ fn test_validate_flow_options_allows_incremental_read_option() {
     );
 
     validate_flow_options(&task).unwrap();
+}
+
+#[test]
+fn test_validate_flow_options_allows_incremental_mode_option() {
+    // The DDL layer only allowlists option keys; value validation (e.g.
+    // `memtable_only` vs `sequence_range` vs bogus) is the flow crate's job
+    // (`batch_opts_for_flow_options`), so any value must be accepted here.
+    for value in ["sequence_range", "bogus"] {
+        let mut task = test_create_flow_task(
+            "my_flow",
+            vec![],
+            TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "my_sink_table"),
+            false,
+        );
+        task.flow_options
+            .insert(FLOW_INCREMENTAL_MODE_KEY.to_string(), value.to_string());
+
+        validate_flow_options(&task).unwrap();
+    }
 }
 
 #[test]
