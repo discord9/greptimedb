@@ -214,14 +214,18 @@ impl FlowQueryExtensions {
         }))
     }
 
-    pub fn validate_for_scan(&self, source_region_id: RegionId) -> Result<bool> {
-        // Fail closed on contradictory extensions: an internal non-source
-        // table must never also be a source table, i.e. present in the
-        // `incremental_after_seqs` region map (whose keys derive the trusted
-        // source table-id set). Overlap means the caller mislabeled a source
-        // table as internal — scanning it as a plain read would silently drop
-        // incremental bounds. The check runs even when the scanned region
-        // itself is excluded, so the contradiction cannot be hidden per-region.
+    /// Validates map-wide (query-global) consistency invariants shared by
+    /// every scan of this query context, independent of any single region.
+    ///
+    /// Fail closed on contradictory extensions: an internal non-source table
+    /// must never also be a source table, i.e. present in the
+    /// `incremental_after_seqs` region map (whose keys derive the trusted
+    /// source table-id set). Overlap means the caller mislabeled a source
+    /// table as internal — scanning it as a plain read would silently drop
+    /// incremental bounds. Because the check is region-independent, it must
+    /// run before any sink/internal short-circuit so a contradictory context
+    /// can never yield a plain scan for the excluded table.
+    pub fn validate_global_consistency(&self) -> Result<()> {
         if let (Some(excluded), Some(after_seqs)) = (
             &self.internal_non_source_table_ids,
             &self.incremental_after_seqs,
@@ -237,7 +241,18 @@ impl FlowQueryExtensions {
                 )));
             }
         }
+        Ok(())
+    }
 
+    /// Per-scan decision validation for one source region: decides whether
+    /// this scan should apply incremental semantics and rejects per-region
+    /// contradictions (e.g. a missing region under an incremental mode).
+    ///
+    /// Map-wide invariants are intentionally NOT re-checked here; callers must
+    /// run [`Self::validate_global_consistency`] first (see `decide_flow_scan`
+    /// in the dummy catalog) so a global contradiction fails closed even for
+    /// sink/internal scans.
+    pub fn validate_for_scan(&self, source_region_id: RegionId) -> Result<bool> {
         if self.sink_table_id.is_some() && self.sink_table_id == Some(source_region_id.table_id()) {
             return Ok(false);
         }
@@ -789,10 +804,12 @@ mod flow_extension_tests {
     }
 
     #[test]
-    fn test_validate_for_scan_rejects_internal_non_source_overlap_with_source_tables() {
+    fn test_validate_global_consistency_rejects_internal_non_source_overlap_with_source_tables() {
         // A table cannot be both a source (present in incremental_after_seqs)
         // and an internal non-source table: the contradictory extension must
-        // fail closed instead of silently scanning it as a plain read.
+        // fail closed instead of silently scanning it as a plain read. The
+        // check is map-wide, so it must fire for every region of the context
+        // (before any per-scan sink/internal short-circuit).
         let staging_region_id = RegionId::new(1024, 1);
         let other_region_id = RegionId::new(2048, 1);
         let exts = HashMap::from([
@@ -817,11 +834,45 @@ mod flow_extension_tests {
         let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
             .unwrap()
             .unwrap();
-        // The error surfaces regardless of which region is being validated.
-        let err = parsed.validate_for_scan(staging_region_id).unwrap_err();
+        // Global consistency rejects the overlapping table-id set.
+        let err = parsed.validate_global_consistency().unwrap_err();
         assert!(format!("{err}").contains(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS));
-        let err = parsed.validate_for_scan(other_region_id).unwrap_err();
-        assert!(format!("{err}").contains(FLOW_INCREMENTAL_AFTER_SEQS));
+
+        // A non-overlapping source region of the same contradictory context is
+        // still rejected at the scan level when global validation runs first
+        // (per-scan validation alone cannot surface the map-wide overlap).
+        let apply_incremental = parsed.validate_for_scan(other_region_id).unwrap();
+        assert!(apply_incremental);
+    }
+
+    #[test]
+    fn test_validate_global_consistency_passes_for_disjoint_sets() {
+        // Disjoint internal/source table-id sets are globally consistent, and
+        // the internal table's scan stays a plain read while the source table
+        // keeps incremental bounds.
+        let staging_region_id = RegionId::new(1024, 1);
+        let source_region_id = RegionId::new(2048, 1);
+        let exts = HashMap::from([
+            (
+                FLOW_INCREMENTAL_MODE.to_string(),
+                FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY.to_string(),
+            ),
+            (
+                FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
+                format!(r#"{{"{}":20}}"#, source_region_id.as_u64()),
+            ),
+            (
+                FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                format!(r#"[{}]"#, staging_region_id.table_id()),
+            ),
+        ]);
+
+        let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
+            .unwrap()
+            .unwrap();
+        parsed.validate_global_consistency().unwrap();
+        assert!(!parsed.validate_for_scan(staging_region_id).unwrap());
+        assert!(parsed.validate_for_scan(source_region_id).unwrap());
     }
 
     #[test]

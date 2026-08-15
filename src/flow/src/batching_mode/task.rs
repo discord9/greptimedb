@@ -63,8 +63,8 @@ use crate::batching_mode::checkpoint::{
 use crate::batching_mode::eval_schedule::{EvalSchedule, select_due_scheduled_times};
 use crate::batching_mode::frontend_client::{FrontendClient, PeerDesc};
 use crate::batching_mode::state::{
-    BackfillJob, BackfillJobStatus, CheckpointMode, CheckpointPersistence, DirtyTimeWindows,
-    FilterExprInfo, TaskState, to_df_literal,
+    BackfillJob, CheckpointMode, CheckpointPersistence, DirtyTimeWindows, FilterExprInfo,
+    PrepareReservation, TaskState, to_df_literal,
 };
 use crate::batching_mode::table_creator::{
     QueryType, create_staging_table_expr, create_table_with_expr,
@@ -755,21 +755,42 @@ impl BatchingTask {
     ///
     /// 1. aligns the requested `[start, end)` range to the flow's time-window
     ///    boundaries;
-    /// 2. for a brand-new job, creates the internal staging table
+    /// 2. atomically installs a `Preparing` reservation for the job in
+    ///    `TaskState` (short critical section) BEFORE any async staging-table
+    ///    existence check / create / plan building, so two concurrent prepares
+    ///    can never both observe the table as absent and independently create
+    ///    it — a duplicate prepare while a reservation is in flight returns
+    ///    Busy instead of independently creating;
+    /// 3. for a brand-new job, creates the internal staging table
     ///    `greptime_private.__flow_backfill_<flow_id>_<job_id>` by cloning the
     ///    active sink/state schema (nullable dimension PKs, window time index,
-    ///    BINARY state, `update_at`/epoch columns as present);
-    /// 3. registers the job in `TaskState` (short critical section) under the
-    ///    `Prepared -> Running -> BaseComplete` lifecycle;
-    /// 4. builds the Base DML plan: the original full aggregate query with an
+    ///    BINARY state, `update_at`/epoch columns as present) — unless the
+    ///    deterministic staging table already exists with no registered job,
+    ///    which fails closed as an orphan instead of being silently adopted
+    ///    (the job registry is memory-only; a table surviving a restart must
+    ///    be cleaned up explicitly before prepare can create a fresh one);
+    /// 4. transitions `Preparing -> Prepared` once the create succeeded and
+    ///    the staging table id is resolved;
+    /// 5. builds the Base DML plan: the original full aggregate query with an
     ///    event-time `[start, end)` filter and the staging table as DML target.
     ///
     /// An exact duplicate prepare (same `job_id`, same aligned range, same
-    /// staging identity) is idempotent: the existing registered job is
-    /// returned untouched — its status and frozen watermark F are preserved,
-    /// the staging table is neither created nor cleared — and only the plan is
-    /// rebuilt against the existing staging table. The same `job_id` with a
-    /// different range or staging identity fails closed.
+    /// staging identity) of a `Prepared` or `BaseComplete` job is idempotent:
+    /// the existing registered job is returned untouched — its status and
+    /// frozen watermark F are preserved, the staging table is neither created
+    /// nor cleared — and only the plan is rebuilt against the existing staging
+    /// table. The same `job_id` with a different range or staging identity
+    /// fails closed.
+    ///
+    /// Failure handling: if the create may have succeeded (ambiguous create
+    /// failure), the reservation is kept as `Preparing { staging_may_exist:
+    /// true }` so the job retains ownership and the table is never anonymous;
+    /// a re-prepare resumes the attempt (re-checks existence, then creates or
+    /// adopts its own table). Once the create succeeded, the job is `Prepared`
+    /// even if plan building then fails, so the work is retryable. An orphan
+    /// conflict (table exists with no registered job) cancels the reservation
+    /// and returns an explicit error; the caller must drop the orphan table
+    /// explicitly, then retry.
     ///
     /// The caller then runs [`Self::run_backfill_base`] to execute the plan and
     /// capture F. No `execution_lock` is held here beyond the brief job
@@ -806,99 +827,218 @@ impl BatchingTask {
 
         let staging_table_name = backfill_staging_table_name(self.config.flow_id, job_id);
 
-        // Idempotent re-prepare: an already-registered job is returned as-is.
-        // The staging table is never re-created or cleared for an existing job
-        // (a table that already received rows must not be swapped under a
-        // registered job's metadata).
-        let existing_job = {
-            let state = self.state.read().unwrap();
-            state.get_backfill_job(job_id).cloned()
+        // Atomic prepare reservation (short critical section) BEFORE any async
+        // staging-table existence check / create / plan building: prevents two
+        // concurrent prepares from both seeing the table as absent, and
+        // rejects duplicate prepares while a reservation is in flight.
+        let reservation = {
+            let mut state = self.state.write().unwrap();
+            state.begin_backfill_prepare(job_id, (start, end), staging_table_name.clone())?
         };
-        let job = if let Some(existing) = existing_job {
-            // Resolve the current staging table id to cross-check identity.
-            let staging_table_id = self
-                .config
-                .catalog_manager
-                .table(
-                    &staging_table_name[0],
-                    &staging_table_name[1],
-                    &staging_table_name[2],
-                    None,
-                )
-                .await
-                .map_err(BoxedError::new)
-                .context(ExternalSnafu)?
-                .map(|table| table.table_info().table_id());
-            let candidate = BackfillJob {
-                job_id,
-                range: (start, end),
-                staging_table_name: staging_table_name.clone(),
-                staging_table_id,
-                frozen_watermark: None,
-                status: BackfillJobStatus::Prepared,
-            };
-            {
-                // Re-register validates identity and is a no-op for an exact
-                // duplicate, preserving status and F.
-                let mut state = self.state.write().unwrap();
-                state.register_backfill_job(&candidate)?;
-            }
-            existing
-        } else {
-            let (sink_table, _) = get_table_info_df_schema(
-                self.config.catalog_manager.clone(),
-                self.config.sink_table_name.clone(),
-            )
-            .await?;
-            // Create the staging table only when the local catalog does not
-            // have it yet; `create_staging_table_expr` uses
-            // `create_if_not_exists` so a concurrent creation on the frontend
-            // is also tolerated.
-            if !self.is_table_exist(&staging_table_name).await? {
-                let create_expr = create_staging_table_expr(&sink_table, &staging_table_name)?;
-                info!(
-                    "Flow {} creating backfill staging table {:?} for job {}",
-                    self.config.flow_id, staging_table_name, job_id
-                );
-                frontend_client
-                    .create(create_expr, &staging_table_name[0], &staging_table_name[1])
+
+        match reservation {
+            PrepareReservation::Reserved(_) => {
+                // Brand-new job: we own the identity. Fail-closed orphan
+                // detection — the deterministic staging table already exists
+                // but no job is registered (memory-only registry; e.g. the
+                // table survived a restart). Never silently adopt it: cancel
+                // the reservation and require explicit cleanup, then a fresh
+                // prepare.
+                let exists = match self.is_table_exist(&staging_table_name).await {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        // The existence check failed before any create could
+                        // have happened: release the reservation so a retry
+                        // starts fresh instead of Busy-ing forever.
+                        let cancel = {
+                            let mut state = self.state.write().unwrap();
+                            state.cancel_backfill_prepare(job_id)
+                        };
+                        if let Err(cancel_err) = cancel {
+                            warn!(
+                                "Flow {} failed to cancel backfill job {} reservation after an existence-check failure: {}",
+                                self.config.flow_id, job_id, cancel_err
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
+                if exists {
+                    {
+                        let mut state = self.state.write().unwrap();
+                        state.cancel_backfill_prepare(job_id)?;
+                    }
+                    return UnexpectedSnafu {
+                        reason: format!(
+                            "backfill staging table {:?} for job {} already exists but no backfill job is registered; refusing to reuse an orphan table (the job registry is memory-only). Drop the orphan table explicitly, then retry prepare",
+                            staging_table_name, job_id
+                        ),
+                    }
+                    .fail();
+                }
+
+                let job = self
+                    .create_staging_table_and_finish_prepare(
+                        frontend_client,
+                        job_id,
+                        &staging_table_name,
+                    )
                     .await?;
+                let plan = self
+                    .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
+                    .await?;
+                Ok(BackfillBase { job, plan })
             }
-            let staging_table_id = self
-                .config
-                .catalog_manager
-                .table(
-                    &staging_table_name[0],
-                    &staging_table_name[1],
-                    &staging_table_name[2],
-                    None,
-                )
-                .await
-                .map_err(BoxedError::new)
-                .context(ExternalSnafu)?
-                .map(|table| table.table_info().table_id());
+            PrepareReservation::Resuming(_) => {
+                // A previous prepare attempt may have created the table
+                // (ambiguous create failure). Resume under the
+                // already-installed reservation: re-check existence, then
+                // adopt our own table or create a fresh one. Any error here
+                // keeps the reservation as `Preparing { staging_may_exist:
+                // true }` (see `create_staging_table_and_finish_prepare`), so
+                // the attempt stays resumable and the table is never anonymous.
+                let job = if self.is_table_exist(&staging_table_name).await? {
+                    // The previous create did land; the table is ours (we own
+                    // the job identity), so adopt it and move to Prepared
+                    // without creating.
+                    self.resolve_staging_table_and_finish_prepare(job_id, &staging_table_name)
+                        .await?
+                } else {
+                    self.create_staging_table_and_finish_prepare(
+                        frontend_client,
+                        job_id,
+                        &staging_table_name,
+                    )
+                    .await?
+                };
+                let plan = self
+                    .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
+                    .await?;
+                Ok(BackfillBase { job, plan })
+            }
+            PrepareReservation::Existing(job) => {
+                // Idempotent re-prepare of a `Prepared`/`BaseComplete` job:
+                // rebuild the plan against the existing staging table; status
+                // and frozen watermark F are untouched.
+                let plan = self
+                    .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
+                    .await?;
+                Ok(BackfillBase { job, plan })
+            }
+        }
+    }
 
-            let job = BackfillJob {
-                job_id,
-                range: (start, end),
-                staging_table_name: staging_table_name.clone(),
-                staging_table_id,
-                frozen_watermark: None,
-                status: BackfillJobStatus::Prepared,
-            };
-            // Short critical section: register the job, then drop the lock
-            // before any query execution.
-            {
-                let mut state = self.state.write().unwrap();
-                state.register_backfill_job(&job)?;
+    /// Creates the backfill staging table for a job whose `Preparing`
+    /// reservation is held (the caller owns the identity), resolves the
+    /// staging table id from the local catalog, and transitions the job
+    /// `Preparing -> Prepared` (short critical section).
+    ///
+    /// On a create failure that may have succeeded remotely
+    /// (`create_if_not_exists` semantics / lost response), keeps the
+    /// reservation as `Preparing { staging_may_exist: true }` so the job
+    /// retains ownership and the table is never anonymous; a re-prepare
+    /// resumes the attempt.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    async fn create_staging_table_and_finish_prepare(
+        &self,
+        frontend_client: &Arc<FrontendClient>,
+        job_id: u64,
+        staging_table_name: &[String; 3],
+    ) -> Result<BackfillJob, Error> {
+        // Any failure before the `Preparing -> Prepared` transition keeps the
+        // reservation as `Preparing { staging_may_exist: true }` (see
+        // [`TaskState::mark_staging_may_exist`]), so the job retains ownership
+        // and the table is never anonymous; a re-prepare resumes the attempt.
+        let (sink_table, _) = match get_table_info_df_schema(
+            self.config.catalog_manager.clone(),
+            self.config.sink_table_name.clone(),
+        )
+        .await
+        {
+            Ok(sink) => sink,
+            Err(e) => {
+                self.keep_prepare_reservation(job_id);
+                return Err(e);
             }
-            job
         };
+        let create_expr = create_staging_table_expr(&sink_table, staging_table_name)?;
+        info!(
+            "Flow {} creating backfill staging table {:?} for job {}",
+            self.config.flow_id, staging_table_name, job_id
+        );
+        if let Err(e) = frontend_client
+            .create(create_expr, &staging_table_name[0], &staging_table_name[1])
+            .await
+        {
+            // The create may have succeeded remotely (create_if_not_exists /
+            // lost response): keep ownership so the table is never anonymous;
+            // a re-prepare resumes.
+            self.keep_prepare_reservation(job_id);
+            return Err(e);
+        }
 
-        let plan = self
-            .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
-            .await?;
-        Ok(BackfillBase { job, plan })
+        match self
+            .resolve_staging_table_and_finish_prepare(job_id, staging_table_name)
+            .await
+        {
+            Ok(job) => Ok(job),
+            Err(e) => {
+                // The table was created but its id could not be resolved: keep
+                // ownership (Preparing { staging_may_exist: true }) so the
+                // table is never anonymous and a re-prepare resumes.
+                self.keep_prepare_reservation(job_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Marks a `Preparing` reservation as possibly having created its staging
+    /// table (ambiguously failed prepare attempt), keeping ownership of the
+    /// job so the table is never anonymous and a re-prepare resumes.
+    fn keep_prepare_reservation(&self, job_id: u64) {
+        let mut state = self.state.write().unwrap();
+        if let Err(mark_err) = state.mark_staging_may_exist(job_id) {
+            warn!(
+                "Flow {} failed to keep backfill job {} reservation after a prepare failure: {}",
+                self.config.flow_id, job_id, mark_err
+            );
+        }
+    }
+
+    /// Resolves the staging table id from the local catalog and transitions
+    /// the job's `Preparing` reservation to `Prepared` (short critical
+    /// section). The caller must hold the prepare reservation for `job_id`.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    async fn resolve_staging_table_and_finish_prepare(
+        &self,
+        job_id: u64,
+        staging_table_name: &[String; 3],
+    ) -> Result<BackfillJob, Error> {
+        let staging_table_id = self
+            .config
+            .catalog_manager
+            .table(
+                &staging_table_name[0],
+                &staging_table_name[1],
+                &staging_table_name[2],
+                None,
+            )
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?
+            .map(|table| table.table_info().table_id())
+            .with_context(|| UnexpectedSnafu {
+                reason: format!(
+                    "backfill staging table {:?} for job {job_id} is missing after create",
+                    staging_table_name
+                ),
+            })?;
+
+        // Preparing -> Prepared (short critical section).
+        {
+            let mut state = self.state.write().unwrap();
+            state.finish_backfill_prepare(job_id, staging_table_id)
+        }
     }
 
     /// Builds the executable Base plan for a backfill job: the original full
@@ -1188,34 +1328,41 @@ impl BatchingTask {
         Ok(extensions)
     }
 
-    /// Explicit cleanup helper for a finished backfill job: drops the staging
-    /// table using the *registered* job's recorded name, and only unregisters
-    /// the job after the drop succeeded (drop-before-remove).
+    /// Explicit cleanup helper for a finished backfill job: atomically
+    /// transitions the registered job `BaseComplete -> Finishing` (short
+    /// critical section) before any DDL, then drops the staging table using
+    /// the *registered* job's recorded name, and only removes the job after
+    /// the drop succeeded (drop-before-remove, CAS on the same `Finishing`
+    /// generation).
     ///
-    /// An unknown `job_id` fails closed without issuing any DROP, so cleanup
-    /// can never blindly drop a table by a deterministic name guess. A failed
-    /// drop keeps the job registered (and its staging table) so cleanup can be
-    /// retried. Phase 2 finalize calls this after a successful merge; Phase 1
-    /// failure paths intentionally keep the staging table (and the registered
-    /// job) so the work is not silently lost.
+    /// Only a `BaseComplete` job is cleanable in Phase 1 (aborting a
+    /// `Prepared`/`Preparing` job is intentionally not exposed). The atomic
+    /// `Finishing` transition prevents cleanup from racing an active run (a
+    /// `Running` job is rejected), a second concurrent finish (already
+    /// `Finishing` -> Busy), or a re-prepare / new generation while cleanup is
+    /// in flight. An unknown `job_id` fails closed without issuing any DROP,
+    /// so cleanup can never blindly drop a table by a deterministic name
+    /// guess.
+    ///
+    /// A failed drop returns the job to `BaseComplete` (restore) so cleanup
+    /// can be retried; the job and its staging table are preserved. Phase 2
+    /// finalize calls this after a successful merge; Phase 1 failure paths
+    /// intentionally keep the staging table (and the registered job) so the
+    /// work is not silently lost.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub(crate) async fn finish_backfill_job(
         &self,
         frontend_client: &Arc<FrontendClient>,
         job_id: u64,
     ) -> Result<(), Error> {
-        // Look up and verify the registered job before any DDL; the staging
-        // name is taken from the job record, not re-derived.
-        let job = self
-            .state
-            .read()
-            .unwrap()
-            .get_backfill_job(job_id)
-            .cloned()
-            .with_context(|| UnexpectedSnafu {
-                reason: format!("no registered backfill job {job_id} to finish"),
-            })?;
-        let staging_table_name = &job.staging_table_name;
+        // Atomic BaseComplete -> Finishing under the state lock: rejects
+        // Running (a finish must never race an active Base run), a second
+        // finish (already Finishing), and a re-prepare / new generation.
+        let job = {
+            let mut state = self.state.write().unwrap();
+            state.begin_backfill_finish(job_id)?
+        };
+        let staging_table_name = job.staging_table_name.clone();
         let full_name = TableReference::full(
             staging_table_name[0].as_str(),
             staging_table_name[1].as_str(),
@@ -1223,15 +1370,29 @@ impl BatchingTask {
         )
         .to_quoted_string();
         let sql = format!("DROP TABLE IF EXISTS {full_name}");
-        frontend_client
+        if let Err(e) = frontend_client
             .sql(&staging_table_name[0], &staging_table_name[1], &sql)
             .await
             .map_err(BoxedError::new)
-            .context(ExternalSnafu)?;
-        // Drop succeeded; only now remove the job (drop-before-remove).
+            .context(ExternalSnafu)
+        {
+            // Drop failed: restore Finishing -> BaseComplete so cleanup is
+            // retryable and the job (with its staging table) is preserved.
+            {
+                let mut state = self.state.write().unwrap();
+                if let Err(restore_err) = state.restore_backfill_finish(job_id) {
+                    warn!(
+                        "Flow {} failed to restore backfill job {} after a failed drop: {}",
+                        self.config.flow_id, job_id, restore_err
+                    );
+                }
+            }
+            return Err(e);
+        }
+        // Drop succeeded; CAS-remove only the same Finishing generation.
         {
             let mut state = self.state.write().unwrap();
-            state.take_backfill_job(job_id);
+            state.remove_backfill_job_if_finishing(job_id)?;
         }
         Ok(())
     }

@@ -404,6 +404,14 @@ fn decide_flow_scan(query_ctx: &QueryContext, region_id: RegionId) -> Result<Flo
         });
     };
 
+    // Run map-wide consistency validation BEFORE any sink/internal
+    // short-circuit: a contradictory context (e.g. a table labeled both a
+    // source and an internal non-source table) must fail closed even when the
+    // scanned region itself would otherwise be excluded from incremental
+    // semantics. Only after global consistency passes may an internal/sink
+    // scan become plain.
+    flow_extensions.validate_global_consistency()?;
+
     // Sink-table and internal non-source-table scans intentionally bypass all
     // flow scan semantics. They should behave like plain reads and must not
     // participate in incremental lower bounds or per-region snapshot binding/
@@ -1044,6 +1052,50 @@ mod tests {
         let request = scan_request_from_query_context(source_region_id, &query_ctx).unwrap();
         assert_eq!(request.memtable_min_sequence, Some(55));
         assert!(request.skip_sst_files);
+    }
+
+    #[test]
+    fn test_scan_request_from_query_context_rejects_contradictory_source_internal_overlap() {
+        // A table cannot be both a source and an internal non-source table.
+        // The contradictory context must fail closed at the production scan
+        // entry point — even for the excluded (internal) table's own region,
+        // which the sink/internal short-circuit would otherwise turn into a
+        // plain scan — and never yield a plain scan.
+        let staging_region_id = RegionId::new(1024, 1);
+        let source_region_id = RegionId::new(2048, 1);
+        let query_ctx = QueryContextBuilder::default()
+            .extensions(HashMap::from([
+                (
+                    FLOW_INCREMENTAL_MODE.to_string(),
+                    "memtable_only".to_string(),
+                ),
+                (
+                    FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
+                    format!(
+                        r#"{{"{}":55,"{}":60}}"#,
+                        staging_region_id.as_u64(),
+                        source_region_id.as_u64()
+                    ),
+                ),
+                (
+                    FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                    format!(r#"[{}]"#, staging_region_id.table_id()),
+                ),
+            ]))
+            .build();
+
+        // The mislabeled internal table's own scan must error (the overlap is
+        // detected before the internal/sink short-circuit, so it can never
+        // become a plain scan).
+        let err = scan_request_from_query_context(staging_region_id, &query_ctx).unwrap_err();
+        assert!(matches!(err, Error::InvalidQueryContextExtension { .. }));
+        assert_eq!(err.status_code(), StatusCode::InvalidArguments);
+
+        // A different source region of the same contradictory context also
+        // errors: the check is map-wide, not per-region.
+        let err = scan_request_from_query_context(source_region_id, &query_ctx).unwrap_err();
+        assert!(matches!(err, Error::InvalidQueryContextExtension { .. }));
+        assert_eq!(err.status_code(), StatusCode::InvalidArguments);
     }
 
     #[test]

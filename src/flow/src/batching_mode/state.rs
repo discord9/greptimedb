@@ -197,7 +197,7 @@ impl TaskState {
     }
 
     /// Registers a Phase-1 backfill job under a strict lifecycle:
-    /// `Prepared -> Running -> BaseComplete`.
+    /// `Preparing -> Prepared -> Running -> BaseComplete -> Finishing`.
     ///
     /// An exact duplicate (same `job_id` and identical immutable identity:
     /// aligned range, staging table name/id) is idempotent: the existing job
@@ -205,6 +205,10 @@ impl TaskState {
     /// and never clears or rebuilds the staging table. Re-registering the same
     /// `job_id` with a different identity fails closed instead of silently
     /// replacing the registered job.
+    ///
+    /// This is the low-level identity-checking primitive; the atomic prepare
+    /// reservation (including the `Preparing`-duplicate Busy rule) lives in
+    /// [`Self::begin_backfill_prepare`].
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub fn register_backfill_job(&mut self, job: &BackfillJob) -> Result<(), Error> {
         if let Some(existing) = self
@@ -254,7 +258,8 @@ impl TaskState {
     ///
     /// Re-entering a `Running` job or re-running a `BaseComplete` job is
     /// rejected: a concurrent or late run must never overwrite the frozen
-    /// watermark F of a completed run.
+    /// watermark F of a completed run. A `Preparing` (reservation not yet
+    /// finished) or `Finishing` (cleanup in flight) job cannot start either.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub fn begin_backfill_run(&mut self, job_id: u64) -> Result<BackfillJob, Error> {
         let job = self
@@ -335,6 +340,9 @@ impl TaskState {
     /// Removes and returns a registered backfill job. Used by finalize
     /// cleanup *after* the staging table drop succeeded (drop-before-remove);
     /// a failed drop keeps the job registered so cleanup can be retried.
+    ///
+    /// For drop-success removal with a generation check, prefer
+    /// [`Self::remove_backfill_job_if_finishing`].
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub fn take_backfill_job(&mut self, job_id: u64) -> Option<BackfillJob> {
         let idx = self
@@ -342,6 +350,257 @@ impl TaskState {
             .iter()
             .position(|job| job.job_id == job_id)?;
         Some(self.backfill_jobs.remove(idx))
+    }
+
+    /// Atomically reserves a backfill prepare under the short state lock,
+    /// BEFORE any async staging-table existence check / create / plan building.
+    ///
+    /// For a brand-new job, installs a `Preparing { staging_may_exist: false }`
+    /// reservation so two concurrent prepares can never both observe the
+    /// staging table as absent and independently create it. An exact-duplicate
+    /// re-prepare of a `Prepared` / `BaseComplete` job returns
+    /// [`PrepareReservation::Existing`] (idempotent; status and F untouched).
+    /// A `Preparing { staging_may_exist: true }` job returns
+    /// [`PrepareReservation::Resuming`] so the caller resumes the previous
+    /// attempt. All other states reject the prepare:
+    /// - `Preparing { staging_may_exist: false }` -> Busy (AlreadyPreparing);
+    ///   the duplicate must not independently create the table.
+    /// - `Running` -> Busy (a Base query is in flight).
+    /// - `Finishing` -> Busy (cleanup is in flight).
+    ///
+    /// A different identity (aligned range or staging name) for the same
+    /// `job_id` is rejected instead of replacing the registered job.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn begin_backfill_prepare(
+        &mut self,
+        job_id: u64,
+        range: (Timestamp, Timestamp),
+        staging_table_name: [String; 3],
+    ) -> Result<PrepareReservation, Error> {
+        if let Some(existing) = self.backfill_jobs.iter().find(|job| job.job_id == job_id) {
+            ensure!(
+                existing.range == range && existing.staging_table_name == staging_table_name,
+                UnexpectedSnafu {
+                    reason: format!(
+                        "backfill job {} already registered with a different identity (range {:?}/{:?}, staging {:?}/{:?}); refusing to replace it",
+                        job_id,
+                        existing.range,
+                        range,
+                        existing.staging_table_name,
+                        staging_table_name
+                    )
+                }
+            );
+            return match existing.status {
+                BackfillJobStatus::Preparing { staging_may_exist: false } => {
+                    UnexpectedSnafu {
+                        reason: format!(
+                            "backfill job {job_id} is already being prepared (Preparing); a duplicate prepare must not independently create the staging table"
+                        ),
+                    }
+                    .fail()
+                }
+                BackfillJobStatus::Preparing { staging_may_exist: true } => {
+                    Ok(PrepareReservation::Resuming(existing.clone()))
+                }
+                BackfillJobStatus::Prepared | BackfillJobStatus::BaseComplete => {
+                    Ok(PrepareReservation::Existing(existing.clone()))
+                }
+                BackfillJobStatus::Running => UnexpectedSnafu {
+                    reason: format!(
+                        "backfill job {job_id} cannot be prepared while a Base run is in flight (Running)"
+                    ),
+                }
+                .fail(),
+                BackfillJobStatus::Finishing => UnexpectedSnafu {
+                    reason: format!(
+                        "backfill job {job_id} cannot be prepared while cleanup is in flight (Finishing)"
+                    ),
+                }
+                .fail(),
+            };
+        }
+        let job = BackfillJob {
+            job_id,
+            range,
+            staging_table_name,
+            staging_table_id: None,
+            frozen_watermark: None,
+            status: BackfillJobStatus::Preparing {
+                staging_may_exist: false,
+            },
+        };
+        self.backfill_jobs.push(job.clone());
+        Ok(PrepareReservation::Reserved(job))
+    }
+
+    /// Transitions a `Preparing` reservation to `Prepared` once the staging
+    /// table create succeeded and its id is resolved. The job's immutable
+    /// identity is unchanged; the recorded `staging_table_id` is filled in.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn finish_backfill_prepare(
+        &mut self,
+        job_id: u64,
+        staging_table_id: TableId,
+    ) -> Result<BackfillJob, Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to finish preparing"),
+            })?;
+        ensure!(
+            matches!(job.status, BackfillJobStatus::Preparing { .. }),
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot finish preparing: already {:?}",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::Prepared;
+        job.staging_table_id = Some(staging_table_id);
+        Ok(job.clone())
+    }
+
+    /// Marks a `Preparing` reservation as possibly having created its staging
+    /// table (ambiguous create failure), keeping ownership of the job so the
+    /// table is never anonymous. A re-prepare then resumes instead of erroring.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn mark_staging_may_exist(&mut self, job_id: u64) -> Result<(), Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to mark"),
+            })?;
+        ensure!(
+            matches!(job.status, BackfillJobStatus::Preparing { .. }),
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot be marked: not Preparing ({:?})",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::Preparing {
+            staging_may_exist: true,
+        };
+        Ok(())
+    }
+
+    /// Cancels a `Preparing` reservation that failed before any create could
+    /// have happened (fail-closed orphan detection): removes the job so the
+    /// registry returns to the pre-prepare state and the caller can retry
+    /// after explicit cleanup.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn cancel_backfill_prepare(&mut self, job_id: u64) -> Result<(), Error> {
+        let idx = self
+            .backfill_jobs
+            .iter()
+            .position(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to cancel"),
+            })?;
+        ensure!(
+            matches!(
+                self.backfill_jobs[idx].status,
+                BackfillJobStatus::Preparing { .. }
+            ),
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot be cancelled: not Preparing ({:?})",
+                    self.backfill_jobs[idx].status
+                )
+            }
+        );
+        self.backfill_jobs.remove(idx);
+        Ok(())
+    }
+
+    /// Atomically transitions a `BaseComplete` job to `Finishing` — the only
+    /// eligible stable state for Phase-1 cleanup. This prevents a cleanup from
+    /// racing an active run (a `Running` job can never be cleaned up from
+    /// under its Base query), a second concurrent finish (`Finishing` ->
+    /// Busy), or a re-prepare / new generation while cleanup is in flight.
+    /// `Prepared` / `Preparing` jobs are not cleanable in Phase 1 (aborting a
+    /// prepared job is a separate transition, intentionally not exposed).
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn begin_backfill_finish(&mut self, job_id: u64) -> Result<BackfillJob, Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to finish"),
+            })?;
+        ensure!(
+            job.status == BackfillJobStatus::BaseComplete,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot finish: only a BaseComplete job is cleanable in Phase 1, job is {:?}",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::Finishing;
+        Ok(job.clone())
+    }
+
+    /// Returns a `Finishing` job to `BaseComplete` after a failed staging DROP,
+    /// preserving the job (and its staging table) for a cleanup retry. Only a
+    /// `Finishing` job may restore.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn restore_backfill_finish(&mut self, job_id: u64) -> Result<BackfillJob, Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to restore"),
+            })?;
+        ensure!(
+            job.status == BackfillJobStatus::Finishing,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot restore: not Finishing ({:?})",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::BaseComplete;
+        Ok(job.clone())
+    }
+
+    /// CAS-removes the registered job only when it is still `Finishing` (the
+    /// same cleanup generation the DROP was issued for). Returns `Ok(None)`
+    /// when the job is already gone; errors if the job exists but is no longer
+    /// `Finishing`, so a generation change can never remove a different job.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn remove_backfill_job_if_finishing(
+        &mut self,
+        job_id: u64,
+    ) -> Result<Option<BackfillJob>, Error> {
+        let idx = match self
+            .backfill_jobs
+            .iter()
+            .position(|job| job.job_id == job_id)
+        {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        ensure!(
+            self.backfill_jobs[idx].status == BackfillJobStatus::Finishing,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} changed state while finishing (now {:?}); refusing to remove",
+                    self.backfill_jobs[idx].status
+                )
+            }
+        );
+        Ok(Some(self.backfill_jobs.remove(idx)))
     }
 
     pub fn is_incremental_disabled(&self) -> bool {
@@ -1173,16 +1432,35 @@ impl FencedRepair {
 /// Lifecycle status of a registered backfill job.
 ///
 /// ```text
-/// Prepared -> Running -> BaseComplete(F)
+/// Preparing -> Prepared -> Running -> BaseComplete(F) -> Finishing
 /// ```
+///
+/// `Preparing` is the atomic prepare reservation: it is installed under the
+/// short state lock *before* any async staging-table existence check / create
+/// / plan building, so two concurrent prepares can never both observe an
+/// absent table and independently create it. `Preparing { staging_may_exist:
+/// false }` means a prepare is in flight (an exact-duplicate prepare returns
+/// Busy instead of independently creating); `Preparing { staging_may_exist:
+/// true }` means a previous attempt may have created the table (ambiguous
+/// create failure) and the job keeps ownership — the table is never anonymous
+/// and a re-prepare resumes the attempt instead of erroring.
 ///
 /// `Prepared` jobs may start (or re-start after a failed run); a `Running`
 /// job is executing its Base query and may not be entered again; `BaseComplete`
 /// carries the frozen scan-open watermark F and is final — a late or
-/// concurrent run must never overwrite it.
+/// concurrent run must never overwrite it. `Finishing` is the atomic cleanup
+/// transition (staging DROP in flight) that only a `BaseComplete` job may
+/// enter; from `Finishing` a job may only return to `BaseComplete` (drop
+/// failure, retryable) or be removed (drop success). Runs and prepares are
+/// rejected while `Finishing`, and a second finish is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
 pub enum BackfillJobStatus {
+    /// Atomic prepare reservation installed under the state lock before any
+    /// async staging-table work. `staging_may_exist` records whether a
+    /// previous attempt may have created the table (ambiguous create failure);
+    /// when `false` the prepare is in flight and duplicates return Busy.
+    Preparing { staging_may_exist: bool },
     /// Registered and prepared; the staging table exists and the Base query
     /// may be (re)started.
     Prepared,
@@ -1191,6 +1469,9 @@ pub enum BackfillJobStatus {
     /// The Base query succeeded; the frozen scan-open watermark F is recorded
     /// and the job is final.
     BaseComplete,
+    /// Cleanup (staging DROP) is in flight; the job may only return to
+    /// `BaseComplete` on drop failure or be removed on drop success.
+    Finishing,
 }
 
 /// A registered Phase-1 two-phase backfill job.
@@ -1225,6 +1506,28 @@ pub struct BackfillJob {
     pub frozen_watermark: Option<BTreeMap<u64, u64>>,
     /// Lifecycle status; see [`BackfillJobStatus`].
     pub status: BackfillJobStatus,
+}
+
+/// Outcome of [`TaskState::begin_backfill_prepare`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+pub enum PrepareReservation {
+    /// A fresh `Preparing { staging_may_exist: false }` reservation was
+    /// installed for a brand-new job; the caller owns the identity and must
+    /// drive the async staging-table existence check / create / plan build,
+    /// then call [`TaskState::finish_backfill_prepare`] (or
+    /// [`TaskState::mark_staging_may_exist`] /
+    /// [`TaskState::cancel_backfill_prepare`] on failure).
+    Reserved(BackfillJob),
+    /// An exact-duplicate re-prepare of a `Prepared` or `BaseComplete` job:
+    /// the registered job is returned untouched (status and frozen watermark F
+    /// preserved) and only the plan is rebuilt. No reservation is held.
+    Existing(BackfillJob),
+    /// A previous prepare attempt left the job in
+    /// `Preparing { staging_may_exist: true }`: the reservation is still held
+    /// and the caller may resume the attempt (re-check existence, then create
+    /// or adopt its own table) under the already-installed reservation.
+    Resuming(BackfillJob),
 }
 
 /// Filter Expression's information
@@ -1412,6 +1715,289 @@ mod test {
         // Failing a non-Running job fails closed.
         let err = state.fail_backfill_run(8).unwrap_err();
         assert!(format!("{err:?}").contains("cannot fail back"));
+    }
+
+    fn backfill_job_prepared(job_id: u64) -> BackfillJob {
+        BackfillJob {
+            job_id,
+            range: (Timestamp::new_second(0), Timestamp::new_second(100)),
+            staging_table_name: [
+                "greptime".to_string(),
+                "greptime_private".to_string(),
+                format!("__flow_backfill_1_{job_id}"),
+            ],
+            staging_table_id: Some(2048),
+            frozen_watermark: None,
+            status: BackfillJobStatus::Prepared,
+        }
+    }
+
+    #[test]
+    fn test_backfill_prepare_reservation_lifecycle() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        let name = [
+            "greptime".to_string(),
+            "greptime_private".to_string(),
+            "__flow_backfill_1_9".to_string(),
+        ];
+
+        // Fresh job: a Preparing reservation is installed.
+        let reservation = state
+            .begin_backfill_prepare(
+                9,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name.clone(),
+            )
+            .unwrap();
+        let PrepareReservation::Reserved(reserved) = reservation else {
+            panic!("expected Reserved reservation, got {reservation:?}");
+        };
+        assert_eq!(reserved.job_id, 9);
+        assert_eq!(
+            reserved.status,
+            BackfillJobStatus::Preparing {
+                staging_may_exist: false
+            }
+        );
+        assert_eq!(reserved.staging_table_id, None);
+        assert_eq!(state.backfill_jobs().len(), 1);
+
+        // An exact-duplicate prepare while the reservation is in flight is
+        // Busy: it must not independently create the table.
+        let err = state
+            .begin_backfill_prepare(
+                9,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name.clone(),
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("already being prepared"));
+
+        // A different range for the same job fails closed instead of replacing
+        // the reservation.
+        let err = state
+            .begin_backfill_prepare(
+                9,
+                (Timestamp::new_second(0), Timestamp::new_second(200)),
+                name.clone(),
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("different identity"));
+
+        // A failed create keeps ownership: Preparing{staging_may_exist:true}.
+        state.mark_staging_may_exist(9).unwrap();
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            BackfillJobStatus::Preparing {
+                staging_may_exist: true
+            }
+        );
+
+        // A re-prepare now resumes (same reservation held) instead of erroring.
+        let reservation = state
+            .begin_backfill_prepare(
+                9,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name.clone(),
+            )
+            .unwrap();
+        assert!(matches!(reservation, PrepareReservation::Resuming(_)));
+
+        // Once the create is confirmed, the reservation moves to Prepared.
+        let job = state.finish_backfill_prepare(9, 4096).unwrap();
+        assert_eq!(job.status, BackfillJobStatus::Prepared);
+        assert_eq!(job.staging_table_id, Some(4096));
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Prepared);
+
+        // An exact-duplicate prepare of a Prepared job is idempotent.
+        let reservation = state
+            .begin_backfill_prepare(
+                9,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name.clone(),
+            )
+            .unwrap();
+        assert!(matches!(reservation, PrepareReservation::Existing(_)));
+
+        // A second finish_prepare on a non-Preparing job fails closed.
+        let err = state.finish_backfill_prepare(9, 9999).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot finish preparing"));
+    }
+
+    #[test]
+    fn test_backfill_cancel_prepare_removes_only_preparing_jobs() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        let name = [
+            "greptime".to_string(),
+            "greptime_private".to_string(),
+            "__flow_backfill_1_10".to_string(),
+        ];
+        state
+            .begin_backfill_prepare(
+                10,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name,
+            )
+            .unwrap();
+        state
+            .register_backfill_job(&backfill_job_prepared(11))
+            .unwrap();
+
+        // Cancelling the Preparing job removes exactly it.
+        state.cancel_backfill_prepare(10).unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(state.backfill_jobs()[0].job_id, 11);
+
+        // Cancelling a non-Preparing (or unknown) job fails closed.
+        let err = state.cancel_backfill_prepare(11).unwrap_err();
+        assert!(format!("{err:?}").contains("not Preparing"));
+        let err = state.cancel_backfill_prepare(999).unwrap_err();
+        assert!(format!("{err:?}").contains("no registered backfill job"));
+    }
+
+    #[test]
+    fn test_backfill_finish_lifecycle_base_complete_only() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+
+        // Prepared jobs are NOT cleanable in Phase 1 (abort is separate).
+        state
+            .register_backfill_job(&backfill_job_prepared(12))
+            .unwrap();
+        let err = state.begin_backfill_finish(12).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("only a BaseComplete job is cleanable"),
+            "expected BaseComplete-only error, got {err:?}"
+        );
+
+        // Drive to BaseComplete via the run transitions.
+        state.begin_backfill_run(12).unwrap();
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Running);
+        // A finish while Running is rejected: cleanup must never race a run.
+        let err = state.begin_backfill_finish(12).unwrap_err();
+        assert!(format!("{err:?}").contains("only a BaseComplete job is cleanable"));
+        state
+            .complete_backfill_run(12, BTreeMap::from([(1, 99)]))
+            .unwrap();
+
+        // BaseComplete -> Finishing.
+        let finishing = state.begin_backfill_finish(12).unwrap();
+        assert_eq!(finishing.status, BackfillJobStatus::Finishing);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            BackfillJobStatus::Finishing
+        );
+
+        // While Finishing: a second finish, a run, and a re-prepare are all
+        // rejected (no new generation can replace the job mid-cleanup).
+        let err = state.begin_backfill_finish(12).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot finish"));
+        let err = state.begin_backfill_run(12).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot start"));
+        let err = state
+            .begin_backfill_prepare(
+                12,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                [
+                    "greptime".to_string(),
+                    "greptime_private".to_string(),
+                    "__flow_backfill_1_12".to_string(),
+                ],
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("cleanup is in flight"));
+
+        // Drop failure: Finishing -> BaseComplete restore keeps the job.
+        let restored = state.restore_backfill_finish(12).unwrap();
+        assert_eq!(restored.status, BackfillJobStatus::BaseComplete);
+        assert_eq!(
+            state.backfill_jobs()[0].frozen_watermark,
+            Some(BTreeMap::from([(1, 99)]))
+        );
+
+        // A second finish after restore is legitimate (retry), and the
+        // successful drop CAS-removes exactly the Finishing job.
+        state.begin_backfill_finish(12).unwrap();
+        let removed = state.remove_backfill_job_if_finishing(12).unwrap();
+        assert_eq!(removed.unwrap().job_id, 12);
+        assert!(state.backfill_jobs().is_empty());
+        // Removing an already-removed job is a no-op (Ok(None)).
+        assert!(
+            state
+                .remove_backfill_job_if_finishing(12)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_backfill_finish_remove_refuses_non_finishing_job() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        state
+            .register_backfill_job(&backfill_job_prepared(13))
+            .unwrap();
+
+        // CAS-remove only removes a Finishing job; a state change (here the
+        // job is still Prepared) must refuse instead of removing it.
+        let err = state.remove_backfill_job_if_finishing(13).unwrap_err();
+        assert!(format!("{err:?}").contains("changed state while finishing"));
+        assert_eq!(state.backfill_jobs().len(), 1);
+    }
+
+    #[test]
+    fn test_backfill_prepare_rejects_running_and_finishing_jobs() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        let name = |id: u64| {
+            [
+                "greptime".to_string(),
+                "greptime_private".to_string(),
+                format!("__flow_backfill_1_{id}"),
+            ]
+        };
+
+        // Running job: prepare is Busy.
+        state
+            .register_backfill_job(&backfill_job_prepared(14))
+            .unwrap();
+        state.begin_backfill_run(14).unwrap();
+        let err = state
+            .begin_backfill_prepare(
+                14,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name(14),
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("Base run is in flight"));
+        state.fail_backfill_run(14).unwrap();
+        state.begin_backfill_run(14).unwrap();
+        state
+            .complete_backfill_run(14, BTreeMap::from([(1, 5)]))
+            .unwrap();
+
+        // Finishing job: prepare is Busy.
+        state.begin_backfill_finish(14).unwrap();
+        let err = state
+            .begin_backfill_prepare(
+                14,
+                (Timestamp::new_second(0), Timestamp::new_second(100)),
+                name(14),
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("cleanup is in flight"));
+        // Restore and clean up for a clean end state.
+        state.restore_backfill_finish(14).unwrap();
+        state.begin_backfill_finish(14).unwrap();
+        state.remove_backfill_job_if_finishing(14).unwrap();
+        assert!(state.backfill_jobs().is_empty());
     }
 
     #[test]

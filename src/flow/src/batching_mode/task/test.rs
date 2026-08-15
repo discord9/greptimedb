@@ -4568,134 +4568,243 @@ impl RecordBatchStream for BackfillMetricsStream {
     }
 }
 
-/// Mock frontend handler for backfill Base queries: captures the
-/// `InsertIntoPlan` request and the query-context extensions, then replies with
-/// a stream whose terminal metrics carry `watermarks` (empty = no watermark;
-/// `None` = a participating region without a provable watermark).
-/// `failures_remaining` makes the handler fail the next `n` queries (before
-/// capturing anything) so failure/retry paths can be exercised.
-struct BackfillWatermarkHandler {
+/// Mock frontend handler for the full Phase-1 backfill lifecycle: handles the
+/// staging `CREATE TABLE` DDL (registering a compatible memory table and
+/// counting create attempts so "only one create" can be proven), the `DROP
+/// TABLE` SQL used by `finish_backfill_job` (with optional failure and an
+/// optional gate to hold a DROP in flight), and the Base `InsertIntoPlan`
+/// query with terminal watermarks.
+///
+/// `fail_creates_remaining` fails the next `n` create DDLs; when
+/// `register_table_on_failed_create` is set the table is still registered
+/// before the failure is returned, simulating a create that may have
+/// succeeded remotely. `query_failures_remaining` fails the next `n` Base
+/// queries so failure/retry paths can be exercised.
+#[derive(Clone)]
+struct BackfillLifecycleHandler {
+    engine: QueryEngineRef,
+    next_table_id: Arc<std::sync::atomic::AtomicU32>,
+    create_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    fail_creates_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    register_table_on_failed_create: bool,
     watermarks: Vec<(u64, Option<u64>)>,
-    failures_remaining: std::sync::atomic::AtomicUsize,
+    query_failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    query_gate: Option<Arc<tokio::sync::Notify>>,
+    fail_drops: bool,
+    drop_gate: Option<Arc<tokio::sync::Notify>>,
+    created_tables: Arc<std::sync::Mutex<Vec<String>>>,
     captured_insert: Arc<std::sync::Mutex<Option<api::v1::InsertIntoPlan>>>,
     captured_ctx_extensions: Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+    captured_sql: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl BackfillWatermarkHandler {
-    fn new(watermarks: Vec<(u64, Option<u64>)>) -> Self {
+impl BackfillLifecycleHandler {
+    fn new(engine: QueryEngineRef, watermarks: Vec<(u64, Option<u64>)>) -> Self {
         Self {
+            engine,
+            next_table_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            create_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_creates_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            register_table_on_failed_create: false,
             watermarks,
-            failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            query_failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            query_gate: None,
+            fail_drops: false,
+            drop_gate: None,
+            created_tables: Arc::new(std::sync::Mutex::new(Vec::new())),
             captured_insert: Arc::new(std::sync::Mutex::new(None)),
             captured_ctx_extensions: Arc::new(std::sync::Mutex::new(None)),
+            captured_sql: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    fn with_failures(watermarks: Vec<(u64, Option<u64>)>, failures: usize) -> Self {
-        Self {
-            failures_remaining: std::sync::atomic::AtomicUsize::new(failures),
-            ..Self::new(watermarks)
-        }
+    fn with_starting_table_id(self, table_id: u32) -> Self {
+        self.next_table_id
+            .store(table_id, std::sync::atomic::Ordering::SeqCst);
+        self
     }
+
+    fn with_failed_creates(
+        mut self,
+        failures: usize,
+        register_table_on_failed_create: bool,
+    ) -> Self {
+        self.fail_creates_remaining
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        self.register_table_on_failed_create = register_table_on_failed_create;
+        self
+    }
+
+    fn with_query_failures(self, failures: usize) -> Self {
+        self.query_failures_remaining
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    fn with_query_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.query_gate = Some(gate);
+        self
+    }
+
+    fn with_failed_drops(mut self) -> Self {
+        self.fail_drops = true;
+        self
+    }
+
+    fn with_drop_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.drop_gate = Some(gate);
+        self
+    }
+
+    fn create_attempts(&self) -> usize {
+        self.create_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Builds a `FrontendClient` wired to the given lifecycle handler.
+fn lifecycle_frontend_client(handler: &Arc<BackfillLifecycleHandler>) -> Arc<FrontendClient> {
+    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
+    Arc::new(FrontendClient::from_grpc_handler(
+        Arc::downgrade(&handler_trait),
+        QueryOptions::default(),
+    ))
 }
 
 #[async_trait::async_trait]
 impl crate::batching_mode::frontend_client::GrpcQueryHandlerWithBoxedError
-    for BackfillWatermarkHandler
+    for BackfillLifecycleHandler
 {
     async fn do_query(
         &self,
         query: api::v1::greptime_request::Request,
         ctx: QueryContextRef,
     ) -> std::result::Result<Output, BoxedError> {
-        if self
-            .failures_remaining
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            self.failures_remaining
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+        use api::v1::ddl_request::Expr;
+        use api::v1::greptime_request::Request;
+        use api::v1::query_request::Query;
+        use api::v1::{DdlRequest, QueryRequest};
+
+        match query {
+            Request::Ddl(DdlRequest {
+                expr: Some(Expr::CreateTable(create)),
+                ..
+            }) => {
+                // Yield so a concurrent prepare task can observe the
+                // reservation while this create is in flight (the memory
+                // catalog completes synchronously, so without a yield the
+                // whole prepare would finish before the other task runs).
+                tokio::task::yield_now().await;
+                let failed = self
+                    .fail_creates_remaining
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0;
+                if failed {
+                    self.fail_creates_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.create_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !failed || self.register_table_on_failed_create {
+                    let table_id = self
+                        .next_table_id
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    register_backfill_staging_table(&self.engine, &create.table_name, table_id);
+                    self.created_tables
+                        .lock()
+                        .unwrap()
+                        .push(create.table_name.clone());
+                }
+                if failed {
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+                Ok(Output::new_with_affected_rows(0))
+            }
+            Request::Query(QueryRequest {
+                query: Some(Query::Sql(sql)),
+                ..
+            }) => {
+                self.captured_sql.lock().unwrap().push(sql.clone());
+                if let Some(gate) = &self.drop_gate {
+                    gate.notified().await;
+                }
+                if self.fail_drops && sql.contains("DROP TABLE") {
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+                // A successful DROP also removes the tracked staging tables
+                // from the local catalog, mirroring the real frontend, so a
+                // later re-prepare observes the table as gone.
+                if sql.contains("DROP TABLE") {
+                    let tables = self.created_tables.lock().unwrap().clone();
+                    let catalog_manager = self.engine.engine_state().catalog_manager();
+                    let memory_catalog = catalog_manager
+                        .as_any()
+                        .downcast_ref::<MemoryCatalogManager>()
+                        .unwrap();
+                    for name in tables {
+                        memory_catalog
+                            .deregister_table_sync(catalog::DeregisterTableRequest {
+                                catalog: DEFAULT_CATALOG_NAME.to_string(),
+                                schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+                                table_name: name,
+                            })
+                            .unwrap();
+                    }
+                    self.created_tables.lock().unwrap().clear();
+                }
+                Ok(Output::new_with_affected_rows(0))
+            }
+            Request::Query(QueryRequest {
+                query: Some(Query::InsertIntoPlan(insert)),
+                ..
+            }) => {
+                // Capture the request BEFORE any gate so tests can observe the
+                // in-flight query, then block.
+                *self.captured_ctx_extensions.lock().unwrap() = Some(ctx.extensions().clone());
+                *self.captured_insert.lock().unwrap() = Some(insert);
+                if let Some(gate) = &self.query_gate {
+                    gate.notified().await;
+                }
+                if self
+                    .query_failures_remaining
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    self.query_failures_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+
+                let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+                    "v",
+                    CDT::int32_datatype(),
+                    false,
+                )]));
+                let batch = RecordBatch::new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Vector::from_slice([1])) as VectorRef],
+                )
+                .unwrap();
+                let metrics = RecordBatchMetrics {
+                    region_watermarks: self
+                        .watermarks
+                        .iter()
+                        .map(|(region_id, watermark)| RegionWatermarkEntry {
+                            region_id: *region_id,
+                            watermark: *watermark,
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                Ok(Output::new_with_stream(Box::pin(BackfillMetricsStream {
+                    schema,
+                    batch: Some(batch),
+                    metrics,
+                    terminal_metrics_only: true,
+                })))
+            }
+            other => panic!("unexpected backfill request, got {other:?}"),
         }
-        *self.captured_ctx_extensions.lock().unwrap() = Some(ctx.extensions().clone());
-        let api::v1::greptime_request::Request::Query(api::v1::QueryRequest {
-            query: Some(api::v1::query_request::Query::InsertIntoPlan(insert)),
-            ..
-        }) = query
-        else {
-            panic!("expected backfill InsertIntoPlan request, got {query:?}");
-        };
-        *self.captured_insert.lock().unwrap() = Some(insert);
-
-        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
-            "v",
-            CDT::int32_datatype(),
-            false,
-        )]));
-        let batch = RecordBatch::new(
-            schema.clone(),
-            vec![Arc::new(Int32Vector::from_slice([1])) as VectorRef],
-        )
-        .unwrap();
-        let metrics = RecordBatchMetrics {
-            region_watermarks: self
-                .watermarks
-                .iter()
-                .map(|(region_id, watermark)| RegionWatermarkEntry {
-                    region_id: *region_id,
-                    watermark: *watermark,
-                })
-                .collect(),
-            ..Default::default()
-        };
-        Ok(Output::new_with_stream(Box::pin(BackfillMetricsStream {
-            schema,
-            batch: Some(batch),
-            metrics,
-            terminal_metrics_only: true,
-        })))
-    }
-}
-
-/// Mock frontend handler for SQL statements (used by
-/// `finish_backfill_job`'s `DROP TABLE` path): records every SQL string and
-/// optionally fails DROP statements so drop-before-remove cleanup can be
-/// exercised.
-struct BackfillSqlCaptureHandler {
-    fail_drops: bool,
-    captured_sql: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-impl BackfillSqlCaptureHandler {
-    fn new(fail_drops: bool) -> Self {
-        Self {
-            fail_drops,
-            captured_sql: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::batching_mode::frontend_client::GrpcQueryHandlerWithBoxedError
-    for BackfillSqlCaptureHandler
-{
-    async fn do_query(
-        &self,
-        query: api::v1::greptime_request::Request,
-        _ctx: QueryContextRef,
-    ) -> std::result::Result<Output, BoxedError> {
-        let api::v1::greptime_request::Request::Query(api::v1::QueryRequest {
-            query: Some(api::v1::query_request::Query::Sql(sql)),
-            ..
-        }) = query
-        else {
-            panic!("expected SQL request, got {query:?}");
-        };
-        self.captured_sql.lock().unwrap().push(sql.clone());
-        if self.fail_drops && sql.contains("DROP TABLE") {
-            return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
-        }
-        Ok(Output::new_with_affected_rows(0))
     }
 }
 
@@ -4829,12 +4938,10 @@ async fn test_prepare_backfill_base_registers_job_and_builds_staging_plan() {
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9201).await;
 
     let staging_table_name = "__flow_backfill_1_42";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9202);
-
-    // The staging table already exists, so prepare must not call the frontend.
-    let (frontend_client, _handler) =
-        FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let frontend_client = Arc::new(frontend_client);
+    // The staging table does NOT pre-exist; prepare must create it through the
+    // frontend (the handler registers it in the local catalog on the DDL).
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
     let start = Timestamp::new_second(0);
     let end = Timestamp::new_second(300);
@@ -4843,7 +4950,14 @@ async fn test_prepare_backfill_base_registers_job_and_builds_staging_plan() {
         .await
         .unwrap();
 
-    // Job registered with aligned range and staging table info.
+    // Exactly one staging table create was issued, and it landed.
+    assert_eq!(handler.create_attempts(), 1);
+    assert_eq!(
+        handler.created_tables.lock().unwrap().as_slice(),
+        &[staging_table_name.to_string()]
+    );
+
+    // Job registered with aligned range, staging table info, and Prepared.
     {
         let state = task.state.read().unwrap();
         assert_eq!(state.backfill_jobs().len(), 1);
@@ -4858,7 +4972,11 @@ async fn test_prepare_backfill_base_registers_job_and_builds_staging_plan() {
                 staging_table_name.to_string(),
             ]
         );
-        assert_eq!(job.staging_table_id, Some(9202));
+        assert_eq!(job.staging_table_id, Some(1));
+        assert_eq!(
+            job.status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
         assert!(job.frozen_watermark.is_none());
     }
 
@@ -4895,32 +5013,346 @@ async fn test_prepare_backfill_base_registers_job_and_builds_staging_plan() {
 }
 
 #[tokio::test]
+async fn test_prepare_backfill_base_orphan_table_fails_closed() {
+    let sink_table_name = "twe_sink_backfill_orphan";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9203).await;
+
+    let staging_table_name = "__flow_backfill_1_49";
+    // Simulate a restart: the deterministic staging table survives but the
+    // in-memory job registry is empty (nothing is registered).
+    register_backfill_staging_table(&query_engine, staging_table_name, 9204);
+
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    let err = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            49,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("refusing to reuse an orphan table"),
+        "expected fail-closed orphan error, got {err:?}"
+    );
+    // No create was attempted and no job was registered: the orphan table was
+    // never silently adopted.
+    assert_eq!(handler.create_attempts(), 0);
+    assert!(task.state.read().unwrap().backfill_jobs().is_empty());
+
+    // Explicit cleanup (drop the orphan) then retry: a fresh prepare creates a
+    // new staging table and registers the job.
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog
+        .deregister_table_sync(catalog::DeregisterTableRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+            table_name: staging_table_name.to_string(),
+        })
+        .unwrap();
+
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            49,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(base.job.job_id, 49);
+    assert_eq!(handler.create_attempts(), 1);
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_backfill_base_concurrent_same_identity_single_create() {
+    let sink_table_name = "twe_sink_backfill_concurrent";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9205).await;
+
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    let task_a = task.clone();
+    let client_a = frontend_client.clone();
+    let engine_a = query_engine.clone();
+    let task_b = task.clone();
+    let client_b = frontend_client.clone();
+    let engine_b = query_engine.clone();
+
+    let (result_a, result_b) = tokio::join!(
+        async move {
+            task_a
+                .prepare_backfill_base(
+                    &engine_a,
+                    &client_a,
+                    50,
+                    Timestamp::new_second(0),
+                    Timestamp::new_second(300),
+                )
+                .await
+        },
+        async move {
+            task_b
+                .prepare_backfill_base(
+                    &engine_b,
+                    &client_b,
+                    50,
+                    Timestamp::new_second(0),
+                    Timestamp::new_second(300),
+                )
+                .await
+        },
+    );
+
+    // Exactly one prepare wins the reservation and creates the staging table;
+    // the other gets Busy (AlreadyPreparing) and must not create.
+    let (winner, loser) = match (result_a, result_b) {
+        (Ok(base), Err(e)) => (base, e),
+        (Err(e), Ok(base)) => (base, e),
+        other => panic!("expected exactly one Ok and one Err, got {other:?}"),
+    };
+    assert_eq!(winner.job.job_id, 50);
+    assert!(
+        format!("{loser:?}").contains("already being prepared"),
+        "expected Busy/AlreadyPreparing error, got {loser:?}"
+    );
+    assert_eq!(handler.create_attempts(), 1, "only one create may happen");
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
+        assert_eq!(
+            state.backfill_jobs()[0].range,
+            (Timestamp::new_second(0), Timestamp::new_second(300))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_backfill_base_concurrent_different_range_no_identity_replacement() {
+    let sink_table_name = "twe_sink_backfill_concurrent_range";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9206).await;
+
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    let task_a = task.clone();
+    let client_a = frontend_client.clone();
+    let engine_a = query_engine.clone();
+    let task_b = task.clone();
+    let client_b = frontend_client.clone();
+    let engine_b = query_engine.clone();
+
+    let (result_a, result_b) = tokio::join!(
+        async move {
+            task_a
+                .prepare_backfill_base(
+                    &engine_a,
+                    &client_a,
+                    51,
+                    Timestamp::new_second(0),
+                    Timestamp::new_second(300),
+                )
+                .await
+        },
+        async move {
+            task_b
+                .prepare_backfill_base(
+                    &engine_b,
+                    &client_b,
+                    51,
+                    Timestamp::new_second(0),
+                    Timestamp::new_second(600),
+                )
+                .await
+        },
+    );
+
+    // Exactly one range wins; the conflicting range is rejected without
+    // replacing the registered identity, and only one create happens.
+    let (winner, loser) = match (result_a, result_b) {
+        (Ok(base), Err(e)) => (base, e),
+        (Err(e), Ok(base)) => (base, e),
+        other => panic!("expected exactly one Ok and one Err, got {other:?}"),
+    };
+    assert_eq!(winner.job.job_id, 51);
+    assert!(
+        format!("{loser:?}").contains("different identity"),
+        "expected identity-mismatch error, got {loser:?}"
+    );
+    assert_eq!(handler.create_attempts(), 1);
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        // The registered identity is the winner's range; nothing was replaced.
+        assert_eq!(state.backfill_jobs()[0].range, winner.job.range);
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_backfill_base_create_failure_keeps_reservation_and_retry_resumes() {
+    let sink_table_name = "twe_sink_backfill_create_fail";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9207).await;
+
+    // The first create fails without creating anything.
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![]).with_failed_creates(1, false),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    let err = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            52,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        StatusCode::EngineExecuteQuery,
+        "expected create failure, got {err:?}"
+    );
+
+    // Ownership is retained as Preparing { staging_may_exist: true }: the job
+    // record is not erased and the table is never anonymous.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Preparing {
+                staging_may_exist: true
+            }
+        );
+    }
+
+    // Re-prepare resumes under the held reservation: the table is still absent
+    // (the failed create created nothing), so a fresh create lands and the job
+    // reaches Prepared. No Busy error, because the reservation is resumable.
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            52,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(base.job.job_id, 52);
+    assert_eq!(
+        handler.create_attempts(),
+        2,
+        "failed attempt + resumed create"
+    );
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_backfill_base_create_may_have_succeeded_is_adopted_on_resume() {
+    let sink_table_name = "twe_sink_backfill_create_ambiguous";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9208).await;
+
+    // The first create fails but the table WAS registered (simulating a create
+    // that succeeded remotely with a lost response): the job keeps ownership
+    // and a re-prepare must adopt its own table without a second create.
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![]).with_failed_creates(1, true),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    let err = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            53,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), StatusCode::EngineExecuteQuery);
+
+    // Re-prepare: the table exists and belongs to our reservation, so it is
+    // adopted and the job moves to Prepared without another create.
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            53,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(base.job.job_id, 53);
+    assert_eq!(
+        handler.create_attempts(),
+        1,
+        "the resumed prepare must adopt the existing table, not re-create it"
+    );
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
+        assert!(state.backfill_jobs()[0].staging_table_id.is_some());
+    }
+}
+
+#[tokio::test]
 async fn test_run_backfill_base_captures_f_and_leaves_checkpoints_untouched() {
     let sink_table_name = "twe_sink_backfill_run";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9301).await;
 
-    let staging_table_name = "__flow_backfill_1_77";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9302);
+    let handler = Arc::new(BackfillLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(7, Some(99))],
+    ));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             77,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
         )
         .await
         .unwrap();
-
-    let handler = Arc::new(BackfillWatermarkHandler::new(vec![(7, Some(99))]));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
+    assert_eq!(handler.create_attempts(), 1);
 
     let frozen = task
         .run_backfill_base(&frontend_client, &base)
@@ -4950,7 +5382,7 @@ async fn test_run_backfill_base_captures_f_and_leaves_checkpoints_untouched() {
     let captured_insert = handler.captured_insert.lock().unwrap().clone().unwrap();
     assert_eq!(
         captured_insert.table_name.unwrap().table_name,
-        staging_table_name
+        "__flow_backfill_1_77"
     );
     let captured_extensions = handler
         .captured_ctx_extensions
@@ -4968,7 +5400,7 @@ async fn test_run_backfill_base_captures_f_and_leaves_checkpoints_untouched() {
         captured_extensions
             .get(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS)
             .map(String::as_str),
-        Some("[9302]")
+        Some("[1]")
     );
 }
 
@@ -4977,29 +5409,20 @@ async fn test_run_backfill_base_fails_on_incomplete_watermark_and_keeps_staging(
     let sink_table_name = "twe_sink_backfill_missing_watermark";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9401).await;
 
-    let staging_table_name = "__flow_backfill_1_88";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9402);
+    // Handler returns no terminal watermarks at all.
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             88,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
         )
         .await
         .unwrap();
-
-    // Handler returns no terminal watermarks at all.
-    let handler = Arc::new(BackfillWatermarkHandler::new(vec![]));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler;
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
 
     let err = task
         .run_backfill_base(&frontend_client, &base)
@@ -5031,32 +5454,23 @@ async fn test_run_backfill_base_multi_region_watermark_success_and_incomplete_fa
     let sink_table_name = "twe_sink_backfill_multi_region";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9501).await;
 
-    let staging_table_name = "__flow_backfill_1_90";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9502);
-
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
-
     // Complete multi-region F: every participating region proves a watermark.
+    let handler = Arc::new(BackfillLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(7, Some(99)), (8, Some(100))],
+    ));
+    let frontend_client = lifecycle_frontend_client(&handler);
+
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             90,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
         )
         .await
         .unwrap();
-    let handler = Arc::new(BackfillWatermarkHandler::new(vec![
-        (7, Some(99)),
-        (8, Some(100)),
-    ]));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler;
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
     let frozen = task
         .run_backfill_base(&frontend_client, &base)
         .await
@@ -5066,27 +5480,21 @@ async fn test_run_backfill_base_multi_region_watermark_success_and_incomplete_fa
     // A separate job whose participating region has no provable watermark
     // (None) is omitted from the map, so F is incomplete and the run fails
     // closed, returning the job to Prepared.
-    let staging_table_name = "__flow_backfill_1_91";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9503);
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![(7, Some(99)), (8, None)])
+            .with_starting_table_id(2),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             91,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
         )
         .await
         .unwrap();
-    let handler = Arc::new(BackfillWatermarkHandler::new(vec![
-        (7, Some(99)),
-        (8, None),
-    ]));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler;
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
     let err = task
         .run_backfill_base(&frontend_client, &base)
         .await
@@ -5115,12 +5523,8 @@ async fn test_prepare_backfill_base_duplicate_same_range_is_idempotent() {
     let sink_table_name = "twe_sink_backfill_dup_prepare";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9601).await;
 
-    let staging_table_name = "__flow_backfill_1_43";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9602);
-
-    let (frontend_client, _handler) =
-        FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let frontend_client = Arc::new(frontend_client);
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
     let start = Timestamp::new_second(0);
     let end = Timestamp::new_second(300);
@@ -5128,11 +5532,11 @@ async fn test_prepare_backfill_base_duplicate_same_range_is_idempotent() {
         .prepare_backfill_base(&query_engine, &frontend_client, 43, start, end)
         .await
         .unwrap();
+    assert_eq!(handler.create_attempts(), 1);
 
     // Exact duplicate prepare (same job_id, same aligned range, same staging
-    // identity): idempotent. Returns the existing job, does not re-create or
-    // clear the staging table (no frontend call would succeed with the empty
-    // handler), and does not reset status/F.
+    // identity): idempotent. Returns the existing job, does not re-create the
+    // staging table, and does not reset status/F.
     let base_dup = task
         .prepare_backfill_base(&query_engine, &frontend_client, 43, start, end)
         .await
@@ -5140,6 +5544,7 @@ async fn test_prepare_backfill_base_duplicate_same_range_is_idempotent() {
     assert_eq!(base_dup.job.job_id, base.job.job_id);
     assert_eq!(base_dup.job.range, base.job.range);
     assert_eq!(base_dup.job.staging_table_name, base.job.staging_table_name);
+    assert_eq!(handler.create_attempts(), 1, "duplicate must not re-create");
     {
         let state = task.state.read().unwrap();
         assert_eq!(state.backfill_jobs().len(), 1);
@@ -5152,12 +5557,8 @@ async fn test_prepare_backfill_base_different_range_rejects() {
     let sink_table_name = "twe_sink_backfill_dup_range";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9701).await;
 
-    let staging_table_name = "__flow_backfill_1_44";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9702);
-
-    let (frontend_client, _handler) =
-        FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let frontend_client = Arc::new(frontend_client);
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
     task.prepare_backfill_base(
         &query_engine,
@@ -5168,6 +5569,7 @@ async fn test_prepare_backfill_base_different_range_rejects() {
     )
     .await
     .unwrap();
+    assert_eq!(handler.create_attempts(), 1);
 
     // Same job_id with a different aligned range fails closed.
     let err = task
@@ -5184,6 +5586,7 @@ async fn test_prepare_backfill_base_different_range_rejects() {
         format!("{err:?}").contains("different identity"),
         "expected identity-mismatch error, got {err:?}"
     );
+    assert_eq!(handler.create_attempts(), 1);
     {
         let state = task.state.read().unwrap();
         assert_eq!(state.backfill_jobs().len(), 1);
@@ -5199,15 +5602,16 @@ async fn test_run_backfill_base_rejects_second_run_after_complete() {
     let sink_table_name = "twe_sink_backfill_second_run";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9801).await;
 
-    let staging_table_name = "__flow_backfill_1_45";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9802);
+    let handler = Arc::new(BackfillLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(7, Some(99))],
+    ));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             45,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
@@ -5215,12 +5619,6 @@ async fn test_run_backfill_base_rejects_second_run_after_complete() {
         .await
         .unwrap();
 
-    let handler = Arc::new(BackfillWatermarkHandler::new(vec![(7, Some(99))]));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
     let frozen = task
         .run_backfill_base(&frontend_client, &base)
         .await
@@ -5250,15 +5648,17 @@ async fn test_run_backfill_base_query_failure_returns_to_prepared_and_retry_succ
     let sink_table_name = "twe_sink_backfill_retry";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 9901).await;
 
-    let staging_table_name = "__flow_backfill_1_46";
-    register_backfill_staging_table(&query_engine, staging_table_name, 9902);
+    // First query fails at the frontend; the job must return to Prepared.
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![(7, Some(99))])
+            .with_query_failures(1),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
 
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
     let base = task
         .prepare_backfill_base(
             &query_engine,
-            &empty_client,
+            &frontend_client,
             46,
             Timestamp::new_second(0),
             Timestamp::new_second(300),
@@ -5266,16 +5666,6 @@ async fn test_run_backfill_base_query_failure_returns_to_prepared_and_retry_succ
         .await
         .unwrap();
 
-    // First query fails at the frontend; the job must return to Prepared.
-    let handler = Arc::new(BackfillWatermarkHandler::with_failures(
-        vec![(7, Some(99))],
-        1,
-    ));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
     let err = task
         .run_backfill_base(&frontend_client, &base)
         .await
@@ -5311,32 +5701,35 @@ async fn test_run_backfill_base_query_failure_returns_to_prepared_and_retry_succ
     }
 }
 
+/// Polls until `cond` holds (with a bounded timeout) so tests can observe a
+/// request that is in flight in another task.
+async fn wait_until<F: Fn() -> bool>(cond: F) {
+    for _ in 0..5000 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("condition not met within timeout");
+}
+
 #[tokio::test]
 async fn test_finish_backfill_job_unknown_job_does_not_drop() {
     let sink_table_name = "twe_sink_backfill_finish_unknown";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 10001).await;
 
-    let staging_table_name = "__flow_backfill_1_47";
-    register_backfill_staging_table(&query_engine, staging_table_name, 10002);
+    let handler = Arc::new(BackfillLifecycleHandler::new(query_engine.clone(), vec![]));
+    let frontend_client = lifecycle_frontend_client(&handler);
 
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
     task.prepare_backfill_base(
         &query_engine,
-        &empty_client,
+        &frontend_client,
         47,
         Timestamp::new_second(0),
         Timestamp::new_second(300),
     )
     .await
     .unwrap();
-
-    let handler = Arc::new(BackfillSqlCaptureHandler::new(false));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
 
     // An unknown job id fails closed without issuing any DROP.
     let err = task
@@ -5364,28 +5757,30 @@ async fn test_finish_backfill_job_drop_failure_keeps_job_and_retry_removes() {
     let sink_table_name = "twe_sink_backfill_finish_retry";
     let (task, query_engine, _) = new_backfill_task(sink_table_name, 10101).await;
 
-    let staging_table_name = "__flow_backfill_1_48";
-    register_backfill_staging_table(&query_engine, staging_table_name, 10102);
-
-    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
-    let empty_client = Arc::new(empty_client);
-    task.prepare_backfill_base(
-        &query_engine,
-        &empty_client,
-        48,
-        Timestamp::new_second(0),
-        Timestamp::new_second(300),
-    )
-    .await
-    .unwrap();
-
-    // Drop fails: the job must stay registered so cleanup is retryable.
-    let handler = Arc::new(BackfillSqlCaptureHandler::new(true));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
+    // Prepare and run to BaseComplete through the same lifecycle handler.
+    let handler = Arc::new(BackfillLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(7, Some(99))],
     ));
+    let frontend_client = lifecycle_frontend_client(&handler);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            48,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    task.run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap();
+
+    // Drop fails: the job must stay registered (restored to BaseComplete) so
+    // cleanup is retryable.
+    let failing = Arc::new((*handler).clone().with_failed_drops());
+    let frontend_client = lifecycle_frontend_client(&failing);
     let err = task
         .finish_backfill_job(&frontend_client, 48)
         .await
@@ -5399,25 +5794,258 @@ async fn test_finish_backfill_job_drop_failure_keeps_job_and_retry_removes() {
         let state = task.state.read().unwrap();
         assert_eq!(state.backfill_jobs().len(), 1);
         assert_eq!(state.backfill_jobs()[0].job_id, 48);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::BaseComplete,
+            "a failed drop must restore the job to BaseComplete for retry"
+        );
     }
     assert_eq!(
-        handler.captured_sql.lock().unwrap().len(),
+        failing.captured_sql.lock().unwrap().len(),
         1,
         "a DROP must have been issued"
     );
 
     // Retry with a succeeding drop removes the job.
-    let handler = Arc::new(BackfillSqlCaptureHandler::new(false));
-    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler;
-    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
-        Arc::downgrade(&handler_trait),
-        QueryOptions::default(),
-    ));
+    let succeeding = Arc::new(handler.clone());
+    let frontend_client = lifecycle_frontend_client(&succeeding);
     task.finish_backfill_job(&frontend_client, 48)
         .await
         .unwrap();
     {
         let state = task.state.read().unwrap();
         assert!(state.backfill_jobs().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_finish_backfill_job_rejects_running_job() {
+    let sink_table_name = "twe_sink_backfill_finish_vs_run";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 10201).await;
+
+    // The Base query blocks at the gate, keeping the job Running.
+    let query_gate = Arc::new(tokio::sync::Notify::new());
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![(7, Some(99))])
+            .with_query_gate(query_gate.clone()),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            54,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+
+    let run_task = task.clone();
+    let run_client = frontend_client.clone();
+    let run_handle = tokio::spawn(async move {
+        run_task
+            .run_backfill_base(&run_client, &base)
+            .await
+            .unwrap()
+    });
+    // Wait until the Base query is in flight (job is Running).
+    wait_until(|| handler.captured_insert.lock().unwrap().is_some()).await;
+    assert_eq!(
+        task.state.read().unwrap().backfill_jobs()[0].status,
+        crate::batching_mode::state::BackfillJobStatus::Running
+    );
+
+    // A finish while Running is rejected and must not issue a DROP.
+    let err = task
+        .finish_backfill_job(&frontend_client, 54)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("only a BaseComplete job is cleanable"),
+        "expected finish-while-Running rejection, got {err:?}"
+    );
+    assert!(handler.captured_sql.lock().unwrap().is_empty());
+
+    // Release the query; the run completes normally and the job reaches
+    // BaseComplete (untouched by the rejected finish).
+    query_gate.notify_one();
+    run_handle.await.unwrap();
+    assert_eq!(
+        task.state.read().unwrap().backfill_jobs()[0].status,
+        crate::batching_mode::state::BackfillJobStatus::BaseComplete
+    );
+}
+
+#[tokio::test]
+async fn test_finish_backfill_job_second_finish_returns_busy() {
+    let sink_table_name = "twe_sink_backfill_double_finish";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 10301).await;
+
+    // The first finish's DROP blocks at the gate, keeping the job Finishing.
+    let drop_gate = Arc::new(tokio::sync::Notify::new());
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![(7, Some(99))])
+            .with_drop_gate(drop_gate.clone()),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            55,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    task.run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap();
+
+    // First finish: DROP in flight, job is Finishing.
+    let finish_task = task.clone();
+    let finish_client = frontend_client.clone();
+    let finish_handle =
+        tokio::spawn(async move { finish_task.finish_backfill_job(&finish_client, 55).await });
+    wait_until(|| !handler.captured_sql.lock().unwrap().is_empty()).await;
+    assert_eq!(
+        task.state.read().unwrap().backfill_jobs()[0].status,
+        crate::batching_mode::state::BackfillJobStatus::Finishing
+    );
+
+    // A second concurrent finish is Busy and must not issue another DROP.
+    let err = task
+        .finish_backfill_job(&frontend_client, 55)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("cannot finish"),
+        "expected second-finish Busy error, got {err:?}"
+    );
+    assert_eq!(handler.captured_sql.lock().unwrap().len(), 1);
+
+    // Release the DROP; the first finish completes and removes the job.
+    drop_gate.notify_one();
+    finish_handle.await.unwrap().unwrap();
+    assert!(task.state.read().unwrap().backfill_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn test_finish_backfill_job_rejects_reprepare_while_finishing() {
+    let sink_table_name = "twe_sink_backfill_finish_vs_prepare";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 10401).await;
+
+    let drop_gate = Arc::new(tokio::sync::Notify::new());
+    let handler = Arc::new(
+        BackfillLifecycleHandler::new(query_engine.clone(), vec![(7, Some(99))])
+            .with_drop_gate(drop_gate.clone()),
+    );
+    let frontend_client = lifecycle_frontend_client(&handler);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            56,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    task.run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap();
+
+    // First finish holds the job in Finishing (DROP gated).
+    let finish_task = task.clone();
+    let finish_client = frontend_client.clone();
+    let finish_handle =
+        tokio::spawn(async move { finish_task.finish_backfill_job(&finish_client, 56).await });
+    wait_until(|| !handler.captured_sql.lock().unwrap().is_empty()).await;
+    assert_eq!(
+        task.state.read().unwrap().backfill_jobs()[0].status,
+        crate::batching_mode::state::BackfillJobStatus::Finishing
+    );
+
+    // A re-prepare while Finishing is rejected: a new generation can never be
+    // installed over an in-flight cleanup.
+    let err = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            56,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("cleanup is in flight"),
+        "expected re-prepare-while-Finishing rejection, got {err:?}"
+    );
+
+    // Release the DROP; the finish completes and removes the job.
+    drop_gate.notify_one();
+    finish_handle.await.unwrap().unwrap();
+    assert!(task.state.read().unwrap().backfill_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn test_finish_backfill_job_then_reprepare_is_a_fresh_generation() {
+    let sink_table_name = "twe_sink_backfill_finish_then_prepare";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 10501).await;
+
+    let handler = Arc::new(BackfillLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(7, Some(99))],
+    ));
+    let frontend_client = lifecycle_frontend_client(&handler);
+
+    // Generation 1: prepare -> run -> finish (DROP succeeds, table removed).
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            57,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    task.run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap();
+    task.finish_backfill_job(&frontend_client, 57)
+        .await
+        .unwrap();
+    assert!(task.state.read().unwrap().backfill_jobs().is_empty());
+    assert_eq!(handler.create_attempts(), 1);
+
+    // Generation 2: a fresh prepare for the same job id is a brand-new job
+    // (registry empty, table gone) and creates a new staging table — the old
+    // generation is never reused.
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &frontend_client,
+            57,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(base.job.job_id, 57);
+    assert_eq!(
+        handler.create_attempts(),
+        2,
+        "a new generation must re-create"
+    );
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            crate::batching_mode::state::BackfillJobStatus::Prepared
+        );
     }
 }
