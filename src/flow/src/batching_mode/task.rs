@@ -18,7 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::v1::{CreateTableExpr, TableName};
 use catalog::CatalogManagerRef;
+use client::DEFAULT_CATALOG_NAME;
 use common_error::ext::BoxedError;
+use common_query::OutputData;
 use common_query::logical_plan::breakup_insert_plan;
 use common_recordbatch::RecordBatches;
 use common_recordbatch::util::collect_batches;
@@ -38,7 +40,9 @@ use datatypes::schema::Schema;
 use datatypes::value::Value;
 use datatypes::vectors::Helper;
 use query::QueryEngineRef;
-use query::options::FLOW_INCREMENTAL_MODE;
+use query::options::{
+    FLOW_INCREMENTAL_MODE, FLOW_INTERNAL_NON_SOURCE_TABLE_IDS, FLOW_RETURN_REGION_SEQ,
+};
 use query::query_engine::DefaultSerializer;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt, ensure};
@@ -59,10 +63,12 @@ use crate::batching_mode::checkpoint::{
 use crate::batching_mode::eval_schedule::{EvalSchedule, select_due_scheduled_times};
 use crate::batching_mode::frontend_client::{FrontendClient, PeerDesc};
 use crate::batching_mode::state::{
-    CheckpointMode, CheckpointPersistence, DirtyTimeWindows, FilterExprInfo, TaskState,
-    to_df_literal,
+    BackfillJob, CheckpointMode, CheckpointPersistence, DirtyTimeWindows, FilterExprInfo,
+    TaskState, to_df_literal,
 };
-use crate::batching_mode::table_creator::{QueryType, create_table_with_expr};
+use crate::batching_mode::table_creator::{
+    QueryType, create_staging_table_expr, create_table_with_expr,
+};
 use crate::batching_mode::time_window::TimeWindowExpr;
 use crate::batching_mode::utils::{
     AddFilterRewriter, ColumnMatcherRewriter, df_plan_to_sql, gen_plan_with_matching_schema,
@@ -90,6 +96,81 @@ fn wall_clock_unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Internal epoch stamped onto every staging row written by Phase 1 backfill
+/// when the cloned staging schema contains the reserved internal epoch column
+/// ([`INTERNAL_FLOW_EPOCH_COL_NAME`]).
+///
+/// `u64::MAX` is strictly larger than any real flow cycle epoch, so an active
+/// checkpoint restore scanning rows by epoch can never mistake staging rows
+/// for sink state rows (staging is never the active sink, but the explicit
+/// value keeps the invariant by construction).
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+pub(crate) const BACKFILL_STAGING_EPOCH: u64 = u64::MAX;
+
+/// The private schema under which internal flow tables (e.g. backfill staging
+/// tables) live. Mirrors `common_catalog::consts::DEFAULT_PRIVATE_SCHEMA_NAME`
+/// (`greptime_private`); `common-catalog` is only a dev-dependency of the flow
+/// crate, so the value is re-derived from the same build-time constant at
+/// runtime.
+pub(crate) fn flow_private_schema_name() -> String {
+    format!("{}_private", DEFAULT_CATALOG_NAME)
+}
+
+/// Builds the staging table name for a backfill job:
+/// `greptime_private.__flow_backfill_<flow_id>_<job_id>`.
+///
+/// Both identifiers are `u64`, so the generated name cannot contain SQL
+/// metacharacters or path separators; the helper is stable and injection-free
+/// by construction.
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+pub(crate) fn backfill_staging_table_name(flow_id: FlowId, job_id: u64) -> [String; 3] {
+    [
+        DEFAULT_CATALOG_NAME.to_string(),
+        flow_private_schema_name(),
+        format!("__flow_backfill_{flow_id}_{job_id}"),
+    ]
+}
+
+/// The prepared Phase-1 backfill base: the registered [`BackfillJob`] plus the
+/// executable DML plan that writes the aggregated Base rows into the staging
+/// table.
+///
+/// Phase 2 finalize consumes this through
+/// [`BatchingTask::run_backfill_base`] and the FULL OUTER merge primitive; it
+/// is deliberately not wired to any user-triggered path in Phase 1.
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+pub(crate) struct BackfillBase {
+    pub job: BackfillJob,
+    pub plan: LogicalPlan,
+}
+
+/// Verifies that the returned terminal watermark map is complete for every
+/// participating region and non-empty. Phase 1 requires this proof before
+/// recording F: a scan-open watermark is the frozen upper bound the Base
+/// aggregation was computed under.
+#[allow(dead_code)] // used by run_backfill_base and Phase 1 tests
+fn verify_backfill_watermark(
+    participating_regions: &std::collections::BTreeSet<u64>,
+    watermark_map: &HashMap<u64, u64>,
+) -> Result<(), Error> {
+    if participating_regions.is_empty()
+        || watermark_map.is_empty()
+        || participating_regions.len() != watermark_map.len()
+        || !participating_regions
+            .iter()
+            .all(|region_id| watermark_map.contains_key(region_id))
+    {
+        return UnexpectedSnafu {
+            reason: format!(
+                "backfill base query returned incomplete terminal watermarks: participating={:?}, watermarks={:?}",
+                participating_regions, watermark_map
+            ),
+        }
+        .fail();
+    }
+    Ok(())
 }
 
 /// The task's config, immutable once created
@@ -654,6 +735,398 @@ impl BatchingTask {
             .create(expr.clone(), catalog, schema)
             .await?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 1 backfill primitives (two-phase incremental backfill).
+    //
+    // These APIs are the staging-side foundation only: they build and run the
+    // Base aggregation into an internal staging table under a frozen scan-open
+    // watermark F, without ever touching the active sink, the active
+    // checkpoints, or `checkpoint_mode`. Normal `execute_once_serialized`
+    // evaluation keeps running concurrently — the job registry in `TaskState`
+    // is only consulted here, and no execution lock is held across the Base
+    // query. Phase 2 wires the merge/finalize path; Phase 1 leaves the staging
+    // table in place on failure and provides explicit cleanup.
+    // ---------------------------------------------------------------------
+
+    /// Prepares a Phase-1 backfill base:
+    ///
+    /// 1. aligns the requested `[start, end)` range to the flow's time-window
+    ///    boundaries;
+    /// 2. creates (if missing) the internal staging table
+    ///    `greptime_private.__flow_backfill_<flow_id>_<job_id>` by cloning the
+    ///    active sink/state schema (nullable dimension PKs, window time index,
+    ///    BINARY state, `update_at`/epoch columns as present);
+    /// 3. registers the job in `TaskState` (short critical section);
+    /// 4. builds the Base DML plan: the original full aggregate query with an
+    ///    event-time `[start, end)` filter and the staging table as DML target.
+    ///
+    /// The caller then runs [`Self::run_backfill_base`] to execute the plan and
+    /// capture F. No `execution_lock` is held here beyond the brief job
+    /// registration, so normal flow evaluation is not blocked.
+    ///
+    /// Phase 1 never auto-drops the staging table on failure; use
+    /// [`Self::finish_backfill_job`] for explicit cleanup after a successful
+    /// finalize.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub(crate) async fn prepare_backfill_base(
+        &self,
+        engine: &QueryEngineRef,
+        frontend_client: &Arc<FrontendClient>,
+        job_id: u64,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<BackfillBase, Error> {
+        let time_window_expr =
+            self.config
+                .time_window_expr
+                .as_ref()
+                .with_context(|| UnexpectedSnafu {
+                    reason: "backfill requires a time window expression".to_string(),
+                })?;
+        // Align the requested range to the flow's time window boundaries.
+        let (start, end) = {
+            let (aligned_start, aligned_end) =
+                DirtyTimeWindows::align_time_window(start, Some(end), time_window_expr)?;
+            let aligned_end = aligned_end.with_context(|| UnexpectedSnafu {
+                reason: format!("failed to align backfill end {end:?}"),
+            })?;
+            (aligned_start, aligned_end)
+        };
+
+        let (sink_table, _) = get_table_info_df_schema(
+            self.config.catalog_manager.clone(),
+            self.config.sink_table_name.clone(),
+        )
+        .await?;
+
+        let staging_table_name = backfill_staging_table_name(self.config.flow_id, job_id);
+        // Create the staging table only when the local catalog does not have it
+        // yet; `create_staging_table_expr` uses `create_if_not_exists` so a
+        // concurrent creation on the frontend is also tolerated.
+        if !self.is_table_exist(&staging_table_name).await? {
+            let create_expr = create_staging_table_expr(&sink_table, &staging_table_name)?;
+            info!(
+                "Flow {} creating backfill staging table {:?} for job {}",
+                self.config.flow_id, staging_table_name, job_id
+            );
+            frontend_client
+                .create(create_expr, &staging_table_name[0], &staging_table_name[1])
+                .await?;
+        }
+        let staging_table_id = self
+            .config
+            .catalog_manager
+            .table(
+                &staging_table_name[0],
+                &staging_table_name[1],
+                &staging_table_name[2],
+                None,
+            )
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?
+            .map(|table| table.table_info().table_id());
+
+        let job = BackfillJob {
+            job_id,
+            range: (start, end),
+            staging_table_name: staging_table_name.clone(),
+            staging_table_id,
+            frozen_watermark: None,
+        };
+        // Short critical section: register the job, then drop the lock before
+        // any query execution.
+        {
+            let mut state = self.state.write().unwrap();
+            state.register_backfill_job(job.clone());
+        }
+
+        let plan = self
+            .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
+            .await?;
+        Ok(BackfillBase { job, plan })
+    }
+
+    /// Builds the executable Base plan for a backfill job: the original full
+    /// aggregate query matched against the staging schema (without the
+    /// reserved epoch column), plus an event-time `[start, end)` filter on the
+    /// flow's window column, wrapped in an `INSERT` DML targeting the staging
+    /// table. When the cloned staging schema contains the reserved internal
+    /// epoch column, every emitted row is stamped with
+    /// [`BACKFILL_STAGING_EPOCH`] so it can never be mistaken for active sink
+    /// state.
+    ///
+    /// This intentionally does NOT go through `prepare_plan_for_incremental`:
+    /// the Base must be a plain full aggregate over `[start, end)`, never a
+    /// delta merged with the active sink.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    async fn build_backfill_base_plan(
+        &self,
+        engine: QueryEngineRef,
+        staging_table_name: &[String; 3],
+        range: (Timestamp, Timestamp),
+    ) -> Result<LogicalPlan, Error> {
+        let (staging_table, _) = get_table_info_df_schema(
+            self.config.catalog_manager.clone(),
+            staging_table_name.clone(),
+        )
+        .await?;
+        let table_meta = &staging_table.table_info().meta;
+        let primary_key_indices = table_meta.primary_key_indices.clone();
+        // Whether the cloned staging schema carries the reserved internal epoch
+        // column; Phase 1 stamps every row with an explicit job epoch when it
+        // does (computed before `staging_table` is moved into the provider).
+        let has_epoch_col = table_meta
+            .schema
+            .column_schema_by_name(INTERNAL_FLOW_EPOCH_COL_NAME)
+            .is_some();
+        let (effective_schema, effective_pk_indices) =
+            strip_internal_epoch_column(&table_meta.schema, &primary_key_indices);
+        let query_ctx = self.state.read().unwrap().query_ctx.clone();
+
+        // Match the flow query output against the staging schema (epoch column
+        // stripped; it is stamped separately below).
+        let select_plan = gen_plan_with_matching_schema(
+            &self.config.query,
+            query_ctx.clone(),
+            engine.clone(),
+            Arc::new(effective_schema),
+            &effective_pk_indices,
+            true,
+        )
+        .await?;
+
+        // Target event-time `[start, end)` filter on the source window column.
+        let col_name = self
+            .config
+            .time_window_expr
+            .as_ref()
+            .map(|expr| expr.column_name.clone())
+            .with_context(|| UnexpectedSnafu {
+                reason: "backfill requires a time window expression".to_string(),
+            })?;
+        let lower = to_df_literal(range.0)?;
+        let upper = to_df_literal(range.1)?;
+        let filter = col(&col_name)
+            .gt_eq(lit(lower))
+            .and(col(&col_name).lt(lit(upper)));
+        let mut add_filter = AddFilterRewriter::new(filter);
+        let select_plan = select_plan
+            .clone()
+            .rewrite(&mut add_filter)
+            .with_context(|_| DatafusionSnafu {
+                context: format!(
+                    "Failed to apply backfill [start,end) filter to plan:\n {}\n",
+                    select_plan
+                ),
+            })?
+            .data;
+        let select_plan = apply_df_optimizer(select_plan, &query_ctx).await?;
+
+        let table_provider = Arc::new(DfTableProviderAdapter::new(staging_table));
+        let table_source = Arc::new(DefaultTableSource::new(table_provider));
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            datafusion_common::TableReference::Full {
+                catalog: staging_table_name[0].clone().into(),
+                schema: staging_table_name[1].clone().into(),
+                table: staging_table_name[2].clone().into(),
+            },
+            table_source,
+            WriteOp::Insert(datafusion_expr::dml::InsertOp::Append),
+            Arc::new(select_plan),
+        ));
+
+        // Stamp the internal job epoch onto every staging row when the cloned
+        // schema contains the reserved epoch column.
+        if has_epoch_col {
+            let LogicalPlan::Dml(dml) = &dml else {
+                unreachable!("dml just built above");
+            };
+            let inner = dml.input.as_ref().clone();
+            let mut exprs = inner
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+                .collect::<Vec<_>>();
+            exprs.push(
+                lit(ScalarValue::UInt64(Some(BACKFILL_STAGING_EPOCH)))
+                    .alias(INTERNAL_FLOW_EPOCH_COL_NAME),
+            );
+            let stamped = LogicalPlanBuilder::from(inner)
+                .project(exprs)
+                .with_context(|_| DatafusionSnafu {
+                    context: "Failed to stamp backfill staging epoch column".to_string(),
+                })?
+                .build()
+                .with_context(|_| DatafusionSnafu {
+                    context: "Failed to finalize epoch-stamped backfill staging plan".to_string(),
+                })?;
+            return Ok(LogicalPlan::Dml(DmlStatement::new(
+                dml.table_name.clone(),
+                dml.target.clone(),
+                dml.op.clone(),
+                Arc::new(stamped),
+            )));
+        }
+
+        Ok(dml)
+    }
+
+    /// Runs the prepared Base query against the frontend without holding
+    /// `execution_lock`, requests terminal region watermarks so the scan-open
+    /// watermark F is bound at scan time, verifies F is complete and non-empty,
+    /// records it on the registered job, and returns it.
+    ///
+    /// Phase 1 side effects are strictly staging-side: no active checkpoint is
+    /// advanced, no checkpoint sentinel is written, and `checkpoint_mode` is
+    /// never changed. On failure the staging table and the registered job are
+    /// kept for retry or explicit cleanup.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub(crate) async fn run_backfill_base(
+        &self,
+        frontend_client: &Arc<FrontendClient>,
+        base: &BackfillBase,
+    ) -> Result<BTreeMap<u64, u64>, Error> {
+        let job = &base.job;
+        let catalog = &job.staging_table_name[0];
+        let schema = &job.staging_table_name[1];
+        // Source table refs are resolved against the flow's own query context
+        // (the staging table only hosts the DML target, never the sources).
+        let (source_catalog, source_schema) = {
+            let ctx = self.state.read().unwrap().query_ctx.clone();
+            (ctx.current_catalog().to_string(), ctx.current_schema())
+        };
+
+        // Fix all table refs to be fully qualified, same as the normal
+        // execution path.
+        let plan = base
+            .plan
+            .clone()
+            .transform_down_with_subqueries(|p| {
+                if let LogicalPlan::TableScan(mut table_scan) = p {
+                    let resolved = table_scan
+                        .table_name
+                        .resolve(&source_catalog, &source_schema);
+                    table_scan.table_name = resolved.into();
+                    Ok(Transformed::yes(LogicalPlan::TableScan(table_scan)))
+                } else {
+                    Ok(Transformed::no(p))
+                }
+            })
+            .with_context(|_| DatafusionSnafu {
+                context: format!("Failed to fix table ref in backfill plan {:?}", base.plan),
+            })?
+            .data;
+
+        let (insert_to, insert_input_plan) = breakup_insert_plan(&plan, catalog, schema)
+            .with_context(|| UnexpectedSnafu {
+                reason: "backfill base plan is not an INSERT into the staging table".to_string(),
+            })?;
+        let req = encode_insert_plan_request(insert_to, &insert_input_plan)?;
+
+        let extensions = self.backfill_query_extensions(job)?;
+        let extension_refs = extensions
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<Vec<_>>();
+        let mut peer_desc = None;
+        let res = frontend_client
+            .query_with_terminal_metrics(
+                catalog,
+                schema,
+                req,
+                &extension_refs,
+                // No preset snapshot_seqs: the scan-open terminal watermark F
+                // is bound by the storage layer at scan time.
+                &HashMap::new(),
+                &mut peer_desc,
+            )
+            .await?;
+        // Consume the output so terminal region watermarks are finalized:
+        // affected-rows (normal INSERT) outputs carry plan-derived metrics,
+        // while stream outputs only mark terminal metrics ready after they are
+        // fully drained.
+        let client::OutputWithMetrics { output, metrics } = res;
+        let affected_rows = match output.data {
+            OutputData::AffectedRows(rows) => rows,
+            OutputData::Stream(stream) => {
+                let _ = collect_batches(stream)
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?;
+                0
+            }
+            OutputData::RecordBatches(_) => 0,
+        };
+        let watermark_map = metrics.region_watermark_map().unwrap_or_default();
+        debug!(
+            "Flow {} backfill job {} base query executed, affected_rows: {}, watermark: {:?}",
+            self.config.flow_id, job.job_id, affected_rows, watermark_map
+        );
+
+        let participating_regions = metrics.participating_regions().unwrap_or_default();
+        verify_backfill_watermark(&participating_regions, &watermark_map)?;
+        let watermark_map = watermark_map.into_iter().collect::<BTreeMap<_, _>>();
+
+        // Record F on the registered job (short critical section).
+        {
+            let mut state = self.state.write().unwrap();
+            state.set_backfill_frozen_watermark(job.job_id, watermark_map.clone())?;
+        }
+        Ok(watermark_map)
+    }
+
+    /// Builds the flow extensions for a backfill Base query: terminal region
+    /// watermark return (to bind F at scan open) plus the staging table id in
+    /// `flow.internal_non_source_table_ids` so the frontend treats any staging
+    /// scan as a plain non-source read.
+    #[allow(dead_code)] // used by run_backfill_base and Phase 1 tests
+    fn backfill_query_extensions(
+        &self,
+        job: &BackfillJob,
+    ) -> Result<Vec<(&'static str, String)>, Error> {
+        let mut extensions = vec![(FLOW_RETURN_REGION_SEQ, "true".to_string())];
+        if let Some(staging_table_id) = job.staging_table_id {
+            let ids = serde_json::to_string(&[staging_table_id]).map_err(|err| {
+                UnexpectedSnafu {
+                    reason: format!("Failed to serialize staging table ids: {err}"),
+                }
+                .build()
+            })?;
+            extensions.push((FLOW_INTERNAL_NON_SOURCE_TABLE_IDS, ids));
+        }
+        Ok(extensions)
+    }
+
+    /// Explicit cleanup helper for a finished backfill job: unregisters the
+    /// job and drops its staging table. Phase 2 finalize calls this after a
+    /// successful merge; Phase 1 failure paths intentionally keep the staging
+    /// table (and the registered job) so the work is not silently lost.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub(crate) async fn finish_backfill_job(
+        &self,
+        frontend_client: &Arc<FrontendClient>,
+        job_id: u64,
+    ) -> Result<(), Error> {
+        {
+            let mut state = self.state.write().unwrap();
+            state.take_backfill_job(job_id);
+        }
+        let staging_table_name = backfill_staging_table_name(self.config.flow_id, job_id);
+        let full_name = TableReference::full(
+            staging_table_name[0].as_str(),
+            staging_table_name[1].as_str(),
+            staging_table_name[2].as_str(),
+        )
+        .to_quoted_string();
+        let sql = format!("DROP TABLE IF EXISTS {full_name}");
+        frontend_client
+            .sql(&staging_table_name[0], &staging_table_name[1], &sql)
+            .await
+            .map(|_| ())
     }
 
     /// Executes the insert plan. Caller must reach this through the serialized path.

@@ -661,6 +661,19 @@ pub fn analyze_incremental_aggregate_plan(
     }))
 }
 
+/// Join kind used by the incremental aggregate merge rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalMergeJoinKind {
+    /// Current incremental behavior: delta LEFT JOIN the merge base. Tail-only
+    /// groups are preserved; groups that exist only in the base are dropped
+    /// (they are already part of the active sink state).
+    Left,
+    /// FULL OUTER merge preserving both Tail-only and Base-only groups. Used
+    /// by two-phase backfill finalize where the merge base is the staging
+    /// table: the merged result must contain every group of either side.
+    FullOuter,
+}
+
 /// Rewrites one incremental aggregate delta plan by left-joining it with the
 /// existing sink-table state and projecting merged aggregate outputs.
 ///
@@ -692,12 +705,41 @@ pub fn analyze_incremental_aggregate_plan(
 /// before projection, aliasing, and the left join. The predicate must reference
 /// raw sink table columns structurally (unqualified), before the `__flow_sink`
 /// alias exists.
+///
+/// This is the `Left` convenience wrapper over
+/// [`rewrite_incremental_aggregate_with_sink_merge_kind`]; the merge base table
+/// parameter is generic, so a later phase can point it at the backfill staging
+/// table instead of the active sink.
 pub async fn rewrite_incremental_aggregate_with_sink_merge(
     delta_plan: &LogicalPlan,
     analysis: &IncrementalAggregateAnalysis,
     sink_table: TableRef,
     sink_table_name: &TableName,
     sink_dirty_filter: Option<Expr>,
+) -> Result<LogicalPlan, Error> {
+    rewrite_incremental_aggregate_with_sink_merge_kind(
+        delta_plan,
+        analysis,
+        sink_table,
+        sink_table_name,
+        sink_dirty_filter,
+        IncrementalMergeJoinKind::Left,
+    )
+    .await
+}
+
+/// Same as [`rewrite_incremental_aggregate_with_sink_merge`] but with an
+/// explicit join kind. `FullOuter` keeps every Base-only and Tail-only group:
+/// group keys are projected as the non-NULL side of the join, and the existing
+/// merge expressions already short-circuit NULL sides, so they are reused
+/// unchanged for both join kinds.
+pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
+    delta_plan: &LogicalPlan,
+    analysis: &IncrementalAggregateAnalysis,
+    base_table: TableRef,
+    base_table_name: &TableName,
+    base_dirty_filter: Option<Expr>,
+    join_kind: IncrementalMergeJoinKind,
 ) -> Result<LogicalPlan, Error> {
     ensure!(
         analysis.unsupported_exprs.is_empty(),
@@ -726,22 +768,22 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
         }
     );
 
-    // UDDSketch state merge requires the sink's state column to be Binary (the
-    // serialized state). Report a clear error instead of letting the left-join
+    // UDDSketch state merge requires the base table's state column to be Binary
+    // (the serialized state). Report a clear error instead of letting the join
     // merge fail with an obscure type-coercion error later.
-    let sink_table_info = sink_table.table_info();
-    let sink_columns = sink_table_info.meta.schema.column_schemas();
+    let base_table_info = base_table.table_info();
+    let base_columns = base_table_info.meta.schema.column_schemas();
     for merge_col in &analysis.merge_columns {
         if let IncrementalAggregateMergeOp::UddSketchState { .. } = merge_col.merge_op
-            && let Some(sink_col) = sink_columns
+            && let Some(base_col) = base_columns
                 .iter()
                 .find(|col| col.name == merge_col.output_field_name)
-            && sink_col.data_type != ConcreteDataType::binary_datatype()
+            && base_col.data_type != ConcreteDataType::binary_datatype()
         {
             return InvalidQuerySnafu {
                 reason: format!(
-                    "UNSUPPORTED_INCREMENTAL_AGG: UDDSketch state sink column '{}' must be Binary to merge states incrementally, found {}",
-                    merge_col.output_field_name, sink_col.data_type
+                    "UNSUPPORTED_INCREMENTAL_AGG: UDDSketch state base column '{}' must be Binary to merge states incrementally, found {}",
+                    merge_col.output_field_name, base_col.data_type
                 ),
             }
             .fail();
@@ -749,7 +791,12 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
     }
 
     let delta_alias = "__flow_delta";
-    let sink_alias = "__flow_sink";
+    let base_alias = "__flow_sink";
+    let join_type = match join_kind {
+        IncrementalMergeJoinKind::Left => JoinType::Left,
+        // `JoinType::Full` is DataFusion's FULL OUTER join.
+        IncrementalMergeJoinKind::FullOuter => JoinType::Full,
+    };
 
     let mut selected_columns = analysis.group_key_names.clone();
     selected_columns.extend(
@@ -780,14 +827,14 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
             context: "Failed to build projected delta plan for incremental sink merge".to_string(),
         })?;
 
-    let table_provider = Arc::new(DfTableProviderAdapter::new(sink_table));
+    let table_provider = Arc::new(DfTableProviderAdapter::new(base_table));
     let table_source = Arc::new(DefaultTableSource::new(table_provider));
-    let sink_scan = LogicalPlan::TableScan(
+    let base_scan = LogicalPlan::TableScan(
         TableScan::try_new(
             TableReference::Full {
-                catalog: sink_table_name[0].clone().into(),
-                schema: sink_table_name[1].clone().into(),
-                table: sink_table_name[2].clone().into(),
+                catalog: base_table_name[0].clone().into(),
+                schema: base_table_name[1].clone().into(),
+                table: base_table_name[2].clone().into(),
             },
             table_source,
             None,
@@ -795,42 +842,42 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
             None,
         )
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to build sink table scan for incremental sink merge".to_string(),
+            context: "Failed to build base table scan for incremental sink merge".to_string(),
         })?,
     );
 
-    let sink_selected_exprs = selected_columns
+    let base_selected_exprs = selected_columns
         .iter()
         .cloned()
         .map(unqualified_col)
         .collect::<Vec<_>>();
-    let sink_input = if let Some(predicate) = sink_dirty_filter {
-        LogicalPlanBuilder::from(sink_scan)
+    let base_input = if let Some(predicate) = base_dirty_filter {
+        LogicalPlanBuilder::from(base_scan)
             .filter(predicate)
             .with_context(|_| DatafusionSnafu {
-                context: "Failed to filter sink table scan for incremental sink merge".to_string(),
+                context: "Failed to filter base table scan for incremental sink merge".to_string(),
             })?
             .build()
             .with_context(|_| DatafusionSnafu {
-                context: "Failed to build filtered sink plan for incremental sink merge"
+                context: "Failed to build filtered base plan for incremental sink merge"
                     .to_string(),
             })?
     } else {
-        sink_scan
+        base_scan
     };
 
-    let sink_selected = LogicalPlanBuilder::from(sink_input)
-        .project(sink_selected_exprs)
+    let base_selected = LogicalPlanBuilder::from(base_input)
+        .project(base_selected_exprs)
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to project sink table scan for incremental sink merge".to_string(),
+            context: "Failed to project base table scan for incremental sink merge".to_string(),
         })?
-        .alias(sink_alias)
+        .alias(base_alias)
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to alias sink plan for incremental sink merge".to_string(),
+            context: "Failed to alias base plan for incremental sink merge".to_string(),
         })?
         .build()
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to build projected sink plan for incremental sink merge".to_string(),
+            context: "Failed to build projected base plan for incremental sink merge".to_string(),
         })?;
 
     let join_keys = (
@@ -844,25 +891,26 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
             .group_key_names
             .iter()
             .cloned()
-            .map(|c| qualified_column(sink_alias, c))
+            .map(|c| qualified_column(base_alias, c))
             .collect::<Vec<_>>(),
     );
 
     let joined = LogicalPlanBuilder::from(delta_selected)
         .join_detailed(
-            sink_selected,
-            JoinType::Left,
+            base_selected,
+            join_type,
             join_keys,
             None,
             NullEquality::NullEqualsNull,
         )
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to left join delta and sink plans for incremental sink merge"
-                .to_string(),
+            context: format!(
+                "Failed to {join_kind:?} join delta and base plans for incremental sink merge"
+            ),
         })?
         .build()
         .with_context(|_| DatafusionSnafu {
-            context: "Failed to build left join plan for incremental sink merge".to_string(),
+            context: format!("Failed to build {join_kind:?} join plan for incremental sink merge"),
         })?;
 
     let group_key_names = analysis.group_key_names.iter().collect::<HashSet<_>>();
@@ -875,18 +923,31 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
 
     let mut projection_exprs = Vec::with_capacity(analysis.output_field_names.len());
     for output_field_name in &analysis.output_field_names {
-        if group_key_names.contains(output_field_name)
-            || literal_columns.contains(output_field_name)
-        {
+        if group_key_names.contains(output_field_name) {
+            // A FULL OUTER merge must keep Base-only groups whose group key is
+            // NULL on the delta side; pick the non-NULL side of the join.
+            let group_key_expr = match join_kind {
+                IncrementalMergeJoinKind::Left => {
+                    qualified_col(delta_alias, output_field_name.clone())
+                }
+                IncrementalMergeJoinKind::FullOuter => when(
+                    is_null(qualified_col(delta_alias, output_field_name.clone())),
+                    qualified_col(base_alias, output_field_name.clone()),
+                )
+                .otherwise(qualified_col(delta_alias, output_field_name.clone()))
+                .with_context(|_| DatafusionSnafu {
+                    context: format!(
+                        "Failed to build FULL OUTER group key merge expr for {output_field_name}"
+                    ),
+                })?,
+            };
+            projection_exprs.push(group_key_expr.alias(output_field_name));
+        } else if literal_columns.contains(output_field_name) {
             projection_exprs.push(
                 qualified_col(delta_alias, output_field_name.clone()).alias(output_field_name),
             );
         } else if let Some(merge_col) = merge_columns.get(output_field_name) {
-            projection_exprs.push(build_left_join_merge_expr(
-                delta_alias,
-                sink_alias,
-                merge_col,
-            )?);
+            projection_exprs.push(build_join_merge_expr(delta_alias, base_alias, merge_col)?);
         } else {
             return InvalidQuerySnafu {
                 reason: format!(
@@ -908,13 +969,16 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
         })
 }
 
-fn build_left_join_merge_expr(
+/// Builds the merged expression for one aggregate output column. Every branch
+/// short-circuits NULL on either side, so the same expression is correct for
+/// both the incremental delta LEFT JOIN and the FULL OUTER base merge.
+fn build_join_merge_expr(
     delta_alias: &str,
-    sink_alias: &str,
+    base_alias: &str,
     merge_col: &IncrementalAggregateMergeColumn,
 ) -> Result<Expr, Error> {
     let left = qualified_col(delta_alias, merge_col.output_field_name.clone());
-    let right = qualified_col(sink_alias, merge_col.output_field_name.clone());
+    let right = qualified_col(base_alias, merge_col.output_field_name.clone());
     let merged = match merge_col.merge_op {
         IncrementalAggregateMergeOp::Sum => when(is_null(left.clone()), right.clone())
             .when(is_null(right.clone()), left.clone())

@@ -859,6 +859,7 @@ struct FlightContext {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::task::{Context, Poll};
 
@@ -958,6 +959,38 @@ mod tests {
                     r#"{"1":10,"2":20}"#.to_string()
                 ),
             ]
+        );
+    }
+
+    /// Distributed metadata roundtrip: the backfill staging-table exclusion
+    /// extension survives the client's Flight metadata serialization and is
+    /// parsed back by the query layer exactly as sent.
+    #[test]
+    fn test_put_flow_extensions_roundtrips_internal_non_source_table_ids() {
+        let mut metadata = MetadataMap::new();
+        Database::put_flow_extensions(
+            &mut metadata,
+            &[
+                ("flow.return_region_seq", "true"),
+                ("flow.internal_non_source_table_ids", r#"[1024, 2048]"#),
+            ],
+        )
+        .unwrap();
+
+        let value = metadata
+            .get(FLOW_EXTENSIONS_METADATA_KEY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded: Vec<(String, String)> = serde_json::from_str(value).unwrap();
+        let extensions = decoded.into_iter().collect::<HashMap<_, _>>();
+        let parsed = query::options::FlowQueryExtensions::parse_flow_extensions(&extensions)
+            .unwrap()
+            .unwrap();
+        assert!(parsed.return_region_seq);
+        assert_eq!(
+            parsed.internal_non_source_table_ids,
+            Some(std::collections::BTreeSet::from([1024, 2048]))
         );
     }
 

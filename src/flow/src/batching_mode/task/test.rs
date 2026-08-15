@@ -13,27 +13,33 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use catalog::RegisterTableRequest;
 use catalog::memory::MemoryCatalogManager;
 use client::OutputWithMetrics;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_catalog::consts::{
+    DEFAULT_CATALOG_NAME, DEFAULT_PRIVATE_SCHEMA_NAME, DEFAULT_SCHEMA_NAME,
+};
 use common_error::ext::{BoxedError, PlainError};
 use common_error::mock::MockError;
 use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_recordbatch::adapter::{RecordBatchMetrics, RegionWatermarkEntry};
-use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
+use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use datatypes::data_type::ConcreteDataType as CDT;
 use datatypes::prelude::{MutableVector, ScalarVectorBuilder};
 use datatypes::schema::{ColumnSchema, Schema};
 use datatypes::vectors::{
-    TimestampMillisecondVector, TimestampNanosecondVector, UInt32Vector, VectorRef,
+    Int32Vector, TimestampMillisecondVector, TimestampNanosecondVector, UInt32Vector, VectorRef,
 };
 use pretty_assertions::assert_eq;
 use query::options::{
     FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE, FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY,
-    FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE, FLOW_SCHEDULED_TIME_MILLIS, QueryOptions,
+    FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE, FLOW_INTERNAL_NON_SOURCE_TABLE_IDS,
+    FLOW_RETURN_REGION_SEQ, FLOW_SCHEDULED_TIME_MILLIS, QueryOptions,
 };
 use session::context::QueryContext;
 use snafu::ResultExt;
@@ -4512,4 +4518,438 @@ async fn test_checkpoint_persist_failure_schedules_backfill_and_replacement_chec
         *checkpoint_write_attempts.lock().unwrap(),
         "one failed checkpoint write followed by one replacement write"
     );
+}
+
+// ---------------------------------------------------------------------
+// Phase 1 two-phase backfill primitives
+// ---------------------------------------------------------------------
+
+/// A metrics-carrying one-shot stream used by the backfill mock handler.
+struct BackfillMetricsStream {
+    schema: datatypes::schema::SchemaRef,
+    batch: Option<RecordBatch>,
+    metrics: RecordBatchMetrics,
+    terminal_metrics_only: bool,
+}
+
+impl futures::Stream for BackfillMetricsStream {
+    type Item = common_recordbatch::error::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.batch.take().map(Ok))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            usize::from(self.batch.is_some()),
+            Some(usize::from(self.batch.is_some())),
+        )
+    }
+}
+
+impl RecordBatchStream for BackfillMetricsStream {
+    fn name(&self) -> &str {
+        "BackfillMetricsStream"
+    }
+
+    fn schema(&self) -> datatypes::schema::SchemaRef {
+        self.schema.clone()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        None
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        if self.terminal_metrics_only && self.batch.is_some() {
+            return None;
+        }
+        Some(self.metrics.clone())
+    }
+}
+
+/// Mock frontend handler for backfill Base queries: captures the
+/// `InsertIntoPlan` request and the query-context extensions, then replies with
+/// a stream whose terminal metrics carry `watermarks` (empty = no watermark).
+struct BackfillWatermarkHandler {
+    watermarks: Vec<(u64, u64)>,
+    captured_insert: Arc<std::sync::Mutex<Option<api::v1::InsertIntoPlan>>>,
+    captured_ctx_extensions: Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+}
+
+impl BackfillWatermarkHandler {
+    fn new(watermarks: Vec<(u64, u64)>) -> Self {
+        Self {
+            watermarks,
+            captured_insert: Arc::new(std::sync::Mutex::new(None)),
+            captured_ctx_extensions: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::batching_mode::frontend_client::GrpcQueryHandlerWithBoxedError
+    for BackfillWatermarkHandler
+{
+    async fn do_query(
+        &self,
+        query: api::v1::greptime_request::Request,
+        ctx: QueryContextRef,
+    ) -> std::result::Result<Output, BoxedError> {
+        *self.captured_ctx_extensions.lock().unwrap() = Some(ctx.extensions().clone());
+        let api::v1::greptime_request::Request::Query(api::v1::QueryRequest {
+            query: Some(api::v1::query_request::Query::InsertIntoPlan(insert)),
+            ..
+        }) = query
+        else {
+            panic!("expected backfill InsertIntoPlan request, got {query:?}");
+        };
+        *self.captured_insert.lock().unwrap() = Some(insert);
+
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "v",
+            CDT::int32_datatype(),
+            false,
+        )]));
+        let batch = RecordBatch::new(
+            schema.clone(),
+            vec![Arc::new(Int32Vector::from_slice([1])) as VectorRef],
+        )
+        .unwrap();
+        let metrics = RecordBatchMetrics {
+            region_watermarks: self
+                .watermarks
+                .iter()
+                .map(|(region_id, watermark)| RegionWatermarkEntry {
+                    region_id: *region_id,
+                    watermark: Some(*watermark),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        Ok(Output::new_with_stream(Box::pin(BackfillMetricsStream {
+            schema,
+            batch: Some(batch),
+            metrics,
+            terminal_metrics_only: true,
+        })))
+    }
+}
+
+/// Builds a task with a time-window expression and a registered sink table,
+/// ready for Phase 1 backfill tests. Returns the task, the query engine, and
+/// the query used to build the task.
+async fn new_backfill_task(
+    sink_table_name: &str,
+    sink_table_id: u32,
+) -> (BatchingTask, QueryEngineRef, String) {
+    let query_engine = create_test_query_engine();
+    let ctx = QueryContext::arc();
+    let plan_query = "SELECT number, date_bin(INTERVAL '5 second', ts) AS time_window \
+         FROM numbers_with_ts GROUP BY time_window, number";
+    let plan = sql_to_df_plan(ctx.clone(), query_engine.clone(), plan_query, true)
+        .await
+        .unwrap();
+    let (column_name, time_window_expr, _, df_schema) = find_time_window_expr(
+        &plan,
+        query_engine.engine_state().catalog_manager().clone(),
+        ctx.clone(),
+    )
+    .await
+    .unwrap();
+    let time_window_expr = time_window_expr
+        .map(|expr| {
+            TimeWindowExpr::from_expr(
+                &expr,
+                &column_name,
+                &df_schema,
+                &query_engine.engine_state().session_state(),
+            )
+        })
+        .transpose()
+        .unwrap();
+
+    register_twe_sink(&query_engine, sink_table_name, sink_table_id);
+
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let task = BatchingTask::try_new(TaskArgs {
+        flow_id: 1,
+        query: plan_query,
+        plan: plan.clone(),
+        time_window_expr,
+        expire_after: None,
+        sink_table_name: [
+            "greptime".to_string(),
+            "public".to_string(),
+            sink_table_name.to_string(),
+        ],
+        source_table_names: vec![[
+            "greptime".to_string(),
+            "public".to_string(),
+            "numbers_with_ts".to_string(),
+        ]],
+        query_ctx: ctx,
+        catalog_manager: query_engine.engine_state().catalog_manager().clone(),
+        shutdown_rx: rx,
+        batch_opts: incremental_batch_opts(),
+        flow_eval_interval: None,
+        eval_schedule: None,
+    })
+    .unwrap();
+    (task, query_engine, plan_query.to_string())
+}
+
+/// Registers a staging table under `greptime_private` mirroring the sink
+/// schema (dimension `number` nullable, window `time_window` time index).
+fn register_backfill_staging_table(query_engine: &QueryEngineRef, table_name: &str, table_id: u32) {
+    let schema = Arc::new(Schema::new(vec![
+        ColumnSchema::new("number", CDT::uint32_datatype(), true),
+        ColumnSchema::new("time_window", CDT::timestamp_millisecond_datatype(), false)
+            .with_time_index(true),
+    ]));
+    let columns: Vec<VectorRef> = vec![
+        Arc::new(UInt32Vector::from_slice([1_u32])),
+        Arc::new(TimestampMillisecondVector::from_slice([0_i64])),
+    ];
+    let recordbatch = RecordBatch::new(schema, columns).unwrap();
+    let table = MemTable::new_with_catalog(
+        table_name,
+        recordbatch,
+        table_id,
+        DEFAULT_CATALOG_NAME.to_string(),
+        DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+    );
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog
+        .register_schema_sync(catalog::RegisterSchemaRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+        })
+        .unwrap();
+    let request = RegisterTableRequest {
+        catalog: DEFAULT_CATALOG_NAME.to_string(),
+        schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+        table_name: table_name.to_string(),
+        table_id,
+        table,
+    };
+    memory_catalog.register_table_sync(request).unwrap();
+}
+
+#[test]
+fn test_backfill_staging_table_name_is_stable_and_injection_free() {
+    assert_eq!(
+        backfill_staging_table_name(1, 7),
+        [
+            DEFAULT_CATALOG_NAME.to_string(),
+            DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+            "__flow_backfill_1_7".to_string(),
+        ]
+    );
+    // u64 identifiers are the only inputs, so the generated name is a strict
+    // `__flow_backfill_<flow_id>_<job_id>` format with no room for SQL
+    // metacharacters.
+    let name = backfill_staging_table_name(u64::MAX, u64::MAX);
+    assert_eq!(name[0], DEFAULT_CATALOG_NAME);
+    assert_eq!(name[1], DEFAULT_PRIVATE_SCHEMA_NAME);
+    assert!(name[2].starts_with("__flow_backfill_"));
+    assert!(name[2].ends_with("_18446744073709551615"));
+}
+
+#[tokio::test]
+async fn test_prepare_backfill_base_registers_job_and_builds_staging_plan() {
+    let sink_table_name = "twe_sink_backfill_prepare";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9201).await;
+
+    let staging_table_name = "__flow_backfill_1_42";
+    register_backfill_staging_table(&query_engine, staging_table_name, 9202);
+
+    // The staging table already exists, so prepare must not call the frontend.
+    let (frontend_client, _handler) =
+        FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+    let frontend_client = Arc::new(frontend_client);
+
+    let start = Timestamp::new_second(0);
+    let end = Timestamp::new_second(300);
+    let base = task
+        .prepare_backfill_base(&query_engine, &frontend_client, 42, start, end)
+        .await
+        .unwrap();
+
+    // Job registered with aligned range and staging table info.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        let job = &state.backfill_jobs()[0];
+        assert_eq!(job.job_id, 42);
+        assert_eq!(job.range, (start, end));
+        assert_eq!(
+            job.staging_table_name,
+            [
+                DEFAULT_CATALOG_NAME.to_string(),
+                DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+                staging_table_name.to_string(),
+            ]
+        );
+        assert_eq!(job.staging_table_id, Some(9202));
+        assert!(job.frozen_watermark.is_none());
+    }
+
+    // The returned base carries the same job and a DML plan targeting the
+    // staging table with the `[start, end)` event-time filter.
+    assert_eq!(base.job.job_id, 42);
+    let LogicalPlan::Dml(dml) = &base.plan else {
+        panic!("expected DML plan, got {:?}", base.plan);
+    };
+    assert_eq!(
+        dml.table_name,
+        TableReference::Full {
+            catalog: Arc::from(DEFAULT_CATALOG_NAME),
+            schema: Arc::from(DEFAULT_PRIVATE_SCHEMA_NAME),
+            table: Arc::from(staging_table_name),
+        }
+    );
+    let inner = format!("{}", dml.input.display_indent());
+    assert!(
+        inner.contains("TimestampMillisecond(0"),
+        "base plan must filter by the aligned lower bound, got: {inner}"
+    );
+    assert!(
+        inner.contains("TimestampMillisecond(300000"),
+        "base plan must filter by the aligned upper bound, got: {inner}"
+    );
+
+    // Phase 1 must not touch checkpoints or checkpoint mode.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.checkpoint_mode(), CheckpointMode::FullSnapshot);
+        assert!(state.checkpoints().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_run_backfill_base_captures_f_and_leaves_checkpoints_untouched() {
+    let sink_table_name = "twe_sink_backfill_run";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9301).await;
+
+    let staging_table_name = "__flow_backfill_1_77";
+    register_backfill_staging_table(&query_engine, staging_table_name, 9302);
+
+    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+    let empty_client = Arc::new(empty_client);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &empty_client,
+            77,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+
+    let handler = Arc::new(BackfillWatermarkHandler::new(vec![(7, 99)]));
+    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
+    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
+        Arc::downgrade(&handler_trait),
+        QueryOptions::default(),
+    ));
+
+    let frozen = task
+        .run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap();
+    assert_eq!(frozen, BTreeMap::from([(7_u64, 99_u64)]));
+
+    // F recorded on the registered job.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(
+            state.backfill_jobs()[0].frozen_watermark,
+            Some(BTreeMap::from([(7_u64, 99_u64)]))
+        );
+        // Active checkpoint state must be untouched by Phase 1.
+        assert_eq!(state.checkpoint_mode(), CheckpointMode::FullSnapshot);
+        assert!(state.checkpoints().is_empty());
+        assert_eq!(state.persisted_epoch(), 0);
+    }
+
+    // The Base request was an InsertIntoPlan into the staging table, carrying
+    // the return_region_seq extension and the staging table id exclusion.
+    let captured_insert = handler.captured_insert.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        captured_insert.table_name.unwrap().table_name,
+        staging_table_name
+    );
+    let captured_extensions = handler
+        .captured_ctx_extensions
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    assert_eq!(
+        captured_extensions
+            .get(FLOW_RETURN_REGION_SEQ)
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        captured_extensions
+            .get(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS)
+            .map(String::as_str),
+        Some("[9302]")
+    );
+}
+
+#[tokio::test]
+async fn test_run_backfill_base_fails_on_incomplete_watermark_and_keeps_staging() {
+    let sink_table_name = "twe_sink_backfill_missing_watermark";
+    let (task, query_engine, _) = new_backfill_task(sink_table_name, 9401).await;
+
+    let staging_table_name = "__flow_backfill_1_88";
+    register_backfill_staging_table(&query_engine, staging_table_name, 9402);
+
+    let (empty_client, _handler) = FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+    let empty_client = Arc::new(empty_client);
+    let base = task
+        .prepare_backfill_base(
+            &query_engine,
+            &empty_client,
+            88,
+            Timestamp::new_second(0),
+            Timestamp::new_second(300),
+        )
+        .await
+        .unwrap();
+
+    // Handler returns no terminal watermarks at all.
+    let handler = Arc::new(BackfillWatermarkHandler::new(vec![]));
+    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler;
+    let frontend_client = Arc::new(FrontendClient::from_grpc_handler(
+        Arc::downgrade(&handler_trait),
+        QueryOptions::default(),
+    ));
+
+    let err = task
+        .run_backfill_base(&frontend_client, &base)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("incomplete terminal watermarks"),
+        "expected incomplete-watermark error, got {err:?}"
+    );
+
+    // Phase 1 failure keeps the staging table and the registered job.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(state.backfill_jobs()[0].job_id, 88);
+        assert!(state.backfill_jobs()[0].frozen_watermark.is_none());
+        assert_eq!(state.checkpoint_mode(), CheckpointMode::FullSnapshot);
+        assert!(state.checkpoints().is_empty());
+    }
 }

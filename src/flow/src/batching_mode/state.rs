@@ -23,6 +23,7 @@ use common_time::Timestamp;
 use datatypes::value::Value;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt, ensure};
+use table::metadata::TableId;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -70,6 +71,12 @@ pub struct TaskState {
     /// larger epoch invalidate the durable record on restart.
     persisted_epoch: u64,
     exec_state: ExecState,
+    /// Registered Phase-1 two-phase backfill jobs. Normal incremental
+    /// execution ignores these entirely: they are the staging-side bookkeeping
+    /// for backfill (aligned range, staging table, frozen watermark F) and
+    /// never block or alter live flow evaluation or checkpoint advancement.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    backfill_jobs: Vec<BackfillJob>,
     /// Shutdown receiver
     pub(crate) shutdown_rx: oneshot::Receiver<()>,
     /// Task handle
@@ -99,6 +106,7 @@ impl TaskState {
             checkpoint_persistence: None,
             persisted_epoch: 0,
             exec_state: ExecState::Idle,
+            backfill_jobs: Vec::new(),
             shutdown_rx,
             task_handle: None,
         }
@@ -186,6 +194,53 @@ impl TaskState {
     /// windows under a frozen full-snapshot high watermark.
     pub fn pending_fenced_repair(&self) -> Option<&FencedRepair> {
         self.pending_fenced_repair.as_ref()
+    }
+
+    /// Registers a Phase-1 backfill job. Replacing an existing job with the
+    /// same `job_id` is allowed (idempotent re-prepare).
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn register_backfill_job(&mut self, job: BackfillJob) {
+        self.backfill_jobs
+            .retain(|existing| existing.job_id != job.job_id);
+        self.backfill_jobs.push(job);
+    }
+
+    /// Registered Phase-1 backfill jobs (never consulted by normal flow
+    /// evaluation or checkpoint handling).
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn backfill_jobs(&self) -> &[BackfillJob] {
+        &self.backfill_jobs
+    }
+
+    /// Records the frozen scan-open watermark F for a backfill job after its
+    /// Base query succeeded.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn set_backfill_frozen_watermark(
+        &mut self,
+        job_id: u64,
+        watermark: BTreeMap<u64, u64>,
+    ) -> Result<(), Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id}"),
+            })?;
+        job.frozen_watermark = Some(watermark);
+        Ok(())
+    }
+
+    /// Removes and returns a registered backfill job. Used by finalize
+    /// cleanup after a successful merge; Phase 1 failure keeps the job (and
+    /// its staging table) registered.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn take_backfill_job(&mut self, job_id: u64) -> Option<BackfillJob> {
+        let idx = self
+            .backfill_jobs
+            .iter()
+            .position(|job| job.job_id == job_id)?;
+        Some(self.backfill_jobs.remove(idx))
     }
 
     pub fn is_incremental_disabled(&self) -> bool {
@@ -1014,6 +1069,34 @@ impl FencedRepair {
     }
 }
 
+/// A registered Phase-1 two-phase backfill job.
+///
+/// Holds everything the staging side of a backfill needs: the aligned
+/// event-time range, the staging table it writes into, and the frozen
+/// scan-open watermark `F` captured by
+/// [`crate::batching_mode::task::BatchingTask::run_backfill_base`].
+///
+/// This is deliberately NOT a checkpoint sub-state: it never affects
+/// `checkpoint_mode`, the active sink, or normal incremental execution.
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+#[derive(Debug, Clone)]
+pub struct BackfillJob {
+    pub job_id: u64,
+    /// Aligned event-time range `[start, end)` covered by this job.
+    pub range: (Timestamp, Timestamp),
+    /// Staging table `greptime_private.__flow_backfill_<flow_id>_<job_id>`.
+    pub staging_table_name: [String; 3],
+    /// Resolved id of the staging table, used to exclude it from source
+    /// incremental bounds via `flow.internal_non_source_table_ids` when a
+    /// later phase scans it.
+    pub staging_table_id: Option<TableId>,
+    /// Frozen scan-open terminal watermark F captured by `run_backfill_base`.
+    /// `None` until the Base query succeeds; a failed Phase 1 keeps the
+    /// staging table and the registered job so the caller may retry or clean
+    /// up explicitly.
+    pub frozen_watermark: Option<BTreeMap<u64, u64>>,
+}
+
 /// Filter Expression's information
 #[derive(Debug, Clone)]
 pub struct FilterExprInfo {
@@ -1077,6 +1160,57 @@ mod test {
 
         state.after_query_exec(std::time::Duration::from_millis(1), true);
         assert!(state.last_execution_time_millis().is_some());
+    }
+
+    #[test]
+    fn test_backfill_job_registry_register_watermark_take() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        let mut job = BackfillJob {
+            job_id: 7,
+            range: (Timestamp::new_second(100), Timestamp::new_second(200)),
+            staging_table_name: [
+                "greptime".to_string(),
+                "greptime_private".to_string(),
+                "__flow_backfill_1_7".to_string(),
+            ],
+            staging_table_id: Some(2048),
+            frozen_watermark: None,
+        };
+        state.register_backfill_job(job.clone());
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert!(state.backfill_jobs()[0].frozen_watermark.is_none());
+
+        state
+            .set_backfill_frozen_watermark(7, BTreeMap::from([(1, 10), (2, 20)]))
+            .unwrap();
+        assert_eq!(
+            state.backfill_jobs()[0].frozen_watermark,
+            Some(BTreeMap::from([(1, 10), (2, 20)]))
+        );
+
+        // Unknown job id fails.
+        assert!(
+            state
+                .set_backfill_frozen_watermark(99, BTreeMap::new())
+                .is_err()
+        );
+
+        // Re-registering the same id replaces the old job.
+        job.frozen_watermark = Some(BTreeMap::from([(3, 30)]));
+        state.register_backfill_job(job.clone());
+        assert_eq!(state.backfill_jobs().len(), 1);
+        assert_eq!(
+            state.backfill_jobs()[0].frozen_watermark,
+            Some(BTreeMap::from([(3, 30)]))
+        );
+
+        // take removes the job and returns it.
+        let taken = state.take_backfill_job(7).unwrap();
+        assert_eq!(taken.job_id, 7);
+        assert!(state.backfill_jobs().is_empty());
+        assert!(state.take_backfill_job(7).is_none());
     }
 
     #[test]

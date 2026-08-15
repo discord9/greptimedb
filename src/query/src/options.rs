@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use common_base::memory_limit::MemoryLimit;
@@ -28,6 +28,12 @@ pub const FLOW_INCREMENTAL_AFTER_SEQS: &str = "flow.incremental_after_seqs";
 pub const FLOW_INCREMENTAL_MODE: &str = "flow.incremental_mode";
 pub const FLOW_RETURN_REGION_SEQ: &str = "flow.return_region_seq";
 pub const FLOW_SINK_TABLE_ID: &str = "flow.sink_table_id";
+/// Table ids of internal non-source tables (e.g. the two-phase backfill
+/// staging table). Scans of these tables are excluded from source incremental
+/// bounds and per-region snapshot binding, exactly like
+/// [`FLOW_SINK_TABLE_ID`], but as a set so several internal tables can share
+/// one query context.
+pub const FLOW_INTERNAL_NON_SOURCE_TABLE_IDS: &str = "flow.internal_non_source_table_ids";
 /// Flow scheduler binding for the logical time of one scheduled attempt.
 /// Query planning, SQL/TQL parsing, range-select rewrite and DataFusion
 /// execution read this extension so `now()` is stable for the whole attempt.
@@ -91,6 +97,11 @@ pub struct FlowQueryExtensions {
     pub return_region_seq: bool,
     /// Optional sink table id used to distinguish source scans from sink reads.
     pub sink_table_id: Option<TableId>,
+    /// Optional set of internal non-source table ids (e.g. the backfill
+    /// staging table). Like [`Self::sink_table_id`], scans of these tables are
+    /// treated as plain reads: they never participate in incremental lower
+    /// bounds or per-region snapshot binding.
+    pub internal_non_source_table_ids: Option<BTreeSet<TableId>>,
 }
 
 impl FlowQueryExtensions {
@@ -103,7 +114,8 @@ impl FlowQueryExtensions {
         let has_flow_context = extensions.contains_key(FLOW_INCREMENTAL_AFTER_SEQS)
             || extensions.contains_key(FLOW_INCREMENTAL_MODE)
             || extensions.contains_key(FLOW_RETURN_REGION_SEQ)
-            || extensions.contains_key(FLOW_SINK_TABLE_ID);
+            || extensions.contains_key(FLOW_SINK_TABLE_ID)
+            || extensions.contains_key(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS);
 
         if !has_flow_context {
             return Ok(None);
@@ -146,6 +158,11 @@ impl FlowQueryExtensions {
                     ))
                 })
             })
+            .transpose()?;
+
+        let internal_non_source_table_ids = extensions
+            .get(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS)
+            .map(|value| parse_table_id_set(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS, value.as_str()))
             .transpose()?;
 
         if matches!(
@@ -193,11 +210,20 @@ impl FlowQueryExtensions {
             incremental_mode,
             return_region_seq,
             sink_table_id,
+            internal_non_source_table_ids,
         }))
     }
 
     pub fn validate_for_scan(&self, source_region_id: RegionId) -> Result<bool> {
         if self.sink_table_id.is_some() && self.sink_table_id == Some(source_region_id.table_id()) {
+            return Ok(false);
+        }
+
+        if self
+            .internal_non_source_table_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&source_region_id.table_id()))
+        {
             return Ok(false);
         }
 
@@ -310,6 +336,39 @@ fn parse_incremental_after_seqs(value: &str) -> Result<HashMap<u64, u64>> {
             Ok((region_id, seq))
         })
         .collect()
+}
+
+/// Parses `flow.internal_non_source_table_ids` as a JSON array of table ids
+/// (numbers or numeric strings), e.g. `[1024, 2048]`.
+fn parse_table_id_set(option_name: &str, value: &str) -> Result<BTreeSet<TableId>> {
+    let raw = serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|e| {
+        invalid_query_context_extension(format!(
+            "Invalid JSON array for {}: {} ({})",
+            option_name, value, e
+        ))
+    })?;
+
+    raw.into_iter()
+        .map(|item| match item {
+            serde_json::Value::Number(num) => num.as_u64().ok_or_else(|| {
+                invalid_query_context_extension(format!(
+                    "Invalid table id in {}: {}",
+                    option_name, num
+                ))
+            }),
+            serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| {
+                invalid_query_context_extension(format!(
+                    "Invalid table id string in {}: {}",
+                    option_name, s
+                ))
+            }),
+            _ => Err(invalid_query_context_extension(format!(
+                "Invalid table id value type in {}: {}",
+                option_name, item
+            ))),
+        })
+        .collect::<Result<BTreeSet<u64>>>()
+        .map(|ids| ids.into_iter().map(|id| id as TableId).collect())
 }
 
 fn parse_bool(option_name: &str, value: &str) -> Result<bool> {
@@ -612,6 +671,78 @@ mod flow_extension_tests {
 
         let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
         assert!(format!("{err}").contains(FLOW_SINK_TABLE_ID));
+    }
+
+    #[test]
+    fn test_parse_flow_extensions_internal_non_source_table_ids_success() {
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            r#"[1024, 2048, "4096"]"#.to_string(),
+        )]);
+
+        let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed.internal_non_source_table_ids,
+            Some(BTreeSet::from([1024, 2048, 4096]))
+        );
+        assert!(parsed.incremental_after_seqs.is_none());
+        assert!(parsed.incremental_mode.is_none());
+        assert!(!parsed.return_region_seq);
+        assert_eq!(parsed.sink_table_id, None);
+    }
+
+    #[test]
+    fn test_parse_flow_extensions_invalid_internal_non_source_table_ids() {
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            "not-json".to_string(),
+        )]);
+        let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
+        assert!(format!("{err}").contains(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS));
+
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            r#"["abc"]"#.to_string(),
+        )]);
+        let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
+        assert!(format!("{err}").contains(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS));
+    }
+
+    #[test]
+    fn test_validate_for_scan_internal_non_source_table_excluded() {
+        let staging_region_id = RegionId::new(1024, 1);
+        let other_region_id = RegionId::new(2048, 1);
+        let exts = HashMap::from([
+            (
+                FLOW_INCREMENTAL_MODE.to_string(),
+                FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY.to_string(),
+            ),
+            (
+                FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
+                format!(
+                    r#"{{"{}":10,"{}":20}}"#,
+                    staging_region_id.as_u64(),
+                    other_region_id.as_u64()
+                ),
+            ),
+            (
+                FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                format!(r#"[{}]"#, staging_region_id.table_id()),
+            ),
+        ]);
+
+        let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
+            .unwrap()
+            .unwrap();
+        // The staging table region is excluded from incremental bounds.
+        let apply_incremental = parsed.validate_for_scan(staging_region_id).unwrap();
+        assert!(!apply_incremental);
+
+        // A source region of a different table still gets incremental bounds.
+        let apply_incremental = parsed.validate_for_scan(other_region_id).unwrap();
+        assert!(apply_incremental);
     }
 
     #[test]

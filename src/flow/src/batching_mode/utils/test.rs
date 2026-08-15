@@ -294,6 +294,64 @@ fn expected_left_join_rewrite_with_sink_filter(
         .unwrap()
 }
 
+/// Expected FULL OUTER merge plan shape used by the two-phase backfill
+/// primitive tests: the delta (Tail) side is fully outer-joined with the base
+/// (staging) side so Base-only and Tail-only groups both survive.
+#[allow(clippy::too_many_arguments)]
+fn expected_full_outer_join_rewrite(
+    delta_plan: &LogicalPlan,
+    base_table: TableRef,
+    base_table_name: &TableName,
+    delta_selected_exprs: Vec<Expr>,
+    base_selected_exprs: Vec<Expr>,
+    join_keys: (Vec<Column>, Vec<Column>),
+    projection_exprs: Vec<Expr>,
+) -> LogicalPlan {
+    let delta_alias = "__flow_delta";
+    let base_alias = "__flow_sink";
+    let delta_selected = LogicalPlanBuilder::from(delta_plan.clone())
+        .project(delta_selected_exprs)
+        .unwrap()
+        .alias(delta_alias)
+        .unwrap()
+        .build()
+        .unwrap();
+    let base_selected = LogicalPlanBuilder::from(test_sink_scan(base_table, base_table_name))
+        .project(base_selected_exprs)
+        .unwrap()
+        .alias(base_alias)
+        .unwrap()
+        .build()
+        .unwrap();
+    let joined = LogicalPlanBuilder::from(delta_selected)
+        .join_detailed(
+            base_selected,
+            JoinType::Full,
+            join_keys,
+            None,
+            NullEquality::NullEqualsNull,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    LogicalPlanBuilder::from(joined)
+        .project(projection_exprs)
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+/// Group-key projection for the FULL OUTER merge: pick the non-NULL side so
+/// Base-only groups (NULL on the delta side) keep their key.
+fn full_outer_group_key_expr(field_name: &str) -> Expr {
+    let left = qualified_col("__flow_delta", field_name);
+    let right = qualified_col("__flow_sink", field_name);
+    when(is_null(left.clone()), right)
+        .otherwise(left)
+        .unwrap()
+        .alias(field_name)
+}
+
 fn max_merge_expr(field_name: &str) -> Expr {
     let left = qualified_col("__flow_delta", field_name);
     let right = qualified_col("__flow_sink", field_name);
@@ -1242,6 +1300,121 @@ async fn test_rewrite_incremental_aggregate_allows_alias_wrapped_scan() {
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
     assert_eq!(rewritten_fields, analysis.output_field_names);
+}
+
+#[tokio::test]
+async fn test_rewrite_incremental_aggregate_full_outer_preserves_base_and_tail_groups() {
+    let query_engine = create_test_query_engine();
+    let ctx = QueryContext::arc();
+    let sql = "SELECT max(number) AS number, ts FROM numbers_with_ts GROUP BY ts";
+    let plan = sql_to_df_plan(ctx, query_engine.clone(), sql, false)
+        .await
+        .unwrap();
+    let analysis = analyze_incremental_aggregate_plan(&plan).unwrap().unwrap();
+    assert!(analysis.unsupported_exprs.is_empty());
+
+    let sink_table_name = [
+        "greptime".to_string(),
+        "public".to_string(),
+        "numbers_with_ts".to_string(),
+    ];
+    let (sink_table, _) = get_table_info_df_schema(
+        query_engine.engine_state().catalog_manager().clone(),
+        sink_table_name.clone(),
+    )
+    .await
+    .unwrap();
+
+    let rewritten = rewrite_incremental_aggregate_with_sink_merge_kind(
+        &plan,
+        &analysis,
+        sink_table.clone(),
+        &sink_table_name,
+        None,
+        IncrementalMergeJoinKind::FullOuter,
+    )
+    .await
+    .unwrap();
+
+    let rewritten_fields = rewritten
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(rewritten_fields, analysis.output_field_names);
+
+    let expected = expected_full_outer_join_rewrite(
+        &plan,
+        sink_table,
+        &sink_table_name,
+        vec![unqualified_col("ts"), unqualified_col("number")],
+        vec![unqualified_col("ts"), unqualified_col("number")],
+        (
+            vec![qualified_column("__flow_delta", "ts")],
+            vec![qualified_column("__flow_sink", "ts")],
+        ),
+        vec![max_merge_expr("number"), full_outer_group_key_expr("ts")],
+    );
+    assert_same_logical_plan(&rewritten, &expected);
+}
+
+#[tokio::test]
+async fn test_rewrite_incremental_aggregate_full_outer_handles_sum_and_literal_outputs() {
+    let query_engine = create_test_query_engine();
+    let ctx = QueryContext::arc();
+    let sql = "SELECT sum(number) AS number, ts, 42 AS lit FROM numbers_with_ts GROUP BY ts";
+    let plan = sql_to_df_plan(ctx, query_engine.clone(), sql, false)
+        .await
+        .unwrap();
+    let analysis = analyze_incremental_aggregate_plan(&plan).unwrap().unwrap();
+    assert!(analysis.unsupported_exprs.is_empty());
+    assert_eq!(analysis.literal_columns, vec!["lit".to_string()]);
+
+    let sink_table_name = [
+        "greptime".to_string(),
+        "public".to_string(),
+        "numbers_with_ts".to_string(),
+    ];
+    let (sink_table, _) = get_table_info_df_schema(
+        query_engine.engine_state().catalog_manager().clone(),
+        sink_table_name.clone(),
+    )
+    .await
+    .unwrap();
+
+    let rewritten = rewrite_incremental_aggregate_with_sink_merge_kind(
+        &plan,
+        &analysis,
+        sink_table.clone(),
+        &sink_table_name,
+        None,
+        IncrementalMergeJoinKind::FullOuter,
+    )
+    .await
+    .unwrap();
+
+    let expected = expected_full_outer_join_rewrite(
+        &plan,
+        sink_table,
+        &sink_table_name,
+        vec![
+            unqualified_col("ts"),
+            unqualified_col("number"),
+            unqualified_col("lit"),
+        ],
+        vec![unqualified_col("ts"), unqualified_col("number")],
+        (
+            vec![qualified_column("__flow_delta", "ts")],
+            vec![qualified_column("__flow_sink", "ts")],
+        ),
+        vec![
+            sum_merge_expr("number"),
+            full_outer_group_key_expr("ts"),
+            qualified_col("__flow_delta", "lit").alias("lit"),
+        ],
+    );
+    assert_same_logical_plan(&rewritten, &expected);
 }
 
 #[tokio::test]

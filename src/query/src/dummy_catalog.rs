@@ -404,10 +404,11 @@ fn decide_flow_scan(query_ctx: &QueryContext, region_id: RegionId) -> Result<Flo
         });
     };
 
-    // Sink-table scans intentionally bypass all flow scan semantics. They should
-    // behave like plain reads and must not participate in incremental lower bounds
-    // or per-region snapshot binding/reuse.
-    if flow_extensions.sink_table_id == Some(region_id.table_id()) {
+    // Sink-table and internal non-source-table scans intentionally bypass all
+    // flow scan semantics. They should behave like plain reads and must not
+    // participate in incremental lower bounds or per-region snapshot binding/
+    // reuse.
+    if is_internal_non_source_scan(&flow_extensions, region_id) {
         return Ok(FlowScanDecision::plain_scan());
     }
 
@@ -478,8 +479,19 @@ fn build_scan_request(
 fn is_sink_scan(query_ctx: &QueryContext, region_id: RegionId) -> Result<bool> {
     Ok(
         FlowQueryExtensions::parse_flow_extensions(&query_ctx.extensions())?
-            .is_some_and(|exts| exts.sink_table_id == Some(region_id.table_id())),
+            .is_some_and(|exts| is_internal_non_source_scan(&exts, region_id)),
     )
+}
+
+/// Whether the region belongs to a table that must be scanned as a plain
+/// non-source read: the active sink table or any internal non-source table
+/// (e.g. the backfill staging table).
+fn is_internal_non_source_scan(flow_extensions: &FlowQueryExtensions, region_id: RegionId) -> bool {
+    flow_extensions.sink_table_id == Some(region_id.table_id())
+        || flow_extensions
+            .internal_non_source_table_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&region_id.table_id()))
 }
 
 fn apply_cached_snapshot_to_request(
@@ -665,8 +677,8 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::options::{
-        FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE, FLOW_RETURN_REGION_SEQ,
-        FLOW_SINK_TABLE_ID,
+        FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE, FLOW_INTERNAL_NON_SOURCE_TABLE_IDS,
+        FLOW_RETURN_REGION_SEQ, FLOW_SINK_TABLE_ID,
     };
 
     fn test_region_id() -> RegionId {
@@ -987,6 +999,57 @@ mod tests {
         assert_eq!(request.sst_min_sequence, None);
         assert!(!request.skip_sst_files);
         assert!(!request.snapshot_on_scan);
+    }
+
+    #[test]
+    fn test_scan_request_from_query_context_treats_internal_non_source_table_as_plain() {
+        let region_id = test_region_id();
+        let query_ctx = QueryContextBuilder::default()
+            .extensions(HashMap::from([
+                (
+                    FLOW_INCREMENTAL_MODE.to_string(),
+                    "memtable_only".to_string(),
+                ),
+                (
+                    FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
+                    format!(r#"{{"{}":55}}"#, region_id.as_u64()),
+                ),
+                (
+                    FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                    format!(r#"[{}]"#, region_id.table_id()),
+                ),
+            ]))
+            .snapshot_seqs(Arc::new(RwLock::new(HashMap::from([(
+                region_id.as_u64(),
+                88_u64,
+            )]))))
+            .sst_min_sequences(Arc::new(RwLock::new(HashMap::from([(
+                region_id.as_u64(),
+                77_u64,
+            )]))))
+            .build();
+
+        let request = scan_request_from_query_context(region_id, &query_ctx).unwrap();
+        assert_eq!(request.memtable_min_sequence, None);
+        assert_eq!(request.memtable_max_sequence, None);
+        assert_eq!(request.sst_min_sequence, None);
+        assert!(!request.skip_sst_files);
+        assert!(!request.snapshot_on_scan);
+    }
+
+    #[test]
+    fn test_scan_request_from_query_context_rejects_invalid_internal_non_source_table_ids() {
+        let region_id = test_region_id();
+        let query_ctx = QueryContextBuilder::default()
+            .extensions(HashMap::from([(
+                FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                "not-json".to_string(),
+            )]))
+            .build();
+
+        let err = scan_request_from_query_context(region_id, &query_ctx).unwrap_err();
+        assert!(matches!(err, Error::InvalidQueryContextExtension { .. }));
+        assert_eq!(err.status_code(), StatusCode::InvalidArguments);
     }
 
     #[test]
