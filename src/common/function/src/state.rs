@@ -209,6 +209,28 @@ impl FunctionState {
             ) -> Result<api::v1::flow::FlowResponse> {
                 todo!()
             }
+
+            async fn backfill(
+                &self,
+                _catalog: &str,
+                _flow: &str,
+                _job_id: u64,
+                _start: i64,
+                _end: i64,
+                _ctx: QueryContextRef,
+            ) -> Result<api::v1::flow::FlowResponse> {
+                todo!()
+            }
+
+            async fn backfill_status(
+                &self,
+                _catalog: &str,
+                _flow: &str,
+                _job_id: u64,
+                _ctx: QueryContextRef,
+            ) -> Result<api::v1::flow::FlowResponse> {
+                todo!()
+            }
         }
 
         Self {

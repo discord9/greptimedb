@@ -753,6 +753,86 @@ mod tests {
         .await
     }
 
+    /// Builds a [`FlowDualEngine`] wired to an in-memory backend and a real
+    /// [`BatchingEngine`] with no flows registered.
+    async fn new_test_dual_engine() -> Arc<FlowDualEngine> {
+        let (frontend_client, _handler) =
+            FrontendClient::from_empty_grpc_handler(QueryOptions::default());
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_meta = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        table_meta.init().await.unwrap();
+        let flow_meta = Arc::new(FlowMetadataManager::new(kv_backend.clone()));
+        let catalog_manager = new_memory_catalog_manager().unwrap();
+        let query_engine = crate::test_utils::create_test_query_engine();
+
+        let streaming_engine = Arc::new(StreamingEngine::new(
+            None,
+            query_engine.clone(),
+            table_meta.clone(),
+        ));
+        let batching_engine = Arc::new(BatchingEngine::new(
+            Arc::new(frontend_client),
+            query_engine,
+            flow_meta.clone(),
+            table_meta,
+            catalog_manager.clone(),
+            BatchingModeOptions::default(),
+        ));
+        Arc::new(FlowDualEngine::new(
+            streaming_engine,
+            batching_engine,
+            flow_meta,
+            catalog_manager,
+            Plugins::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_handle_backfill_dispatches_to_batching_engine() {
+        use api::v1::flow::{BackfillFlow, FlowRequest, flow_request};
+
+        let dual_engine = new_test_dual_engine().await;
+        let req = FlowRequest {
+            header: None,
+            body: Some(flow_request::Body::Backfill(BackfillFlow {
+                flow_id: Some(api::v1::FlowId { id: 999 }),
+                job_id: 7,
+                start: 1000,
+                end: 2000,
+            })),
+        };
+
+        let err = dual_engine.handle(req).await.unwrap_err();
+        // The batching engine has no flow 999, so `request_flow_backfill`
+        // answers FlowNotFound — proving the Backfill arm dispatched to it.
+        assert!(
+            matches!(err, common_meta::error::Error::FlowNotFound { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_backfill_status_dispatches_to_batching_engine_and_reports_status() {
+        use api::v1::flow::{BackfillStatusFlow, FlowRequest, flow_request};
+
+        let dual_engine = new_test_dual_engine().await;
+        let req = FlowRequest {
+            header: None,
+            body: Some(flow_request::Body::BackfillStatus(BackfillStatusFlow {
+                flow_id: Some(api::v1::FlowId { id: 999 }),
+                job_id: 7,
+            })),
+        };
+
+        let err = dual_engine.handle(req).await.unwrap_err();
+        // `get_backfill_job_status` on an unknown flow answers FlowNotFound,
+        // proving the BackfillStatus arm dispatched to the batching engine.
+        assert!(
+            matches!(err, common_meta::error::Error::FlowNotFound { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
     async fn new_test_flownode_server_with_frontend_client(
         frontend_client: FrontendClient,
         batching_opts: BatchingModeOptions,

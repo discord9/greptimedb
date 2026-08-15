@@ -125,13 +125,34 @@ pub trait ProcedureServiceHandler: Send + Sync {
     ) -> Result<MetaGcResponse>;
 }
 
-/// This flow service handler is only use for flush flow for now.
+/// This flow service handler is used for flow administration requests:
+/// flush, backfill trigger, and backfill status query.
 #[async_trait]
 pub trait FlowServiceHandler: Send + Sync {
     async fn flush(
         &self,
         catalog: &str,
         flow: &str,
+        ctx: QueryContextRef,
+    ) -> Result<api::v1::flow::FlowResponse>;
+
+    /// Trigger a backfill job for the given flow over `[start, end)` (millis).
+    async fn backfill(
+        &self,
+        catalog: &str,
+        flow: &str,
+        job_id: u64,
+        start: i64,
+        end: i64,
+        ctx: QueryContextRef,
+    ) -> Result<api::v1::flow::FlowResponse>;
+
+    /// Query the status of a backfill job for the given flow.
+    async fn backfill_status(
+        &self,
+        catalog: &str,
+        flow: &str,
+        job_id: u64,
         ctx: QueryContextRef,
     ) -> Result<api::v1::flow::FlowResponse>;
 }

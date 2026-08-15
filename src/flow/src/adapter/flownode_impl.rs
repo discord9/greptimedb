@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use api::v1::flow::{
-    CreateRequest, DirtyWindowRequests, DropRequest, FlowRequest, FlowResponse, FlushFlow,
-    flow_request,
+    BackfillFlow, BackfillStatusFlow, CreateRequest, DirtyWindowRequests, DropRequest, FlowRequest,
+    FlowResponse, FlushFlow, flow_request,
 };
 use api::v1::region::InsertRequests;
 use catalog::CatalogManager;
@@ -35,6 +35,7 @@ use common_meta::key::flow::flow_info::FlowScheduleConfig;
 use common_meta::key::flow::flow_state::FlowStat;
 use common_runtime::JoinHandle;
 use common_telemetry::{error, info, trace, warn};
+use common_time::Timestamp;
 use datatypes::value::Value;
 use futures::TryStreamExt;
 use itertools::Itertools;
@@ -45,6 +46,7 @@ use store_api::storage::{RegionId, TableId};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::adapter::{CreateFlowArgs, StreamingEngine};
+use crate::batching_mode::BackfillJobStatus;
 use crate::batching_mode::engine::BatchingEngine;
 use crate::engine::{FlowEngine, FlowStatProvider};
 use crate::error::{
@@ -930,6 +932,54 @@ impl common_meta::node_manager::Flownode for FlowDualEngine {
                 Ok(FlowResponse {
                     affected_flows: vec![flow_id],
                     affected_rows: row as u64,
+                    ..Default::default()
+                })
+            }
+            Some(flow_request::Body::Backfill(BackfillFlow {
+                flow_id: Some(flow_id),
+                job_id,
+                start,
+                end,
+            })) => {
+                self.batching_engine()
+                    .request_flow_backfill(
+                        flow_id.id as u64,
+                        job_id,
+                        Timestamp::new_millisecond(start),
+                        Timestamp::new_millisecond(end),
+                    )
+                    .await
+                    .map_err(to_meta_err(snafu::location!()))?;
+                Ok(FlowResponse {
+                    affected_flows: vec![flow_id],
+                    ..Default::default()
+                })
+            }
+            Some(flow_request::Body::BackfillStatus(BackfillStatusFlow {
+                flow_id: Some(flow_id),
+                job_id,
+            })) => {
+                let status = self
+                    .batching_engine()
+                    .get_backfill_job_status(flow_id.id as u64, job_id)
+                    .await
+                    .map_err(to_meta_err(snafu::location!()))?;
+                let status_str = match status {
+                    None => "None",
+                    Some(BackfillJobStatus::Preparing { .. }) => "Preparing",
+                    Some(BackfillJobStatus::Prepared) => "Prepared",
+                    Some(BackfillJobStatus::Running) => "Running",
+                    Some(BackfillJobStatus::BaseComplete) => "BaseComplete",
+                    Some(BackfillJobStatus::Finishing) => "Finishing",
+                };
+                let mut extensions = HashMap::new();
+                extensions.insert(
+                    "backfill_status".to_string(),
+                    status_str.as_bytes().to_vec(),
+                );
+                Ok(FlowResponse {
+                    affected_flows: vec![flow_id],
+                    extensions,
                     ..Default::default()
                 })
             }
