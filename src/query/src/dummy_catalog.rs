@@ -1003,7 +1003,11 @@ mod tests {
 
     #[test]
     fn test_scan_request_from_query_context_treats_internal_non_source_table_as_plain() {
-        let region_id = test_region_id();
+        // The internal non-source (staging) table is not a source: its region
+        // is absent from `incremental_after_seqs` (which only lists the real
+        // source table's region), so its scans must be plain reads.
+        let staging_region_id = RegionId::new(1024, 1);
+        let source_region_id = RegionId::new(2048, 1);
         let query_ctx = QueryContextBuilder::default()
             .extensions(HashMap::from([
                 (
@@ -1012,29 +1016,34 @@ mod tests {
                 ),
                 (
                     FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
-                    format!(r#"{{"{}":55}}"#, region_id.as_u64()),
+                    format!(r#"{{"{}":55}}"#, source_region_id.as_u64()),
                 ),
                 (
                     FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
-                    format!(r#"[{}]"#, region_id.table_id()),
+                    format!(r#"[{}]"#, staging_region_id.table_id()),
                 ),
             ]))
             .snapshot_seqs(Arc::new(RwLock::new(HashMap::from([(
-                region_id.as_u64(),
+                staging_region_id.as_u64(),
                 88_u64,
             )]))))
             .sst_min_sequences(Arc::new(RwLock::new(HashMap::from([(
-                region_id.as_u64(),
+                staging_region_id.as_u64(),
                 77_u64,
             )]))))
             .build();
 
-        let request = scan_request_from_query_context(region_id, &query_ctx).unwrap();
+        let request = scan_request_from_query_context(staging_region_id, &query_ctx).unwrap();
         assert_eq!(request.memtable_min_sequence, None);
         assert_eq!(request.memtable_max_sequence, None);
         assert_eq!(request.sst_min_sequence, None);
         assert!(!request.skip_sst_files);
         assert!(!request.snapshot_on_scan);
+
+        // A real source region still gets incremental bounds.
+        let request = scan_request_from_query_context(source_region_id, &query_ctx).unwrap();
+        assert_eq!(request.memtable_min_sequence, Some(55));
+        assert!(request.skip_sst_files);
     }
 
     #[test]

@@ -215,6 +215,29 @@ impl FlowQueryExtensions {
     }
 
     pub fn validate_for_scan(&self, source_region_id: RegionId) -> Result<bool> {
+        // Fail closed on contradictory extensions: an internal non-source
+        // table must never also be a source table, i.e. present in the
+        // `incremental_after_seqs` region map (whose keys derive the trusted
+        // source table-id set). Overlap means the caller mislabeled a source
+        // table as internal — scanning it as a plain read would silently drop
+        // incremental bounds. The check runs even when the scanned region
+        // itself is excluded, so the contradiction cannot be hidden per-region.
+        if let (Some(excluded), Some(after_seqs)) = (
+            &self.internal_non_source_table_ids,
+            &self.incremental_after_seqs,
+        ) {
+            let source_table_ids = after_seqs
+                .keys()
+                .map(|region_id| RegionId::from_u64(*region_id).table_id())
+                .collect::<BTreeSet<_>>();
+            if let Some(overlap) = excluded.intersection(&source_table_ids).next() {
+                return Err(invalid_query_context_extension(format!(
+                    "Table id {} appears in both {} and the source region set of {}; internal non-source tables and source tables must be disjoint",
+                    overlap, FLOW_INTERNAL_NON_SOURCE_TABLE_IDS, FLOW_INCREMENTAL_AFTER_SEQS
+                )));
+            }
+        }
+
         if self.sink_table_id.is_some() && self.sink_table_id == Some(source_region_id.table_id()) {
             return Ok(false);
         }
@@ -340,6 +363,11 @@ fn parse_incremental_after_seqs(value: &str) -> Result<HashMap<u64, u64>> {
 
 /// Parses `flow.internal_non_source_table_ids` as a JSON array of table ids
 /// (numbers or numeric strings), e.g. `[1024, 2048]`.
+///
+/// Fail-closed parsing for a trusted internal option: malformed JSON, an
+/// empty array, non-numeric items, and ids that overflow the `u32` table id
+/// range are all rejected. Duplicate ids are canonicalized by the returned
+/// set.
 fn parse_table_id_set(option_name: &str, value: &str) -> Result<BTreeSet<TableId>> {
     let raw = serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|e| {
         invalid_query_context_extension(format!(
@@ -348,27 +376,43 @@ fn parse_table_id_set(option_name: &str, value: &str) -> Result<BTreeSet<TableId
         ))
     })?;
 
+    if raw.is_empty() {
+        return Err(invalid_query_context_extension(format!(
+            "{} must not be an empty array",
+            option_name
+        )));
+    }
+
     raw.into_iter()
-        .map(|item| match item {
-            serde_json::Value::Number(num) => num.as_u64().ok_or_else(|| {
+        .map(|item| {
+            let id = match item {
+                serde_json::Value::Number(num) => num.as_u64().ok_or_else(|| {
+                    invalid_query_context_extension(format!(
+                        "Invalid table id in {}: {}",
+                        option_name, num
+                    ))
+                }),
+                serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| {
+                    invalid_query_context_extension(format!(
+                        "Invalid table id string in {}: {}",
+                        option_name, s
+                    ))
+                }),
+                _ => Err(invalid_query_context_extension(format!(
+                    "Invalid table id value type in {}: {}",
+                    option_name, item
+                ))),
+            }?;
+            // `TableId` is `u32`; use a checked conversion so ids above
+            // `u32::MAX` are rejected instead of silently narrowing.
+            TableId::try_from(id).map_err(|_| {
                 invalid_query_context_extension(format!(
-                    "Invalid table id in {}: {}",
-                    option_name, num
+                    "Table id {} in {} overflows the u32 table id range",
+                    id, option_name
                 ))
-            }),
-            serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| {
-                invalid_query_context_extension(format!(
-                    "Invalid table id string in {}: {}",
-                    option_name, s
-                ))
-            }),
-            _ => Err(invalid_query_context_extension(format!(
-                "Invalid table id value type in {}: {}",
-                option_name, item
-            ))),
+            })
         })
-        .collect::<Result<BTreeSet<u64>>>()
-        .map(|ids| ids.into_iter().map(|id| id as TableId).collect())
+        .collect()
 }
 
 fn parse_bool(option_name: &str, value: &str) -> Result<bool> {
@@ -712,6 +756,43 @@ mod flow_extension_tests {
 
     #[test]
     fn test_validate_for_scan_internal_non_source_table_excluded() {
+        // The staging table is an internal non-source table: it is NOT among
+        // the source regions of `incremental_after_seqs`, and its scans must
+        // be plain reads. Other tables' regions still get incremental bounds.
+        let staging_region_id = RegionId::new(1024, 1);
+        let source_region_id = RegionId::new(2048, 1);
+        let exts = HashMap::from([
+            (
+                FLOW_INCREMENTAL_MODE.to_string(),
+                FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY.to_string(),
+            ),
+            (
+                FLOW_INCREMENTAL_AFTER_SEQS.to_string(),
+                format!(r#"{{"{}":20}}"#, source_region_id.as_u64()),
+            ),
+            (
+                FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+                format!(r#"[{}]"#, staging_region_id.table_id()),
+            ),
+        ]);
+
+        let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
+            .unwrap()
+            .unwrap();
+        // The staging table region is excluded from incremental bounds.
+        let apply_incremental = parsed.validate_for_scan(staging_region_id).unwrap();
+        assert!(!apply_incremental);
+
+        // A source region of a different table still gets incremental bounds.
+        let apply_incremental = parsed.validate_for_scan(source_region_id).unwrap();
+        assert!(apply_incremental);
+    }
+
+    #[test]
+    fn test_validate_for_scan_rejects_internal_non_source_overlap_with_source_tables() {
+        // A table cannot be both a source (present in incremental_after_seqs)
+        // and an internal non-source table: the contradictory extension must
+        // fail closed instead of silently scanning it as a plain read.
         let staging_region_id = RegionId::new(1024, 1);
         let other_region_id = RegionId::new(2048, 1);
         let exts = HashMap::from([
@@ -736,13 +817,63 @@ mod flow_extension_tests {
         let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
             .unwrap()
             .unwrap();
-        // The staging table region is excluded from incremental bounds.
-        let apply_incremental = parsed.validate_for_scan(staging_region_id).unwrap();
-        assert!(!apply_incremental);
+        // The error surfaces regardless of which region is being validated.
+        let err = parsed.validate_for_scan(staging_region_id).unwrap_err();
+        assert!(format!("{err}").contains(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS));
+        let err = parsed.validate_for_scan(other_region_id).unwrap_err();
+        assert!(format!("{err}").contains(FLOW_INCREMENTAL_AFTER_SEQS));
+    }
 
-        // A source region of a different table still gets incremental bounds.
-        let apply_incremental = parsed.validate_for_scan(other_region_id).unwrap();
-        assert!(apply_incremental);
+    #[test]
+    fn test_parse_flow_extensions_internal_non_source_table_ids_rejects_overflow() {
+        // TableId is u32; ids above u32::MAX must be rejected by the checked
+        // conversion instead of silently narrowing.
+        let over_max = u64::from(u32::MAX) + 1;
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            format!(r#"[{over_max}]"#),
+        )]);
+        let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
+        assert!(
+            format!("{err}").contains("overflows the u32 table id range"),
+            "expected overflow error, got {err}"
+        );
+
+        // A string id is rejected the same way.
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            format!(r#"["{over_max}"]"#),
+        )]);
+        let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
+        assert!(format!("{err}").contains("overflows the u32 table id range"));
+    }
+
+    #[test]
+    fn test_parse_flow_extensions_internal_non_source_table_ids_rejects_empty() {
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            "[]".to_string(),
+        )]);
+        let err = FlowQueryExtensions::parse_flow_extensions(&exts).unwrap_err();
+        assert!(
+            format!("{err}").contains("must not be an empty array"),
+            "expected empty-array error, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flow_extensions_internal_non_source_table_ids_canonicalizes_duplicates() {
+        let exts = HashMap::from([(
+            FLOW_INTERNAL_NON_SOURCE_TABLE_IDS.to_string(),
+            r#"[1024, "1024", 2048]"#.to_string(),
+        )]);
+        let parsed = FlowQueryExtensions::parse_flow_extensions(&exts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed.internal_non_source_table_ids,
+            Some(BTreeSet::from([1024, 2048]))
+        );
     }
 
     #[test]

@@ -19,10 +19,14 @@ use common_recordbatch::RecordBatch;
 use common_time::Timestamp;
 use datafusion_common::tree_node::TreeNode as _;
 use datafusion_expr::GroupingSet;
+use datatypes::arrow::array::Array as _;
 use datatypes::prelude::{ConcreteDataType, MutableVector, Scalar, ScalarVectorBuilder, VectorRef};
 use datatypes::schema::{ColumnSchema, Schema};
 use datatypes::timestamp::TimestampMillisecond;
-use datatypes::vectors::{BinaryVectorBuilder, TimestampMillisecondVectorBuilder};
+use datatypes::vectors::{
+    BinaryVectorBuilder, Int64Vector, TimestampMillisecondVector,
+    TimestampMillisecondVectorBuilder, UInt32Vector,
+};
 use pretty_assertions::assert_eq;
 use query::query_engine::DefaultSerializer;
 use session::context::QueryContext;
@@ -350,6 +354,43 @@ fn full_outer_group_key_expr(field_name: &str) -> Expr {
         .otherwise(left)
         .unwrap()
         .alias(field_name)
+}
+
+/// Literal output projection for the FULL OUTER merge: pick the non-NULL side
+/// so Base-only rows (NULL on the delta side) keep their literal value.
+fn full_outer_literal_expr(field_name: &str) -> Expr {
+    let left = qualified_col("__flow_delta", field_name);
+    let right = qualified_col("__flow_sink", field_name);
+    when(is_null(left.clone()), right)
+        .otherwise(left)
+        .unwrap()
+        .alias(field_name)
+}
+
+/// A `(ts, number, lit)` base table mirroring a backfill staging table that
+/// carries literal output columns (the sink schema clone), used by the
+/// FULL OUTER plan-shape tests.
+fn full_outer_lit_base_table(table_name: &str) -> TableRef {
+    let schema = Arc::new(Schema::new(vec![
+        ColumnSchema::new(
+            "ts",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+            false,
+        )
+        .with_time_index(true),
+        ColumnSchema::new("number", ConcreteDataType::uint32_datatype(), true),
+        ColumnSchema::new("lit", ConcreteDataType::int64_datatype(), true),
+    ]));
+    let recordbatch = RecordBatch::new(
+        schema,
+        vec![
+            Arc::new(TimestampMillisecondVector::from_vec(vec![5_i64])) as VectorRef,
+            Arc::new(UInt32Vector::from_vec(vec![100_u32])) as VectorRef,
+            Arc::new(Int64Vector::from_vec(vec![42_i64])) as VectorRef,
+        ],
+    )
+    .unwrap();
+    MemTable::table(table_name, recordbatch)
 }
 
 fn max_merge_expr(field_name: &str) -> Expr {
@@ -1371,23 +1412,34 @@ async fn test_rewrite_incremental_aggregate_full_outer_handles_sum_and_literal_o
     assert!(analysis.unsupported_exprs.is_empty());
     assert_eq!(analysis.literal_columns, vec!["lit".to_string()]);
 
-    let sink_table_name = [
+    // The FULL OUTER merge base is the backfill staging table, whose schema is
+    // a clone of the flow output schema — it carries the literal column too.
+    let base_table = full_outer_lit_base_table("full_outer_lit_base");
+    let base_table_name = [
         "greptime".to_string(),
         "public".to_string(),
-        "numbers_with_ts".to_string(),
+        "full_outer_lit_base".to_string(),
     ];
-    let (sink_table, _) = get_table_info_df_schema(
-        query_engine.engine_state().catalog_manager().clone(),
-        sink_table_name.clone(),
-    )
-    .await
-    .unwrap();
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<catalog::memory::MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog
+        .register_table_sync(RegisterTableRequest {
+            catalog: "greptime".to_string(),
+            schema: "public".to_string(),
+            table_name: "full_outer_lit_base".to_string(),
+            table_id: 9402,
+            table: base_table.clone(),
+        })
+        .unwrap();
 
     let rewritten = rewrite_incremental_aggregate_with_sink_merge_kind(
         &plan,
         &analysis,
-        sink_table.clone(),
-        &sink_table_name,
+        base_table.clone(),
+        &base_table_name,
         None,
         IncrementalMergeJoinKind::FullOuter,
     )
@@ -1396,14 +1448,18 @@ async fn test_rewrite_incremental_aggregate_full_outer_handles_sum_and_literal_o
 
     let expected = expected_full_outer_join_rewrite(
         &plan,
-        sink_table,
-        &sink_table_name,
+        base_table,
+        &base_table_name,
         vec![
             unqualified_col("ts"),
             unqualified_col("number"),
             unqualified_col("lit"),
         ],
-        vec![unqualified_col("ts"), unqualified_col("number")],
+        vec![
+            unqualified_col("ts"),
+            unqualified_col("number"),
+            unqualified_col("lit"),
+        ],
         (
             vec![qualified_column("__flow_delta", "ts")],
             vec![qualified_column("__flow_sink", "ts")],
@@ -1411,10 +1467,170 @@ async fn test_rewrite_incremental_aggregate_full_outer_handles_sum_and_literal_o
         vec![
             sum_merge_expr("number"),
             full_outer_group_key_expr("ts"),
-            qualified_col("__flow_delta", "lit").alias("lit"),
+            full_outer_literal_expr("lit"),
         ],
     );
     assert_same_logical_plan(&rewritten, &expected);
+}
+
+/// Builds a backfill-staging-like base table with two group-key dimensions
+/// (`grp` nullable, `ts`) plus the merge column `m` and the literal `lit`.
+fn full_outer_behavior_base_table(table_name: &str) -> TableRef {
+    let schema = Arc::new(Schema::new(vec![
+        ColumnSchema::new("grp", ConcreteDataType::uint32_datatype(), true),
+        ColumnSchema::new(
+            "ts",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+            true,
+        ),
+        ColumnSchema::new("m", ConcreteDataType::uint32_datatype(), true),
+        ColumnSchema::new("lit", ConcreteDataType::int64_datatype(), true),
+    ]));
+    let recordbatch = RecordBatch::new(
+        schema,
+        vec![
+            // grp=NULL exercises the nullable group-key Base-only path.
+            Arc::new(UInt32Vector::from(vec![Some(5_u32), Some(20_u32), None])) as VectorRef,
+            Arc::new(TimestampMillisecondVector::from(vec![
+                Some(5_i64),
+                Some(20_i64),
+                Some(30_i64),
+            ])) as VectorRef,
+            Arc::new(UInt32Vector::from(vec![
+                Some(100_u32),
+                Some(200_u32),
+                Some(300_u32),
+            ])) as VectorRef,
+            Arc::new(Int64Vector::from(vec![
+                Some(42_i64),
+                Some(42_i64),
+                Some(42_i64),
+            ])) as VectorRef,
+        ],
+    )
+    .unwrap();
+    MemTable::table(table_name, recordbatch)
+}
+
+/// Behavioral FULL OUTER merge execution: with a literal output column, a
+/// Base-only row must keep its literal value instead of producing NULL.
+///
+/// Covers matched, Base-only, and Tail-only groups plus a multi-dimension /
+/// nullable group key.
+#[tokio::test]
+async fn test_rewrite_incremental_aggregate_full_outer_executes_literal_for_base_only_rows() {
+    let query_engine = create_test_query_engine();
+    let ctx = QueryContext::arc();
+
+    // Delta (Tail) side: numbers_with_ts has one row per ts, so the aggregate
+    // produces groups (grp=i, ts=i, m=i, lit=42) for i in 1..=10.
+    let sql = "SELECT max(number) AS m, number AS grp, ts, 42 AS lit FROM numbers_with_ts GROUP BY number, ts";
+    let plan = sql_to_df_plan(ctx.clone(), query_engine.clone(), sql, false)
+        .await
+        .unwrap();
+    let analysis = analyze_incremental_aggregate_plan(&plan).unwrap().unwrap();
+    assert!(analysis.unsupported_exprs.is_empty());
+    assert_eq!(
+        analysis.group_key_names,
+        vec!["grp".to_string(), "ts".to_string()]
+    );
+    assert_eq!(analysis.literal_columns, vec!["lit".to_string()]);
+
+    // Base (staging) side: (grp=5, ts=5) matches a delta group with a larger
+    // base value; (grp=20, ts=20) and (grp=NULL, ts=30) are Base-only.
+    let base_table = full_outer_behavior_base_table("full_outer_behavior_base");
+    let base_table_name = [
+        "greptime".to_string(),
+        "public".to_string(),
+        "full_outer_behavior_base".to_string(),
+    ];
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<catalog::memory::MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog
+        .register_table_sync(RegisterTableRequest {
+            catalog: "greptime".to_string(),
+            schema: "public".to_string(),
+            table_name: "full_outer_behavior_base".to_string(),
+            table_id: 9403,
+            table: base_table.clone(),
+        })
+        .unwrap();
+
+    let rewritten = rewrite_incremental_aggregate_with_sink_merge_kind(
+        &plan,
+        &analysis,
+        base_table,
+        &base_table_name,
+        None,
+        IncrementalMergeJoinKind::FullOuter,
+    )
+    .await
+    .unwrap();
+
+    let output = query_engine.execute(rewritten, ctx).await.unwrap();
+    let common_query::OutputData::Stream(stream) = output.data else {
+        panic!("expected record stream output, got {:?}", output.data);
+    };
+    let batches = common_recordbatch::util::collect_batches(stream)
+        .await
+        .unwrap();
+
+    // (grp, ts) -> (m, lit)
+    let mut rows: std::collections::HashMap<(Option<u32>, i64), (u32, i64)> =
+        std::collections::HashMap::new();
+    for batch in batches.iter() {
+        let m_col = batch.column_by_name("m").unwrap();
+        let grp_col = batch.column_by_name("grp").unwrap();
+        let ts_col = batch.column_by_name("ts").unwrap();
+        let lit_col = batch.column_by_name("lit").unwrap();
+        let m_arr = m_col
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt32Array>()
+            .unwrap();
+        let grp_arr = grp_col
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt32Array>()
+            .unwrap();
+        let ts_arr = ts_col
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+        let lit_arr = lit_col
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::Int64Array>()
+            .unwrap();
+        for i in 0..ts_arr.len() {
+            rows.insert(
+                (
+                    (!grp_arr.is_null(i)).then(|| grp_arr.value(i)),
+                    ts_arr.value(i),
+                ),
+                (m_arr.value(i), lit_arr.value(i)),
+            );
+        }
+    }
+
+    // 10 delta groups + 2 unmatched base groups.
+    assert_eq!(rows.len(), 12, "unexpected merged rows: {rows:?}");
+
+    // Every row — matched, Base-only, or Tail-only — keeps lit = 42. The
+    // Finding-1 regression: Base-only rows must not lose the literal.
+    assert!(
+        rows.values().all(|(_, lit)| *lit == 42),
+        "all merged rows must keep lit=42, got: {rows:?}"
+    );
+
+    // Matched group: delta m=5 merged with base m=100 via max.
+    assert_eq!(rows[&(Some(5), 5)], (100, 42));
+    // Base-only group: value comes from the base side, literal preserved.
+    assert_eq!(rows[&(Some(20), 20)], (200, 42));
+    // Base-only group with a NULL group key: key and value from the base side.
+    assert_eq!(rows[&(None, 30)], (300, 42));
+    // Tail-only group: delta value, literal preserved.
+    assert_eq!(rows[&(Some(1), 1)], (1, 42));
 }
 
 #[tokio::test]

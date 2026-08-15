@@ -730,9 +730,13 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
 
 /// Same as [`rewrite_incremental_aggregate_with_sink_merge`] but with an
 /// explicit join kind. `FullOuter` keeps every Base-only and Tail-only group:
-/// group keys are projected as the non-NULL side of the join, and the existing
-/// merge expressions already short-circuit NULL sides, so they are reused
-/// unchanged for both join kinds.
+/// group keys are projected as the non-NULL side of the join, the merge base
+/// also carries the literal output columns (the base table must contain them,
+/// which the backfill staging schema does by construction), and literal
+/// outputs pick the non-NULL side of the join so Base-only rows keep their
+/// literal values instead of producing NULL. The existing merge expressions
+/// already short-circuit NULL sides, so they are reused unchanged for both
+/// join kinds.
 pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
     delta_plan: &LogicalPlan,
     analysis: &IncrementalAggregateAnalysis,
@@ -805,8 +809,21 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
             .iter()
             .map(|c| c.output_field_name.clone()),
     );
+    // The delta (Tail) side always projects the literal output columns: they
+    // are ordinary output fields of the delta aggregate plan.
     let mut delta_selected_columns = selected_columns.clone();
     delta_selected_columns.extend(analysis.literal_columns.iter().cloned());
+
+    // A FULL OUTER merge must also project the literal columns from the base
+    // side, otherwise Base-only rows (NULL on the delta side) would lose their
+    // literal values. The base table is the backfill staging table whose
+    // schema is a clone of the sink/flow output schema, so it carries every
+    // literal output column. The `Left` path intentionally keeps the
+    // historical base projection (group keys + merge columns only) unchanged.
+    let mut base_selected_columns = selected_columns.clone();
+    if matches!(join_kind, IncrementalMergeJoinKind::FullOuter) {
+        base_selected_columns.extend(analysis.literal_columns.iter().cloned());
+    }
 
     let delta_selected_exprs = delta_selected_columns
         .iter()
@@ -846,7 +863,7 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
         })?,
     );
 
-    let base_selected_exprs = selected_columns
+    let base_selected_exprs = base_selected_columns
         .iter()
         .cloned()
         .map(unqualified_col)
@@ -943,9 +960,25 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
             };
             projection_exprs.push(group_key_expr.alias(output_field_name));
         } else if literal_columns.contains(output_field_name) {
-            projection_exprs.push(
-                qualified_col(delta_alias, output_field_name.clone()).alias(output_field_name),
-            );
+            // A FULL OUTER merge must keep the literal value of Base-only rows
+            // (NULL on the delta side); pick the non-NULL side of the join.
+            // The `Left` path keeps the historical delta-side projection.
+            let literal_expr = match join_kind {
+                IncrementalMergeJoinKind::Left => {
+                    qualified_col(delta_alias, output_field_name.clone())
+                }
+                IncrementalMergeJoinKind::FullOuter => when(
+                    is_null(qualified_col(delta_alias, output_field_name.clone())),
+                    qualified_col(base_alias, output_field_name.clone()),
+                )
+                .otherwise(qualified_col(delta_alias, output_field_name.clone()))
+                .with_context(|_| DatafusionSnafu {
+                    context: format!(
+                        "Failed to build FULL OUTER literal merge expr for {output_field_name}"
+                    ),
+                })?,
+            };
+            projection_exprs.push(literal_expr.alias(output_field_name));
         } else if let Some(merge_col) = merge_columns.get(output_field_name) {
             projection_exprs.push(build_join_merge_expr(delta_alias, base_alias, merge_col)?);
         } else {

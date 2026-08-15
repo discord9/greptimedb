@@ -196,13 +196,49 @@ impl TaskState {
         self.pending_fenced_repair.as_ref()
     }
 
-    /// Registers a Phase-1 backfill job. Replacing an existing job with the
-    /// same `job_id` is allowed (idempotent re-prepare).
+    /// Registers a Phase-1 backfill job under a strict lifecycle:
+    /// `Prepared -> Running -> BaseComplete`.
+    ///
+    /// An exact duplicate (same `job_id` and identical immutable identity:
+    /// aligned range, staging table name/id) is idempotent: the existing job
+    /// is kept untouched, so a re-prepare never resets a recorded watermark F
+    /// and never clears or rebuilds the staging table. Re-registering the same
+    /// `job_id` with a different identity fails closed instead of silently
+    /// replacing the registered job.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
-    pub fn register_backfill_job(&mut self, job: BackfillJob) {
-        self.backfill_jobs
-            .retain(|existing| existing.job_id != job.job_id);
-        self.backfill_jobs.push(job);
+    pub fn register_backfill_job(&mut self, job: &BackfillJob) -> Result<(), Error> {
+        if let Some(existing) = self
+            .backfill_jobs
+            .iter()
+            .find(|existing| existing.job_id == job.job_id)
+        {
+            ensure!(
+                existing.range == job.range
+                    && existing.staging_table_name == job.staging_table_name
+                    && existing.staging_table_id == job.staging_table_id,
+                UnexpectedSnafu {
+                    reason: format!(
+                        "backfill job {} already registered with a different identity (range {:?}/{:?}, staging {:?}/{:?}, staging_table_id {:?}/{:?}); refusing to replace it",
+                        job.job_id,
+                        existing.range,
+                        job.range,
+                        existing.staging_table_name,
+                        job.staging_table_name,
+                        existing.staging_table_id,
+                        job.staging_table_id
+                    )
+                }
+            );
+            return Ok(());
+        }
+        self.backfill_jobs.push(job.clone());
+        Ok(())
+    }
+
+    /// Returns the registered backfill job with the given id, if any.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn get_backfill_job(&self, job_id: u64) -> Option<&BackfillJob> {
+        self.backfill_jobs.iter().find(|job| job.job_id == job_id)
     }
 
     /// Registered Phase-1 backfill jobs (never consulted by normal flow
@@ -212,10 +248,40 @@ impl TaskState {
         &self.backfill_jobs
     }
 
-    /// Records the frozen scan-open watermark F for a backfill job after its
-    /// Base query succeeded.
+    /// Atomically transitions a registered `Prepared` job to `Running`
+    /// (short critical section, before the Base query starts). Returns the
+    /// job so the caller works with the authoritative registered state.
+    ///
+    /// Re-entering a `Running` job or re-running a `BaseComplete` job is
+    /// rejected: a concurrent or late run must never overwrite the frozen
+    /// watermark F of a completed run.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
-    pub fn set_backfill_frozen_watermark(
+    pub fn begin_backfill_run(&mut self, job_id: u64) -> Result<BackfillJob, Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to run"),
+            })?;
+        ensure!(
+            job.status == BackfillJobStatus::Prepared,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot start: already {:?}",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::Running;
+        Ok(job.clone())
+    }
+
+    /// Records the frozen scan-open watermark F and transitions a `Running`
+    /// job to `BaseComplete`. Only a `Running` job may complete: a late
+    /// completion from a stale run must not overwrite the F of a newer state.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn complete_backfill_run(
         &mut self,
         job_id: u64,
         watermark: BTreeMap<u64, u64>,
@@ -225,15 +291,50 @@ impl TaskState {
             .iter_mut()
             .find(|job| job.job_id == job_id)
             .with_context(|| UnexpectedSnafu {
-                reason: format!("no registered backfill job {job_id}"),
+                reason: format!("no registered backfill job {job_id} to complete"),
             })?;
+        ensure!(
+            job.status == BackfillJobStatus::Running,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot complete: already {:?}",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::BaseComplete;
         job.frozen_watermark = Some(watermark);
         Ok(())
     }
 
+    /// Transitions a `Running` job back to `Prepared` after its Base query
+    /// failed. The staging table and the registered job are kept so the caller
+    /// can retry; only a `Running` job may fail back.
+    #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+    pub fn fail_backfill_run(&mut self, job_id: u64) -> Result<(), Error> {
+        let job = self
+            .backfill_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to fail"),
+            })?;
+        ensure!(
+            job.status == BackfillJobStatus::Running,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill job {job_id} cannot fail back: already {:?}",
+                    job.status
+                )
+            }
+        );
+        job.status = BackfillJobStatus::Prepared;
+        Ok(())
+    }
+
     /// Removes and returns a registered backfill job. Used by finalize
-    /// cleanup after a successful merge; Phase 1 failure keeps the job (and
-    /// its staging table) registered.
+    /// cleanup *after* the staging table drop succeeded (drop-before-remove);
+    /// a failed drop keeps the job registered so cleanup can be retried.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub fn take_backfill_job(&mut self, job_id: u64) -> Option<BackfillJob> {
         let idx = self
@@ -1069,12 +1170,39 @@ impl FencedRepair {
     }
 }
 
+/// Lifecycle status of a registered backfill job.
+///
+/// ```text
+/// Prepared -> Running -> BaseComplete(F)
+/// ```
+///
+/// `Prepared` jobs may start (or re-start after a failed run); a `Running`
+/// job is executing its Base query and may not be entered again; `BaseComplete`
+/// carries the frozen scan-open watermark F and is final — a late or
+/// concurrent run must never overwrite it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+pub enum BackfillJobStatus {
+    /// Registered and prepared; the staging table exists and the Base query
+    /// may be (re)started.
+    Prepared,
+    /// A Base query is currently executing; no other run may start.
+    Running,
+    /// The Base query succeeded; the frozen scan-open watermark F is recorded
+    /// and the job is final.
+    BaseComplete,
+}
+
 /// A registered Phase-1 two-phase backfill job.
 ///
 /// Holds everything the staging side of a backfill needs: the aligned
 /// event-time range, the staging table it writes into, and the frozen
 /// scan-open watermark `F` captured by
 /// [`crate::batching_mode::task::BatchingTask::run_backfill_base`].
+///
+/// The identity (`job_id`, `range`, `staging_table_name`, `staging_table_id`)
+/// is immutable once registered; re-registering the same `job_id` with a
+/// different identity fails closed.
 ///
 /// This is deliberately NOT a checkpoint sub-state: it never affects
 /// `checkpoint_mode`, the active sink, or normal incremental execution.
@@ -1095,6 +1223,8 @@ pub struct BackfillJob {
     /// staging table and the registered job so the caller may retry or clean
     /// up explicitly.
     pub frozen_watermark: Option<BTreeMap<u64, u64>>,
+    /// Lifecycle status; see [`BackfillJobStatus`].
+    pub status: BackfillJobStatus,
 }
 
 /// Filter Expression's information
@@ -1163,11 +1293,11 @@ mod test {
     }
 
     #[test]
-    fn test_backfill_job_registry_register_watermark_take() {
+    fn test_backfill_job_lifecycle_register_begin_complete_fail_take() {
         let query_ctx = QueryContext::arc();
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut state = TaskState::new(query_ctx, rx);
-        let mut job = BackfillJob {
+        let job = BackfillJob {
             job_id: 7,
             range: (Timestamp::new_second(100), Timestamp::new_second(200)),
             staging_table_name: [
@@ -1177,40 +1307,111 @@ mod test {
             ],
             staging_table_id: Some(2048),
             frozen_watermark: None,
+            status: BackfillJobStatus::Prepared,
         };
-        state.register_backfill_job(job.clone());
+        state.register_backfill_job(&job).unwrap();
         assert_eq!(state.backfill_jobs().len(), 1);
         assert!(state.backfill_jobs()[0].frozen_watermark.is_none());
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Prepared);
 
+        // Exact duplicate register is idempotent and preserves state.
+        state.register_backfill_job(&job).unwrap();
+        assert_eq!(state.backfill_jobs().len(), 1);
+
+        // Same job_id with a different identity fails closed.
+        let mut mismatched = job.clone();
+        mismatched.range = (Timestamp::new_second(0), Timestamp::new_second(100));
+        let err = state.register_backfill_job(&mismatched).unwrap_err();
+        assert!(format!("{err:?}").contains("different identity"));
+
+        // begin: Prepared -> Running.
+        let running = state.begin_backfill_run(7).unwrap();
+        assert_eq!(running.job_id, 7);
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Running);
+
+        // A second concurrent run is rejected.
+        let err = state.begin_backfill_run(7).unwrap_err();
+        assert!(format!("{err:?}").contains("already Running"));
+
+        // complete: Running -> BaseComplete(F).
         state
-            .set_backfill_frozen_watermark(7, BTreeMap::from([(1, 10), (2, 20)]))
+            .complete_backfill_run(7, BTreeMap::from([(1, 10), (2, 20)]))
             .unwrap();
         assert_eq!(
             state.backfill_jobs()[0].frozen_watermark,
             Some(BTreeMap::from([(1, 10), (2, 20)]))
         );
-
-        // Unknown job id fails.
-        assert!(
-            state
-                .set_backfill_frozen_watermark(99, BTreeMap::new())
-                .is_err()
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            BackfillJobStatus::BaseComplete
         );
 
-        // Re-registering the same id replaces the old job.
-        job.frozen_watermark = Some(BTreeMap::from([(3, 30)]));
-        state.register_backfill_job(job.clone());
-        assert_eq!(state.backfill_jobs().len(), 1);
+        // A completed job cannot be re-run: the recorded F is final.
+        let err = state.begin_backfill_run(7).unwrap_err();
+        assert!(format!("{err:?}").contains("already BaseComplete"));
+        // A late completion from a stale run cannot overwrite F either.
+        let err = state
+            .complete_backfill_run(7, BTreeMap::from([(9, 99)]))
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("cannot complete"));
         assert_eq!(
             state.backfill_jobs()[0].frozen_watermark,
-            Some(BTreeMap::from([(3, 30)]))
+            Some(BTreeMap::from([(1, 10), (2, 20)]))
         );
+
+        // Unknown ids fail closed on every transition.
+        assert!(state.begin_backfill_run(99).is_err());
+        assert!(state.complete_backfill_run(99, BTreeMap::new()).is_err());
+        assert!(state.fail_backfill_run(99).is_err());
 
         // take removes the job and returns it.
         let taken = state.take_backfill_job(7).unwrap();
         assert_eq!(taken.job_id, 7);
         assert!(state.backfill_jobs().is_empty());
         assert!(state.take_backfill_job(7).is_none());
+    }
+
+    #[test]
+    fn test_backfill_job_failed_run_returns_to_prepared_for_retry() {
+        let query_ctx = QueryContext::arc();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = TaskState::new(query_ctx, rx);
+        let job = BackfillJob {
+            job_id: 8,
+            range: (Timestamp::new_second(0), Timestamp::new_second(100)),
+            staging_table_name: [
+                "greptime".to_string(),
+                "greptime_private".to_string(),
+                "__flow_backfill_1_8".to_string(),
+            ],
+            staging_table_id: None,
+            frozen_watermark: None,
+            status: BackfillJobStatus::Prepared,
+        };
+        state.register_backfill_job(&job).unwrap();
+
+        state.begin_backfill_run(8).unwrap();
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Running);
+
+        // A failed Base query returns the job to Prepared (staging kept) so
+        // the caller can retry.
+        state.fail_backfill_run(8).unwrap();
+        assert_eq!(state.backfill_jobs()[0].status, BackfillJobStatus::Prepared);
+        assert!(state.backfill_jobs()[0].frozen_watermark.is_none());
+
+        // Retry: begin again works, and this time the run completes.
+        state.begin_backfill_run(8).unwrap();
+        state
+            .complete_backfill_run(8, BTreeMap::from([(1, 10)]))
+            .unwrap();
+        assert_eq!(
+            state.backfill_jobs()[0].status,
+            BackfillJobStatus::BaseComplete
+        );
+
+        // Failing a non-Running job fails closed.
+        let err = state.fail_backfill_run(8).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot fail back"));
     }
 
     #[test]

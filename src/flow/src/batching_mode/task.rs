@@ -63,8 +63,8 @@ use crate::batching_mode::checkpoint::{
 use crate::batching_mode::eval_schedule::{EvalSchedule, select_due_scheduled_times};
 use crate::batching_mode::frontend_client::{FrontendClient, PeerDesc};
 use crate::batching_mode::state::{
-    BackfillJob, CheckpointMode, CheckpointPersistence, DirtyTimeWindows, FilterExprInfo,
-    TaskState, to_df_literal,
+    BackfillJob, BackfillJobStatus, CheckpointMode, CheckpointPersistence, DirtyTimeWindows,
+    FilterExprInfo, TaskState, to_df_literal,
 };
 use crate::batching_mode::table_creator::{
     QueryType, create_staging_table_expr, create_table_with_expr,
@@ -141,6 +141,7 @@ pub(crate) fn backfill_staging_table_name(flow_id: FlowId, job_id: u64) -> [Stri
 /// [`BatchingTask::run_backfill_base`] and the FULL OUTER merge primitive; it
 /// is deliberately not wired to any user-triggered path in Phase 1.
 #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
+#[derive(Debug)]
 pub(crate) struct BackfillBase {
     pub job: BackfillJob,
     pub plan: LogicalPlan,
@@ -754,13 +755,21 @@ impl BatchingTask {
     ///
     /// 1. aligns the requested `[start, end)` range to the flow's time-window
     ///    boundaries;
-    /// 2. creates (if missing) the internal staging table
+    /// 2. for a brand-new job, creates the internal staging table
     ///    `greptime_private.__flow_backfill_<flow_id>_<job_id>` by cloning the
     ///    active sink/state schema (nullable dimension PKs, window time index,
     ///    BINARY state, `update_at`/epoch columns as present);
-    /// 3. registers the job in `TaskState` (short critical section);
+    /// 3. registers the job in `TaskState` (short critical section) under the
+    ///    `Prepared -> Running -> BaseComplete` lifecycle;
     /// 4. builds the Base DML plan: the original full aggregate query with an
     ///    event-time `[start, end)` filter and the staging table as DML target.
+    ///
+    /// An exact duplicate prepare (same `job_id`, same aligned range, same
+    /// staging identity) is idempotent: the existing registered job is
+    /// returned untouched — its status and frozen watermark F are preserved,
+    /// the staging table is neither created nor cleared — and only the plan is
+    /// rebuilt against the existing staging table. The same `job_id` with a
+    /// different range or staging identity fails closed.
     ///
     /// The caller then runs [`Self::run_backfill_base`] to execute the plan and
     /// capture F. No `execution_lock` is held here beyond the brief job
@@ -795,53 +804,96 @@ impl BatchingTask {
             (aligned_start, aligned_end)
         };
 
-        let (sink_table, _) = get_table_info_df_schema(
-            self.config.catalog_manager.clone(),
-            self.config.sink_table_name.clone(),
-        )
-        .await?;
-
         let staging_table_name = backfill_staging_table_name(self.config.flow_id, job_id);
-        // Create the staging table only when the local catalog does not have it
-        // yet; `create_staging_table_expr` uses `create_if_not_exists` so a
-        // concurrent creation on the frontend is also tolerated.
-        if !self.is_table_exist(&staging_table_name).await? {
-            let create_expr = create_staging_table_expr(&sink_table, &staging_table_name)?;
-            info!(
-                "Flow {} creating backfill staging table {:?} for job {}",
-                self.config.flow_id, staging_table_name, job_id
-            );
-            frontend_client
-                .create(create_expr, &staging_table_name[0], &staging_table_name[1])
-                .await?;
-        }
-        let staging_table_id = self
-            .config
-            .catalog_manager
-            .table(
-                &staging_table_name[0],
-                &staging_table_name[1],
-                &staging_table_name[2],
-                None,
-            )
-            .await
-            .map_err(BoxedError::new)
-            .context(ExternalSnafu)?
-            .map(|table| table.table_info().table_id());
 
-        let job = BackfillJob {
-            job_id,
-            range: (start, end),
-            staging_table_name: staging_table_name.clone(),
-            staging_table_id,
-            frozen_watermark: None,
+        // Idempotent re-prepare: an already-registered job is returned as-is.
+        // The staging table is never re-created or cleared for an existing job
+        // (a table that already received rows must not be swapped under a
+        // registered job's metadata).
+        let existing_job = {
+            let state = self.state.read().unwrap();
+            state.get_backfill_job(job_id).cloned()
         };
-        // Short critical section: register the job, then drop the lock before
-        // any query execution.
-        {
-            let mut state = self.state.write().unwrap();
-            state.register_backfill_job(job.clone());
-        }
+        let job = if let Some(existing) = existing_job {
+            // Resolve the current staging table id to cross-check identity.
+            let staging_table_id = self
+                .config
+                .catalog_manager
+                .table(
+                    &staging_table_name[0],
+                    &staging_table_name[1],
+                    &staging_table_name[2],
+                    None,
+                )
+                .await
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+                .map(|table| table.table_info().table_id());
+            let candidate = BackfillJob {
+                job_id,
+                range: (start, end),
+                staging_table_name: staging_table_name.clone(),
+                staging_table_id,
+                frozen_watermark: None,
+                status: BackfillJobStatus::Prepared,
+            };
+            {
+                // Re-register validates identity and is a no-op for an exact
+                // duplicate, preserving status and F.
+                let mut state = self.state.write().unwrap();
+                state.register_backfill_job(&candidate)?;
+            }
+            existing
+        } else {
+            let (sink_table, _) = get_table_info_df_schema(
+                self.config.catalog_manager.clone(),
+                self.config.sink_table_name.clone(),
+            )
+            .await?;
+            // Create the staging table only when the local catalog does not
+            // have it yet; `create_staging_table_expr` uses
+            // `create_if_not_exists` so a concurrent creation on the frontend
+            // is also tolerated.
+            if !self.is_table_exist(&staging_table_name).await? {
+                let create_expr = create_staging_table_expr(&sink_table, &staging_table_name)?;
+                info!(
+                    "Flow {} creating backfill staging table {:?} for job {}",
+                    self.config.flow_id, staging_table_name, job_id
+                );
+                frontend_client
+                    .create(create_expr, &staging_table_name[0], &staging_table_name[1])
+                    .await?;
+            }
+            let staging_table_id = self
+                .config
+                .catalog_manager
+                .table(
+                    &staging_table_name[0],
+                    &staging_table_name[1],
+                    &staging_table_name[2],
+                    None,
+                )
+                .await
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+                .map(|table| table.table_info().table_id());
+
+            let job = BackfillJob {
+                job_id,
+                range: (start, end),
+                staging_table_name: staging_table_name.clone(),
+                staging_table_id,
+                frozen_watermark: None,
+                status: BackfillJobStatus::Prepared,
+            };
+            // Short critical section: register the job, then drop the lock
+            // before any query execution.
+            {
+                let mut state = self.state.write().unwrap();
+                state.register_backfill_job(&job)?;
+            }
+            job
+        };
 
         let plan = self
             .build_backfill_base_plan(engine.clone(), &staging_table_name, (start, end))
@@ -980,17 +1032,27 @@ impl BatchingTask {
     /// watermark F is bound at scan time, verifies F is complete and non-empty,
     /// records it on the registered job, and returns it.
     ///
+    /// The registered job is atomically transitioned `Prepared -> Running`
+    /// (short critical section) before the query starts and `Running ->
+    /// BaseComplete(F)` after success, so a concurrent or late second run is
+    /// rejected and can never overwrite the recorded F. On failure the job
+    /// returns to `Prepared` and the staging table is kept for retry.
+    ///
     /// Phase 1 side effects are strictly staging-side: no active checkpoint is
     /// advanced, no checkpoint sentinel is written, and `checkpoint_mode` is
-    /// never changed. On failure the staging table and the registered job are
-    /// kept for retry or explicit cleanup.
+    /// never changed.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub(crate) async fn run_backfill_base(
         &self,
         frontend_client: &Arc<FrontendClient>,
         base: &BackfillBase,
     ) -> Result<BTreeMap<u64, u64>, Error> {
-        let job = &base.job;
+        // Atomic Prepared -> Running transition (short critical section).
+        let running_job = {
+            let mut state = self.state.write().unwrap();
+            state.begin_backfill_run(base.job.job_id)?
+        };
+        let job = &running_job;
         let catalog = &job.staging_table_name[0];
         let schema = &job.staging_table_name[1];
         // Source table refs are resolved against the flow's own query context
@@ -1033,49 +1095,74 @@ impl BatchingTask {
             .map(|(key, value)| (*key, value.as_str()))
             .collect::<Vec<_>>();
         let mut peer_desc = None;
-        let res = frontend_client
-            .query_with_terminal_metrics(
-                catalog,
-                schema,
-                req,
-                &extension_refs,
-                // No preset snapshot_seqs: the scan-open terminal watermark F
-                // is bound by the storage layer at scan time.
-                &HashMap::new(),
-                &mut peer_desc,
-            )
-            .await?;
-        // Consume the output so terminal region watermarks are finalized:
-        // affected-rows (normal INSERT) outputs carry plan-derived metrics,
-        // while stream outputs only mark terminal metrics ready after they are
-        // fully drained.
-        let client::OutputWithMetrics { output, metrics } = res;
-        let affected_rows = match output.data {
-            OutputData::AffectedRows(rows) => rows,
-            OutputData::Stream(stream) => {
-                let _ = collect_batches(stream)
-                    .await
-                    .map_err(BoxedError::new)
-                    .context(ExternalSnafu)?;
-                0
-            }
-            OutputData::RecordBatches(_) => 0,
-        };
-        let watermark_map = metrics.region_watermark_map().unwrap_or_default();
-        debug!(
-            "Flow {} backfill job {} base query executed, affected_rows: {}, watermark: {:?}",
-            self.config.flow_id, job.job_id, affected_rows, watermark_map
-        );
+        let result = async {
+            let res = frontend_client
+                .query_with_terminal_metrics(
+                    catalog,
+                    schema,
+                    req,
+                    &extension_refs,
+                    // No preset snapshot_seqs: the scan-open terminal watermark
+                    // F is bound by the storage layer at scan time.
+                    &HashMap::new(),
+                    &mut peer_desc,
+                )
+                .await?;
+            // Consume the output so terminal region watermarks are finalized:
+            // affected-rows (normal INSERT) outputs carry plan-derived metrics,
+            // while stream outputs only mark terminal metrics ready after they
+            // are fully drained.
+            let client::OutputWithMetrics { output, metrics } = res;
+            let affected_rows = match output.data {
+                OutputData::AffectedRows(rows) => rows,
+                OutputData::Stream(stream) => {
+                    let _ = collect_batches(stream)
+                        .await
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+                    0
+                }
+                OutputData::RecordBatches(_) => 0,
+            };
+            let watermark_map = metrics.region_watermark_map().unwrap_or_default();
+            debug!(
+                "Flow {} backfill job {} base query executed, affected_rows: {}, watermark: {:?}",
+                self.config.flow_id, job.job_id, affected_rows, watermark_map
+            );
 
-        let participating_regions = metrics.participating_regions().unwrap_or_default();
-        verify_backfill_watermark(&participating_regions, &watermark_map)?;
-        let watermark_map = watermark_map.into_iter().collect::<BTreeMap<_, _>>();
-
-        // Record F on the registered job (short critical section).
-        {
-            let mut state = self.state.write().unwrap();
-            state.set_backfill_frozen_watermark(job.job_id, watermark_map.clone())?;
+            let participating_regions = metrics.participating_regions().unwrap_or_default();
+            verify_backfill_watermark(&participating_regions, &watermark_map)?;
+            Ok(watermark_map.into_iter().collect::<BTreeMap<_, _>>())
         }
+        .await;
+
+        let watermark_map = match result {
+            Ok(watermark_map) => {
+                // Record F on the registered job (Running -> BaseComplete,
+                // short critical section).
+                {
+                    let mut state = self.state.write().unwrap();
+                    state.complete_backfill_run(job.job_id, watermark_map.clone())?;
+                }
+                watermark_map
+            }
+            Err(e) => {
+                // Any failure (query error, drain error, or incomplete
+                // watermark): Running -> Prepared (short critical section);
+                // the staging table and the registered job are kept for retry.
+                let transition = {
+                    let mut state = self.state.write().unwrap();
+                    state.fail_backfill_run(job.job_id)
+                };
+                if let Err(transition_err) = transition {
+                    warn!(
+                        "Flow {} failed to return backfill job {} to Prepared after a failed Base run: {}",
+                        self.config.flow_id, job.job_id, transition_err
+                    );
+                }
+                return Err(e);
+            }
+        };
         Ok(watermark_map)
     }
 
@@ -1101,21 +1188,34 @@ impl BatchingTask {
         Ok(extensions)
     }
 
-    /// Explicit cleanup helper for a finished backfill job: unregisters the
-    /// job and drops its staging table. Phase 2 finalize calls this after a
-    /// successful merge; Phase 1 failure paths intentionally keep the staging
-    /// table (and the registered job) so the work is not silently lost.
+    /// Explicit cleanup helper for a finished backfill job: drops the staging
+    /// table using the *registered* job's recorded name, and only unregisters
+    /// the job after the drop succeeded (drop-before-remove).
+    ///
+    /// An unknown `job_id` fails closed without issuing any DROP, so cleanup
+    /// can never blindly drop a table by a deterministic name guess. A failed
+    /// drop keeps the job registered (and its staging table) so cleanup can be
+    /// retried. Phase 2 finalize calls this after a successful merge; Phase 1
+    /// failure paths intentionally keep the staging table (and the registered
+    /// job) so the work is not silently lost.
     #[allow(dead_code)] // Phase 2 wires the caller; Phase 1 ships the primitive + tests.
     pub(crate) async fn finish_backfill_job(
         &self,
         frontend_client: &Arc<FrontendClient>,
         job_id: u64,
     ) -> Result<(), Error> {
-        {
-            let mut state = self.state.write().unwrap();
-            state.take_backfill_job(job_id);
-        }
-        let staging_table_name = backfill_staging_table_name(self.config.flow_id, job_id);
+        // Look up and verify the registered job before any DDL; the staging
+        // name is taken from the job record, not re-derived.
+        let job = self
+            .state
+            .read()
+            .unwrap()
+            .get_backfill_job(job_id)
+            .cloned()
+            .with_context(|| UnexpectedSnafu {
+                reason: format!("no registered backfill job {job_id} to finish"),
+            })?;
+        let staging_table_name = &job.staging_table_name;
         let full_name = TableReference::full(
             staging_table_name[0].as_str(),
             staging_table_name[1].as_str(),
@@ -1126,7 +1226,14 @@ impl BatchingTask {
         frontend_client
             .sql(&staging_table_name[0], &staging_table_name[1], &sql)
             .await
-            .map(|_| ())
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?;
+        // Drop succeeded; only now remove the job (drop-before-remove).
+        {
+            let mut state = self.state.write().unwrap();
+            state.take_backfill_job(job_id);
+        }
+        Ok(())
     }
 
     /// Executes the insert plan. Caller must reach this through the serialized path.
