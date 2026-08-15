@@ -30,6 +30,11 @@ mod task;
 mod time_window;
 pub(crate) mod utils;
 
+/// Re-export of the backfill job lifecycle status so the crate's public
+/// backfill trigger surface (see [`engine::BatchingEngine`]) can return it
+/// without leaking the private `state` module.
+pub use state::BackfillJobStatus;
+
 /// Reserved internal epoch column name stamped on every emitted sink state row
 /// when checkpoint persistence is active.
 ///

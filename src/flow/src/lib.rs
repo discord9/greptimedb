@@ -44,9 +44,18 @@ mod utils;
 // timestamp without duplicating literals. The definitions themselves live in
 // the private `batching_mode` module; see its docs for the sentinel safety
 // caveat.
+// The enterprise incremental-flow backfill trigger surface: the batching
+// engine entry point (`request_flow_backfill` / `get_backfill_job_status`)
+// and the types its signatures expose. OSS provides no SQL/CLI backfill
+// entry; this surface exists for the enterprise crate (linked via git
+// submodule) to drive the two-phase backfill primitives.
+pub use batching_mode::engine::BatchingEngine;
 pub use batching_mode::{
-    CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS, INTERNAL_FLOW_EPOCH_COL_NAME, INTERNAL_FLOW_STATE_COL_KEY,
+    BackfillJobStatus, CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS, INTERNAL_FLOW_EPOCH_COL_NAME,
+    INTERNAL_FLOW_STATE_COL_KEY,
 };
+pub use common_time::Timestamp;
+pub use engine::FlowId;
 
 #[cfg(test)]
 mod test_utils;
@@ -54,7 +63,7 @@ mod test_utils;
 pub use adapter::flownode_impl::FlowDualEngineRef;
 pub use adapter::{FlowConfig, FlowStreamingEngineRef, StreamingEngine};
 pub use batching_mode::frontend_client::{FrontendClient, GrpcQueryHandlerWithBoxedError};
-pub(crate) use engine::{CreateFlowArgs, FlowId, TableName};
+pub(crate) use engine::{CreateFlowArgs, TableName};
 pub use error::{Error, Result};
 pub use server::{
     FlownodeBuilder, FlownodeInstance, FlownodeServer, FlownodeServiceBuilder, FrontendInvoker,

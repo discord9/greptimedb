@@ -3153,4 +3153,4 @@ fn value_as_u64(value: Value) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod test;
+pub(crate) mod test;

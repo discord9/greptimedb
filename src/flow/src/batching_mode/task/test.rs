@@ -4582,7 +4582,7 @@ impl RecordBatchStream for BackfillMetricsStream {
 /// succeeded remotely. `query_failures_remaining` fails the next `n` Base
 /// queries so failure/retry paths can be exercised.
 #[derive(Clone)]
-struct BackfillLifecycleHandler {
+pub(crate) struct BackfillLifecycleHandler {
     engine: QueryEngineRef,
     next_table_id: Arc<std::sync::atomic::AtomicU32>,
     create_attempts: Arc<std::sync::atomic::AtomicUsize>,
@@ -4600,7 +4600,7 @@ struct BackfillLifecycleHandler {
 }
 
 impl BackfillLifecycleHandler {
-    fn new(engine: QueryEngineRef, watermarks: Vec<(u64, Option<u64>)>) -> Self {
+    pub(crate) fn new(engine: QueryEngineRef, watermarks: Vec<(u64, Option<u64>)>) -> Self {
         Self {
             engine,
             next_table_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -4636,7 +4636,7 @@ impl BackfillLifecycleHandler {
         self
     }
 
-    fn with_query_failures(self, failures: usize) -> Self {
+    pub(crate) fn with_query_failures(self, failures: usize) -> Self {
         self.query_failures_remaining
             .store(failures, std::sync::atomic::Ordering::SeqCst);
         self
@@ -4657,14 +4657,16 @@ impl BackfillLifecycleHandler {
         self
     }
 
-    fn create_attempts(&self) -> usize {
+    pub(crate) fn create_attempts(&self) -> usize {
         self.create_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 /// Builds a `FrontendClient` wired to the given lifecycle handler.
-fn lifecycle_frontend_client(handler: &Arc<BackfillLifecycleHandler>) -> Arc<FrontendClient> {
+pub(crate) fn lifecycle_frontend_client(
+    handler: &Arc<BackfillLifecycleHandler>,
+) -> Arc<FrontendClient> {
     let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
     Arc::new(FrontendClient::from_grpc_handler(
         Arc::downgrade(&handler_trait),
@@ -4812,7 +4814,7 @@ impl crate::batching_mode::frontend_client::GrpcQueryHandlerWithBoxedError
 /// Builds a task with a time-window expression and a registered sink table,
 /// ready for Phase 1 backfill tests. Returns the task, the query engine, and
 /// the query used to build the task.
-async fn new_backfill_task(
+pub(crate) async fn new_backfill_task(
     sink_table_name: &str,
     sink_table_id: u32,
 ) -> (BatchingTask, QueryEngineRef, String) {

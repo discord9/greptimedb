@@ -31,7 +31,7 @@ use common_meta::key::table_info::{TableInfoManager, TableInfoValue};
 use common_runtime::JoinHandle;
 use common_telemetry::tracing::warn;
 use common_telemetry::{debug, info};
-use common_time::TimeToLive;
+use common_time::{TimeToLive, Timestamp};
 use datafusion_common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_expr::LogicalPlan;
 use datatypes::prelude::ConcreteDataType;
@@ -47,7 +47,7 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::batching_mode::eval_schedule::EvalSchedule;
 use crate::batching_mode::frontend_client::FrontendClient;
-use crate::batching_mode::state::DirtyTimeWindows;
+use crate::batching_mode::state::{BackfillJobStatus, DirtyTimeWindows};
 use crate::batching_mode::task::{BatchingTask, TaskArgs};
 use crate::batching_mode::time_window::{TimeWindowExpr, find_time_window_expr};
 use crate::batching_mode::utils::sql_to_df_plan;
@@ -1016,6 +1016,143 @@ impl BatchingEngine {
     }
 }
 
+/// Enterprise two-phase backfill trigger surface.
+///
+/// These methods are the **programmatic trigger surface** for the enterprise
+/// incremental-flow backfill: the enterprise crate (linked via git submodule)
+/// drives the OSS two-phase backfill primitives through
+/// [`BatchingEngine::request_flow_backfill`] and observes job progress through
+/// [`BatchingEngine::get_backfill_job_status`]. OSS deliberately provides
+/// **no SQL/CLI entry point** for backfill; these methods are the only way to
+/// trigger it, and callers outside the enterprise layer must not depend on
+/// them.
+///
+/// A request runs asynchronously without holding the task's `execution_lock`,
+/// so backfill never blocks live flow evaluation. Phase 2 finalize is not
+/// invoked here: the scheduled execution loop
+/// (`BatchingTask::execute_once_unlocked`) polls for `BaseComplete` jobs and
+/// finalizes one per round automatically.
+impl BatchingEngine {
+    /// Requests a two-phase backfill for the batching flow `flow_id` over the
+    /// aligned event-time range `[start, end)` (`start` inclusive, `end`
+    /// exclusive).
+    ///
+    /// This is the enterprise incremental-flow backfill trigger. Internally
+    /// it:
+    /// 1. resolves the flow's task — a missing flow, or a flow that is not a
+    ///    batching task in this engine, fails with `FlowNotFound`;
+    /// 2. validates that checkpoint persistence is armed — Phase 2 finalize
+    ///    requires it to commit the catch-up, so a flow without persistence is
+    ///    rejected up front;
+    /// 3. registers the backfill job (idempotently) and prepares the staging
+    ///    table and the Base plan (`prepare_backfill_base`), aligning the
+    ///    range to the flow's time-window boundaries;
+    /// 4. runs the Base query and captures the frozen scan-open watermark F
+    ///    (`run_backfill_base`) when the job is `Prepared`.
+    ///
+    /// A `BaseComplete` job is never re-run: repeating the request with the
+    /// same `job_id` and the same range is a no-op (idempotent). The same
+    /// `job_id` with a different range or an in-flight `Running`/`Finishing`
+    /// job fails closed. After Phase 2 finalize removes the job, a later
+    /// request with the same `job_id` starts a fresh backfill generation.
+    ///
+    /// Phase 2 finalize is left to the scheduled loop and is not invoked here.
+    ///
+    /// # Errors
+    ///
+    /// - `FlowNotFound` when `flow_id` has no batching task in this engine.
+    /// - `Unexpected` when the flow has no checkpoint persistence, when
+    ///   `job_id` is already registered with a different identity, or when the
+    ///   range cannot be aligned to the flow's time windows.
+    pub async fn request_flow_backfill(
+        &self,
+        flow_id: FlowId,
+        job_id: u64,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<(), Error> {
+        debug!("Request backfill for flow {flow_id}, job {job_id}, range [{start:?}, {end:?})");
+        ensure!(
+            start < end,
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill range [{start:?}, {end:?}) for flow {flow_id} job {job_id} is empty or inverted"
+                ),
+            }
+        );
+
+        let task = self
+            .runtime
+            .read()
+            .await
+            .tasks
+            .get(&flow_id)
+            .cloned()
+            .with_context(|| FlowNotFoundSnafu { id: flow_id })?;
+
+        // Phase 2 finalize requires checkpoint persistence to commit the
+        // catch-up; reject a trigger for a flow that can never finalize.
+        ensure!(
+            task.state
+                .read()
+                .unwrap()
+                .checkpoint_persistence()
+                .is_some(),
+            UnexpectedSnafu {
+                reason: format!(
+                    "backfill requires checkpoint persistence; flow {flow_id} has none"
+                ),
+            }
+        );
+
+        let base = task
+            .prepare_backfill_base(
+                &self.query_engine,
+                &self.frontend_client,
+                job_id,
+                start,
+                end,
+            )
+            .await?;
+
+        // A `BaseComplete` job already captured F; never re-run it (idempotent
+        // duplicate request). A `Prepared` job (fresh, or a retry after a
+        // failed Base run) executes the Base query now.
+        if base.job.status == BackfillJobStatus::Prepared {
+            task.run_backfill_base(&self.frontend_client, &base).await?;
+        }
+        Ok(())
+    }
+
+    /// Returns the current status of the backfill job `job_id` for the
+    /// batching flow `flow_id`, if the job is still registered.
+    ///
+    /// This is the observation surface for the enterprise backfill trigger
+    /// ([`Self::request_flow_backfill`]): `None` means the job is not
+    /// registered yet (or was already finalized — Phase 2 finalize removes the
+    /// job once the staging table is dropped).
+    ///
+    /// # Errors
+    ///
+    /// - `FlowNotFound` when `flow_id` has no batching task in this engine.
+    pub async fn get_backfill_job_status(
+        &self,
+        flow_id: FlowId,
+        job_id: u64,
+    ) -> Result<Option<BackfillJobStatus>, Error> {
+        let task = self
+            .runtime
+            .read()
+            .await
+            .tasks
+            .get(&flow_id)
+            .cloned()
+            .with_context(|| FlowNotFoundSnafu { id: flow_id })?;
+        let state = task.state.read().unwrap();
+        Ok(state.get_backfill_job(job_id).map(|job| job.status))
+    }
+}
+
 fn notify_flow_shutdown(flow_id: FlowId, tx: Option<oneshot::Sender<()>>, action: &str) -> bool {
     let Some(tx) = tx else {
         return false;
@@ -1085,6 +1222,8 @@ impl FlowEngine for BatchingEngine {
 mod tests {
     use api::v1::flow::{DirtyWindowRequest, TimeRange};
     use catalog::memory::new_memory_catalog_manager;
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_meta::key::TableMetadataManager;
     use common_meta::key::flow::FlowMetadataManager;
     use common_meta::key::table_route::TableRouteValue;
@@ -1095,6 +1234,10 @@ mod tests {
     use session::context::QueryContext;
 
     use super::*;
+    use crate::batching_mode::state::CheckpointPersistence;
+    use crate::batching_mode::task::test::{
+        BackfillLifecycleHandler, lifecycle_frontend_client, new_backfill_task,
+    };
     use crate::test_utils::create_test_query_engine;
 
     struct DropNotify(Option<oneshot::Sender<()>>);
@@ -1768,5 +1911,220 @@ GROUP BY l.number, time_window
             .await;
         assert!(!engine.flow_exist_inner(42).await);
         assert!(!engine.runtime.read().await.shutdown_txs.contains_key(&42));
+    }
+
+    // ---------------------------------------------------------------------
+    // Enterprise backfill trigger surface (request_flow_backfill)
+    // ---------------------------------------------------------------------
+
+    /// Builds an engine wired to the given frontend client and query engine,
+    /// with fresh in-memory meta managers.
+    async fn new_test_engine_with_parts(
+        frontend_client: Arc<FrontendClient>,
+        query_engine: QueryEngineRef,
+    ) -> BatchingEngine {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let table_meta = Arc::new(TableMetadataManager::new(kv_backend.clone()));
+        table_meta.init().await.unwrap();
+        let flow_meta = Arc::new(FlowMetadataManager::new(kv_backend));
+        let catalog_manager = new_memory_catalog_manager().unwrap();
+        BatchingEngine::new(
+            frontend_client,
+            query_engine,
+            flow_meta,
+            table_meta,
+            catalog_manager,
+            BatchingModeOptions::default(),
+        )
+    }
+
+    /// Builds a batching engine with one registered flow (id 1) whose task has
+    /// a time-window expression and a registered sink, wired to a backfill
+    /// lifecycle frontend. `with_persistence` arms checkpoint persistence on
+    /// the task (required by the backfill trigger).
+    async fn new_backfill_engine(
+        sink_table_name: &str,
+        sink_table_id: u32,
+        with_persistence: bool,
+    ) -> (BatchingEngine, Arc<BackfillLifecycleHandler>) {
+        let (task, query_engine, _) = new_backfill_task(sink_table_name, sink_table_id).await;
+        if with_persistence {
+            task.state
+                .write()
+                .unwrap()
+                .set_checkpoint_persistence(Some(CheckpointPersistence {
+                    epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+                    state_col_name: "state".to_string(),
+                    window_col_name: "time_window".to_string(),
+                    primary_key_columns: vec![],
+                }));
+        }
+        let handler = Arc::new(BackfillLifecycleHandler::new(
+            query_engine.clone(),
+            vec![(11, Some(99))],
+        ));
+        let frontend_client = lifecycle_frontend_client(&handler);
+        let engine = new_test_engine_with_parts(frontend_client, query_engine).await;
+        let (shutdown_tx, _rx) = tokio::sync::oneshot::channel();
+        // `new_backfill_task` pins the task's flow_id to 1.
+        engine.runtime.write().await.insert(1, task, shutdown_tx);
+        (engine, handler)
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_drives_prepare_and_run_and_is_idempotent() {
+        let (engine, handler) = new_backfill_engine("twe_sink_engine_entry", 9301, true).await;
+        let start = Timestamp::new_second(0);
+        let end = Timestamp::new_second(300);
+
+        // Not yet registered: the status query observes None.
+        assert_eq!(engine.get_backfill_job_status(1, 7).await.unwrap(), None);
+
+        engine
+            .request_flow_backfill(1, 7, start, end)
+            .await
+            .expect("backfill request should succeed");
+
+        // Job registered with BaseComplete: staging created exactly once and
+        // the Base run captured the frozen watermark F.
+        assert_eq!(
+            engine.get_backfill_job_status(1, 7).await.unwrap(),
+            Some(BackfillJobStatus::BaseComplete)
+        );
+        assert_eq!(handler.create_attempts(), 1);
+        let frozen_watermark = {
+            let runtime = engine.runtime.read().await;
+            let state = runtime.tasks[&1].state.read().unwrap();
+            state.backfill_jobs()[0].frozen_watermark.clone()
+        };
+        assert_eq!(frozen_watermark, Some(BTreeMap::from([(11_u64, 99_u64)])));
+
+        // Exact-duplicate request is a no-op: no new staging create, no re-run,
+        // status and frozen F untouched.
+        engine
+            .request_flow_backfill(1, 7, start, end)
+            .await
+            .expect("duplicate backfill request should be idempotent");
+        assert_eq!(handler.create_attempts(), 1);
+        assert_eq!(
+            engine.get_backfill_job_status(1, 7).await.unwrap(),
+            Some(BackfillJobStatus::BaseComplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_unknown_flow_errors() {
+        let (engine, _handler) = new_backfill_engine("twe_sink_engine_unknown", 9302, true).await;
+
+        let err = engine
+            .request_flow_backfill(
+                9999,
+                7,
+                Timestamp::new_second(0),
+                Timestamp::new_second(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::FlowNotFound { .. }), "{err}");
+
+        let err = engine.get_backfill_job_status(9999, 7).await.unwrap_err();
+        assert!(matches!(err, Error::FlowNotFound { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_requires_checkpoint_persistence() {
+        let (engine, _handler) =
+            new_backfill_engine("twe_sink_engine_no_persist", 9303, false).await;
+
+        let err = engine
+            .request_flow_backfill(1, 7, Timestamp::new_second(0), Timestamp::new_second(300))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unexpected { .. }), "{err}");
+        assert!(err.to_string().contains("checkpoint persistence"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_rejects_empty_range() {
+        let (engine, _handler) =
+            new_backfill_engine("twe_sink_engine_empty_range", 9304, true).await;
+
+        let err = engine
+            .request_flow_backfill(1, 7, Timestamp::new_second(300), Timestamp::new_second(300))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unexpected { .. }), "{err}");
+        assert!(err.to_string().contains("empty or inverted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_duplicate_job_different_range_rejects() {
+        let (engine, _handler) =
+            new_backfill_engine("twe_sink_engine_diff_range", 9305, true).await;
+        let start = Timestamp::new_second(0);
+        let end = Timestamp::new_second(300);
+        engine
+            .request_flow_backfill(1, 7, start, end)
+            .await
+            .expect("first backfill request should succeed");
+
+        let err = engine
+            .request_flow_backfill(1, 7, start, Timestamp::new_second(600))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unexpected { .. }), "{err}");
+
+        // The registered job identity is untouched.
+        let (range, status) = {
+            let runtime = engine.runtime.read().await;
+            let state = runtime.tasks[&1].state.read().unwrap();
+            let job = &state.backfill_jobs()[0];
+            (job.range, job.status)
+        };
+        assert_eq!(range, (start, end));
+        assert_eq!(status, BackfillJobStatus::BaseComplete);
+    }
+
+    #[tokio::test]
+    async fn test_request_flow_backfill_retries_after_failed_base_run() {
+        // The first Base query fails at the frontend; the job returns to
+        // Prepared, and a re-request retries the run and completes.
+        let (task, query_engine, _) = new_backfill_task("twe_sink_engine_retry", 9306).await;
+        task.state
+            .write()
+            .unwrap()
+            .set_checkpoint_persistence(Some(CheckpointPersistence {
+                epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+                state_col_name: "state".to_string(),
+                window_col_name: "time_window".to_string(),
+                primary_key_columns: vec![],
+            }));
+        let handler = Arc::new(
+            BackfillLifecycleHandler::new(query_engine.clone(), vec![(11, Some(99))])
+                .with_query_failures(1),
+        );
+        let frontend_client = lifecycle_frontend_client(&handler);
+        let engine = new_test_engine_with_parts(frontend_client, query_engine).await;
+        let (shutdown_tx, _rx) = tokio::sync::oneshot::channel();
+        engine.runtime.write().await.insert(1, task, shutdown_tx);
+
+        let err = engine
+            .request_flow_backfill(1, 7, Timestamp::new_second(0), Timestamp::new_second(300))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::Internal, "{err:?}");
+        assert_eq!(
+            engine.get_backfill_job_status(1, 7).await.unwrap(),
+            Some(BackfillJobStatus::Prepared)
+        );
+
+        engine
+            .request_flow_backfill(1, 7, Timestamp::new_second(0), Timestamp::new_second(300))
+            .await
+            .expect("retry should succeed");
+        assert_eq!(
+            engine.get_backfill_job_status(1, 7).await.unwrap(),
+            Some(BackfillJobStatus::BaseComplete)
+        );
     }
 }
