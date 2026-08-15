@@ -63,8 +63,8 @@ use crate::batching_mode::checkpoint::{
 use crate::batching_mode::eval_schedule::{EvalSchedule, select_due_scheduled_times};
 use crate::batching_mode::frontend_client::{FrontendClient, PeerDesc};
 use crate::batching_mode::state::{
-    BackfillJob, CheckpointMode, CheckpointPersistence, DirtyTimeWindows, FilterExprInfo,
-    PrepareReservation, TaskState, to_df_literal,
+    BackfillJob, BackfillJobStatus, CheckpointMode, CheckpointPersistence, DirtyTimeWindows,
+    FilterExprInfo, PrepareReservation, TaskState, to_df_literal,
 };
 use crate::batching_mode::table_creator::{
     QueryType, create_staging_table_expr, create_table_with_expr,
@@ -88,6 +88,7 @@ use crate::metrics::{
 use crate::{Error, FlowId};
 
 mod ckpt;
+mod finalize;
 mod inc;
 
 /// Returns the current wall-clock Unix timestamp in seconds.
@@ -590,6 +591,50 @@ impl BatchingTask {
         frontend_client: &Arc<FrontendClient>,
         max_window_cnt: Option<usize>,
     ) -> ExecuteOnceOutcome {
+        // Phase-2 backfill finalize: poll for a BaseComplete job BEFORE the
+        // normal incremental evaluation and finalize ONE job per round. The
+        // whole finalize runs under `execution_lock` (held by the caller);
+        // this is the OSS integration point — the enterprise side wires its
+        // own trigger through a fork. A successful finalize consumes the round
+        // (the next round resumes normal evaluation); a failed finalize keeps
+        // the job BaseComplete for retry and surfaces the error so the caller
+        // (e.g. the scheduled loop) logs it.
+        let pending_finalize_job = {
+            let state = self.state.read().unwrap();
+            state
+                .backfill_jobs()
+                .iter()
+                .find(|job| job.status == BackfillJobStatus::BaseComplete)
+                .map(|job| job.job_id)
+        };
+        if let Some(job_id) = pending_finalize_job {
+            match self
+                .run_backfill_finalize(engine, frontend_client, job_id)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        "Flow {} finalized backfill job {}; skipping normal evaluation this round",
+                        self.config.flow_id, job_id
+                    );
+                    return ExecuteOnceOutcome {
+                        new_query: None,
+                        result: Ok(None),
+                    };
+                }
+                Err(err) => {
+                    warn!(
+                        "Flow {} failed to finalize backfill job {}; the job stays BaseComplete and will be retried: {:?}",
+                        self.config.flow_id, job_id, err
+                    );
+                    return ExecuteOnceOutcome {
+                        new_query: None,
+                        result: Err(err),
+                    };
+                }
+            }
+        }
+
         let new_query = match self.gen_insert_plan_unlocked(engine, max_window_cnt).await {
             Ok(new_query) => new_query,
             Err(err) => {

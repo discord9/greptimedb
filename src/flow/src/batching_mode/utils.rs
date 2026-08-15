@@ -736,7 +736,11 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge(
 /// outputs pick the non-NULL side of the join so Base-only rows keep their
 /// literal values instead of producing NULL. The existing merge expressions
 /// already short-circuit NULL sides, so they are reused unchanged for both
-/// join kinds.
+/// join kinds. A `FullOuter` merge with no aggregate merge columns (a plain
+/// GROUP BY) is also supported: the FULL OUTER join on the group keys yields
+/// exactly the deduplicated union of both sides, which is what the backfill
+/// staging merge needs to preserve Base-only groups. The `Left` path keeps
+/// requiring at least one mergeable aggregate column.
 pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
     delta_plan: &LogicalPlan,
     analysis: &IncrementalAggregateAnalysis,
@@ -756,7 +760,8 @@ pub async fn rewrite_incremental_aggregate_with_sink_merge_kind(
     );
 
     ensure!(
-        !analysis.merge_columns.is_empty(),
+        !analysis.merge_columns.is_empty()
+            || matches!(join_kind, IncrementalMergeJoinKind::FullOuter),
         InvalidQuerySnafu {
             reason:
                 "UNSUPPORTED_INCREMENTAL_AGG: aggregate query has no mergeable aggregate columns"

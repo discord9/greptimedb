@@ -37,7 +37,7 @@ use crate::batching_mode::utils::{
 use crate::error::{ExternalSnafu, UnexpectedSnafu};
 
 impl BatchingTask {
-    async fn sink_table_id(&self) -> Result<TableId, Error> {
+    pub(super) async fn sink_table_id(&self) -> Result<TableId, Error> {
         let table = self
             .config
             .catalog_manager

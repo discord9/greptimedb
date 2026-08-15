@@ -29,6 +29,7 @@ use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_recordbatch::adapter::{RecordBatchMetrics, RegionWatermarkEntry};
 use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
+use datatypes::arrow::array::Array as _;
 use datatypes::data_type::ConcreteDataType as CDT;
 use datatypes::prelude::{MutableVector, ScalarVectorBuilder};
 use datatypes::schema::{ColumnSchema, Schema};
@@ -39,7 +40,7 @@ use pretty_assertions::assert_eq;
 use query::options::{
     FLOW_INCREMENTAL_AFTER_SEQS, FLOW_INCREMENTAL_MODE, FLOW_INCREMENTAL_MODE_MEMTABLE_ONLY,
     FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE, FLOW_INTERNAL_NON_SOURCE_TABLE_IDS,
-    FLOW_RETURN_REGION_SEQ, FLOW_SCHEDULED_TIME_MILLIS, QueryOptions,
+    FLOW_RETURN_REGION_SEQ, FLOW_SCHEDULED_TIME_MILLIS, FLOW_SINK_TABLE_ID, QueryOptions,
 };
 use session::context::QueryContext;
 use snafu::ResultExt;
@@ -6047,5 +6048,1541 @@ async fn test_finish_backfill_job_then_reprepare_is_a_fresh_generation() {
             state.backfill_jobs()[0].status,
             crate::batching_mode::state::BackfillJobStatus::Prepared
         );
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// Phase-2 finalize tests: unified catch-up (non-target delta branch + target
+/// FULL OUTER staging merge branch) with a single pre-bound high watermark H.
+///
+/// The mock frontend executes the captured branch SELECT plans through the
+/// query engine (real aggregation / merge behavior) and returns the branch's
+/// terminal region watermarks from a synthetic map, so the end-to-end test can
+/// assert the exact rows each branch would insert into the active sink.
+/// ---------------------------------------------------------------------------
+/// Builds a query engine with a custom `numbers_with_ts` source (rows are
+/// `(number, ts_ms)`). Mirrors `crate::test_utils::create_test_query_engine`
+/// but with caller-controlled source data.
+fn create_finalize_engine(source_rows: &[(u32, i64)]) -> QueryEngineRef {
+    let catalog_list = catalog::memory::new_memory_catalog_manager().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        ColumnSchema::new("number", CDT::uint32_datatype(), false),
+        ColumnSchema::new("ts", CDT::timestamp_millisecond_datatype(), false).with_time_index(true),
+    ]));
+    let mut numbers = datatypes::vectors::UInt32VectorBuilder::with_capacity(source_rows.len());
+    let mut ts =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(source_rows.len());
+    for (number, ts_ms) in source_rows {
+        numbers.push(Some(*number));
+        ts.push(Some(datatypes::timestamp::TimestampMillisecond::new(
+            *ts_ms,
+        )));
+    }
+    let recordbatch = RecordBatch::new(schema, vec![numbers.to_vector(), ts.to_vector()]).unwrap();
+    let table = MemTable::table("numbers_with_ts", recordbatch);
+    catalog_list
+        .register_table_sync(RegisterTableRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_SCHEMA_NAME.to_string(),
+            table_name: "numbers_with_ts".to_string(),
+            table_id: 1024,
+            table,
+        })
+        .unwrap();
+    let factory = query::QueryEngineFactory::new(
+        catalog_list,
+        None,
+        None,
+        None,
+        None,
+        false,
+        QueryOptions::default(),
+    );
+    let engine = factory.query_engine();
+    crate::transform::register_function_to_query_engine(&engine);
+    engine
+}
+
+/// The active sink used by the finalize tests: the flow output columns
+/// (`number` dimension, `max_ts` aggregate, `time_window` time index) plus the
+/// auto-created `update_at` and the reserved internal epoch column, so
+/// `stamp_epoch_into_plan` and `write_checkpoint_row` can run.
+fn finalize_sink_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ColumnSchema::new("number", CDT::uint32_datatype(), true),
+        ColumnSchema::new("max_ts", CDT::timestamp_millisecond_datatype(), true),
+        ColumnSchema::new("time_window", CDT::timestamp_millisecond_datatype(), false)
+            .with_time_index(true),
+        ColumnSchema::new("update_at", CDT::timestamp_millisecond_datatype(), true),
+        ColumnSchema::new(
+            crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME,
+            CDT::uint64_datatype(),
+            true,
+        ),
+    ]))
+}
+
+/// A finalize sink row: `(number, max_ts_ms, time_window_ms, epoch)`.
+type FinalizeSinkRow = (Option<u32>, Option<i64>, Option<i64>, Option<u64>);
+
+fn finalize_sink_recordbatch(rows: Vec<FinalizeSinkRow>) -> RecordBatch {
+    let schema = finalize_sink_schema();
+    let mut numbers = datatypes::vectors::UInt32VectorBuilder::with_capacity(rows.len());
+    let mut max_ts =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    let mut windows =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    let mut update_at =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    let mut epochs = datatypes::vectors::UInt64VectorBuilder::with_capacity(rows.len());
+    for (number, max_ts_ms, window_ms, epoch) in rows {
+        numbers.push(number);
+        max_ts.push(max_ts_ms.map(datatypes::timestamp::TimestampMillisecond::new));
+        windows.push(window_ms.map(datatypes::timestamp::TimestampMillisecond::new));
+        update_at.push(Some(datatypes::timestamp::TimestampMillisecond::new(0)));
+        epochs.push(epoch);
+    }
+    RecordBatch::new(
+        schema,
+        vec![
+            numbers.to_vector(),
+            max_ts.to_vector(),
+            windows.to_vector(),
+            update_at.to_vector(),
+            epochs.to_vector(),
+        ],
+    )
+    .unwrap()
+}
+
+fn register_finalize_sink(
+    query_engine: &QueryEngineRef,
+    table_name: &str,
+    table_id: u32,
+    rows: Vec<FinalizeSinkRow>,
+) {
+    let batch = finalize_sink_recordbatch(rows);
+    let table = MemTable::table(table_name, batch);
+    let request = RegisterTableRequest {
+        catalog: DEFAULT_CATALOG_NAME.to_string(),
+        schema: DEFAULT_SCHEMA_NAME.to_string(),
+        table_name: table_name.to_string(),
+        table_id,
+        table,
+    };
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog.register_table_sync(request).unwrap();
+}
+
+/// The backfill staging table for the finalize tests: the flow output columns
+/// only (the FULL OUTER merge base reads group keys + aggregate columns).
+fn finalize_staging_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ColumnSchema::new("number", CDT::uint32_datatype(), true),
+        ColumnSchema::new("max_ts", CDT::timestamp_millisecond_datatype(), true),
+        ColumnSchema::new("time_window", CDT::timestamp_millisecond_datatype(), false)
+            .with_time_index(true),
+        ColumnSchema::new("update_at", CDT::timestamp_millisecond_datatype(), true),
+    ]))
+}
+
+fn finalize_staging_recordbatch(rows: Vec<(u32, i64, i64)>) -> RecordBatch {
+    let schema = finalize_staging_schema();
+    let mut numbers = datatypes::vectors::UInt32VectorBuilder::with_capacity(rows.len());
+    let mut max_ts =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    let mut windows =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    let mut update_at =
+        datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
+    for (number, max_ts_ms, window_ms) in rows {
+        numbers.push(Some(number));
+        max_ts.push(Some(datatypes::timestamp::TimestampMillisecond::new(
+            max_ts_ms,
+        )));
+        windows.push(Some(datatypes::timestamp::TimestampMillisecond::new(
+            window_ms,
+        )));
+        update_at.push(Some(datatypes::timestamp::TimestampMillisecond::new(0)));
+    }
+    RecordBatch::new(
+        schema,
+        vec![
+            numbers.to_vector(),
+            max_ts.to_vector(),
+            windows.to_vector(),
+            update_at.to_vector(),
+        ],
+    )
+    .unwrap()
+}
+
+fn register_finalize_staging(
+    query_engine: &QueryEngineRef,
+    table_name: &str,
+    table_id: u32,
+    rows: Vec<(u32, i64, i64)>,
+) {
+    let batch = finalize_staging_recordbatch(rows);
+    let table = MemTable::new_with_catalog(
+        table_name,
+        batch,
+        table_id,
+        DEFAULT_CATALOG_NAME.to_string(),
+        DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+    );
+    let catalog_manager = query_engine.engine_state().catalog_manager();
+    let memory_catalog = catalog_manager
+        .as_any()
+        .downcast_ref::<MemoryCatalogManager>()
+        .unwrap();
+    memory_catalog
+        .register_schema_sync(catalog::RegisterSchemaRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+        })
+        .unwrap();
+    let request = RegisterTableRequest {
+        catalog: DEFAULT_CATALOG_NAME.to_string(),
+        schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+        table_name: table_name.to_string(),
+        table_id,
+        table,
+    };
+    memory_catalog.register_table_sync(request).unwrap();
+}
+
+/// Builds a task for the finalize tests: a time-window aggregate flow over a
+/// custom `numbers_with_ts` source with the finalize sink registered.
+async fn new_finalize_task(
+    sink_table: &str,
+    _sink_table_id: u32,
+    source_rows: &[(u32, i64)],
+) -> (BatchingTask, QueryEngineRef) {
+    let query_engine = create_finalize_engine(source_rows);
+    let ctx = QueryContext::arc();
+    let flow_query = "SELECT number, max(ts) AS max_ts, date_bin(INTERVAL '5 second', ts) AS time_window \
+         FROM numbers_with_ts GROUP BY time_window, number";
+    let plan = sql_to_df_plan(ctx.clone(), query_engine.clone(), flow_query, true)
+        .await
+        .unwrap();
+    let (column_name, time_window_expr, _, df_schema) = find_time_window_expr(
+        &plan,
+        query_engine.engine_state().catalog_manager().clone(),
+        ctx.clone(),
+    )
+    .await
+    .unwrap();
+    let time_window_expr = time_window_expr
+        .map(|expr| {
+            TimeWindowExpr::from_expr(
+                &expr,
+                &column_name,
+                &df_schema,
+                &query_engine.engine_state().session_state(),
+            )
+        })
+        .transpose()
+        .unwrap();
+
+    // NOTE: the sink table is registered by each test (empty or pre-seeded
+    // with the active state at L) so the e2e test can control the Active side.
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    let task = BatchingTask::try_new(TaskArgs {
+        flow_id: 1,
+        query: flow_query,
+        plan: plan.clone(),
+        time_window_expr,
+        expire_after: None,
+        sink_table_name: [
+            "greptime".to_string(),
+            "public".to_string(),
+            sink_table.to_string(),
+        ],
+        source_table_names: vec![[
+            "greptime".to_string(),
+            "public".to_string(),
+            "numbers_with_ts".to_string(),
+        ]],
+        query_ctx: ctx,
+        catalog_manager: query_engine.engine_state().catalog_manager().clone(),
+        shutdown_rx: rx,
+        batch_opts: sequence_range_batch_opts(),
+        flow_eval_interval: None,
+        eval_schedule: None,
+    })
+    .unwrap();
+    (task, query_engine)
+}
+
+/// A stream that yields a list of batches and exposes terminal region
+/// watermarks only once exhausted (mirrors `BackfillMetricsStream`).
+struct FinalizeMetricsStream {
+    batches: Vec<RecordBatch>,
+    idx: usize,
+    metrics: RecordBatchMetrics,
+}
+
+impl futures::Stream for FinalizeMetricsStream {
+    type Item = common_recordbatch::error::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.idx < self.batches.len() {
+            let batch = self.batches[self.idx].clone();
+            self.idx += 1;
+            Poll::Ready(Some(Ok(batch)))
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.batches.len() - self.idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl RecordBatchStream for FinalizeMetricsStream {
+    fn name(&self) -> &str {
+        "FinalizeMetricsStream"
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        None
+    }
+
+    fn schema(&self) -> datatypes::schema::SchemaRef {
+        self.batches
+            .first()
+            .map(|batch| batch.schema.clone())
+            .unwrap_or_else(|| Arc::new(Schema::new(vec![])))
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        if self.idx < self.batches.len() {
+            // Not terminal yet: do not overwrite the terminal metrics handle.
+            None
+        } else {
+            Some(self.metrics.clone())
+        }
+    }
+}
+
+/// A finalize mock frontend: executes captured branch/probe SELECT plans
+/// through the query engine (real aggregation and FULL OUTER merge behavior),
+/// returns synthetic terminal watermarks, handles the checkpoint-row write
+/// (detected by the EmptyRelation sentinel projection) as a one-row affected
+/// write, and drops the staging table on the DROP TABLE SQL.
+#[derive(Clone)]
+struct FinalizeLifecycleHandler {
+    engine: QueryEngineRef,
+    /// Watermarks returned for every branch AND the probe (unless overridden).
+    watermarks: Vec<(u64, Option<u64>)>,
+    /// Watermarks returned for the probe specifically; defaults to `watermarks`.
+    probe_watermarks: Option<Vec<(u64, Option<u64>)>>,
+    /// Number of branch queries to fail (first N branches).
+    branch_failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fails the second branch (the target final branch).
+    fail_second_branch: bool,
+    /// Fails the probe.
+    fail_probe: bool,
+    /// Fails the checkpoint-row write.
+    fail_checkpoint_write: bool,
+    /// Fails the DROP TABLE SQL.
+    fail_drops: bool,
+    created_tables: Arc<std::sync::Mutex<Vec<String>>>,
+    captured_probe_requests: Arc<std::sync::Mutex<Vec<api::v1::QueryRequest>>>,
+    captured_branch_plans: Arc<std::sync::Mutex<Vec<api::v1::InsertIntoPlan>>>,
+    captured_branch_extensions: Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>,
+    captured_branch_snapshot_seqs: Arc<std::sync::Mutex<Vec<HashMap<u64, u64>>>>,
+    captured_checkpoint_plans: Arc<std::sync::Mutex<Vec<api::v1::InsertIntoPlan>>>,
+    /// Record batches of every executed branch SELECT (the rows each branch
+    /// would insert into the active sink).
+    captured_branches: Arc<std::sync::Mutex<Vec<Vec<RecordBatch>>>>,
+    branch_count: Arc<std::sync::atomic::AtomicUsize>,
+    request_log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl FinalizeLifecycleHandler {
+    fn new(engine: QueryEngineRef, watermarks: Vec<(u64, Option<u64>)>) -> Self {
+        Self {
+            engine,
+            watermarks,
+            probe_watermarks: None,
+            branch_failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_second_branch: false,
+            fail_probe: false,
+            fail_checkpoint_write: false,
+            fail_drops: false,
+            created_tables: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_probe_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_branch_plans: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_branch_extensions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_branch_snapshot_seqs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_checkpoint_plans: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_branches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            branch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            request_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_probe_watermarks(mut self, watermarks: Vec<(u64, Option<u64>)>) -> Self {
+        self.probe_watermarks = Some(watermarks);
+        self
+    }
+
+    fn with_branch_failures(self, failures: usize) -> Self {
+        self.branch_failures_remaining
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    fn with_fail_second_branch(mut self) -> Self {
+        self.fail_second_branch = true;
+        self
+    }
+
+    fn with_fail_probe(mut self) -> Self {
+        self.fail_probe = true;
+        self
+    }
+
+    fn with_fail_checkpoint_write(mut self) -> Self {
+        self.fail_checkpoint_write = true;
+        self
+    }
+
+    fn with_failed_drops(mut self) -> Self {
+        self.fail_drops = true;
+        self
+    }
+
+    fn branch_count(&self) -> usize {
+        self.branch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn finalize_frontend_client(handler: &Arc<FinalizeLifecycleHandler>) -> Arc<FrontendClient> {
+    let handler_trait: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
+    Arc::new(FrontendClient::from_grpc_handler(
+        Arc::downgrade(&handler_trait),
+        QueryOptions::default(),
+    ))
+}
+
+fn finalize_metrics_stream(batches: Vec<RecordBatch>, watermarks: &[(u64, Option<u64>)]) -> Output {
+    let metrics = RecordBatchMetrics {
+        region_watermarks: watermarks
+            .iter()
+            .map(|(region_id, watermark)| RegionWatermarkEntry {
+                region_id: *region_id,
+                watermark: *watermark,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    Output::new_with_stream(Box::pin(FinalizeMetricsStream {
+        batches,
+        idx: 0,
+        metrics,
+    }))
+}
+
+#[async_trait::async_trait]
+impl GrpcQueryHandlerWithBoxedError for FinalizeLifecycleHandler {
+    async fn do_query(
+        &self,
+        query: api::v1::greptime_request::Request,
+        ctx: QueryContextRef,
+    ) -> std::result::Result<Output, BoxedError> {
+        use api::v1::greptime_request::Request;
+        use api::v1::query_request::Query;
+        use api::v1::{DdlRequest, QueryRequest};
+
+        match query {
+            Request::Ddl(DdlRequest { expr: Some(_), .. }) => {
+                panic!("finalize tests register tables directly, no DDL expected")
+            }
+            Request::Query(QueryRequest {
+                query: Some(Query::Sql(sql)),
+                ..
+            }) => {
+                self.request_log.lock().unwrap().push("drop");
+                if self.fail_drops && sql.contains("DROP TABLE") {
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+                if sql.contains("DROP TABLE") {
+                    // The DROP statement is
+                    // `DROP TABLE IF EXISTS <catalog>.<schema>.<table>` (the
+                    // table name may or may not be quoted); extract the last
+                    // dot-separated segment as the table name and deregister
+                    // it from the private schema.
+                    let table_name = sql
+                        .rsplit('.')
+                        .next()
+                        .expect("table name in DROP")
+                        .trim()
+                        .trim_matches('"')
+                        .to_string();
+                    let catalog_manager = self.engine.engine_state().catalog_manager();
+                    let memory_catalog = catalog_manager
+                        .as_any()
+                        .downcast_ref::<MemoryCatalogManager>()
+                        .unwrap();
+                    memory_catalog
+                        .deregister_table_sync(catalog::DeregisterTableRequest {
+                            catalog: DEFAULT_CATALOG_NAME.to_string(),
+                            schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+                            table_name,
+                        })
+                        .unwrap();
+                    self.created_tables.lock().unwrap().clear();
+                }
+                Ok(Output::new_with_affected_rows(0))
+            }
+            Request::Query(QueryRequest {
+                query: Some(Query::InsertIntoPlan(insert)),
+                ..
+            }) => {
+                let session_state = decode_session_state(&self.engine);
+                let plan = DFLogicalSubstraitConvertor {}
+                    .decode(
+                        bytes::Bytes::from(insert.logical_plan.clone()),
+                        session_state,
+                    )
+                    .await
+                    .map_err(BoxedError::new)?;
+
+                if contains_empty_relation(&plan) {
+                    // The checkpoint-row write: the singleton sentinel
+                    // projection over an empty relation. The write must affect
+                    // exactly one row.
+                    self.request_log.lock().unwrap().push("checkpoint");
+                    self.captured_checkpoint_plans
+                        .lock()
+                        .unwrap()
+                        .push(insert.clone());
+                    if self.fail_checkpoint_write {
+                        return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                    }
+                    return Ok(Output::new_with_affected_rows(1));
+                }
+
+                // A finalize branch: execute the merged SELECT through the
+                // query engine and return its rows (with terminal watermarks).
+                let branch_idx = self
+                    .branch_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.request_log.lock().unwrap().push("branch");
+                self.captured_branch_plans
+                    .lock()
+                    .unwrap()
+                    .push(insert.clone());
+                self.captured_branch_extensions
+                    .lock()
+                    .unwrap()
+                    .push(ctx.extensions().clone());
+                self.captured_branch_snapshot_seqs
+                    .lock()
+                    .unwrap()
+                    .push(ctx.snapshots());
+
+                if self
+                    .branch_failures_remaining
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    self.branch_failures_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+                if self.fail_second_branch && branch_idx == 1 {
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+
+                let output = self
+                    .engine
+                    .execute(plan, ctx)
+                    .await
+                    .map_err(BoxedError::new)?;
+                let batches = match output.data {
+                    common_query::OutputData::RecordBatches(batches) => {
+                        batches.into_iter().collect::<Vec<_>>()
+                    }
+                    common_query::OutputData::Stream(stream) => {
+                        common_recordbatch::util::collect_batches(stream)
+                            .await
+                            .map_err(BoxedError::new)?
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    }
+                    common_query::OutputData::AffectedRows(_) => vec![],
+                };
+                self.captured_branches.lock().unwrap().push(batches.clone());
+                Ok(finalize_metrics_stream(batches, &self.watermarks))
+            }
+            Request::Query(QueryRequest {
+                query: Some(Query::LogicalPlan(bytes)),
+                ..
+            }) => {
+                // The high-watermark probe.
+                self.request_log.lock().unwrap().push("probe");
+                self.captured_probe_requests
+                    .lock()
+                    .unwrap()
+                    .push(QueryRequest {
+                        query: Some(Query::LogicalPlan(bytes.clone())),
+                    });
+                if self.fail_probe {
+                    return Err(BoxedError::new(MockError::new(StatusCode::Internal)));
+                }
+                let session_state = decode_session_state(&self.engine);
+                let plan = DFLogicalSubstraitConvertor {}
+                    .decode(bytes::Bytes::from(bytes), session_state)
+                    .await
+                    .map_err(BoxedError::new)?;
+                let output = self
+                    .engine
+                    .execute(plan, ctx)
+                    .await
+                    .map_err(BoxedError::new)?;
+                let batches = match output.data {
+                    common_query::OutputData::RecordBatches(batches) => {
+                        batches.into_iter().collect::<Vec<_>>()
+                    }
+                    common_query::OutputData::Stream(stream) => {
+                        common_recordbatch::util::collect_batches(stream)
+                            .await
+                            .map_err(BoxedError::new)?
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    }
+                    common_query::OutputData::AffectedRows(_) => vec![],
+                };
+                let probe_watermarks = self.probe_watermarks.as_deref().unwrap_or(&self.watermarks);
+                Ok(finalize_metrics_stream(batches, probe_watermarks))
+            }
+            other => panic!("unexpected finalize request, got {other:?}"),
+        }
+    }
+}
+
+/// Drives a registered job to `BaseComplete(F)`: reserve -> finish prepare
+/// (staging table must already be registered with `staging_table_id`) -> run
+/// -> complete.
+fn drive_job_to_base_complete(
+    task: &BatchingTask,
+    job_id: u64,
+    range: (Timestamp, Timestamp),
+    staging_name: [String; 3],
+    staging_table_id: u32,
+    frozen: BTreeMap<u64, u64>,
+) {
+    let mut state = task.state.write().unwrap();
+    let reservation = state
+        .begin_backfill_prepare(job_id, range, staging_name)
+        .expect("finalize job reserves");
+    // A fresh job reserves; a retry of an already-registered (BaseComplete)
+    // job returns `Existing` with the identity preserved and stays
+    // BaseComplete.
+    let is_fresh = match reservation {
+        crate::batching_mode::state::PrepareReservation::Reserved(_) => {
+            state
+                .finish_backfill_prepare(job_id, staging_table_id)
+                .expect("finish prepare");
+            true
+        }
+        crate::batching_mode::state::PrepareReservation::Existing(_) => false,
+        other => panic!("unexpected finalize prepare reservation: {other:?}"),
+    };
+    if is_fresh {
+        state.begin_backfill_run(job_id).expect("begin run");
+        state
+            .complete_backfill_run(job_id, frozen)
+            .expect("complete run");
+    }
+}
+
+/// Seeds the durable frontier L, checkpoint persistence, and a registered
+/// BaseComplete job with frozen watermark F, then runs `run_backfill_finalize`.
+#[allow(clippy::too_many_arguments)]
+async fn run_finalize_with_setup(
+    engine: &QueryEngineRef,
+    task: &BatchingTask,
+    frontend_client: &Arc<FrontendClient>,
+    job_id: u64,
+    range: (Timestamp, Timestamp),
+    staging_name: [String; 3],
+    staging_table_id: u32,
+    frozen: BTreeMap<u64, u64>,
+    lower: BTreeMap<u64, u64>,
+) -> Result<(), crate::Error> {
+    {
+        let mut state = task.state.write().unwrap();
+        state.set_checkpoint_persistence(Some(CheckpointPersistence {
+            epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+            state_col_name: "state".to_string(),
+            window_col_name: "time_window".to_string(),
+            primary_key_columns: vec!["number".to_string()],
+        }));
+        state.advance_checkpoints(lower.clone().into_iter().collect());
+    }
+    drive_job_to_base_complete(task, job_id, range, staging_name, staging_table_id, frozen);
+    task.run_backfill_finalize(engine, frontend_client, job_id)
+        .await
+}
+
+/// The finalize test range: `[0s, 15s)` aligned to 5-second windows.
+fn finalize_test_range() -> (Timestamp, Timestamp) {
+    (Timestamp::new_second(0), Timestamp::new_second(15))
+}
+
+fn finalize_staging_name(job_id: u64) -> [String; 3] {
+    backfill_staging_table_name(1, job_id)
+}
+
+/// Asserts the non-target branch plan carries the event-time EXCLUDE filter
+/// `ts < start OR ts >= end` (test list item 1).
+#[tokio::test]
+async fn test_finalize_non_target_plan_has_exclude_filter() {
+    let (task, query_engine) =
+        new_finalize_task("finalize_plan_sink", 9150, &[(1, 1000), (5, 20000)]).await;
+    register_finalize_sink(&query_engine, "finalize_plan_sink", 9150, vec![]);
+
+    let range = finalize_test_range();
+    let plan = task
+        .build_backfill_non_target_delta_plan(query_engine.clone(), range)
+        .await
+        .expect("non-target delta plan builds");
+    let LogicalPlan::Dml(dml) = &plan else {
+        panic!("expected DML insert into the active sink, got {:?}", plan);
+    };
+    assert_eq!(
+        dml.table_name.table().to_string().as_str(),
+        "finalize_plan_sink",
+        "the non-target branch must write into the active sink"
+    );
+    let inner = format!("{}", dml.input.display_indent());
+    // The exclude filter is `(ts < 0) OR (ts >= 15000)` (in millis).
+    assert!(
+        inner.contains("TimestampMillisecond(0") && inner.contains("OR"),
+        "non-target branch must carry the exclude filter (win < start) OR (win >= end), got: {inner}"
+    );
+    assert!(
+        inner.contains("TimestampMillisecond(15000"),
+        "non-target branch must carry the aligned upper bound, got: {inner}"
+    );
+}
+
+/// Asserts the target final branch carries the Tail event-time filter
+/// `ts >= start AND ts < end`, merges FULL OUTER with the staging table as the
+/// base, and writes into the active sink (test list items 2 and 3).
+#[tokio::test]
+async fn test_finalize_target_plan_filters_and_full_outer_staging_base() {
+    let (task, query_engine) =
+        new_finalize_task("finalize_target_plan_sink", 9151, &[(1, 1000), (2, 5000)]).await;
+    register_finalize_sink(&query_engine, "finalize_target_plan_sink", 9151, vec![]);
+
+    let job_id = 31;
+    let staging_name = finalize_staging_name(job_id);
+    register_finalize_staging(&query_engine, &staging_name[2], 31, vec![(1, 1000, 0)]);
+    let job = BackfillJob {
+        job_id,
+        range: finalize_test_range(),
+        staging_table_name: staging_name.clone(),
+        staging_table_id: Some(31),
+        frozen_watermark: Some(BTreeMap::from([(11_u64, 99_u64)])),
+        status: crate::batching_mode::state::BackfillJobStatus::BaseComplete,
+    };
+
+    let plan = task
+        .build_backfill_final_delta_plan(query_engine.clone(), &job)
+        .await
+        .expect("target final plan builds");
+    let LogicalPlan::Dml(dml) = &plan else {
+        panic!("expected DML insert into the active sink, got {:?}", plan);
+    };
+    assert_eq!(
+        dml.table_name.table().to_string().as_str(),
+        "finalize_target_plan_sink",
+        "the target branch must write into the active sink"
+    );
+    let inner = format!("{}", dml.input.display_indent());
+    // Tail event-time filter `ts >= 0 AND ts < 15000` (millis).
+    assert!(
+        inner.contains("TimestampMillisecond(0") && inner.contains("AND"),
+        "target branch must carry the event-time [start, end) filter, got: {inner}"
+    );
+    assert!(
+        inner.contains("TimestampMillisecond(15000"),
+        "target branch must carry the aligned upper bound, got: {inner}"
+    );
+    // FULL OUTER join against the staging table base (DataFusion renders
+    // `JoinType::Full` as "Full Join" in `display_indent`).
+    assert!(
+        inner.contains("Full Join"),
+        "target branch must merge FULL OUTER with the staging base, got: {inner}"
+    );
+    assert!(
+        inner.contains("__flow_backfill_1_31"),
+        "target branch merge base must be the staging table, got: {inner}"
+    );
+    // No dirty-window or retention filter may sneak into the delta plan.
+    assert!(
+        !inner.contains("expire_after"),
+        "target branch must not apply a retention filter, got: {inner}"
+    );
+}
+
+/// Asserts the probe runs FIRST and both branches are pre-bound to the SAME
+/// high watermark H, with the correct after-seqs (L for the non-target branch,
+/// F for the target branch) and sequence-range incremental extensions
+/// (test list item 5).
+#[tokio::test]
+async fn test_finalize_branches_prebound_consistent_high() {
+    let (task, query_engine) = new_finalize_task(
+        "finalize_h_sink",
+        9152,
+        &[
+            (1, 1000),
+            (2, 5000),
+            (2, 7000),
+            (3, 10000),
+            (5, 20000),
+            (6, -1000),
+        ],
+    )
+    .await;
+    register_finalize_sink(&query_engine, "finalize_h_sink", 9152, vec![]);
+
+    let job_id = 32;
+    let staging_name = finalize_staging_name(job_id);
+    register_finalize_staging(
+        &query_engine,
+        &staging_name[2],
+        32,
+        vec![(1, 1000, 0), (2, 5000, 5000)],
+    );
+
+    let frozen = BTreeMap::from([(11_u64, 99_u64), (22_u64, 199_u64)]);
+    let lower = BTreeMap::from([(11_u64, 50_u64), (22_u64, 100_u64)]);
+    let high = BTreeMap::from([(11_u64, 120_u64), (22_u64, 250_u64)]);
+    let watermarks = high
+        .iter()
+        .map(|(region_id, seq)| (*region_id, Some(*seq)))
+        .collect::<Vec<_>>();
+
+    let handler = Arc::new(FinalizeLifecycleHandler::new(
+        query_engine.clone(),
+        watermarks,
+    ));
+    let frontend_client = finalize_frontend_client(&handler);
+    run_finalize_with_setup(
+        &query_engine,
+        &task,
+        &frontend_client,
+        job_id,
+        finalize_test_range(),
+        staging_name,
+        32,
+        frozen.clone(),
+        lower.clone(),
+    )
+    .await
+    .expect("finalize succeeds with a consistent pre-bound H");
+
+    // Probe first, then non-target branch, target branch, checkpoint, drop.
+    let log = handler.request_log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec!["probe", "branch", "branch", "checkpoint", "drop"],
+        "the probe must run before both branches and the commit after them, got {log:?}"
+    );
+
+    // Both branches are pre-bound to the same H.
+    let snapshot_seqs = handler.captured_branch_snapshot_seqs.lock().unwrap();
+    assert_eq!(snapshot_seqs.len(), 2);
+    let high_map: HashMap<u64, u64> = high.iter().map(|(k, v)| (*k, *v)).collect();
+    assert_eq!(
+        snapshot_seqs[0], high_map,
+        "non-target branch must be pre-bound to H"
+    );
+    assert_eq!(
+        snapshot_seqs[1], high_map,
+        "target branch must be pre-bound to the SAME H"
+    );
+
+    // after_seqs: L on the non-target branch, F on the target branch.
+    let extensions = handler.captured_branch_extensions.lock().unwrap();
+    assert_eq!(extensions.len(), 2);
+    let after_seqs_0: BTreeMap<u64, u64> =
+        serde_json::from_str(extensions[0].get(FLOW_INCREMENTAL_AFTER_SEQS).unwrap()).unwrap();
+    let after_seqs_1: BTreeMap<u64, u64> =
+        serde_json::from_str(extensions[1].get(FLOW_INCREMENTAL_AFTER_SEQS).unwrap()).unwrap();
+    assert_eq!(after_seqs_0, lower, "non-target branch replays (L, H]");
+    assert_eq!(after_seqs_1, frozen, "target branch replays (F, H]");
+    for ext in extensions.iter() {
+        assert_eq!(
+            ext.get(FLOW_INCREMENTAL_MODE).map(String::as_str),
+            Some(FLOW_INCREMENTAL_MODE_SEQUENCE_RANGE),
+            "finalize branches must run in sequence_range incremental mode"
+        );
+        assert_eq!(
+            ext.get(FLOW_SINK_TABLE_ID).map(String::as_str),
+            Some("1"),
+            "the active sink must be excluded from incremental semantics (memory-catalog MemTable carries table id 1)"
+        );
+        assert_eq!(
+            ext.get(FLOW_INTERNAL_NON_SOURCE_TABLE_IDS)
+                .map(String::as_str),
+            Some("[32]"),
+            "the staging table must be scanned as a plain non-source read"
+        );
+    }
+
+    // The probe itself was sent as a watermark-only read.
+    let probes = handler.captured_probe_requests.lock().unwrap();
+    assert_eq!(probes.len(), 1);
+    assert!(matches!(
+        probes[0].query,
+        Some(api::v1::query_request::Query::LogicalPlan(_))
+    ));
+}
+
+/// Extracts rows `(number, max_ts_ms, time_window_ms)` from a batch list.
+fn finalize_rows(batches: &[RecordBatch]) -> Vec<(u32, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let number = batch
+            .column_by_name("number")
+            .expect("number column")
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt32Array>()
+            .expect("number array");
+        let max_ts = batch
+            .column_by_name("max_ts")
+            .expect("max_ts column")
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::TimestampMillisecondArray>()
+            .expect("max_ts array");
+        let window = batch
+            .column_by_name("time_window")
+            .expect("time_window column")
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::TimestampMillisecondArray>()
+            .expect("time_window array");
+        for i in 0..number.len() {
+            if number.is_null(i) || max_ts.is_null(i) || window.is_null(i) {
+                continue;
+            }
+            rows.push((number.value(i), max_ts.value(i), window.value(i)));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// End-to-end finalize: Base (staging, F) + Tail + non-target data + pre-seeded
+/// Active sink rows, asserting the active sink state equals
+/// `Base ⊕ Tail(target) ∪ Active ∪ Delta(non-target)` with no duplicates, no
+/// loss, correct target window values, and late rows excluded from the target.
+/// Also asserts the checkpoint advances to H, the staging table is dropped,
+/// and the job is removed (test list items 4, 6, and 8).
+#[tokio::test]
+async fn test_finalize_end_to_end_merges_and_commits() {
+    // Source rows: in-range (1,2,2,3) + non-target (5: ts >= end, 6: late ts <
+    // start). (2,7000) arrived after F was frozen, so it only enters the Tail.
+    let (task, query_engine) = new_finalize_task(
+        "finalize_e2e_sink",
+        9153,
+        &[
+            (1, 1000),
+            (2, 5000),
+            (2, 7000),
+            (3, 10000),
+            (5, 20000),
+            (6, -1000),
+        ],
+    )
+    .await;
+    // Active sink state at L: one pre-existing non-target group (7, window 0).
+    register_finalize_sink(
+        &query_engine,
+        "finalize_e2e_sink",
+        9153,
+        vec![(Some(7), Some(500), Some(0), None)],
+    );
+
+    let job_id = 33;
+    let staging_name = finalize_staging_name(job_id);
+    // Base (staging) at F: covers (1, window 0) and (2, window 5000) up to F.
+    register_finalize_staging(
+        &query_engine,
+        &staging_name[2],
+        33,
+        vec![(1, 1000, 0), (2, 5000, 5000)],
+    );
+
+    // Multi-region F / L / H maps (test list item 8).
+    let frozen = BTreeMap::from([(11_u64, 99_u64), (22_u64, 199_u64)]);
+    let lower = BTreeMap::from([(11_u64, 50_u64), (22_u64, 100_u64)]);
+    let high = BTreeMap::from([(11_u64, 120_u64), (22_u64, 250_u64)]);
+    let watermarks = high
+        .iter()
+        .map(|(region_id, seq)| (*region_id, Some(*seq)))
+        .collect::<Vec<_>>();
+
+    let handler = Arc::new(FinalizeLifecycleHandler::new(
+        query_engine.clone(),
+        watermarks,
+    ));
+    let frontend_client = finalize_frontend_client(&handler);
+    run_finalize_with_setup(
+        &query_engine,
+        &task,
+        &frontend_client,
+        job_id,
+        finalize_test_range(),
+        staging_name.clone(),
+        33,
+        frozen,
+        lower,
+    )
+    .await
+    .expect("finalize succeeds");
+
+    // --- Branch outputs ---
+    let captured_rows = {
+        let captured = handler.captured_branches.lock().unwrap();
+        assert_eq!(captured.len(), 2, "exactly two branch writes expected");
+        captured.clone()
+    };
+
+    // Target branch: Base ⊕ Tail over [0s, 15s).
+    let target_rows = finalize_rows(&captured_rows[1]);
+    assert_eq!(
+        target_rows,
+        vec![
+            (1, 1000, 0),      // matched: max(1000, 1000)
+            (2, 7000, 5000),   // Tail-only update: max(7000, 5000)
+            (3, 10000, 10000), // Tail-only group
+        ],
+        "target window values must merge Base and Tail exactly once, got {target_rows:?}"
+    );
+    assert!(
+        !target_rows
+            .iter()
+            .any(|(number, _, _)| *number == 5 || *number == 6),
+        "non-target rows must never enter the target branch"
+    );
+
+    // Non-target branch: Active ∪ Delta over ts outside [0s, 15s).
+    let non_target_rows = finalize_rows(&captured_rows[0]);
+    assert_eq!(
+        non_target_rows,
+        vec![(5, 20000, 20000), (6, -1000, -5000)],
+        "non-target delta rows must be replayed, got {non_target_rows:?}"
+    );
+
+    // No duplicates across branches (disjoint event-time ranges) and the
+    // pre-existing Active row is untouched (it is not re-written).
+    let mut all_rows = target_rows.clone();
+    all_rows.extend(non_target_rows.iter().cloned());
+    all_rows.sort_unstable();
+    all_rows.dedup();
+    assert_eq!(
+        all_rows.len(),
+        target_rows.len() + non_target_rows.len(),
+        "branches must not overlap"
+    );
+
+    // --- Commit side effects (test list item 6) ---
+    // The checkpoint row carries epoch 1 and the full H map.
+    let checkpoint_plan_bytes = {
+        let checkpoint_plans = handler.captured_checkpoint_plans.lock().unwrap();
+        assert_eq!(checkpoint_plans.len(), 1);
+        checkpoint_plans[0].logical_plan.clone()
+    };
+    let session_state = decode_session_state(&query_engine);
+    let checkpoint_plan = DFLogicalSubstraitConvertor {}
+        .decode(bytes::Bytes::from(checkpoint_plan_bytes), session_state)
+        .await
+        .unwrap();
+    let checkpoint_text = format!("{}", checkpoint_plan.display_indent());
+    assert!(
+        checkpoint_text.contains("UInt64(1)"),
+        "checkpoint row must carry the real cycle epoch, got: {checkpoint_text}"
+    );
+    // The encoded checkpoint record inside the state literal.
+    let mut encoded = None;
+    let _ = checkpoint_plan.apply(|node| {
+        if let datafusion_expr::LogicalPlan::Projection(projection) = node {
+            for expr in &projection.expr {
+                if let datafusion_expr::Expr::Alias(alias) = expr
+                    && let datafusion_expr::Expr::Literal(ScalarValue::Binary(Some(bytes)), _) =
+                        alias.expr.as_ref()
+                {
+                    encoded = Some(bytes.clone());
+                }
+            }
+        }
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+    });
+    let decoded = decode_checkpoint_record(&encoded.expect("encoded checkpoint state"))
+        .unwrap()
+        .expect("decodable checkpoint record");
+    assert_eq!(decoded.epoch, 1);
+    assert_eq!(decoded.checkpoints, high, "checkpoint must advance to H");
+
+    // State: epoch advanced, checkpoints == H, job removed, staging dropped.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(
+            state.persisted_epoch(),
+            1,
+            "epoch must be monotonic and durable"
+        );
+        assert_eq!(
+            state.checkpoints(),
+            &high,
+            "the durable frontier must advance to H"
+        );
+        assert_eq!(state.backfill_jobs().len(), 0, "the job must be removed");
+        assert_eq!(
+            state.checkpoint_mode(),
+            CheckpointMode::Incremental,
+            "finalize leaves the flow in incremental mode"
+        );
+    }
+    // The branch plans carry the real cycle epoch (1), never the staging
+    // sentinel epoch u64::MAX. Decoded BEFORE the drop assertion below, since
+    // the captured branch plans reference the staging table (the FULL OUTER
+    // merge base) which is dropped by the commit.
+    // The captured branch plans are Substrait-encoded and their decode
+    // resolves the FULL OUTER merge base (the staging table) through the
+    // catalog, which the commit already dropped. Re-register a placeholder
+    // staging table only for the decode, then deregister it again before the
+    // drop assertion below.
+    register_finalize_staging(&query_engine, &staging_name[2], 33, vec![]);
+    let branch_plan_bytes = {
+        let branch_plans = handler.captured_branch_plans.lock().unwrap();
+        assert_eq!(branch_plans.len(), 2);
+        branch_plans
+            .iter()
+            .map(|insert| insert.logical_plan.clone())
+            .collect::<Vec<_>>()
+    };
+    for insert_bytes in branch_plan_bytes {
+        let session_state = decode_session_state(&query_engine);
+        let plan = DFLogicalSubstraitConvertor {}
+            .decode(bytes::Bytes::from(insert_bytes), session_state)
+            .await
+            .unwrap();
+        let text = format!("{}", plan.display_indent());
+        assert!(
+            text.contains("UInt64(1)"),
+            "branch plans must carry the real cycle epoch, got: {text}"
+        );
+        assert!(
+            !text.contains("UInt64(18446744073709551615)"),
+            "branch plans must never carry the staging sentinel epoch, got: {text}"
+        );
+    }
+    {
+        let catalog_manager = query_engine.engine_state().catalog_manager();
+        let memory_catalog = catalog_manager
+            .as_any()
+            .downcast_ref::<MemoryCatalogManager>()
+            .unwrap();
+        memory_catalog
+            .deregister_table_sync(catalog::DeregisterTableRequest {
+                catalog: DEFAULT_CATALOG_NAME.to_string(),
+                schema: DEFAULT_PRIVATE_SCHEMA_NAME.to_string(),
+                table_name: staging_name[2].clone(),
+            })
+            .unwrap();
+    }
+
+    // The staging table was dropped by the commit.
+    assert!(
+        !task.is_table_exist(&staging_name).await.unwrap(),
+        "the staging table must be dropped after a successful finalize"
+    );
+}
+
+/// Failure paths: a failed non-target branch, a failed target branch, a failed
+/// checkpoint write, and unproved branch watermarks all keep the job
+/// BaseComplete, never advance the checkpoint or epoch, never drop the staging
+/// table, and a retry succeeds (test list item 7).
+#[tokio::test]
+async fn test_finalize_failure_paths_keep_job_retryable() {
+    async fn assert_finalize_failure_keeps_state(
+        sink_table: &str,
+        sink_table_id: u32,
+        handler_config: impl FnOnce(&QueryEngineRef) -> Arc<FinalizeLifecycleHandler>,
+    ) -> (
+        BatchingTask,
+        QueryEngineRef,
+        Arc<FinalizeLifecycleHandler>,
+        Arc<FrontendClient>,
+        [String; 3],
+    ) {
+        let (task, query_engine) = new_finalize_task(
+            sink_table,
+            sink_table_id,
+            &[(1, 1000), (2, 5000), (2, 7000), (5, 20000), (6, -1000)],
+        )
+        .await;
+        register_finalize_sink(&query_engine, sink_table, sink_table_id, vec![]);
+        let job_id = 34;
+        let staging_name = finalize_staging_name(job_id);
+        register_finalize_staging(
+            &query_engine,
+            &staging_name[2],
+            34,
+            vec![(1, 1000, 0), (2, 5000, 5000)],
+        );
+        let handler = handler_config(&query_engine);
+        let frontend_client = finalize_frontend_client(&handler);
+        let frozen = BTreeMap::from([(11_u64, 99_u64)]);
+        let lower = BTreeMap::from([(11_u64, 50_u64)]);
+        let err = run_finalize_with_setup(
+            &query_engine,
+            &task,
+            &frontend_client,
+            job_id,
+            finalize_test_range(),
+            staging_name.clone(),
+            34,
+            frozen,
+            lower.clone(),
+        )
+        .await
+        .expect_err("finalize must fail");
+        let _ = err;
+        // Failure must leave everything untouched and retryable.
+        {
+            let state = task.state.read().unwrap();
+            assert_eq!(state.backfill_jobs().len(), 1, "job must stay registered");
+            assert_eq!(
+                state.backfill_jobs()[0].status,
+                crate::batching_mode::state::BackfillJobStatus::BaseComplete,
+                "job must stay BaseComplete for retry"
+            );
+            assert_eq!(
+                state.backfill_jobs()[0].frozen_watermark,
+                Some(BTreeMap::from([(11_u64, 99_u64)]))
+            );
+            assert_eq!(state.checkpoints(), &lower, "checkpoints must not advance");
+            assert_eq!(state.persisted_epoch(), 0, "epoch must not advance");
+        }
+        assert!(
+            task.is_table_exist(&staging_name).await.unwrap(),
+            "staging table must be kept on failure"
+        );
+        (task, query_engine, handler, frontend_client, staging_name)
+    }
+
+    let high = BTreeMap::from([(11_u64, 120_u64)]);
+    let watermarks = vec![(11_u64, Some(120_u64))];
+
+    // (a) Non-target branch fails.
+    let (task, query_engine, handler, frontend_client, staging_name) =
+        assert_finalize_failure_keeps_state("finalize_fail_nt_sink", 9161, |engine| {
+            Arc::new(
+                FinalizeLifecycleHandler::new(engine.clone(), watermarks.clone())
+                    .with_branch_failures(1),
+            )
+        })
+        .await;
+    assert_eq!(handler.branch_count(), 1, "only the first branch ran");
+    // Retry with the failure cleared succeeds and commits.
+    run_finalize_with_setup(
+        &query_engine,
+        &task,
+        &frontend_client,
+        34,
+        finalize_test_range(),
+        staging_name,
+        34,
+        BTreeMap::from([(11_u64, 99_u64)]),
+        BTreeMap::from([(11_u64, 50_u64)]),
+    )
+    .await
+    .expect("retry after a non-target branch failure succeeds");
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.checkpoints(), &high);
+        assert_eq!(state.persisted_epoch(), 1);
+        assert_eq!(state.backfill_jobs().len(), 0);
+    }
+
+    // (b) Target branch fails.
+    let (task, query_engine, handler, frontend_client, staging_name) =
+        assert_finalize_failure_keeps_state("finalize_fail_t_sink", 9162, |engine| {
+            Arc::new(
+                FinalizeLifecycleHandler::new(engine.clone(), watermarks.clone())
+                    .with_fail_second_branch(),
+            )
+        })
+        .await;
+    assert_eq!(
+        handler.branch_count(),
+        2,
+        "both branches ran, the target failed"
+    );
+    // Retry succeeds.
+    run_finalize_with_setup(
+        &query_engine,
+        &task,
+        &frontend_client,
+        34,
+        finalize_test_range(),
+        staging_name,
+        34,
+        BTreeMap::from([(11_u64, 99_u64)]),
+        BTreeMap::from([(11_u64, 50_u64)]),
+    )
+    .await
+    .expect("retry after a target branch failure succeeds");
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.checkpoints(), &high);
+        assert_eq!(state.backfill_jobs().len(), 0);
+    }
+
+    // (c) Checkpoint-row write fails.
+    let (task, query_engine, handler, _frontend_client, staging_name) =
+        assert_finalize_failure_keeps_state("finalize_fail_ckpt_sink", 9163, |engine| {
+            Arc::new(
+                FinalizeLifecycleHandler::new(engine.clone(), watermarks.clone())
+                    .with_fail_checkpoint_write(),
+            )
+        })
+        .await;
+    assert_eq!(
+        handler.branch_count(),
+        2,
+        "both branches ran before the commit"
+    );
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(
+            state.checkpoint_mode(),
+            CheckpointMode::FullSnapshot,
+            "a failed checkpoint write falls back to full snapshot"
+        );
+    }
+    // Retry after clearing the failure succeeds.
+    {
+        let mut state = task.state.write().unwrap();
+        state.set_checkpoint_persistence(Some(CheckpointPersistence {
+            epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+            state_col_name: "state".to_string(),
+            window_col_name: "time_window".to_string(),
+            primary_key_columns: vec!["number".to_string()],
+        }));
+    }
+    let handler = Arc::new(FinalizeLifecycleHandler::new(
+        query_engine.clone(),
+        watermarks.clone(),
+    ));
+    let frontend_client = finalize_frontend_client(&handler);
+    run_finalize_with_setup(
+        &query_engine,
+        &task,
+        &frontend_client,
+        34,
+        finalize_test_range(),
+        staging_name,
+        34,
+        BTreeMap::from([(11_u64, 99_u64)]),
+        BTreeMap::from([(11_u64, 50_u64)]),
+    )
+    .await
+    .expect("retry after a checkpoint write failure succeeds");
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.checkpoints(), &high);
+        assert_eq!(state.backfill_jobs().len(), 0);
+    }
+
+    // (d) Unproved branch watermarks (returned != pre-bound H) fail closed.
+    // The probe returns the correct H (120), but the branches return a
+    // different watermark (119), so the pre-bound watermark proof fails.
+    let (task, query_engine, _handler, _frontend_client, _staging_name) =
+        assert_finalize_failure_keeps_state("finalize_fail_wm_sink", 9164, |engine| {
+            Arc::new(
+                FinalizeLifecycleHandler::new(engine.clone(), vec![(11_u64, Some(119_u64))])
+                    .with_probe_watermarks(vec![(11_u64, Some(120_u64))]),
+            )
+        })
+        .await;
+    // The probe captured H correctly but the branch watermark proof failed;
+    // assert the failure was a watermark mismatch by checking state untouched.
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.checkpoints(), &BTreeMap::from([(11_u64, 50_u64)]));
+        assert_eq!(state.persisted_epoch(), 0);
+        assert_eq!(state.backfill_jobs().len(), 1);
+    }
+    let _ = (query_engine, _handler, _frontend_client, _staging_name);
+}
+
+/// Rejects: a non-BaseComplete job, a BaseComplete job without a frozen
+/// watermark, and a missing durable frontier L.
+#[tokio::test]
+async fn test_finalize_rejects_invalid_job_and_missing_lower_bound() {
+    let (task, query_engine) = new_finalize_task("finalize_reject_sink", 9165, &[]).await;
+    register_finalize_sink(&query_engine, "finalize_reject_sink", 9165, vec![]);
+    let handler = Arc::new(FinalizeLifecycleHandler::new(
+        query_engine.clone(),
+        vec![(11_u64, Some(120_u64))],
+    ));
+    let frontend_client = finalize_frontend_client(&handler);
+    let job_id = 35;
+    let staging_name = finalize_staging_name(job_id);
+    register_finalize_staging(&query_engine, &staging_name[2], 35, vec![]);
+
+    // Prepared (not BaseComplete) -> rejected.
+    {
+        let mut state = task.state.write().unwrap();
+        state.set_checkpoint_persistence(Some(CheckpointPersistence {
+            epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+            state_col_name: "state".to_string(),
+            window_col_name: "time_window".to_string(),
+            primary_key_columns: vec!["number".to_string()],
+        }));
+        state.advance_checkpoints(BTreeMap::from([(11_u64, 50_u64)]).into_iter().collect());
+        let reservation = state
+            .begin_backfill_prepare(job_id, finalize_test_range(), staging_name.clone())
+            .unwrap();
+        assert!(matches!(
+            reservation,
+            crate::batching_mode::state::PrepareReservation::Reserved(_)
+        ));
+        state.finish_backfill_prepare(job_id, 35).unwrap();
+    }
+    let err = task
+        .run_backfill_finalize(&query_engine, &frontend_client, job_id)
+        .await
+        .expect_err("a Prepared job must not finalize");
+    assert!(
+        format!("{err:?}").contains("only a BaseComplete job"),
+        "expected BaseComplete rejection, got {err:?}"
+    );
+
+    // BaseComplete without F -> rejected.
+    {
+        let mut state = task.state.write().unwrap();
+        state.begin_backfill_run(job_id).unwrap();
+        state
+            .complete_backfill_run(job_id, BTreeMap::new())
+            .unwrap();
+    }
+    let err = task
+        .run_backfill_finalize(&query_engine, &frontend_client, job_id)
+        .await
+        .expect_err("a BaseComplete job without F must not finalize");
+    assert!(
+        format!("{err:?}").contains("frozen watermark"),
+        "expected missing-F rejection, got {err:?}"
+    );
+
+    // Empty durable frontier L -> rejected.
+    {
+        let mut state = task.state.write().unwrap();
+        state
+            .complete_backfill_run(job_id, BTreeMap::from([(11_u64, 99_u64)]))
+            .unwrap_err();
+        // The job is already BaseComplete; re-register a fresh one.
+        state.take_backfill_job(job_id);
+        let reservation = state
+            .begin_backfill_prepare(job_id, finalize_test_range(), staging_name.clone())
+            .unwrap();
+        assert!(matches!(
+            reservation,
+            crate::batching_mode::state::PrepareReservation::Reserved(_)
+        ));
+        state.finish_backfill_prepare(job_id, 35).unwrap();
+        state.begin_backfill_run(job_id).unwrap();
+        state
+            .complete_backfill_run(job_id, BTreeMap::from([(11_u64, 99_u64)]))
+            .unwrap();
+        state.advance_checkpoints(HashMap::new());
+    }
+    let err = task
+        .run_backfill_finalize(&query_engine, &frontend_client, job_id)
+        .await
+        .expect_err("an empty durable frontier L must not finalize");
+    assert!(
+        format!("{err:?}").contains("non-empty durable checkpoint frontier"),
+        "expected missing-L rejection, got {err:?}"
+    );
+}
+
+/// The integration point: `execute_once_unlocked` polls for a BaseComplete job
+/// and finalizes one job per round before normal evaluation, skipping the
+/// round's normal incremental work.
+#[tokio::test]
+async fn test_execute_once_unlocked_finalizes_pending_job() {
+    let (task, query_engine) = new_finalize_task(
+        "finalize_poll_sink",
+        9166,
+        &[(1, 1000), (2, 5000), (5, 20000)],
+    )
+    .await;
+    register_finalize_sink(&query_engine, "finalize_poll_sink", 9166, vec![]);
+    let job_id = 36;
+    let staging_name = finalize_staging_name(job_id);
+    register_finalize_staging(&query_engine, &staging_name[2], 36, vec![(1, 1000, 0)]);
+
+    let watermarks = vec![(11_u64, Some(120_u64))];
+    let handler = Arc::new(FinalizeLifecycleHandler::new(
+        query_engine.clone(),
+        watermarks,
+    ));
+    let frontend_client = finalize_frontend_client(&handler);
+
+    {
+        let mut state = task.state.write().unwrap();
+        state.set_checkpoint_persistence(Some(CheckpointPersistence {
+            epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
+            state_col_name: "state".to_string(),
+            window_col_name: "time_window".to_string(),
+            primary_key_columns: vec!["number".to_string()],
+        }));
+        state.advance_checkpoints(BTreeMap::from([(11_u64, 50_u64)]).into_iter().collect());
+    }
+    drive_job_to_base_complete(
+        &task,
+        job_id,
+        finalize_test_range(),
+        staging_name,
+        36,
+        BTreeMap::from([(11_u64, 99_u64)]),
+    );
+
+    let outcome = task
+        .execute_once_unlocked(&query_engine, &frontend_client, None)
+        .await;
+    assert!(
+        outcome.result.is_ok(),
+        "finalize inside the poll must succeed"
+    );
+    let log = handler.request_log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec!["probe", "branch", "branch", "checkpoint", "drop"],
+        "the poll must finalize the pending job before any normal evaluation"
+    );
+    {
+        let state = task.state.read().unwrap();
+        assert_eq!(state.backfill_jobs().len(), 0);
+        assert_eq!(state.checkpoints(), &BTreeMap::from([(11_u64, 120_u64)]));
     }
 }
