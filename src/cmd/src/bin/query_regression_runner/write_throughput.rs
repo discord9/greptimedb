@@ -113,7 +113,7 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
                 .start_all(
                     &client,
                     &config_path,
-                    scheduler_env(false, scheduler.as_ref()),
+                    scheduler_env(target_name == "candidate", scheduler.as_ref()),
                 )
                 .await?;
         }
