@@ -117,12 +117,10 @@ pub(super) struct WorkloadSchedulerConfig {
     pub(super) query_weight: u64,
     #[serde(default)]
     pub(super) write_weight: u64,
-    /// Minimum required share of scheduler polls admitted to the write
-    /// workload, in [0, 1]. 0.0 disables the fairness gate; when the
-    /// scheduler-enabled (candidate) target's measured write poll share
-    /// falls below this value the run fails.
+    /// Minimum number of write-class admissions required during the mixed
+    /// measurement. Zero disables the anti-starvation gate.
     #[serde(default)]
-    pub(super) min_write_poll_share: f64,
+    pub(super) min_write_admitted_delta: u64,
 }
 
 #[derive(Debug, Deserialize)]

@@ -91,9 +91,10 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
 
     let mut measurements = Vec::new();
     let mut query_measurements = Vec::new();
-    // Fairness-gate entries (`min_write_poll_share`) collected per target and
-    // merged into the report thresholds so they feed the final failed verdict.
-    let mut scheduler_poll_share_checks = Vec::new();
+    // Admission-progress gate entries collected per target and merged into
+    // report thresholds so they feed the final failed verdict. Poll counters
+    // remain observational diagnostics only.
+    let mut scheduler_admission_checks = Vec::new();
     for target_name in ["base", "candidate"] {
         let binary = if target_name == "base" {
             args.base_bin.clone()
@@ -134,9 +135,13 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
         let mix = write_measure.mix.as_ref();
         let mut scheduler_polls_before = None;
         let mut scheduler_polls_after = None;
+        let mut scheduler_status_before = None;
+        let mut scheduler_status_after = None;
         if mix.is_some() && !args.dry_run {
             scheduler_polls_before =
                 Some(scrape_scheduler_polls(&client, target.datanode_http_port).await);
+            scheduler_status_before =
+                Some(scrape_scheduler_status(&client, target.datanode_http_port).await);
         }
         let (rw, flushes, query_measurement) = if let Some(mix) = mix {
             let (rw, flushes, attempts) = run_mixed_ingestion_and_queries(
@@ -157,6 +162,8 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
             if !args.dry_run {
                 scheduler_polls_after =
                     Some(scrape_scheduler_polls(&client, target.datanode_http_port).await);
+                scheduler_status_after =
+                    Some(scrape_scheduler_status(&client, target.datanode_http_port).await);
             }
             (rw, flushes, Some(query_measurement))
         } else {
@@ -202,19 +209,34 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
             target_report["mix"] = serde_json::to_value(mix)?;
             match (&scheduler_polls_after, &scheduler_polls_before) {
                 (Some(after), Some(before)) => {
-                    let poll_deltas = scheduler_poll_deltas(after, before);
-                    target_report["scheduler_poll_deltas"] = poll_deltas.clone();
-                    // Fairness gate: the candidate's write poll share must not
-                    // fall below min_write_poll_share, or write polls are
-                    // considered starved by query polls and the run fails.
-                    if let Some(share_report) =
-                        scheduler_poll_share_report(target_name, scheduler.as_ref(), &poll_deltas)
-                    {
-                        target_report["scheduler_poll_share"] = share_report.clone();
-                        scheduler_poll_share_checks.push(share_report);
-                    }
+                    // Poll counters are retained as observational diagnostics;
+                    // poll count is not a fairness or admission-share gate.
+                    target_report["scheduler_poll_deltas"] = scheduler_poll_deltas(after, before);
                 }
                 _ => target_report["scheduler_poll_deltas"] = json!({"status": "planned"}),
+            }
+            if let (Some(after), Some(before)) = (&scheduler_status_after, &scheduler_status_before)
+            {
+                target_report["scheduler_status_before"] = before.clone();
+                target_report["scheduler_status_after"] = after.clone();
+                let admission =
+                    scheduler_admission_report(target_name, scheduler.as_ref(), before, after);
+                if !admission.is_null() {
+                    target_report["scheduler_admission_deltas"] = admission.clone();
+                    if admission["status"] != "skipped" {
+                        scheduler_admission_checks.push(admission);
+                    }
+                }
+            } else if scheduler.as_ref().is_some_and(|config| {
+                target_name == "candidate" && config.min_write_admitted_delta > 0
+            }) {
+                let admission = scheduler_admission_failure(
+                    target_name,
+                    scheduler.as_ref().unwrap().min_write_admitted_delta,
+                    "scheduler status snapshot unavailable",
+                );
+                target_report["scheduler_admission_deltas"] = admission.clone();
+                scheduler_admission_checks.push(admission);
             }
         }
         let flushes_ok = target_report["flushes"].as_array().is_some_and(|flushes| {
@@ -297,9 +319,9 @@ pub(super) async fn run_write_throughput(args: RunWriteThroughputArgs) -> Result
         }
         enforced
     };
-    // Dry runs scrape no scheduler polls, so `scheduler_poll_share_checks` is
-    // empty there; real runs merge the per-target fairness entries in.
-    thresholds.extend(scheduler_poll_share_checks);
+    // Dry runs scrape no scheduler status, so `scheduler_admission_checks` is
+    // empty there; real candidate runs merge admission gate entries in.
+    thresholds.extend(scheduler_admission_checks);
     report["thresholds"] = json!(thresholds);
     let failed = report["thresholds"]
         .as_array()
@@ -1375,80 +1397,163 @@ fn scheduler_poll_deltas(after: &Value, before: &Value) -> Value {
     Value::Object(result)
 }
 
-/// Fairness gate for the mixed read/write measurement: the scheduler-enabled
-/// target's write polls must keep at least `min_write_poll_share` of all
-/// admitted scheduler polls, otherwise the write path is considered starved by
-/// query polls and the run fails.
-///
-/// Only applies to the scheduler-enabled target (`candidate`) when the case
-/// sets `min_write_poll_share > 0.0`; every other combination (no scheduler
-/// section, base target, disabled gate) yields `None` and no report entry.
-///
-/// The share is `write_delta / (write_delta + query_delta)` from the already
-/// scraped poll deltas. When the deltas cannot be verified the entry reports
-/// `status = "skipped"` instead of failing — the run is never failed on
-/// unverifiable data:
-/// - a null delta (counter missing in either snapshot or reset) means the
-///   share is unknown;
-/// - a zero total (no poll activity at all) makes the share undefined.
-fn scheduler_poll_share_report(
+/// Live workload-scheduler status snapshot (the admission gate's source of
+/// truth). Errors are retained in the snapshot so a configured gate can fail
+/// with an actionable diagnostic rather than silently skipping measurement.
+async fn scrape_scheduler_status(client: &Client, port: u16) -> Value {
+    let url = format!("http://127.0.0.1:{port}/debug/workload_scheduler");
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(error) => return json!({ "error": error.to_string() }),
+    };
+    let http_status = response.status().as_u16();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            return json!({
+                "http_status": http_status,
+                "error": error.to_string(),
+            });
+        }
+    };
+    match serde_json::from_str::<Value>(&body) {
+        Ok(body) => json!({ "http_status": http_status, "body": body }),
+        Err(error) => json!({
+            "http_status": http_status,
+            "error": format!("invalid scheduler status JSON: {error}"),
+        }),
+    }
+}
+
+fn scheduler_status_class(
+    snapshot: &Value,
+    workload: &str,
+) -> std::result::Result<(u64, Option<f64>), String> {
+    let status = snapshot
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "scheduler status HTTP response unavailable".to_string())?;
+    if !(200..300).contains(&status) {
+        return Err(format!("scheduler status HTTP response was {status}"));
+    }
+    if let Some(error) = snapshot.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    let body = snapshot
+        .get("body")
+        .ok_or_else(|| "scheduler status response body unavailable".to_string())?;
+    if body.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Err("workload scheduler status is not enabled".to_string());
+    }
+    let class = body
+        .get("classes")
+        .and_then(|classes| classes.get(workload))
+        .ok_or_else(|| format!("scheduler status is missing classes.{workload}"))?;
+    let admitted = class
+        .get("admitted")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!("scheduler status is missing numeric classes.{workload}.admitted")
+        })?;
+    let wait_ms = class
+        .get("total_admission_wait_ms")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite());
+    Ok((admitted, wait_ms))
+}
+
+fn scheduler_admission_failure(target_name: &str, limit: u64, reason: &str) -> Value {
+    json!({
+        "target": target_name,
+        "threshold": "min_write_admitted_delta",
+        "status": "failed",
+        "limit": limit,
+        "reason": reason,
+        "message": format!("write admission progress could not be validated: {reason}"),
+    })
+}
+
+/// Anti-starvation gate based on scheduler class admissions, not poll counts.
+/// It applies only to the enabled candidate and only when configured with a
+/// positive minimum. Missing, invalid, disabled, or reset status data fails
+/// this configured gate explicitly.
+fn scheduler_admission_report(
     target_name: &str,
     scheduler: Option<&crate::query_regression_runner::model::WorkloadSchedulerConfig>,
-    deltas: &Value,
-) -> Option<Value> {
-    let scheduler = scheduler?;
-    let min_share = scheduler.min_write_poll_share;
-    if target_name != "candidate" || min_share <= 0.0 {
-        return None;
-    }
-    let Some(write_delta) = deltas.get("write").and_then(Value::as_u64) else {
-        return Some(json!({
-            "target": target_name,
-            "threshold": "min_write_poll_share",
-            "status": "skipped",
-            "reason": "write poll delta unavailable",
-            "limit": min_share,
-        }));
+    before: &Value,
+    after: &Value,
+) -> Value {
+    let Some(scheduler) = scheduler else {
+        return Value::Null;
     };
-    let Some(query_delta) = deltas.get("query").and_then(Value::as_u64) else {
-        return Some(json!({
-            "target": target_name,
-            "threshold": "min_write_poll_share",
-            "status": "skipped",
-            "reason": "query poll delta unavailable",
-            "limit": min_share,
-        }));
-    };
-    let total = write_delta as u128 + query_delta as u128;
-    if total == 0 {
-        return Some(json!({
-            "target": target_name,
-            "threshold": "min_write_poll_share",
-            "status": "skipped",
-            "reason": "no scheduler poll activity (write and query deltas are both zero)",
-            "write_delta": write_delta,
-            "query_delta": query_delta,
-            "limit": min_share,
-        }));
+    let limit = scheduler.min_write_admitted_delta;
+    if target_name != "candidate" || limit == 0 {
+        return Value::Null;
     }
-    let write_share = write_delta as f64 / total as f64;
-    let passed = write_share >= min_share;
+    let (query_before, query_wait_before) = match scheduler_status_class(before, "query") {
+        Ok(value) => value,
+        Err(reason) => return scheduler_admission_failure(target_name, limit, &reason),
+    };
+    let (write_before, write_wait_before) = match scheduler_status_class(before, "write") {
+        Ok(value) => value,
+        Err(reason) => return scheduler_admission_failure(target_name, limit, &reason),
+    };
+    let (query_after, query_wait_after) = match scheduler_status_class(after, "query") {
+        Ok(value) => value,
+        Err(reason) => return scheduler_admission_failure(target_name, limit, &reason),
+    };
+    let (write_after, write_wait_after) = match scheduler_status_class(after, "write") {
+        Ok(value) => value,
+        Err(reason) => return scheduler_admission_failure(target_name, limit, &reason),
+    };
+    let Some(query_delta) = query_after.checked_sub(query_before) else {
+        return scheduler_admission_failure(
+            target_name,
+            limit,
+            &format!("query admitted counter decreased/reset ({query_before} -> {query_after})"),
+        );
+    };
+    let Some(write_delta) = write_after.checked_sub(write_before) else {
+        return scheduler_admission_failure(
+            target_name,
+            limit,
+            &format!("write admitted counter decreased/reset ({write_before} -> {write_after})"),
+        );
+    };
     let mut report = json!({
         "target": target_name,
-        "threshold": "min_write_poll_share",
-        "status": if passed { "passed" } else { "failed" },
-        "actual_share": write_share,
-        "write_delta": write_delta,
-        "query_delta": query_delta,
-        "limit": min_share,
+        "threshold": "min_write_admitted_delta",
+        "status": if query_delta > 0 && write_delta >= limit { "passed" } else { "failed" },
+        "query_admitted_delta": query_delta,
+        "write_admitted_delta": write_delta,
+        "limit": limit,
     });
-    if !passed {
-        report["message"] = json!(format!(
-            "write poll share {:.2} below min {:.2}",
-            write_share, min_share
+    if query_delta == 0 {
+        report["reason"] = json!("query admitted delta is zero; query class was not active");
+    } else if write_delta < limit {
+        report["reason"] = json!(format!(
+            "write admitted delta {write_delta} is below minimum {limit}"
         ));
     }
-    Some(report)
+    if let (Some(query_wait_before), Some(query_wait_after)) = (query_wait_before, query_wait_after)
+        && query_after >= query_before
+    {
+        report["query_total_admission_wait_ms"] = json!(query_wait_after - query_wait_before);
+        if query_delta > 0 {
+            report["query_mean_admission_wait_ms"] =
+                json!((query_wait_after - query_wait_before) / query_delta as f64);
+        }
+    }
+    if let (Some(write_wait_before), Some(write_wait_after)) = (write_wait_before, write_wait_after)
+        && write_after >= write_before
+    {
+        report["write_total_admission_wait_ms"] = json!(write_wait_after - write_wait_before);
+        if write_delta > 0 {
+            report["write_mean_admission_wait_ms"] =
+                json!((write_wait_after - write_wait_before) / write_delta as f64);
+        }
+    }
+    report
 }
 
 #[cfg(test)]
@@ -1824,7 +1929,7 @@ mod tests {
             max_concurrent_polls: 16,
             query_weight: 2,
             write_weight: 8,
-            min_write_poll_share: 0.0,
+            min_write_admitted_delta: 0,
         };
         let base_env = scheduler_env(false, Some(&scheduler)).unwrap();
         assert_eq!(
@@ -1865,7 +1970,7 @@ mod tests {
             max_concurrent_polls: 16,
             query_weight: 2,
             write_weight: 8,
-            min_write_poll_share: 0.0,
+            min_write_admitted_delta: 0,
         };
         assert_eq!(
             scheduler_report_entry("base", Some(&scheduler)),
@@ -2112,81 +2217,100 @@ mod tests {
         );
     }
 
-    fn share_scheduler(min_write_poll_share: f64) -> WorkloadSchedulerConfig {
+    fn admission_scheduler(min_write_admitted_delta: u64) -> WorkloadSchedulerConfig {
         WorkloadSchedulerConfig {
             enable: false,
             max_concurrent_polls: 16,
             query_weight: 2,
             write_weight: 8,
-            min_write_poll_share,
+            min_write_admitted_delta,
         }
     }
 
+    fn scheduler_status(
+        enabled: bool,
+        query_admitted: u64,
+        write_admitted: u64,
+        query_wait_ms: f64,
+        write_wait_ms: f64,
+    ) -> Value {
+        json!({
+            "http_status": 200,
+            "body": {
+                "enabled": enabled,
+                "classes": {
+                    "query": { "admitted": query_admitted, "total_admission_wait_ms": query_wait_ms },
+                    "write": { "admitted": write_admitted, "total_admission_wait_ms": write_wait_ms }
+                }
+            }
+        })
+    }
+
     #[test]
-    fn scheduler_poll_share_ignored_when_not_applicable() {
-        let scheduler = share_scheduler(0.5);
-        let deltas = json!({ "query": 50, "write": 50 });
-        // Base target never runs with the scheduler enabled.
-        assert!(scheduler_poll_share_report("base", Some(&scheduler), &deltas).is_none());
-        // No scheduler section at all.
-        assert!(scheduler_poll_share_report("candidate", None, &deltas).is_none());
-        // Gate disabled (min_write_poll_share == 0.0).
+    fn scheduler_admission_gate_ignored_when_not_applicable() {
+        let before = scheduler_status(true, 10, 20, 1.0, 2.0);
+        let after = scheduler_status(true, 10, 20, 1.0, 2.0);
         assert!(
-            scheduler_poll_share_report("candidate", Some(&share_scheduler(0.0)), &deltas)
-                .is_none()
+            scheduler_admission_report("base", Some(&admission_scheduler(1)), &before, &after)
+                .is_null()
+        );
+        assert!(scheduler_admission_report("candidate", None, &before, &after).is_null());
+        assert!(
+            scheduler_admission_report("candidate", Some(&admission_scheduler(0)), &before, &after)
+                .is_null()
         );
     }
 
     #[test]
-    fn scheduler_poll_share_skips_when_unverifiable() {
-        let scheduler = share_scheduler(0.5);
-        // No poll activity at all: the share is undefined, so skip instead of
-        // failing (nothing can be starved when nothing ran).
-        let report = scheduler_poll_share_report(
-            "candidate",
-            Some(&scheduler),
-            &json!({ "query": 0, "write": 0 }),
-        )
-        .unwrap();
-        assert_eq!(report["status"], "skipped");
-        assert_eq!(report["threshold"], "min_write_poll_share");
-        // Missing/reset write counter: delta unknown, skip.
-        let report = scheduler_poll_share_report(
-            "candidate",
-            Some(&scheduler),
-            &json!({ "query": 80, "write": Value::Null }),
-        )
-        .unwrap();
-        assert_eq!(report["status"], "skipped");
-    }
-
-    #[test]
-    fn scheduler_poll_share_passes_at_or_above_minimum() {
-        let scheduler = share_scheduler(0.5);
-        let report = scheduler_poll_share_report(
-            "candidate",
-            Some(&scheduler),
-            &json!({ "query": 50, "write": 50 }),
-        )
-        .unwrap();
+    fn scheduler_admission_gate_passes_and_reports_mean_wait() {
+        let before = scheduler_status(true, 10, 20, 100.0, 50.0);
+        let after = scheduler_status(true, 15, 24, 200.0, 90.0);
+        let report =
+            scheduler_admission_report("candidate", Some(&admission_scheduler(4)), &before, &after);
         assert_eq!(report["status"], "passed");
-        assert_eq!(report["actual_share"], 0.5);
-        assert_eq!(report["limit"], 0.5);
+        assert_eq!(report["query_admitted_delta"], 5);
+        assert_eq!(report["write_admitted_delta"], 4);
+        assert_eq!(report["query_mean_admission_wait_ms"], 20.0);
+        assert_eq!(report["write_mean_admission_wait_ms"], 10.0);
     }
 
     #[test]
-    fn scheduler_poll_share_fails_below_minimum() {
-        let scheduler = share_scheduler(0.5);
-        let report = scheduler_poll_share_report(
-            "candidate",
-            Some(&scheduler),
-            &json!({ "query": 58, "write": 42 }),
-        )
-        .unwrap();
+    fn scheduler_admission_gate_fails_on_insufficient_write_or_query() {
+        let before = scheduler_status(true, 10, 20, 0.0, 0.0);
+        let after = scheduler_status(true, 11, 22, 1.0, 1.0);
+        let report =
+            scheduler_admission_report("candidate", Some(&admission_scheduler(3)), &before, &after);
         assert_eq!(report["status"], "failed");
-        assert_eq!(report["message"], "write poll share 0.42 below min 0.50");
-        assert_eq!(report["write_delta"], 42);
-        assert_eq!(report["query_delta"], 58);
+        assert!(report["reason"].as_str().unwrap().contains("below minimum"));
+        let after = scheduler_status(true, 10, 24, 1.0, 1.0);
+        let report =
+            scheduler_admission_report("candidate", Some(&admission_scheduler(3)), &before, &after);
+        assert_eq!(report["status"], "failed");
+        assert_eq!(
+            report["reason"],
+            "query admitted delta is zero; query class was not active"
+        );
+    }
+
+    #[test]
+    fn scheduler_admission_gate_fails_on_invalid_status_or_counter_reset() {
+        let before = scheduler_status(true, 10, 20, 0.0, 0.0);
+        for after in [
+            scheduler_status(false, 11, 22, 1.0, 1.0),
+            json!({ "http_status": 500, "body": {} }),
+            json!({ "http_status": 200, "body": { "enabled": true, "classes": { "query": {} } } }),
+            json!({ "error": "unavailable" }),
+            scheduler_status(true, 9, 22, 1.0, 1.0),
+        ] {
+            let report = scheduler_admission_report(
+                "candidate",
+                Some(&admission_scheduler(1)),
+                &before,
+                &after,
+            );
+            assert_eq!(report["status"], "failed", "{report}");
+            assert_eq!(report["threshold"], "min_write_admitted_delta");
+        }
     }
 
     #[test]

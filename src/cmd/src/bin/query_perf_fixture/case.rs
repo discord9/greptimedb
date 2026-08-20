@@ -114,14 +114,10 @@ pub(super) struct WorkloadSchedulerCaseConfig {
     /// Relative share for write polls while queries are also backlogged.
     #[serde(default = "default_scheduler_write_weight")]
     pub(super) write_weight: u64,
-    /// Minimum required share of scheduler polls admitted to the write
-    /// workload during the mixed read/write measurement, in [0, 1]
-    /// (0.50 = writes must hold at least 50% of all admitted polls).
-    /// 0.0 disables the fairness gate; when enabled, a scheduler-enabled
-    /// target whose measured write poll share falls below this value fails
-    /// the run (write polls starved by query polls).
+    /// Minimum number of write-class admissions required during the mixed
+    /// read/write measurement. Zero disables the anti-starvation gate.
     #[serde(default)]
-    pub(super) min_write_poll_share: f64,
+    pub(super) min_write_admitted_delta: u64,
 }
 
 pub(super) fn default_scheduler_query_weight() -> u64 {
@@ -140,11 +136,6 @@ impl WorkloadSchedulerCaseConfig {
             if value == 0 {
                 return Err(format!("scenario.scheduler.{name} must be positive"));
             }
-        }
-        if !(0.0..=1.0).contains(&self.min_write_poll_share) {
-            return Err(
-                "scenario.scheduler.min_write_poll_share must be within [0.0, 1.0]".to_string(),
-            );
         }
         Ok(())
     }
@@ -912,47 +903,27 @@ max_query_p99_regression_pct = 10.0
         assert_eq!(scheduler.max_concurrent_polls, 16);
         assert_eq!(scheduler.query_weight, 2);
         assert_eq!(scheduler.write_weight, 8);
-        // min_write_poll_share is optional and defaults to 0.0 (gate off).
-        assert_eq!(scheduler.min_write_poll_share, 0.0);
+        // min_write_admitted_delta is optional and defaults to 0 (gate off).
+        assert_eq!(scheduler.min_write_admitted_delta, 0);
         scheduler
             .validate()
             .expect("scheduler config must validate");
     }
 
     #[test]
-    fn write_throughput_parses_explicit_min_write_poll_share() {
-        let with_share = SCHEDULER_CASE.replace(
+    fn write_throughput_parses_explicit_min_write_admitted_delta() {
+        let with_delta = SCHEDULER_CASE.replace(
             "write_weight = 8",
-            "write_weight = 8\nmin_write_poll_share = 0.5",
+            "write_weight = 8\nmin_write_admitted_delta = 1234",
         );
-        let scenario = write_throughput_scenario(&with_share);
+        let scenario = write_throughput_scenario(&with_delta);
         let scheduler = scenario
             .scheduler
             .expect("scheduler section must parse into Some");
-        assert_eq!(scheduler.min_write_poll_share, 0.5);
+        assert_eq!(scheduler.min_write_admitted_delta, 1234);
         scheduler
             .validate()
-            .expect("in-range min_write_poll_share must validate");
-    }
-
-    #[test]
-    fn write_throughput_rejects_out_of_range_min_write_poll_share() {
-        for value in ["-0.1", "1.5"] {
-            let invalid = SCHEDULER_CASE.replace(
-                "write_weight = 8",
-                &format!("write_weight = 8\nmin_write_poll_share = {value}"),
-            );
-            let scenario = write_throughput_scenario(&invalid);
-            let err = scenario
-                .scheduler
-                .unwrap()
-                .validate()
-                .expect_err("out-of-range min_write_poll_share must be rejected");
-            assert!(
-                err.contains("scenario.scheduler.min_write_poll_share must be within [0.0, 1.0]"),
-                "{err}"
-            );
-        }
+            .expect("any u64 admitted delta must validate");
     }
 
     #[test]
