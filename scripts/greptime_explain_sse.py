@@ -16,6 +16,7 @@
 
 import argparse
 import datetime
+import http.client
 import json
 import os
 import re
@@ -36,6 +37,10 @@ TERMINAL_EVENTS = {"final", "error", "canceled"}
 
 class ClientError(Exception):
     """An expected client-side or protocol error."""
+
+
+class ConnectionClosedBeforeResponse(ClientError):
+    """The transport closed before an HTTP response could be received."""
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
@@ -156,6 +161,14 @@ def tls_context(args):
 
 def iso_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def diagnostic_url(value):
+    parts = urlsplit(value)
+    # Do not expose query parameters (which may contain request details) or
+    # userinfo (which may contain credentials) in transport diagnostics.
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def safe_body(body, secrets=()):
@@ -388,6 +401,29 @@ def run(args):
             if 300 <= error.code < 400:
                 raise ClientError("redirect refused; use final HTTPS endpoint") from error
             raise
+        except (
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            BrokenPipeError,
+            socket.error,
+            ssl.SSLError,
+            URLError,
+        ) as error:
+            elapsed = int((time.monotonic() - started) * 1000)
+            raise ConnectionClosedBeforeResponse(
+                "Connection closed before HTTP response after %dms; url=%s; timestamp=%s; "
+                "the request did not reach SSE protocol; check frontend/proxy logs at the timestamp "
+                "and compare curl -v"
+                % (elapsed, diagnostic_url(url), iso_now())
+            ) from error
+        except OSError as error:
+            elapsed = int((time.monotonic() - started) * 1000)
+            raise ConnectionClosedBeforeResponse(
+                "Connection closed before HTTP response after %dms; url=%s; timestamp=%s; "
+                "the request did not reach SSE protocol; check frontend/proxy logs at the timestamp "
+                "and compare curl -v"
+                % (elapsed, diagnostic_url(url), iso_now())
+            ) from error
         with response:
             status = getattr(response, "status", response.getcode())
             content_type = response.headers.get("Content-Type", "")

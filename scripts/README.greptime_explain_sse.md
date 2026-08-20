@@ -94,6 +94,24 @@ blocked execution path. If metrics continue changing, inspect the operators
 identified by the snapshot diffs. This endpoint is **not a profiler**: its
 output alone cannot prove that CPU, Flight, or `flat_merge` is the root cause.
 
+## Troubleshooting
+
+If the client reports `Connection closed before HTTP response`, the remote
+endpoint closed the connection before returning any HTTP headers, so the
+request did not reach the SSE protocol. Check frontend and proxy logs at the
+reported timestamp and compare the result with `curl -v`:
+
+```console
+curl -v -N -X POST \
+  'https://frontend.example:4000/v1/sql/analyze/stream?snapshot_interval_ms=1000' \
+  -H 'Accept: text/event-stream' \
+  --data-urlencode 'sql=EXPLAIN ANALYZE VERBOSE SELECT count(*) FROM demo.metrics'
+```
+
+This comparison command intentionally has no authentication header. If the
+service requires authentication, add credentials yourself only in a secure
+HTTPS environment; never paste a token into support materials.
+
 For support, collect at minimum: a redacted SQL statement; the command with
 bearer tokens and other secrets removed; the JSONL evidence; frontend and
 datanode logs for the specified time window; and the run's duration.
