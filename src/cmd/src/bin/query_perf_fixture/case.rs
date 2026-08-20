@@ -114,10 +114,6 @@ pub(super) struct WorkloadSchedulerCaseConfig {
     /// Relative share for write polls while queries are also backlogged.
     #[serde(default = "default_scheduler_write_weight")]
     pub(super) write_weight: u64,
-    /// Minimum number of write-class admissions required during the mixed
-    /// read/write measurement. Zero disables the anti-starvation gate.
-    #[serde(default)]
-    pub(super) min_write_admitted_delta: u64,
 }
 
 pub(super) fn default_scheduler_query_weight() -> u64 {
@@ -903,27 +899,9 @@ max_query_p99_regression_pct = 10.0
         assert_eq!(scheduler.max_concurrent_polls, 16);
         assert_eq!(scheduler.query_weight, 2);
         assert_eq!(scheduler.write_weight, 8);
-        // min_write_admitted_delta is optional and defaults to 0 (gate off).
-        assert_eq!(scheduler.min_write_admitted_delta, 0);
         scheduler
             .validate()
             .expect("scheduler config must validate");
-    }
-
-    #[test]
-    fn write_throughput_parses_explicit_min_write_admitted_delta() {
-        let with_delta = SCHEDULER_CASE.replace(
-            "write_weight = 8",
-            "write_weight = 8\nmin_write_admitted_delta = 1234",
-        );
-        let scenario = write_throughput_scenario(&with_delta);
-        let scheduler = scenario
-            .scheduler
-            .expect("scheduler section must parse into Some");
-        assert_eq!(scheduler.min_write_admitted_delta, 1234);
-        scheduler
-            .validate()
-            .expect("any u64 admitted delta must validate");
     }
 
     #[test]

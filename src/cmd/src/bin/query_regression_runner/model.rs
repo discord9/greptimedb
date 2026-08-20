@@ -117,10 +117,6 @@ pub(super) struct WorkloadSchedulerConfig {
     pub(super) query_weight: u64,
     #[serde(default)]
     pub(super) write_weight: u64,
-    /// Minimum number of write-class admissions required during the mixed
-    /// measurement. Zero disables the anti-starvation gate.
-    #[serde(default)]
-    pub(super) min_write_admitted_delta: u64,
 }
 
 #[derive(Debug, Deserialize)]
