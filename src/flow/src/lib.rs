@@ -51,8 +51,8 @@ mod utils;
 // submodule) to drive the two-phase backfill primitives.
 pub use batching_mode::engine::BatchingEngine;
 pub use batching_mode::{
-    BackfillJobStatus, CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS, INTERNAL_FLOW_EPOCH_COL_NAME,
-    INTERNAL_FLOW_STATE_COL_KEY,
+    BackfillJobStatus, CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS, INTERNAL_FLOW_CHECKPOINT_COL_NAME,
+    INTERNAL_FLOW_EPOCH_COL_NAME, INTERNAL_FLOW_STATE_COL_KEY,
 };
 pub use common_time::Timestamp;
 pub use engine::FlowId;

@@ -2629,6 +2629,11 @@ fn persistence_sink_schema() -> Arc<Schema> {
             CDT::uint64_datatype(),
             true,
         ),
+        ColumnSchema::new(
+            crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME,
+            CDT::binary_datatype(),
+            true,
+        ),
     ]))
 }
 
@@ -2639,13 +2644,15 @@ type SinkRow = (Option<i64>, Option<u64>, Option<Vec<u8>>);
 fn persistence_sink_recordbatch(rows: Vec<SinkRow>) -> RecordBatch {
     let schema = persistence_sink_schema();
     let mut states = datatypes::vectors::BinaryVectorBuilder::with_capacity(rows.len());
+    let mut checkpoints = datatypes::vectors::BinaryVectorBuilder::with_capacity(rows.len());
     let mut windows =
         datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
     let mut epochs = datatypes::vectors::UInt64VectorBuilder::with_capacity(rows.len());
     let mut update_at =
         datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
     for (window, epoch, state) in rows {
-        states.push(state.as_deref());
+        states.push(None);
+        checkpoints.push(state.as_deref());
         windows.push(window.map(datatypes::timestamp::TimestampMillisecond::new));
         epochs.push(epoch);
         update_at.push(Some(datatypes::timestamp::TimestampMillisecond::new(0)));
@@ -2657,6 +2664,7 @@ fn persistence_sink_recordbatch(rows: Vec<SinkRow>) -> RecordBatch {
             windows.to_vector(),
             update_at.to_vector(),
             epochs.to_vector(),
+            checkpoints.to_vector(),
         ],
     )
     .unwrap()
@@ -2700,6 +2708,11 @@ fn persistence_sink_schema_with_dimension() -> Arc<Schema> {
             CDT::uint64_datatype(),
             true,
         ),
+        ColumnSchema::new(
+            crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME,
+            CDT::binary_datatype(),
+            true,
+        ),
     ]))
 }
 
@@ -2712,6 +2725,7 @@ fn dimension_persistence_sink_recordbatch(rows: Vec<DimensionSinkRow>) -> Record
     let schema = persistence_sink_schema_with_dimension();
     let mut hosts = datatypes::vectors::StringVectorBuilder::with_capacity(rows.len());
     let mut states = datatypes::vectors::BinaryVectorBuilder::with_capacity(rows.len());
+    let mut checkpoints = datatypes::vectors::BinaryVectorBuilder::with_capacity(rows.len());
     let mut windows =
         datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
     let mut epochs = datatypes::vectors::UInt64VectorBuilder::with_capacity(rows.len());
@@ -2719,7 +2733,8 @@ fn dimension_persistence_sink_recordbatch(rows: Vec<DimensionSinkRow>) -> Record
         datatypes::vectors::TimestampMillisecondVectorBuilder::with_capacity(rows.len());
     for (host, window, epoch, state) in rows {
         hosts.push(host.as_deref());
-        states.push(state.as_deref());
+        states.push(None);
+        checkpoints.push(state.as_deref());
         windows.push(window.map(datatypes::timestamp::TimestampMillisecond::new));
         epochs.push(epoch);
         update_at.push(Some(datatypes::timestamp::TimestampMillisecond::new(0)));
@@ -2732,6 +2747,7 @@ fn dimension_persistence_sink_recordbatch(rows: Vec<DimensionSinkRow>) -> Record
             windows.to_vector(),
             update_at.to_vector(),
             epochs.to_vector(),
+            checkpoints.to_vector(),
         ],
     )
     .unwrap()
@@ -2893,6 +2909,20 @@ fn register_sink_table_with_meta(
         extra_options,
         ..Default::default()
     };
+    let schema = if schema
+        .column_schema_by_name(crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME)
+        .is_none()
+    {
+        let mut columns = schema.column_schemas().to_vec();
+        columns.push(ColumnSchema::new(
+            crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME,
+            CDT::binary_datatype(),
+            true,
+        ));
+        Arc::new(Schema::new(columns))
+    } else {
+        schema
+    };
     let meta = TableMetaBuilder::empty()
         .schema(schema)
         .primary_key_indices(primary_key_indices)
@@ -3007,18 +3037,18 @@ async fn new_ee_sequence_range_task(sink_table: &str, query: &str) -> TestTaskPa
 fn test_persistence() -> CheckpointPersistence {
     CheckpointPersistence {
         epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-        state_col_name: "state".to_string(),
+        checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
         window_col_name: "window".to_string(),
         primary_key_columns: vec![],
     }
 }
 
-/// A `CheckpointPersistence` whose sink has a nullable `host` primary-key
-/// (dimension) column, exercising the typed-NULL sentinel key projection.
+/// A `CheckpointPersistence` whose sink has a `host` primary-key (dimension)
+/// column, exercising the marker sentinel key projection.
 fn test_persistence_with_dimension() -> CheckpointPersistence {
     CheckpointPersistence {
         epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-        state_col_name: "state".to_string(),
+        checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
         window_col_name: "window".to_string(),
         primary_key_columns: vec!["host".to_string()],
     }
@@ -3187,8 +3217,7 @@ async fn test_detect_checkpoint_persistence_fails_closed_on_broken_contracts() {
         "an epoch column in the primary key must fail closed"
     );
 
-    // A non-nullable primary-key column cannot carry the typed-NULL sentinel
-    // key; persistence must fail closed.
+    // Marker values allow persistence with non-nullable primary-key columns.
     let sink_table = "persistence_detect_non_nullable_pk";
     let TestTaskParts {
         task, query_engine, ..
@@ -3218,8 +3247,8 @@ async fn test_detect_checkpoint_persistence_fails_closed_on_broken_contracts() {
         task.detect_checkpoint_persistence()
             .await
             .unwrap()
-            .is_none(),
-        "a non-nullable primary-key column must fail closed"
+            .is_some(),
+        "a non-nullable primary-key column must be accepted with markers"
     );
 }
 
@@ -3284,8 +3313,8 @@ async fn test_detect_checkpoint_persistence_resolves_state_column_explicitly() {
         .expect("explicit state column name must activate persistence");
     assert_eq!(test_persistence_with_dimension(), persistence);
 
-    // A configured state-column name that does not exist in the sink schema
-    // (or is not BINARY) fails closed.
+    // The configured query state-column option does not affect checkpoint
+    // persistence now that checkpoint records use the dedicated column.
     let sink_table = "persistence_detect_missing_state_col";
     let missing_opts = Arc::new(BatchingModeOptions {
         experimental_enable_incremental_read: true,
@@ -3314,12 +3343,12 @@ async fn test_detect_checkpoint_persistence_resolves_state_column_explicitly() {
         task.detect_checkpoint_persistence()
             .await
             .unwrap()
-            .is_none(),
-        "a missing configured state column must fail closed"
+            .is_some(),
+        "a missing configured state column must not affect persistence"
     );
 
-    // Without the explicit name, two non-PK BINARY columns are ambiguous and
-    // must fail closed.
+    // Multiple query-produced BINARY columns are allowed because checkpoint
+    // persistence uses the dedicated internal column.
     let sink_table = "persistence_detect_ambiguous_state_col";
     let TestTaskParts {
         task, query_engine, ..
@@ -3349,8 +3378,8 @@ async fn test_detect_checkpoint_persistence_resolves_state_column_explicitly() {
         task.detect_checkpoint_persistence()
             .await
             .unwrap()
-            .is_none(),
-        "two non-PK BINARY columns without an explicit name must fail closed"
+            .is_some(),
+        "query BINARY columns must not affect persistence"
     );
 }
 
@@ -3718,12 +3747,11 @@ async fn test_restore_rejects_sentinel_row_with_non_null_dimension_pk() {
 }
 
 #[tokio::test]
-async fn test_restore_accepts_canonical_all_null_dimension_sentinel() {
-    // The canonical sentinel row `(NULL host, sentinel window)` with a
+async fn test_restore_accepts_canonical_marker_dimension_sentinel() {
+    // The canonical sentinel row `(marker host, sentinel window)` with a
     // decodable record and matching physical epoch must restore successfully
-    // through the dimension sink: the restore scan projects the primary-key
-    // column and requires every dimension to be NULL.
-    let sink_table = "persistence_all_null_dimension_sentinel";
+    // through the dimension sink.
+    let sink_table = "persistence_marker_dimension_sentinel";
     let TestTaskParts {
         task, query_engine, ..
     } = new_sequence_range_test_task(sink_table).await;
@@ -3739,7 +3767,7 @@ async fn test_restore_accepts_canonical_all_null_dimension_sentinel() {
         vec![
             (None, Some(1_000), Some(3), None),
             (
-                None,
+                Some("__greptime_checkpoint__".to_string()),
                 Some(crate::batching_mode::CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS),
                 Some(3),
                 Some(encoded),
@@ -4066,7 +4094,7 @@ async fn test_write_checkpoint_row_sends_singleton_sentinel_row() {
         format!("{epoch_expr:?}").contains("UInt64(7)"),
         "epoch literal expected, got {epoch_expr:?}"
     );
-    // state column -> the encoded v1 record bytes must appear verbatim.
+    // checkpoint column -> the encoded v1 record bytes must appear verbatim.
     let expected = encode_checkpoint_record(&CheckpointRecord {
         format_version: CHECKPOINT_RECORD_FORMAT_VERSION,
         epoch: 7,
@@ -4079,9 +4107,9 @@ async fn test_write_checkpoint_row_sends_singleton_sentinel_row() {
     let state_bytes = match &projection.expr[2] {
         Expr::Alias(alias) => match alias.expr.as_ref() {
             Expr::Literal(ScalarValue::Binary(Some(bytes)), _) => bytes,
-            other => panic!("expected binary literal for state column, got {other:?}"),
+            other => panic!("expected binary literal for checkpoint column, got {other:?}"),
         },
-        other => panic!("expected alias for state column, got {other:?}"),
+        other => panic!("expected alias for checkpoint column, got {other:?}"),
     };
     assert_eq!(
         &expected, state_bytes,
@@ -4155,11 +4183,10 @@ impl GrpcQueryHandlerWithBoxedError for CaptureInsertWithRowsHandler {
 }
 
 #[tokio::test]
-async fn test_write_checkpoint_row_projects_typed_null_primary_keys() {
-    // The canonical sentinel logical key is `(typed NULL for every
-    // primary-key/dimension column, sentinel window)`. The checkpoint writer
-    // must explicitly project each PK column as a typed NULL instead of
-    // relying on omitted columns/defaults.
+async fn test_write_checkpoint_row_projects_marker_primary_keys() {
+    // The canonical sentinel logical key uses marker values for every
+    // primary-key/dimension column and the sentinel window. The checkpoint
+    // writer explicitly projects each PK column with its marker value.
     let sink_table = "persistence_write_dimension_sink";
     let TestTaskParts {
         task, query_engine, ..
@@ -4210,10 +4237,10 @@ async fn test_write_checkpoint_row_projects_typed_null_primary_keys() {
     let LogicalPlan::Projection(projection) = &plan else {
         panic!("expected projection over empty relation, got {plan:?}");
     };
-    // typed NULL host + window + epoch + state + auto update_at.
+    // marker host + window + epoch + checkpoint + auto update_at.
     assert_eq!(5, projection.expr.len(), "{projection:?}");
 
-    // The primary-key column must be projected first as a typed NULL string.
+    // The primary-key column must be projected first as the marker string.
     let host_expr = &projection.expr[0];
     let host_sql = format!("{host_expr:?}");
     assert!(
@@ -4221,8 +4248,8 @@ async fn test_write_checkpoint_row_projects_typed_null_primary_keys() {
         "host primary key must be projected explicitly, got {host_sql}"
     );
     assert!(
-        host_sql.contains("NULL") && host_sql.contains("Utf8"),
-        "host must be a typed NULL string literal, got {host_sql}"
+        host_sql.contains("__greptime_checkpoint__"),
+        "host must be the canonical marker string literal, got {host_sql}"
     );
 
     // window column -> sentinel timestamp.
@@ -4239,7 +4266,7 @@ async fn test_write_checkpoint_row_projects_typed_null_primary_keys() {
         format!("{epoch_expr:?}").contains("UInt64(7)"),
         "epoch literal expected, got {epoch_expr:?}"
     );
-    // state column -> the encoded v1 record bytes must appear verbatim.
+    // checkpoint column -> the encoded v1 record bytes must appear verbatim.
     let expected = encode_checkpoint_record(&CheckpointRecord {
         format_version: CHECKPOINT_RECORD_FORMAT_VERSION,
         epoch: 7,
@@ -4249,9 +4276,9 @@ async fn test_write_checkpoint_row_projects_typed_null_primary_keys() {
     let state_bytes = match &projection.expr[3] {
         Expr::Alias(alias) => match alias.expr.as_ref() {
             Expr::Literal(ScalarValue::Binary(Some(bytes)), _) => bytes,
-            other => panic!("expected binary literal for state column, got {other:?}"),
+            other => panic!("expected binary literal for checkpoint column, got {other:?}"),
         },
-        other => panic!("expected alias for state column, got {other:?}"),
+        other => panic!("expected alias for checkpoint column, got {other:?}"),
     };
     assert_eq!(
         &expected, state_bytes,
@@ -6727,7 +6754,7 @@ async fn run_finalize_with_setup(
         let mut state = task.state.write().unwrap();
         state.set_checkpoint_persistence(Some(CheckpointPersistence {
             epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-            state_col_name: "state".to_string(),
+            checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
             window_col_name: "time_window".to_string(),
             primary_key_columns: vec!["number".to_string()],
         }));
@@ -7384,7 +7411,7 @@ async fn test_finalize_failure_paths_keep_job_retryable() {
         let mut state = task.state.write().unwrap();
         state.set_checkpoint_persistence(Some(CheckpointPersistence {
             epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-            state_col_name: "state".to_string(),
+            checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
             window_col_name: "time_window".to_string(),
             primary_key_columns: vec!["number".to_string()],
         }));
@@ -7455,7 +7482,7 @@ async fn test_finalize_rejects_invalid_job_and_missing_lower_bound() {
         let mut state = task.state.write().unwrap();
         state.set_checkpoint_persistence(Some(CheckpointPersistence {
             epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-            state_col_name: "state".to_string(),
+            checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
             window_col_name: "time_window".to_string(),
             primary_key_columns: vec!["number".to_string()],
         }));
@@ -7554,7 +7581,7 @@ async fn test_execute_once_unlocked_finalizes_pending_job() {
         let mut state = task.state.write().unwrap();
         state.set_checkpoint_persistence(Some(CheckpointPersistence {
             epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-            state_col_name: "state".to_string(),
+            checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
             window_col_name: "time_window".to_string(),
             primary_key_columns: vec!["number".to_string()],
         }));

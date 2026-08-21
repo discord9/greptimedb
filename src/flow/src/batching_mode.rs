@@ -45,7 +45,11 @@ pub use state::BackfillJobStatus;
 /// are byte-for-byte unaffected.
 pub const INTERNAL_FLOW_EPOCH_COL_NAME: &str = "__greptime_internal_flow_epoch";
 
-/// Sentinel window timestamp (in milliseconds: 9999-12-31T23:59:59.999Z) used
+/// Reserved internal column storing the encoded checkpoint record on the
+/// singleton sentinel row. NULL on every normal data row.
+pub const INTERNAL_FLOW_CHECKPOINT_COL_NAME: &str = "__greptime_internal_flow_checkpoint";
+
+/// Sentinel window timestamp (in milliseconds: 0001-01-01T00:00:00.000Z) used
 /// to mark the singleton checkpoint row in the sink table's window/time-index
 /// column.
 ///
@@ -59,7 +63,7 @@ pub const INTERNAL_FLOW_EPOCH_COL_NAME: &str = "__greptime_internal_flow_epoch";
 /// reads/writes it when the sink schema already contains the reserved epoch
 /// column, and ordinary flows (without that column) are byte-for-byte
 /// unaffected.
-pub const CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS: i64 = 253_402_300_799_999;
+pub const CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS: i64 = -62_135_596_800_000;
 
 /// Reserved internal flow option key carrying the exact sink BINARY state
 /// column name of an incremental flow. Defined in `common-meta` (the flow

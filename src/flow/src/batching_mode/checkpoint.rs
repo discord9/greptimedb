@@ -74,16 +74,16 @@ pub(super) fn decode_checkpoint_record(bytes: &[u8]) -> Result<Option<Checkpoint
 /// Convert the millisecond sentinel window timestamp to the sink window
 /// column's native time unit.
 ///
-/// A nanosecond sentinel at year 9999 would overflow `i64`, so the nanosecond
-/// representation is clamped to the largest representable value; every
-/// practical source timestamp is far below it. Second/microsecond conversions
+/// A nanosecond sentinel at year 0001 would overflow `i64`, so the nanosecond
+/// representation is clamped to the smallest representable value; every
+/// practical source timestamp is far above it. Second/microsecond conversions
 /// are exact.
 pub(super) fn checkpoint_sentinel_ts_in_unit(unit: TimeUnit) -> i64 {
     match unit {
         TimeUnit::Second => CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS / 1000,
         TimeUnit::Millisecond => CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS,
         TimeUnit::Microsecond => CHECKPOINT_SENTINEL_WINDOW_TS_MILLIS * 1000,
-        TimeUnit::Nanosecond => i64::MAX,
+        TimeUnit::Nanosecond => i64::MIN,
     }
 }
 
@@ -276,12 +276,12 @@ mod tests {
             sentinel * 1000,
             checkpoint_sentinel_ts_in_unit(TimeUnit::Microsecond)
         );
-        // A year-9999 nanosecond sentinel would overflow i64, so the
-        // nanosecond representation is clamped to the largest representable
+        // A year-0001 nanosecond sentinel would overflow i64, so the
+        // nanosecond representation is clamped to the smallest representable
         // value. The exact clamped value is a storage detail; the assertion
-        // pins that it stays representable and far above any real timestamp.
+        // pins that it stays representable and far below any real timestamp.
         assert_eq!(
-            i64::MAX,
+            i64::MIN,
             checkpoint_sentinel_ts_in_unit(TimeUnit::Nanosecond)
         );
     }

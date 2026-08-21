@@ -1389,7 +1389,7 @@ pub enum CheckpointMode {
 /// Resolved once at task creation when the batching mode is `SequenceRange`
 /// and the sink schema satisfies the persistence contract (see
 /// `BatchingTask::detect_checkpoint_persistence`): the reserved internal epoch
-/// column, an explicitly identified BINARY state column, and a timestamp
+/// column, the dedicated internal BINARY checkpoint column, and a timestamp
 /// time-index window column. The window column's sentinel value marks the
 /// singleton checkpoint row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1397,15 +1397,15 @@ pub struct CheckpointPersistence {
     /// Name of the reserved internal epoch column
     /// ([`crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME`]).
     pub epoch_col_name: String,
-    /// Name of the sink BINARY column storing the encoded checkpoint record.
-    pub state_col_name: String,
+    /// Name of the dedicated internal BINARY column storing the encoded
+    /// checkpoint record.
+    pub checkpoint_col_name: String,
     /// Name of the sink window/time-index column used for the sentinel row.
     pub window_col_name: String,
     /// Sink primary-key (dimension) column names. The singleton checkpoint
-    /// row's logical key is `(typed NULL for every entry, sentinel window)`;
-    /// the writer explicitly projects each entry as a typed NULL rather than
-    /// relying on omitted columns/defaults. Empty when the sink has no
-    /// explicit primary-key columns (time-index-only key).
+    /// row's logical key uses canonical marker values for every entry and the
+    /// sentinel window. Empty when the sink has no explicit primary-key
+    /// columns (time-index-only key).
     pub primary_key_columns: Vec<String>,
 }
 

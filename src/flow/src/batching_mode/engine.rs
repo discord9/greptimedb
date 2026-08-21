@@ -1954,7 +1954,7 @@ GROUP BY l.number, time_window
                 .unwrap()
                 .set_checkpoint_persistence(Some(CheckpointPersistence {
                     epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-                    state_col_name: "state".to_string(),
+                    checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
                     window_col_name: "time_window".to_string(),
                     primary_key_columns: vec![],
                 }));
@@ -2095,7 +2095,7 @@ GROUP BY l.number, time_window
             .unwrap()
             .set_checkpoint_persistence(Some(CheckpointPersistence {
                 epoch_col_name: crate::batching_mode::INTERNAL_FLOW_EPOCH_COL_NAME.to_string(),
-                state_col_name: "state".to_string(),
+                checkpoint_col_name: crate::batching_mode::INTERNAL_FLOW_CHECKPOINT_COL_NAME.to_string(),
                 window_col_name: "time_window".to_string(),
                 primary_key_columns: vec![],
             }));
