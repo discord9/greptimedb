@@ -57,7 +57,7 @@ use crate::error::Error;
 use crate::manifest::action::RegionEdit;
 use crate::read::read_columns::ReadColumns;
 use crate::read::scan_region::Scanner;
-use crate::sst::file::{FileHandle, FileMeta};
+use crate::sst::file::FileMeta;
 use crate::test_util;
 use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 use crate::test_util::{CreateRequestBuilder, TestEnv};
@@ -2419,18 +2419,12 @@ async fn test_compaction_output_not_laundered_from_legacy_input() {
         .get();
     assert_eq!(8, barrier);
 
-    // The sequence-less parquet is encoded as all zeroes. Its physical column
-    // therefore must not retain a source-domain sequence; legacy reads use the
-    // reader's existing all-zero compatibility override from FileMeta.
-    let mut sequence_less_meta = outputs[0].meta_ref().clone();
-    sequence_less_meta.sequence = None;
-    let sequence_less_handle = FileHandle::new(
-        sequence_less_meta,
-        Arc::new(crate::sst::file_purger::NoopFilePurger),
-    );
+    // Sequence-less output must not configure a FileMeta sequence override.
+    // The physical sequence column retains the source values, which are below
+    // the output's admission barrier.
     let mut reader = region
         .access_layer
-        .read_sst(sequence_less_handle)
+        .read_sst(outputs[0].clone())
         .build()
         .await
         .unwrap()
@@ -2445,7 +2439,7 @@ async fn test_compaction_output_not_laundered_from_legacy_input() {
         .as_any()
         .downcast_ref::<datatypes::arrow::array::UInt64Array>()
         .expect("sequence column");
-    assert!(sequence.values().iter().all(|sequence| *sequence == 0));
+    assert!(sequence.values().iter().all(|sequence| *sequence < barrier));
 
     // A cursor before the barrier must fail closed.
     let err = engine

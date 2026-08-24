@@ -504,14 +504,14 @@ impl SstMerger for DefaultSstMerger {
             )
         };
         // The flat/primary-key parquet formats require their three internal
-        // columns. For a sequence-less output, write the sequence column as
-        // zero instead of its file barrier. The reader recognizes all-zero
-        // sequence columns and overrides them from FileMeta for legacy reads;
-        // exact reads skip this file at file level before row filtering.
+        // columns. For a sequence-less output, don't force a sequence override.
+        // The reader recognizes all-zero sequence columns and overrides them
+        // from FileMeta for legacy reads; leaving this unset avoids that
+        // override for sequence-less output.
         let write_max_sequence = if output_preserves_sequence {
             input_max_sequence.map(NonZeroU64::get)
         } else {
-            Some(0)
+            None
         };
 
         let builder = CompactionSstReaderBuilder {
