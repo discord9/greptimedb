@@ -273,11 +273,11 @@ impl GroupsAccumulator for CountHashGroupAccumulator {
 
         let mut builder = ListBuilder::new(UInt64Builder::with_capacity(array.len()))
             .with_field(Arc::new(Field::new_list_field(DataType::UInt64, true)));
-        for row in 0..array.len() {
+        for (row, &hash) in hashes.iter().enumerate() {
             let included = array.is_valid(row)
                 && opt_filter.is_none_or(|filter| filter.is_valid(row) && filter.value(row));
             if included {
-                builder.values().append_value(hashes[row]);
+                builder.values().append_value(hash);
             }
             builder.append(true);
         }

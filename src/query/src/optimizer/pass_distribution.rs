@@ -18,7 +18,9 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, Partitioning, ReplaceChildrenOptions,
+};
 use datafusion_common::Result as DfResult;
 use datafusion_physical_expr::Distribution;
 use datafusion_physical_expr::utils::map_columns_before_projection;
@@ -97,10 +99,10 @@ impl PassDistribution {
             return Ok(plan);
         }
 
-        let required = plan.required_input_distribution();
+        let required = plan.input_distribution_requirements();
         let mut new_children = Vec::with_capacity(children.len());
         for (idx, child) in children.into_iter().enumerate() {
-            let child_req = match required.get(idx) {
+            let child_req = match required.child_distribution(idx) {
                 Some(Distribution::UnspecifiedDistribution) if idx == 0 => {
                     Self::map_hash_requirement_through_projection(plan.as_ref(), &current_req)
                 }
@@ -121,7 +123,10 @@ impl PassDistribution {
         if unchanged {
             Ok(plan)
         } else {
-            plan.with_new_children(new_children)
+            plan.replace_children(
+                new_children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
         }
     }
 

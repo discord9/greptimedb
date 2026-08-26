@@ -28,8 +28,9 @@ use datafusion::logical_expr::{EmptyRelation, LogicalPlan, UserDefinedLogicalNod
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-    PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirements, Partitioning, PhysicalExpr, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, StatisticsArgs,
 };
 use datafusion::prelude::Expr;
 use datafusion_expr::col;
@@ -415,8 +416,8 @@ impl ExecutionPlan for ScalarCalculateExec {
         vec![true; self.children().len()]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition])
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -479,8 +480,16 @@ impl ExecutionPlan for ScalarCalculateExec {
         Some(self.metric.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let input_stats = self.input.partition_statistics(partition)?;
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let input_stats = &input_stats[0];
 
         let estimated_row_num = (self.end - self.start) as f64 / self.interval as f64;
         let estimated_total_bytes = input_stats

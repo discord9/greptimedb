@@ -30,8 +30,8 @@ use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, InputDistributionRequirements,
+    PhysicalExpr, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_expr::col;
 use datatypes::arrow::compute;
@@ -349,18 +349,18 @@ impl ExecutionPlan for SeriesDivideExec {
         self.input.properties()
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
         if self.tag_columns.is_empty() {
-            return vec![Distribution::SinglePartition];
+            return InputDistributionRequirements::new(vec![Distribution::SinglePartition]);
         }
         let schema = self.input.schema();
-        vec![Distribution::HashPartitioned(
+        InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
             self.tag_columns
                 .iter()
                 // Safety: the tag column names is verified in the planning phase
                 .map(|tag| Arc::new(ColumnExpr::new_with_schema(tag, &schema).unwrap()) as _)
                 .collect(),
-        )]
+        )])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

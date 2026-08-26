@@ -29,11 +29,12 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, accept,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    InputDistributionRequirements, PlanProperties, ReplaceChildrenOptions, accept,
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{DataFusionError, assert_eq_or_internal_err, internal_err};
-use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -171,13 +172,17 @@ impl ExecutionPlan for DistAnalyzeExec {
     }
 
     /// AnalyzeExec is handled specially so this value is ignored
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![]
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        // AnalyzeExec is handled specially so this value is ignored.
+        InputDistributionRequirements::new(vec![
+            datafusion_physical_expr::Distribution::UnspecifiedDistribution,
+        ])
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         assert_eq_or_internal_err!(
             children.len(),
@@ -189,6 +194,17 @@ impl ExecutionPlan for DistAnalyzeExec {
             self.verbose,
             self.format,
         )))
+    }
+
+    #[allow(deprecated)]
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -416,7 +432,14 @@ mod tests {
             AnalyzeFormat::TEXT,
         ));
 
-        assert!(ExecutionPlan::with_new_children(analyze, vec![]).is_err());
+        assert!(
+            ExecutionPlan::replace_children(
+                analyze,
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -427,9 +450,10 @@ mod tests {
             AnalyzeFormat::TEXT,
         ));
 
-        let result = ExecutionPlan::with_new_children(
+        let result = ExecutionPlan::replace_children(
             analyze,
             vec![empty_plan("first"), empty_plan("second")],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
         );
 
         if let Ok(plan) = result {
@@ -454,7 +478,12 @@ mod tests {
         ));
         let replacement = empty_plan("replacement");
 
-        let rebuilt = ExecutionPlan::with_new_children(analyze, vec![replacement]).unwrap();
+        let rebuilt = ExecutionPlan::replace_children(
+            analyze,
+            vec![replacement],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap();
         let rebuilt = rebuilt.downcast_ref::<DistAnalyzeExec>().unwrap();
 
         assert_eq!(rebuilt.input().schema().field(0).name(), "replacement");

@@ -34,8 +34,9 @@ use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream, Statistics,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirements, PhysicalExpr, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics, StatisticsArgs,
 };
 use datafusion_expr::col;
 use futures::{Stream, StreamExt, ready};
@@ -447,14 +448,17 @@ impl ExecutionPlan for RangeManipulateExec {
         vec![&self.input]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        let input_requirement = self.input.required_input_distribution();
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        let input_requirement = self
+            .input
+            .input_distribution_requirements()
+            .into_per_child();
         if input_requirement.is_empty() {
             // if the input is EmptyMetric, its required_input_distribution() is empty so we can't
             // use its input distribution.
-            vec![Distribution::UnspecifiedDistribution]
+            InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution])
         } else {
-            input_requirement
+            InputDistributionRequirements::new(input_requirement)
         }
     }
 
@@ -538,8 +542,16 @@ impl ExecutionPlan for RangeManipulateExec {
         Some(self.metric.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let input_stats = self.input.partition_statistics(partition)?;
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let input_stats = &input_stats[0];
 
         let estimated_row_num = (self.end - self.start) as f64 / self.interval as f64;
         let estimated_total_bytes = input_stats

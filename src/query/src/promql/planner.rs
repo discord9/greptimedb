@@ -52,7 +52,7 @@ use datafusion_expr::expr_fn::when;
 use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::utils::{conjunction, disjunction};
 use datafusion_expr::{
-    ExprSchemable, Literal, Projection, SortExpr, TableScan, TableSource, col, lit,
+    ExprSchemable, Literal, Projection, SortExpr, TableScanBuilder, TableSource, col, lit,
 };
 use datafusion_functions::core::coalesce;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
@@ -3046,13 +3046,12 @@ impl PromPlanner {
                         projection.sort_unstable();
                         projection.dedup();
 
-                        let new_scan = TableScan::try_new(
-                            scan.table_name.clone(),
-                            scan.source.clone(),
-                            Some(projection),
-                            scan.filters,
-                            scan.fetch,
-                        )?;
+                        let new_scan =
+                            TableScanBuilder::new(scan.table_name.clone(), scan.source.clone())
+                                .with_projection(Some(projection))
+                                .with_filters(scan.filters)
+                                .with_fetch(scan.fetch)
+                                .build()?;
                         Ok(Transformed::yes(LogicalPlan::TableScan(new_scan)))
                     }
                     LogicalPlan::Projection(proj) => {

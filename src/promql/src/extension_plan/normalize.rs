@@ -29,8 +29,9 @@ use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirements, PhysicalExpr, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, StatisticsArgs,
 };
 use datafusion_expr::col;
 use datatypes::arrow::array::TimestampMillisecondArray;
@@ -277,19 +278,19 @@ impl ExecutionPlan for SeriesNormalizeExec {
         self.input.schema()
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
         if self.tag_columns.is_empty() {
-            return vec![Distribution::SinglePartition];
+            return InputDistributionRequirements::new(vec![Distribution::SinglePartition]);
         }
 
         let schema = self.input.schema();
-        vec![Distribution::HashPartitioned(
+        InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
             self.tag_columns
                 .iter()
                 // Safety: the tag column names is verified in the planning phase
                 .map(|tag| Arc::new(ColumnExpr::new_with_schema(tag, &schema).unwrap()) as _)
                 .collect(),
-        )]
+        )])
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -351,8 +352,16 @@ impl ExecutionPlan for SeriesNormalizeExec {
         Some(self.metric.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn name(&self) -> &str {

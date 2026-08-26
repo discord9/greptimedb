@@ -37,7 +37,8 @@ use datafusion::physical_plan::expressions::{Column as PhyColumn, TryCastExpr as
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    Partitioning, PhysicalExpr, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+    InputDistributionRequirements, Partitioning, PhysicalExpr, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, StatisticsArgs,
 };
 use datafusion::prelude::{Column, Expr};
 use datafusion_expr::{EmptyRelation, col};
@@ -580,8 +581,10 @@ impl ExecutionPlan for HistogramFoldExec {
         vec![Some(OrderingRequirements::Hard(vec![requirement]))]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::HashPartitioned(self.partition_exprs.clone())]
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
+            self.partition_exprs.clone(),
+        )])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -670,7 +673,11 @@ impl ExecutionPlan for HistogramFoldExec {
         Some(self.metric.clone_inner())
     }
 
-    fn partition_statistics(&self, _: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,

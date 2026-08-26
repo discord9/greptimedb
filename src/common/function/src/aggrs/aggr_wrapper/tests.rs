@@ -43,7 +43,7 @@ use datafusion_expr::expr::{AggregateFunction, NullTreatment};
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{
     Aggregate, AggregateUDFImpl, ColumnarValue, Expr, LogicalPlan, ScalarFunctionArgs, SortExpr,
-    TableScan, lit,
+    TableScanBuilder, lit,
 };
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::expressions::col;
@@ -234,14 +234,12 @@ fn dummy_table_scan() -> LogicalPlan {
     let table_provider = Arc::new(DummyTableProvider::default());
     let table_source = DefaultTableSource::new(table_provider);
     LogicalPlan::TableScan(
-        TableScan::try_new(
-            TableReference::bare("Number"),
-            Arc::new(table_source),
-            None,
-            vec![],
-            None,
-        )
-        .unwrap(),
+        TableScanBuilder::new(TableReference::bare("Number"), Arc::new(table_source))
+            .with_projection(None)
+            .with_filters(vec![])
+            .with_fetch(None)
+            .build()
+            .unwrap(),
     )
 }
 
@@ -249,14 +247,12 @@ fn dummy_table_scan_with_ts() -> LogicalPlan {
     let table_provider = Arc::new(DummyTableProvider::with_ts(None));
     let table_source = DefaultTableSource::new(table_provider);
     LogicalPlan::TableScan(
-        TableScan::try_new(
-            TableReference::bare("Number"),
-            Arc::new(table_source),
-            None,
-            vec![],
-            None,
-        )
-        .unwrap(),
+        TableScanBuilder::new(TableReference::bare("Number"), Arc::new(table_source))
+            .with_projection(None)
+            .with_filters(vec![])
+            .with_fetch(None)
+            .build()
+            .unwrap(),
     )
 }
 
@@ -1108,14 +1104,12 @@ async fn test_udaf_correct_eval_result() {
         );
         let table_source = DefaultTableSource::new(Arc::new(table_provider));
         let logical_plan = LogicalPlan::TableScan(
-            TableScan::try_new(
-                test_table_ref.clone(),
-                Arc::new(table_source),
-                None,
-                vec![],
-                None,
-            )
-            .unwrap(),
+            TableScanBuilder::new(test_table_ref.clone(), Arc::new(table_source))
+                .with_projection(None)
+                .with_filters(vec![])
+                .with_fetch(None)
+                .build()
+                .unwrap(),
         );
 
         let args = case.args;

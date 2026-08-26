@@ -18,7 +18,7 @@ use catalog::RegisterTableRequest;
 use common_recordbatch::RecordBatch;
 use common_time::Timestamp;
 use datafusion_common::tree_node::TreeNode as _;
-use datafusion_expr::GroupingSet;
+use datafusion_expr::{GroupingSet, TableScanBuilder};
 use datatypes::prelude::{ConcreteDataType, MutableVector, Scalar, ScalarVectorBuilder, VectorRef};
 use datatypes::schema::{ColumnSchema, Schema};
 use datatypes::timestamp::TimestampMillisecond;
@@ -92,17 +92,15 @@ fn test_sink_scan(sink_table: TableRef, sink_table_name: &TableName) -> LogicalP
     let table_provider = Arc::new(DfTableProviderAdapter::new(sink_table));
     let table_source = Arc::new(DefaultTableSource::new(table_provider));
     LogicalPlan::TableScan(
-        TableScan::try_new(
+        TableScanBuilder::new(
             TableReference::Full {
                 catalog: sink_table_name[0].clone().into(),
                 schema: sink_table_name[1].clone().into(),
                 table: sink_table_name[2].clone().into(),
             },
             table_source,
-            None,
-            vec![],
-            None,
         )
+        .build()
         .unwrap(),
     )
 }

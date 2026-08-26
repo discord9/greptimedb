@@ -37,7 +37,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, StatisticsArgs,
 };
 use datafusion::physical_planner::PhysicalPlanner;
 use datafusion::prelude::{Expr, col, lit};
@@ -284,7 +284,12 @@ impl ExecutionPlan for EmptyMetricExec {
         Some(self.metric.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let partition = args.partition();
         if partition.is_some() {
             return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
         }

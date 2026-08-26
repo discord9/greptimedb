@@ -26,13 +26,14 @@ use datafusion::physical_plan::projection::{ProjectionExec, make_with_child, upd
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    Statistics, apply_expression_roots,
+    ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    InputDistributionRequirements, PlanProperties, ReplaceChildrenOptions,
+    SendableRecordBatchStream, Statistics, StatisticsArgs, apply_expression_roots,
 };
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{Extension, LogicalPlan, SortExpr, UserDefinedLogicalNodeCore};
-use datafusion_physical_expr::{Distribution, LexOrdering, OrderingRequirements, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, OrderingRequirements, PhysicalExpr};
 
 /// MergeSort Logical Plan, have same field as `Sort`, but indicate it is a merge sort,
 /// which assume each input partition is a sorted stream, and will use `SortPreserveingMergeExec`
@@ -189,8 +190,8 @@ impl ExecutionPlan for MergeSortExec {
             })
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.inner.required_input_distribution()
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        self.inner.input_distribution_requirements()
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -223,9 +224,10 @@ impl ExecutionPlan for MergeSortExec {
         apply_expression_roots(self.inner.expr().iter().map(|sort_expr| &sort_expr.expr), f)
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
@@ -234,11 +236,31 @@ impl ExecutionPlan for MergeSortExec {
             )));
         }
 
-        Ok(Arc::new(Self::new(
-            self.inner.expr().clone(),
-            children.swap_remove(0),
-            self.inner.fetch(),
-        )))
+        match options.children_properties {
+            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
+                inner: SortPreservingMergeExec::new(
+                    self.inner.expr().clone(),
+                    children.swap_remove(0),
+                )
+                .with_fetch(self.inner.fetch()),
+            })),
+            ChildrenPropertiesMode::Recompute => Ok(Arc::new(Self::new(
+                self.inner.expr().clone(),
+                children.swap_remove(0),
+                self.inner.fetch(),
+            ))),
+        }
+    }
+
+    #[allow(deprecated)]
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -253,8 +275,16 @@ impl ExecutionPlan for MergeSortExec {
         self.inner.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.inner.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.inner.child_stats_requests(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        self.inner.statistics_from_inputs(input_stats, args)
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {

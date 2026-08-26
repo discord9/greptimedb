@@ -20,7 +20,7 @@ use common_time::Timestamp;
 use common_time::range::TimestampRange;
 use common_time::timestamp::TimeUnit;
 use datafusion::common::ScalarValue;
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion_common::ToDFSchema;
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::tree_node::TreeNode;
@@ -185,7 +185,10 @@ impl Predicate {
         };
 
         for expr in &physical_exprs {
-            match PruningPredicate::try_new(expr.clone(), schema.clone()) {
+            match PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(expr.clone())
+            {
                 Ok(p) => match p.prune(stats) {
                     Ok(r) => {
                         for (curr_val, res) in r.into_iter().zip(res.iter_mut()) {
@@ -197,7 +200,7 @@ impl Predicate {
                     }
                 },
                 Err(e) => {
-                    // since dynamic filter exprs could be complex, it's possible that `PruningPredicate::try_new` fails to prove anything from it. In that case, we just log it and skip pruning with this expr.
+                    // since dynamic filter exprs could be complex, it's possible that the pruning predicate builder fails to prove anything from it. In that case, we just log it and skip pruning with this expr.
                     debug!("Failed to create pruning predicate for expr: {e:?}");
                 }
             }

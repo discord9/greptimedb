@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -24,6 +23,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions};
 use datafusion_common::Result as DataFusionResult;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
@@ -317,7 +317,10 @@ fn remove_repartition(
             if maybe_repartition.is::<RepartitionExec>() {
                 let maybe_scan = maybe_repartition.children()[0];
                 if maybe_scan.is::<RegionScanExec>() {
-                    let new_filter = plan.clone().with_new_children(vec![maybe_scan.clone()])?;
+                    let new_filter = plan.clone().replace_children(
+                        vec![maybe_scan.clone()],
+                        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                    )?;
                     return Ok(Transformed::yes(new_filter));
                 }
             }

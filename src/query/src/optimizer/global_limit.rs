@@ -21,7 +21,9 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, ReplaceChildrenOptions,
+};
 use datafusion_common::Result as DfResult;
 use datafusion_physical_expr::{Distribution, OrderingRequirements, Partitioning};
 
@@ -57,7 +59,7 @@ impl EnsureGlobalLimitForFetch {
         let plan = if children.is_empty() {
             plan
         } else {
-            let required_input_distribution = plan.required_input_distribution();
+            let required_input_distribution = plan.input_distribution_requirements();
             let required_input_ordering = plan.required_input_ordering();
             let maintains_input_order = plan.maintains_input_order();
             let child_parent = ParentContext {
@@ -72,7 +74,7 @@ impl EnsureGlobalLimitForFetch {
                 .enumerate()
                 .map(|(idx, child)| {
                     let required_distribution = required_input_distribution
-                        .get(idx)
+                        .child_distribution(idx)
                         .cloned()
                         .unwrap_or(Distribution::UnspecifiedDistribution);
                     let partitioning_to_restore =
@@ -101,7 +103,10 @@ impl EnsureGlobalLimitForFetch {
                     Self::optimize_plan(Arc::clone(child), parent)
                 })
                 .collect::<DfResult<Vec<_>>>()?;
-            plan.with_new_children(children)?
+            plan.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
         };
 
         let Some(fetch) = plan.fetch() else {

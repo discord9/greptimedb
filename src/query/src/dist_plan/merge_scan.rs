@@ -1422,6 +1422,7 @@ mod tests {
     use datafusion::config::ConfigOptions;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_plan::filter_pushdown::ChildFilterPushdownResult;
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
     use datafusion_common::TableReference;
     use datafusion_expr::{LogicalPlanBuilder, col, lit};
     use datafusion_physical_expr::Distribution;
@@ -1525,6 +1526,12 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    fn merge_scan_statistics(exec: &MergeScanExec) -> Arc<Statistics> {
+        StatisticsContext::new()
+            .compute(exec, &StatisticsArgs::new())
+            .unwrap()
     }
 
     fn task_context_with_engine_state(
@@ -1675,9 +1682,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            merge_scan_exec_with_plan(regions.clone(), limited, 10)
-                .partition_statistics(None)
-                .unwrap()
+            merge_scan_statistics(&merge_scan_exec_with_plan(regions.clone(), limited, 10))
                 .num_rows,
             Precision::Inexact(100)
         );
@@ -1691,10 +1696,12 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            merge_scan_exec_with_plan(vec![RegionId::new(1024, 1)], large_limit, 10)
-                .partition_statistics(None)
-                .unwrap()
-                .num_rows,
+            merge_scan_statistics(&merge_scan_exec_with_plan(
+                vec![RegionId::new(1024, 1)],
+                large_limit,
+                10,
+            ))
+            .num_rows,
             Precision::Inexact(large_bound)
         );
 
@@ -1704,17 +1711,16 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            merge_scan_exec_with_plan(regions.clone(), uncapped.clone(), 10)
-                .partition_statistics(None)
-                .unwrap()
-                .num_rows,
+            merge_scan_statistics(&merge_scan_exec_with_plan(
+                regions.clone(),
+                uncapped.clone(),
+                10,
+            ))
+            .num_rows,
             Precision::Absent
         );
         assert_eq!(
-            merge_scan_exec_with_plan(Vec::new(), uncapped, 10)
-                .partition_statistics(None)
-                .unwrap()
-                .num_rows,
+            merge_scan_statistics(&merge_scan_exec_with_plan(Vec::new(), uncapped, 10)).num_rows,
             Precision::Inexact(0)
         );
 
@@ -1728,10 +1734,12 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            merge_scan_exec_with_plan(regions.clone(), global_aggregate, 10)
-                .partition_statistics(None)
-                .unwrap()
-                .num_rows,
+            merge_scan_statistics(&merge_scan_exec_with_plan(
+                regions.clone(),
+                global_aggregate,
+                10,
+            ))
+            .num_rows,
             Precision::Inexact(2)
         );
 
@@ -1751,10 +1759,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            merge_scan_exec_with_plan(regions, grouping_sets, 10)
-                .partition_statistics(None)
-                .unwrap()
-                .num_rows,
+            merge_scan_statistics(&merge_scan_exec_with_plan(regions, grouping_sets, 10)).num_rows,
             Precision::Absent
         );
     }

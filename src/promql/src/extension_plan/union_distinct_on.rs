@@ -30,8 +30,9 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-    PlanProperties, RecordBatchStream, SendableRecordBatchStream, hash_utils,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, InputDistributionRequirements,
+    Partitioning, PhysicalExpr, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+    hash_utils,
 };
 use datafusion_expr::col;
 use datatypes::arrow::compute;
@@ -364,8 +365,11 @@ impl ExecutionPlan for UnionDistinctOnExec {
         self.output_schema.clone()
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition, Distribution::SinglePartition]
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::SinglePartition,
+            Distribution::SinglePartition,
+        ])
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
