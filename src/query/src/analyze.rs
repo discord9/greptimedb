@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{DataFusionError, assert_eq_or_internal_err, internal_err};
-use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -161,6 +161,13 @@ impl ExecutionPlan for DistAnalyzeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
+    ) -> DfResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     /// AnalyzeExec is handled specially so this value is ignored

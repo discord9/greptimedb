@@ -63,6 +63,7 @@ impl ExtensionAnalyzerRule for TypeConversionRule {
                 projected_schema,
                 filters,
                 fetch,
+                statistics_requests,
             }) => {
                 let mut converter = TypeConverter::new(projected_schema.clone(), ctx.query_ctx());
                 let rewrite_filters = filters
@@ -76,6 +77,7 @@ impl ExtensionAnalyzerRule for TypeConversionRule {
                     projected_schema,
                     filters: rewrite_filters,
                     fetch,
+                    statistics_requests,
                 })))
             }
             LogicalPlan::Projection { .. } => {
@@ -359,10 +361,9 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion_common::arrow::datatypes::Field;
-    use datafusion_common::{Column, DFSchema, NullEquality};
+    use datafusion_common::{Column, DFSchema, NullEquality, TableReference};
     use datafusion_expr::expr::{Cast, Exists};
     use datafusion_expr::{Join, JoinConstraint, JoinType, Literal, LogicalPlanBuilder, Subquery};
-    use datafusion_sql::TableReference;
     use session::context::QueryContext;
 
     use super::*;

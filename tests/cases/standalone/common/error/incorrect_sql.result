@@ -7,7 +7,8 @@ Error: 1001(Unsupported), SQL statement is not supported, keyword: SELEC
 -- Unrecognized column
 SELECT x FROM (SELECT 1 as y);
 
-Error: 3000(PlanQuery), Failed to plan SQL: No field named x. Valid fields are y.
+Error: 3000(PlanQuery), Failed to plan SQL: No field named x.
+Valid fields are y.
 
 -- Unrecognized function
 SELECT FUNFUNFUN();
@@ -18,7 +19,7 @@ Did you mean 'range_fn'?
 -- Wrong aggregate parameters
 SELECT SUM(42, 84, 11, 'hello');
 
-Error: 3000(PlanQuery), Failed to plan SQL: Error during planning: Internal error: Function 'sum' failed to match any signature, errors: Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4.
+Error: 3000(PlanQuery), Failed to plan SQL: Error during planning: Internal error: Function 'sum' failed to match any signature, errors: Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4,Error during planning: Function 'sum' expects 1 arguments but received 4.
 This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues. No function matches the given name and argument types 'sum(Int64, Int64, Int64, Utf8)'. You might need to add explicit type casts.
 	Candidate functions:
 	sum(Decimal)
@@ -26,6 +27,7 @@ This issue was likely caused by a bug in DataFusion's code. Please help us to re
 	sum(Int64)
 	sum(Float64)
 	sum(Duration)
+	sum(Interval)
 
 -- No matching function signature
 SELECT cos(0, 1, 2, 3);
@@ -70,12 +72,14 @@ Affected Rows: 0
 -- Non-existent column
 SELECT feathe FROM chickens;
 
-Error: 3000(PlanQuery), Failed to plan SQL: No field named feathe. Valid fields are chickens.feather, chickens.beak, chickens.ts.
+Error: 3000(PlanQuery), Failed to plan SQL: No field named feathe. Did you mean 'chickens.feather'?
+Valid fields are chickens.feather, chickens.beak, chickens.ts.
 
 -- Non-existent column with multiple tables
 SELECT feathe FROM chickens, integers, strings;
 
-Error: 3000(PlanQuery), Failed to plan SQL: No field named feathe. Valid fields are chickens.feather, chickens.beak, chickens.ts, integers.integ, integers.ts, strings.str, strings.ts.
+Error: 3000(PlanQuery), Failed to plan SQL: No field named feathe. Did you mean 'chickens.feather'?
+Valid fields are chickens.feather, chickens.beak, chickens.ts, integers.integ, integers.ts, strings.str, strings.ts.
 
 -- Ambiguous column reference
 SELECT ts FROM chickens, integers;

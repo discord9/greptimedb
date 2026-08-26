@@ -16,13 +16,12 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
-use datafusion_common::{Column, Result as DataFusionResult, ScalarValue};
+use datafusion_common::{Column, Result as DataFusionResult, ScalarValue, TableReference};
 use datafusion_expr::expr::{AggregateFunction, WindowFunction};
 use datafusion_expr::utils::COUNT_STAR_EXPANSION;
 use datafusion_expr::{Expr, LogicalPlan, WindowFunctionDefinition, col, lit};
 use datafusion_optimizer::AnalyzerRule;
 use datafusion_optimizer::utils::NamePreserver;
-use datafusion_sql::TableReference;
 use table::table::adapter::DfTableProviderAdapter;
 
 /// A replacement to DataFusion's [`CountWildcardRule`]. This rule
@@ -202,9 +201,8 @@ mod test {
     use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
     use datafusion::functions_aggregate::count::count_all;
     use datafusion::functions_aggregate::min_max::max;
-    use datafusion_common::Column;
+    use datafusion_common::{Column, TableReference};
     use datafusion_expr::LogicalPlanBuilder;
-    use datafusion_sql::TableReference;
     use datatypes::data_type::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema, SchemaBuilder};
     use datatypes::vectors::{Int64Vector, TimestampMillisecondVector, VectorRef};

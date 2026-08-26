@@ -35,6 +35,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion_expr::expr::Expr;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::utils::conjunction;
 use datatypes::schema::SchemaRef;
 use object_store::ObjectStore;
@@ -138,8 +139,13 @@ fn new_parquet_stream_with_exec_plan(
             .to_dfschema_ref()
             .context(error::ParquetScanPlanSnafu)?;
 
-        let filters = create_physical_expr(&expr, &df_schema, &ExecutionProps::new())
-            .context(error::ParquetScanPlanSnafu)?;
+        let filters = create_physical_expr(
+            &expr,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .context(error::ParquetScanPlanSnafu)?;
         parquet_source = parquet_source.with_predicate(filters);
     };
 

@@ -42,6 +42,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Column as ColumnExpr, DataFusionError, Result, Statistics};
 use datafusion_expr::{Expr, Extension, FetchType, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion_physical_expr::expressions::Column;
@@ -866,7 +867,7 @@ impl MergeScanExec {
     }
 
     pub fn try_with_new_distribution(&self, distribution: Distribution) -> Option<Self> {
-        let Distribution::HashPartitioned(hash_exprs) = distribution else {
+        let Distribution::KeyPartitioned(hash_exprs) = distribution else {
             // not applicable
             return None;
         };
@@ -1154,6 +1155,15 @@ impl ExecutionPlan for MergeScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion_physical_expr::PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     // DataFusion will swap children unconditionally.
@@ -3267,7 +3277,7 @@ mod tests {
         // A distribution that differs from the current partitioning but shares a
         // column name present in partition_cols, so try_with_new_distribution
         // produces a clone instead of returning None.
-        let new_dist = Distribution::HashPartitioned(vec![
+        let new_dist = Distribution::KeyPartitioned(vec![
             Arc::new(Column::new("col1", 0)),
             Arc::new(Column::new("col2", 1)),
         ]);

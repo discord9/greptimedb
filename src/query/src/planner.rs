@@ -15,6 +15,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -46,9 +47,12 @@ use sql::statements::explain::ExplainStatement;
 use sql::statements::query::Query;
 use sql::statements::statement::Statement;
 use sql::statements::tql::Tql;
+use sqlparser::ast::{
+    FunctionArg, FunctionArgExpr, FunctionArguments, Statement as SqlStatement, visit_expressions,
+};
 
 use crate::error::{
-    CteColumnSchemaMismatchSnafu, PlanSqlSnafu, QueryPlanSnafu, Result, SqlSnafu,
+    CteColumnSchemaMismatchSnafu, PlanSqlSnafu, QueryPlanSnafu, RangeQuerySnafu, Result, SqlSnafu,
     UnimplementedSnafu,
 };
 use crate::log_query::planner::LogQueryPlanner;
@@ -76,6 +80,35 @@ pub trait LogicalPlanner: Send + Sync {
 pub struct DfLogicalPlanner {
     engine_state: Arc<QueryEngineState>,
     session_state: SessionState,
+}
+
+fn range_query_has_nested_range(stmt: &SqlStatement) -> bool {
+    let mut nested = false;
+    let _ = visit_expressions(stmt, |expr| {
+        if let sqlparser::ast::Expr::Function(function) = expr
+            && function.name.to_string().eq_ignore_ascii_case("range_fn")
+            && let FunctionArguments::List(args) = &function.args
+            && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(range_expr))) = args.args.first()
+        {
+            let mut inner_range = false;
+            let _ = visit_expressions(range_expr, |expr| {
+                if let sqlparser::ast::Expr::Function(function) = expr
+                    && function.name.to_string().eq_ignore_ascii_case("range_fn")
+                {
+                    inner_range = true;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            if inner_range {
+                nested = true;
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    nested
 }
 
 impl DfLogicalPlanner {
@@ -140,13 +173,15 @@ impl DfLogicalPlanner {
             // notice format is already set in query context, so can be ignore here
             Ok(LogicalPlan::Analyze(Analyze {
                 verbose,
+                format: ExplainFormat::Indent,
                 input: plan,
                 schema,
+                analyze_level: None,
+                analyze_categories: None,
             }))
         } else {
             let stringified_plans = vec![plan.to_stringified(PlanType::InitialLogicalPlan)];
 
-            // default to configuration value
             let options = self.session_state.config().options();
             let format = format
                 .map(|x| ExplainFormat::from_str(&x))
@@ -160,6 +195,7 @@ impl DfLogicalPlanner {
                 stringified_plans,
                 schema,
                 logical_optimization_succeeded: false,
+                show_statistics: None,
             }))
         }
     }
@@ -236,6 +272,15 @@ impl DfLogicalPlanner {
         };
 
         let sql_to_rel = SqlToRel::new_with_options(&context_provider, parser_options);
+
+        if let datafusion::sql::parser::Statement::Statement(sql_stmt) = &df_stmt
+            && range_query_has_nested_range(sql_stmt)
+        {
+            return RangeQuerySnafu {
+                msg: "Nest Range Query is not allowed",
+            }
+            .fail();
+        }
 
         // this IF is to handle different version of ASTs
         let result = if is_tql_cte {
@@ -665,6 +710,8 @@ mod tests {
     use catalog::RegisterTableRequest;
     use catalog::memory::MemoryCatalogManager;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_time::Timezone;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema};
@@ -846,6 +893,68 @@ mod tests {
             .plan(&stmt, QueryContext::arc())
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn range_query_nested_range_is_scoped_to_outer_range_argument() {
+        let query = QueryLanguageParser::parse_sql(
+            "SELECT min(max(field_0) RANGE '20s') RANGE '20s' FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let sql_stmt = match query {
+            QueryStatement::Sql(Statement::Query(query)) => {
+                sqlparser::ast::Statement::Query(Box::new(query.inner))
+            }
+            _ => unreachable!(),
+        };
+        assert!(range_query_has_nested_range(&sql_stmt));
+
+        let siblings = QueryLanguageParser::parse_sql(
+            "SELECT min(field_0) RANGE '20s', max(field_0) RANGE '20s' FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let sql_stmt = match siblings {
+            QueryStatement::Sql(Statement::Query(query)) => {
+                sqlparser::ast::Statement::Query(Box::new(query.inner))
+            }
+            _ => unreachable!(),
+        };
+        assert!(!range_query_has_nested_range(&sql_stmt));
+
+        let wrapped = QueryLanguageParser::parse_sql(
+            "SELECT sin(min(field_0) RANGE '20s') FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let sql_stmt = match wrapped {
+            QueryStatement::Sql(Statement::Query(query)) => {
+                sqlparser::ast::Statement::Query(Box::new(query.inner))
+            }
+            _ => unreachable!(),
+        };
+        assert!(!range_query_has_nested_range(&sql_stmt));
+    }
+
+    #[tokio::test]
+    async fn range_query_nested_range_returns_invalid_syntax() {
+        let query = QueryLanguageParser::parse_sql(
+            "SELECT min(max(field_0) RANGE '20s') RANGE '20s' FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let engine = create_test_engine().await;
+        let error = engine
+            .planner()
+            .plan(&query, QueryContext::arc())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Range Query: Nest Range Query is not allowed"
+        );
+        assert_eq!(error.status_code(), StatusCode::InvalidSyntax);
     }
 
     async fn parse_promql_to_plan(query: &str) -> LogicalPlan {

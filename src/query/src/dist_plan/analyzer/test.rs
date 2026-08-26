@@ -30,7 +30,7 @@ use datafusion::functions_aggregate::expr_fn::avg;
 use datafusion::functions_aggregate::min_max::{max, min};
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{ExprSchema, JoinType, ScalarValue};
+use datafusion_common::{ExprSchema, JoinType, ScalarValue, TableReference};
 use datafusion_expr::expr::{Exists, ScalarFunction};
 use datafusion_expr::utils::split_conjunction;
 use datafusion_expr::{
@@ -39,7 +39,6 @@ use datafusion_expr::{
 };
 use datafusion_functions::datetime::date_bin;
 use datafusion_functions::datetime::expr_fn::now;
-use datafusion_sql::TableReference;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, SchemaBuilder, SchemaRef};
 use futures::Stream;

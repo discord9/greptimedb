@@ -36,6 +36,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::{AggregateFunction, AggregateFunctionParams};
 use datafusion_expr::function::StateFieldsArgs;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{
     Accumulator, Aggregate, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, ExprSchemable,
     GroupsAccumulator, LogicalPlan, Signature,
@@ -216,6 +217,7 @@ impl StateMergeHelper {
                 aggr.input.schema(),
                 aggr.input.schema().as_arrow(),
                 &Default::default(),
+                &PhysicalPlanningContext::default(),
             )
             .with_name(name)
             .with_human_display(human_display)
@@ -574,11 +576,10 @@ impl GroupsAccumulator for StateGroupsAccum {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> datafusion_common::Result<()> {
         self.inner
-            .merge_batch(values, group_indices, opt_filter, total_num_groups)
+            .merge_batch(values, group_indices, total_num_groups)
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> datafusion_common::Result<ArrayRef> {
@@ -596,10 +597,6 @@ impl GroupsAccumulator for StateGroupsAccum {
         opt_filter: Option<&BooleanArray>,
     ) -> datafusion_common::Result<Vec<ArrayRef>> {
         self.inner.convert_to_state(values, opt_filter)
-    }
-
-    fn supports_convert_to_state(&self) -> bool {
-        self.inner.supports_convert_to_state()
     }
 
     fn size(&self) -> usize {

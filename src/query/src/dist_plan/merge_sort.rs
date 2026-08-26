@@ -27,11 +27,12 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    Statistics,
+    Statistics, apply_expression_roots,
 };
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{Extension, LogicalPlan, SortExpr, UserDefinedLogicalNodeCore};
-use datafusion_physical_expr::{Distribution, LexOrdering, OrderingRequirements};
+use datafusion_physical_expr::{Distribution, LexOrdering, OrderingRequirements, PhysicalExpr};
 
 /// MergeSort Logical Plan, have same field as `Sort`, but indicate it is a merge sort,
 /// which assume each input partition is a sorted stream, and will use `SortPreserveingMergeExec`
@@ -213,6 +214,13 @@ impl ExecutionPlan for MergeSortExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.inner.children()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(self.inner.expr().iter().map(|sort_expr| &sort_expr.expr), f)
     }
 
     fn with_new_children(
@@ -422,6 +430,13 @@ mod tests {
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(

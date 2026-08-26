@@ -29,7 +29,7 @@ use common_function::handlers::{
 use common_function::state::FunctionState;
 use common_stat::get_total_memory_bytes;
 use common_telemetry::warn;
-use datafusion::catalog::TableFunction;
+use datafusion::catalog::{Session, TableFunction};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::SessionStateBuilder;
@@ -233,11 +233,6 @@ impl QueryEngineState {
         physical_optimizer
             .rules
             .insert(7, Arc::new(PromqlTsidNarrowJoin));
-        // Enforce sorting AFTER custom rules that modify the plan structure
-        physical_optimizer.rules.insert(
-            8,
-            Arc::new(datafusion::physical_optimizer::enforce_sorting::EnforceSorting {}),
-        );
         // Add rule for windowed sort
         physical_optimizer
             .rules
@@ -502,10 +497,10 @@ impl QueryPlanner for DfQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &DfLogicalPlan,
-        session_state: &SessionState,
+        session: &dyn Session,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         self.physical_planner
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(logical_plan, session)
             .await
     }
 }

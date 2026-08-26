@@ -37,7 +37,8 @@ use datafusion_expr::{
 };
 use datatypes::arrow;
 use datatypes::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Int64Array, ListArray, UInt64Array,
+    Array, ArrayRef, AsArray, BooleanArray, Int64Array, ListArray, ListBuilder, UInt64Array,
+    UInt64Builder,
 };
 use datatypes::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use datatypes::arrow::datatypes::{DataType, Field, FieldRef};
@@ -258,11 +259,36 @@ impl GroupsAccumulator for CountHashGroupAccumulator {
         Ok(Arc::new(Int64Array::from(counts)))
     }
 
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        assert_eq!(values.len(), 1, "count_hash expects a single argument");
+        let array = &values[0];
+        let mut hashes = vec![0; array.len()];
+        if array.data_type() != &DataType::Null {
+            create_hashes(&[ArrayRef::clone(array)], &self.random_state, &mut hashes)?;
+        }
+
+        let mut builder = ListBuilder::new(UInt64Builder::with_capacity(array.len()))
+            .with_field(Arc::new(Field::new_list_field(DataType::UInt64, true)));
+        for row in 0..array.len() {
+            let included = array.is_valid(row)
+                && opt_filter.is_none_or(|filter| filter.is_valid(row) && filter.value(row));
+            if included {
+                builder.values().append_value(hashes[row]);
+            }
+            builder.append(true);
+        }
+
+        Ok(vec![Arc::new(builder.finish())])
+    }
+
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
         assert_eq!(
@@ -386,8 +412,16 @@ impl Accumulator for CountHashAccumulator {
             &self.random_state,
             &mut self.batch_hashes,
         )?;
-        for hash in &self.batch_hashes {
-            self.values.insert(*hash);
+        if let Some(nulls) = arr.logical_nulls() {
+            for (&hash, is_valid) in self.batch_hashes.iter().zip(nulls.iter()) {
+                if is_valid {
+                    self.values.insert(hash);
+                }
+            }
+        } else {
+            for &hash in &self.batch_hashes {
+                self.values.insert(hash);
+            }
         }
         Ok(())
     }
@@ -466,7 +500,7 @@ mod tests {
         ])) as ArrayRef;
         acc.update_batch(&[array])?;
         let result = acc.evaluate()?;
-        assert_eq!(result, ScalarValue::Int64(Some(4)));
+        assert_eq!(result, ScalarValue::Int64(Some(3)));
 
         // Test with empty data
         let mut acc = create_test_accumulator();
@@ -480,7 +514,38 @@ mod tests {
         let array = Arc::new(Int32Array::from(vec![None, None, None])) as ArrayRef;
         acc.update_batch(&[array])?;
         let result = acc.evaluate()?;
-        assert_eq!(result, ScalarValue::Int64(Some(1)));
+        assert_eq!(result, ScalarValue::Int64(Some(0)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_hash_null_inputs_agree() -> Result<()> {
+        let values = Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])) as ArrayRef;
+
+        let mut scalar = create_test_accumulator();
+        scalar.update_batch(&[Arc::clone(&values)])?;
+        let scalar_count = scalar.evaluate()?;
+
+        let mut group = create_test_group_accumulator();
+        let group_indices = vec![0; values.len()];
+        group.update_batch(&[Arc::clone(&values)], &group_indices, None, 1)?;
+        let group_result = group.evaluate(EmitTo::All)?;
+        let group_count = group_result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        let converter = create_test_group_accumulator();
+        let converted_state = converter.convert_to_state(&[values], None)?;
+        let mut converted = create_test_accumulator();
+        converted.merge_batch(&converted_state)?;
+        let converted_count = converted.evaluate()?;
+
+        assert_eq!(scalar_count, ScalarValue::Int64(Some(2)));
+        assert_eq!(group_count, 2);
+        assert_eq!(converted_count, ScalarValue::Int64(Some(2)));
 
         Ok(())
     }
@@ -672,8 +737,7 @@ mod tests {
         )
         .await?;
 
-        assert!(!create_test_group_accumulator().supports_convert_to_state());
-        assert_eq!(skipped_rows, 0, "the row-hash skip path must be disabled");
+        assert!(skipped_rows > 0, "the row-hash skip path must be exercised");
         assert_eq!(results.get(&1), Some(&1));
         assert_eq!(results.get(&2), Some(&1));
         assert_eq!(results.get(&3), Some(&0));
@@ -695,7 +759,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(skipped_rows, 0, "the row-hash skip path must be disabled");
+        assert!(skipped_rows > 0, "the row-hash skip path must be exercised");
         assert_eq!(results.get(&1), Some(&1));
         assert_eq!(results.get(&2), Some(&1));
         assert_eq!(results.get(&3), Some(&0));
@@ -771,7 +835,7 @@ mod tests {
         // We will merge acc1's group 0 into acc2's group 0
         // and acc1's group 1 into acc2's group 2
         let merge_group_indices = vec![0, 2];
-        acc2.merge_batch(&state1, &merge_group_indices, None, 3)?;
+        acc2.merge_batch(&state1, &merge_group_indices, 3)?;
 
         let result_array = acc2.evaluate(EmitTo::All)?;
         let result = result_array.as_any().downcast_ref::<Int64Array>().unwrap();

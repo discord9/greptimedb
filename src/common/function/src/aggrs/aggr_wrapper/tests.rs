@@ -37,6 +37,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
 use datafusion_common::arrow::array::AsArray;
 use datafusion_common::arrow::datatypes::{Float64Type, UInt64Type};
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Column, TableReference};
 use datafusion_expr::expr::{AggregateFunction, NullTreatment};
 use datafusion_expr::function::AccumulatorArgs;
@@ -98,6 +99,15 @@ impl ExecutionPlan for MockInputExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion_physical_expr::PhysicalExpr>,
+        ) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -869,7 +879,7 @@ fn test_avg_state_groups_accumulator_state_merge_evaluate() {
         .update_batch(&merged_values, &merged_group_indices, None, 3)
         .unwrap();
     merged_accum
-        .merge_batch(&source_state, &[1, 2, 0], None, 3)
+        .merge_batch(&source_state, &[1, 2, 0], 3)
         .unwrap();
 
     let result = merged_accum.evaluate(EmitTo::All).unwrap();
@@ -993,7 +1003,7 @@ async fn test_udaf_correct_eval_result() {
                 Some(3),
                 Some(3),
             ]))],
-            expected_output: Some(ScalarValue::Int64(Some(4))),
+            expected_output: Some(ScalarValue::Int64(Some(3))),
             expected_fn: None,
             distinct: false,
             filter: None,

@@ -244,6 +244,7 @@ mod tests {
     use datafusion::physical_plan::get_plan_string;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::expr::ScalarFunction;
+    use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion_expr::{Expr, Literal, ScalarUDF};
     use datafusion_physical_expr::{ScalarFunctionExpr, create_physical_expr};
     use datatypes::prelude::ConcreteDataType;
@@ -339,6 +340,7 @@ mod tests {
             )),
             &DFSchema::try_from(batch.schema().clone()).unwrap(),
             &Default::default(),
+            &PhysicalPlanningContext::default(),
         )
         .unwrap();
 
@@ -404,6 +406,7 @@ mod tests {
             )),
             &DFSchema::try_from(batch.schema().clone()).unwrap(),
             &Default::default(),
+            &PhysicalPlanningContext::default(),
         )
         .unwrap();
 

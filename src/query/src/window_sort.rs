@@ -37,10 +37,12 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    apply_expression_roots,
 };
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::bisect;
 use datafusion_common::{DataFusionError, internal_err};
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datatypes::value::Value;
 use futures::Stream;
 use itertools::Itertools;
@@ -204,6 +206,13 @@ impl ExecutionPlan for WindowedSortExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        apply_expression_roots([&self.expression.expr], f)
     }
 
     fn with_new_children(

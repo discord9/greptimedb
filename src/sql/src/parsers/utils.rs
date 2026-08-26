@@ -22,10 +22,9 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_common::tree_node::{TreeNode, TreeNodeVisitor};
-use datafusion_common::{DFSchema, ScalarValue};
+use datafusion_common::{DFSchema, ScalarValue, TableReference};
 use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::{AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
-use datafusion_sql::TableReference;
 use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datatypes::arrow::datatypes::DataType;
 use datatypes::schema::{

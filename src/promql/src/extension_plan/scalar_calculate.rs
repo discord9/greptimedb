@@ -18,18 +18,20 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::common::stats::Precision;
-use datafusion::common::{DFSchema, DFSchemaRef, Result as DataFusionResult, Statistics};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{
+    DFSchema, DFSchemaRef, Result as DataFusionResult, Statistics, TableReference,
+};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::{EmptyRelation, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
+    PlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion::prelude::Expr;
-use datafusion::sql::TableReference;
 use datafusion_expr::col;
 use datatypes::arrow::array::{Array, ArrayRef, Float64Array, TimestampMillisecondArray};
 use datatypes::arrow::compute::{CastOptions, cast_with_options, concat_batches};
@@ -128,7 +130,10 @@ impl ScalarCalculate {
             .output_schema
             .fields()
             .iter()
-            .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
+            .map(|field| {
+                Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(field.metadata().clone())
+            })
             .collect();
         let input_schema = exec_input.schema();
         let ts_index = input_schema
@@ -137,7 +142,10 @@ impl ScalarCalculate {
         let val_index = input_schema
             .index_of(&self.field_column)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ));
         let properties = exec_input.properties();
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -388,6 +396,13 @@ struct ScalarCalculateExec {
 }
 
 impl ExecutionPlan for ScalarCalculateExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

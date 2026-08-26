@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use common_query::native_histogram::{START_TIMESTAMP_FIELD, native_histogram_arrow_type};
 use datafusion::arrow::array::{Array, BooleanArray, StructArray};
 use datafusion::arrow::compute;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DFSchema, DFSchemaRef, Result as DataFusionResult, Statistics};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
@@ -28,8 +29,8 @@ use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream,
 };
 use datafusion_expr::col;
 use datatypes::arrow::array::TimestampMillisecondArray;
@@ -265,6 +266,13 @@ pub struct SeriesNormalizeExec {
 }
 
 impl ExecutionPlan for SeriesNormalizeExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }

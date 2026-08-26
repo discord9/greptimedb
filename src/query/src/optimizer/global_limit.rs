@@ -196,7 +196,7 @@ fn partitioning_to_restore_for(
     child: &Arc<dyn ExecutionPlan>,
     required_distribution: &Distribution,
 ) -> Option<Partitioning> {
-    if !matches!(required_distribution, Distribution::HashPartitioned(_))
+    if !matches!(required_distribution, Distribution::KeyPartitioned(_))
         || child.output_partitioning().partition_count() <= 1
     {
         return None;
@@ -233,7 +233,7 @@ fn inherited_partitioning_to_restore(
 
     let satisfies_parent_distribution = matches!(
         parent.required_distribution,
-        Distribution::HashPartitioned(_)
+        Distribution::KeyPartitioned(_)
     ) && plan
         .output_partitioning()
         .satisfaction(

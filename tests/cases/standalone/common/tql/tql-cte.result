@@ -244,8 +244,8 @@ SELECT round(avg(summary)) as avg_sum FROM tql_agg;
 |               |         Aggregate: groupBy=[[labels.ts]], aggr=[[sum(labels.cpu)]]                                                                                                                        |
 |               |           PromInstantManipulate: range=[0..40000], lookback=[300000], interval=[10000], time index=[ts]                                                                                   |
 |               |             PromSeriesDivide: tags=["host"]                                                                                                                                               |
-|               |               Filter: labels.host ~ Utf8("^(?:host.*)$") AND labels.ts >= TimestampMillisecond(-299999, None) AND labels.ts <= TimestampMillisecond(40000, None)                          |
-|               |                 TableScan: labels, partial_filters=[labels.host ~ Utf8("^(?:host.*)$"), labels.ts >= TimestampMillisecond(-299999, None), labels.ts <= TimestampMillisecond(40000, None)] |
+|               |               Filter: labels.ts >= TimestampMillisecond(-299999, None) AND labels.ts <= TimestampMillisecond(40000, None) AND labels.host ~ Utf8("^(?:host.*)$")                          |
+|               |                 TableScan: labels, partial_filters=[labels.ts >= TimestampMillisecond(-299999, None), labels.ts <= TimestampMillisecond(40000, None), labels.host ~ Utf8("^(?:host.*)$")] |
 |               | ]]                                                                                                                                                                                        |
 | physical_plan | CooperativeExec                                                                                                                                                                           |
 |               |   MergeScanExec: REDACTED

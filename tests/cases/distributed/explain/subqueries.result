@@ -598,8 +598,8 @@ EXPLAIN SELECT x FROM (VALUES (2),(1)) v(x) ORDER BY x;
 |_|_SubqueryAlias: v_|
 |_|_Projection: column1 AS x_|
 |_|_Values: (Int64(2)), (Int64(1))_|
-| physical_plan | SortExec: expr=[x@0 ASC NULLS LAST], preserve_partitioning=[false] |
-|_|_ProjectionExec: expr=[column1@0 as x]_|
+| physical_plan | ProjectionExec: expr=[column1@0 as x]_|
+|_|_SortExec: expr=[column1@0 ASC NULLS LAST], preserve_partitioning=[false] |
 |_|_DataSourceExec: partitions=1, partition_sizes=[1]_|
 |_|_|
 +-+-+

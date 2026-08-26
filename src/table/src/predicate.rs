@@ -25,6 +25,7 @@ use datafusion_common::ToDFSchema;
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::expr::{Expr, InList};
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Between, BinaryExpr, Operator};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
@@ -143,8 +144,13 @@ impl Predicate {
         // registering variables.
         let execution_props = &ExecutionProps::new();
 
-        create_physical_expr(expr, df_schema.as_ref(), execution_props)
-            .context(error::DatafusionSnafu)
+        create_physical_expr(
+            expr,
+            df_schema.as_ref(),
+            execution_props,
+            &PhysicalPlanningContext::default(),
+        )
+        .context(error::DatafusionSnafu)
     }
 
     /// Builds physical exprs according to provided schema.

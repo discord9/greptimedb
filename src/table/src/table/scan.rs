@@ -35,9 +35,10 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    RecordBatchStream as DfRecordBatchStream,
+    RecordBatchStream as DfRecordBatchStream, apply_expression_roots,
 };
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{ColumnStatistics, DataFusionError, Statistics};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{
@@ -390,6 +391,17 @@ impl ExecutionPlan for RegionScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        self.output_ordering
+            .as_ref()
+            .map_or(Ok(TreeNodeRecursion::Continue), |ordering| {
+                apply_expression_roots(ordering.iter().map(|sort_expr| &sort_expr.expr), f)
+            })
     }
 
     fn with_new_children(

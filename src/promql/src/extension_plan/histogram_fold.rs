@@ -24,6 +24,7 @@ use datafusion::arrow::compute::{SortOptions, concat_batches};
 use datafusion::arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DFSchema, DFSchemaRef, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
@@ -525,6 +526,16 @@ pub struct HistogramFoldExec {
 }
 
 impl ExecutionPlan for HistogramFoldExec {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.tag_columns.iter().chain(self.partition_exprs.iter()),
+            f,
+        )
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

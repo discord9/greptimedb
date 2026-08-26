@@ -69,7 +69,7 @@ impl PassDistribution {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // If this is a MergeScanExec, try to apply the current requirement.
         if let Some(merge_scan) = plan.downcast_ref::<MergeScanExec>()
-            && let Some(Distribution::HashPartitioned(hash_exprs)) = current_req.as_ref()
+            && let Some(Distribution::KeyPartitioned(hash_exprs)) = current_req.as_ref()
         {
             if let Partitioning::Hash(current_hash_exprs, _) = &merge_scan.properties().partitioning
                 && *current_hash_exprs == *hash_exprs
@@ -78,7 +78,7 @@ impl PassDistribution {
             }
 
             if let Some(new_plan) = merge_scan
-                .try_with_new_distribution(Distribution::HashPartitioned(hash_exprs.clone()))
+                .try_with_new_distribution(Distribution::KeyPartitioned(hash_exprs.clone()))
             {
                 // Leaf node; no children to process
                 return Ok(Arc::new(new_plan) as _);
@@ -129,7 +129,7 @@ impl PassDistribution {
         plan: &dyn ExecutionPlan,
         current_req: &Option<Distribution>,
     ) -> Option<Distribution> {
-        let Some(Distribution::HashPartitioned(required_exprs)) = current_req else {
+        let Some(Distribution::KeyPartitioned(required_exprs)) = current_req else {
             return None;
         };
 
@@ -141,7 +141,7 @@ impl PassDistribution {
             .collect::<Vec<_>>();
         let mapped = map_columns_before_projection(required_exprs, &proj_exprs);
 
-        (mapped.len() == required_exprs.len()).then_some(Distribution::HashPartitioned(mapped))
+        (mapped.len() == required_exprs.len()).then_some(Distribution::KeyPartitioned(mapped))
     }
 }
 
@@ -289,7 +289,7 @@ mod tests {
     fn merge_scan_rejects_hash_requirement_on_partition_key_subset() {
         let merge_scan = test_merge_scan_exec(test_schema());
 
-        let new_plan = merge_scan.try_with_new_distribution(Distribution::HashPartitioned(vec![
+        let new_plan = merge_scan.try_with_new_distribution(Distribution::KeyPartitioned(vec![
             partition_column(DATA_SCHEMA_TSID_COLUMN_NAME, 1),
         ]));
 
