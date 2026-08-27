@@ -26,7 +26,7 @@ use std::sync::Arc;
 use ahash::RandomState;
 use datafusion_common::cast::as_list_array;
 use datafusion_common::error::Result;
-use datafusion_common::hash_utils::{RandomState as FixedState, create_hashes};
+use datafusion_common::hash_utils::create_hashes_with_hasher;
 use datafusion_common::utils::SingleRowListArrayBuilder;
 use datafusion_common::{ScalarValue, internal_err, not_impl_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -49,6 +49,14 @@ type HashValueType = u64;
 
 // read from /dev/urandom 4047821dc6144e4b2abddf23ad4171126a52eeecd26eff2191cf673b965a7875
 const RANDOM_SEED_0: u64 = 0x4047821dc6144e4b;
+const RANDOM_SEED_1: u64 = 0x2abddf23ad417112;
+const RANDOM_SEED_2: u64 = 0x6a52eeecd26eff21;
+const RANDOM_SEED_3: u64 = 0x91cf673b965a7875;
+
+// Keep the ahash v1 state used by the serialized count_hash state. Changing
+// this state changes the meaning of every hash in an intermediate state.
+const AHASH_V1_RANDOM_STATE: RandomState =
+    RandomState::with_seeds(RANDOM_SEED_0, RANDOM_SEED_1, RANDOM_SEED_2, RANDOM_SEED_3);
 
 impl CountHash {
     pub fn register(registry: &FunctionRegistry) {
@@ -104,7 +112,7 @@ impl AggregateUDFImpl for CountHash {
 
         Ok(Box::new(CountHashAccumulator {
             values: HashSet::default(),
-            random_state: FixedState::with_seed(RANDOM_SEED_0),
+            random_state: AHASH_V1_RANDOM_STATE,
             batch_hashes: vec![],
         }))
     }
@@ -150,7 +158,7 @@ impl AggregateUDFImpl for CountHash {
 pub struct CountHashGroupAccumulator {
     /// One HashSet per group to track distinct values
     distinct_sets: Vec<HashSet<HashValueType, RandomState>>,
-    random_state: FixedState,
+    random_state: RandomState,
     batch_hashes: Vec<HashValueType>,
 }
 
@@ -164,7 +172,7 @@ impl CountHashGroupAccumulator {
     pub fn new() -> Self {
         Self {
             distinct_sets: vec![],
-            random_state: FixedState::with_seed(RANDOM_SEED_0),
+            random_state: AHASH_V1_RANDOM_STATE,
             batch_hashes: vec![],
         }
     }
@@ -191,11 +199,7 @@ impl GroupsAccumulator for CountHashGroupAccumulator {
         let array = &values[0];
         self.batch_hashes.clear();
         self.batch_hashes.resize(array.len(), 0);
-        create_hashes(
-            &[ArrayRef::clone(array)],
-            &self.random_state,
-            &mut self.batch_hashes,
-        )?;
+        create_hashes_with_hasher([array], &self.random_state, &mut self.batch_hashes)?;
         let hashes = &self.batch_hashes;
 
         // Use a pattern similar to accumulate_indices to process rows
@@ -268,13 +272,19 @@ impl GroupsAccumulator for CountHashGroupAccumulator {
         let array = &values[0];
         let mut hashes = vec![0; array.len()];
         if array.data_type() != &DataType::Null {
-            create_hashes(&[ArrayRef::clone(array)], &self.random_state, &mut hashes)?;
+            create_hashes_with_hasher([array], &self.random_state, &mut hashes)?;
         }
 
+        // Compute logical nulls once before constructing the state. In
+        // particular, dictionary values may be null even when the dictionary
+        // array itself has no physical null bitmap.
+        let logical_nulls = array.logical_nulls();
         let mut builder = ListBuilder::new(UInt64Builder::with_capacity(array.len()))
             .with_field(Arc::new(Field::new_list_field(DataType::UInt64, true)));
         for (row, &hash) in hashes.iter().enumerate() {
-            let included = array.is_valid(row)
+            let included = logical_nulls
+                .as_ref()
+                .is_none_or(|nulls| nulls.is_valid(row))
                 && opt_filter.is_none_or(|filter| filter.is_valid(row) && filter.value(row));
             if included {
                 builder.values().append_value(hash);
@@ -374,7 +384,7 @@ impl GroupsAccumulator for CountHashGroupAccumulator {
 #[derive(Debug)]
 struct CountHashAccumulator {
     values: HashSet<HashValueType, RandomState>,
-    random_state: FixedState,
+    random_state: RandomState,
     batch_hashes: Vec<HashValueType>,
 }
 
@@ -407,11 +417,7 @@ impl Accumulator for CountHashAccumulator {
 
         self.batch_hashes.clear();
         self.batch_hashes.resize(arr.len(), 0);
-        create_hashes(
-            &[ArrayRef::clone(arr)],
-            &self.random_state,
-            &mut self.batch_hashes,
-        )?;
+        create_hashes_with_hasher([arr], &self.random_state, &mut self.batch_hashes)?;
         if let Some(nulls) = arr.logical_nulls() {
             for (&hash, is_valid) in self.batch_hashes.iter().zip(nulls.iter()) {
                 if is_valid {
@@ -471,7 +477,11 @@ mod tests {
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::test::TestMemoryExec;
     use datafusion::physical_plan::{ExecutionPlan, collect, collect_partitioned};
-    use datatypes::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
+    use datatypes::arrow::array::{
+        Array, BooleanArray, DictionaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+        Int32Array, Int64Array, StringArray,
+    };
+    use datatypes::arrow::buffer::Buffer;
     use datatypes::arrow::datatypes::Schema;
     use datatypes::arrow::record_batch::RecordBatch;
 
@@ -480,7 +490,7 @@ mod tests {
     fn create_test_accumulator() -> CountHashAccumulator {
         CountHashAccumulator {
             values: HashSet::default(),
-            random_state: FixedState::with_seed(RANDOM_SEED_0),
+            random_state: AHASH_V1_RANDOM_STATE,
             batch_hashes: vec![],
         }
     }
@@ -516,6 +526,145 @@ mod tests {
         let result = acc.evaluate()?;
         assert_eq!(result, ScalarValue::Int64(Some(0)));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_hash_serialized_hash_vectors() -> Result<()> {
+        let int_values = Arc::new(Int32Array::from(vec![1, 2, 3, 42])) as ArrayRef;
+        let string_values =
+            Arc::new(StringArray::from(vec!["", "foo", "bar", "greptime"])) as ArrayRef;
+        for (values, expected) in [
+            (
+                int_values,
+                [
+                    3520623206881679283,
+                    16267663279875310162,
+                    16422880750557392924,
+                    7252379638962005787,
+                ],
+            ),
+            (
+                string_values,
+                [
+                    18009168453573014612,
+                    10396535899549028891,
+                    11005861365722079054,
+                    1809722114723738005,
+                ],
+            ),
+        ] {
+            let mut hashes = vec![0; values.len()];
+            create_hashes_with_hasher([&values], &AHASH_V1_RANDOM_STATE, &mut hashes)?;
+            assert_eq!(hashes, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_hash_float_raw_bit_vectors() -> Result<()> {
+        let cases: [(ArrayRef, [u64; 2]); 3] = [
+            (
+                Arc::new(Float64Array::from(vec![0.0, -0.0])) as ArrayRef,
+                [10235160885650180287, 5570633911902918511],
+            ),
+            (
+                Arc::new(Float32Array::from(vec![0.0, -0.0])) as ArrayRef,
+                [10235160885650180287, 1123207262851531737],
+            ),
+            (
+                Arc::new(Float16Array::new(
+                    ScalarBuffer::from(Buffer::from_slice_ref([0_u16, 0x8000_u16])),
+                    None,
+                )) as ArrayRef,
+                [10235160885650180287, 5283916240992853682],
+            ),
+        ];
+        for (array, expected) in cases {
+            let mut hashes = vec![0; array.len()];
+            create_hashes_with_hasher([&array], &AHASH_V1_RANDOM_STATE, &mut hashes)?;
+            assert_eq!(hashes, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_hash_float_paths_and_state_merge_agree() -> Result<()> {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0, 0.0]));
+
+        let mut scalar = create_test_accumulator();
+        scalar.update_batch(&[Arc::clone(&values)])?;
+        let scalar_state = scalar.state()?;
+
+        let mut group = create_test_group_accumulator();
+        group.update_batch(&[Arc::clone(&values)], &[0, 0, 0], None, 1)?;
+        let group_count = group
+            .evaluate(EmitTo::All)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        let mut group_for_state = create_test_group_accumulator();
+        group_for_state.update_batch(&[Arc::clone(&values)], &[0, 0, 0], None, 1)?;
+        let group_state = group_for_state.state(EmitTo::All)?;
+
+        let converter = create_test_group_accumulator();
+        let converted_state = converter.convert_to_state(&[Arc::clone(&values)], None)?;
+        let mut converted = create_test_accumulator();
+        converted.merge_batch(&converted_state)?;
+
+        assert_eq!(scalar.evaluate()?, ScalarValue::Int64(Some(2)));
+        assert_eq!(group_count, 2);
+        assert_eq!(converted.evaluate()?, ScalarValue::Int64(Some(2)));
+
+        let mut merged = create_test_accumulator();
+        merged.merge_batch(&[scalar_state[0].to_array()?])?;
+        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(2)));
+
+        // Group state is also the same two raw-bit hashes and can be merged
+        // independently into an accumulator.
+        let mut merged_group = create_test_accumulator();
+        merged_group.merge_batch(&[group_state[0].clone()])?;
+        assert_eq!(merged_group.evaluate()?, ScalarValue::Int64(Some(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_hash_dictionary_nulls_agree() -> Result<()> {
+        use datatypes::arrow::datatypes::Int8Type;
+
+        let dictionary_values =
+            Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")])) as ArrayRef;
+        let keys = Int8Array::from(vec![0, 1, 2, 1]);
+        let dictionary = Arc::new(DictionaryArray::<Int8Type>::try_new(
+            keys,
+            dictionary_values,
+        )?) as ArrayRef;
+
+        let mut scalar = create_test_accumulator();
+        scalar.update_batch(&[Arc::clone(&dictionary)])?;
+        let scalar_count = scalar.evaluate()?;
+
+        let mut grouped = create_test_group_accumulator();
+        let group_indices = vec![0; dictionary.len()];
+        grouped.update_batch(&[Arc::clone(&dictionary)], &group_indices, None, 1)?;
+        let grouped_count = grouped
+            .evaluate(EmitTo::All)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        let converter = create_test_group_accumulator();
+        let converted_state = converter.convert_to_state(&[dictionary], None)?;
+        let mut converted = create_test_accumulator();
+        converted.merge_batch(&converted_state)?;
+        let converted_count = converted.evaluate()?;
+
+        assert_eq!(scalar_count, ScalarValue::Int64(Some(2)));
+        assert_eq!(grouped_count, 2);
+        assert_eq!(converted_count, ScalarValue::Int64(Some(2)));
         Ok(())
     }
 

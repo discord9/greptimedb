@@ -48,7 +48,7 @@ use sql::statements::query::Query;
 use sql::statements::statement::Statement;
 use sql::statements::tql::Tql;
 use sqlparser::ast::{
-    FunctionArg, FunctionArgExpr, FunctionArguments, Statement as SqlStatement, visit_expressions,
+    Expr as SqlParserExpr, ObjectNamePart, Statement as SqlStatement, Visit, Visitor,
 };
 
 use crate::error::{
@@ -82,33 +82,43 @@ pub struct DfLogicalPlanner {
     session_state: SessionState,
 }
 
+fn is_range_fn(expr: &SqlParserExpr) -> bool {
+    let SqlParserExpr::Function(function) = expr else {
+        return false;
+    };
+
+    matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(ident)]
+        if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("range_fn"))
+}
+
 fn range_query_has_nested_range(stmt: &SqlStatement) -> bool {
-    let mut nested = false;
-    let _ = visit_expressions(stmt, |expr| {
-        if let sqlparser::ast::Expr::Function(function) = expr
-            && function.name.to_string().eq_ignore_ascii_case("range_fn")
-            && let FunctionArguments::List(args) = &function.args
-            && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(range_expr))) = args.args.first()
-        {
-            let mut inner_range = false;
-            let _ = visit_expressions(range_expr, |expr| {
-                if let sqlparser::ast::Expr::Function(function) = expr
-                    && function.name.to_string().eq_ignore_ascii_case("range_fn")
-                {
-                    inner_range = true;
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+    struct RangeQueryVisitor {
+        range_depth: usize,
+    }
+
+    impl Visitor for RangeQueryVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlParserExpr) -> ControlFlow<Self::Break> {
+            if is_range_fn(expr) {
+                if self.range_depth > 0 {
+                    return ControlFlow::Break(());
                 }
-            });
-            if inner_range {
-                nested = true;
-                return ControlFlow::Break(());
+                self.range_depth += 1;
             }
+            ControlFlow::Continue(())
         }
-        ControlFlow::Continue(())
-    });
-    nested
+
+        fn post_visit_expr(&mut self, expr: &SqlParserExpr) -> ControlFlow<Self::Break> {
+            if is_range_fn(expr) {
+                self.range_depth -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = RangeQueryVisitor { range_depth: 0 };
+    stmt.visit(&mut visitor).is_break()
 }
 
 impl DfLogicalPlanner {
@@ -935,6 +945,30 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(!range_query_has_nested_range(&sql_stmt));
+
+        let nested_in_another_argument = QueryLanguageParser::parse_sql(
+            "SELECT covariance(field_0, min(field_0) RANGE '20s') RANGE '20s' FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let sql_stmt = match nested_in_another_argument {
+            QueryStatement::Sql(Statement::Query(query)) => {
+                sqlparser::ast::Statement::Query(Box::new(query.inner))
+            }
+            _ => unreachable!(),
+        };
+        assert!(range_query_has_nested_range(&sql_stmt));
+
+        let nested_dml = QueryLanguageParser::parse_sql(
+            "INSERT INTO test (id) SELECT covariance(field_0, min(field_0) RANGE '20s') RANGE '20s' FROM test ALIGN '1m'",
+            &QueryContext::arc(),
+        )
+        .unwrap();
+        let sql_stmt = match nested_dml {
+            QueryStatement::Sql(Statement::Insert(insert)) => insert.inner,
+            _ => unreachable!(),
+        };
+        assert!(range_query_has_nested_range(&sql_stmt));
     }
 
     #[tokio::test]

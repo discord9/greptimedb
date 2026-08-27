@@ -1666,19 +1666,19 @@ async fn test_execute_query_external_table_json_default_ts_column(instance: Arc<
 +--------------------+----------------------+-----+------+--------------------------+---------------+
 | Column             | Type                 | Key | Null | Default                  | Semantic Type |
 +--------------------+----------------------+-----+------+--------------------------+---------------+
-| environment        | String               |     | YES  |                          | FIELD         |
-| greptime_timestamp | TimestampMillisecond | PRI | NO   | 1970-01-01 00:00:00+0000 | TIMESTAMP     |
 | hostname           | String               |     | YES  |                          | FIELD         |
-| usage_guest        | Int64                |     | YES  |                          | FIELD         |
-| usage_guest_nice   | Int64                |     | YES  |                          | FIELD         |
+| environment        | String               |     | YES  |                          | FIELD         |
+| usage_user         | Int64                |     | YES  |                          | FIELD         |
+| usage_system       | Int64                |     | YES  |                          | FIELD         |
 | usage_idle         | Int64                |     | YES  |                          | FIELD         |
+| usage_nice         | Int64                |     | YES  |                          | FIELD         |
 | usage_iowait       | Int64                |     | YES  |                          | FIELD         |
 | usage_irq          | Int64                |     | YES  |                          | FIELD         |
-| usage_nice         | Int64                |     | YES  |                          | FIELD         |
 | usage_softirq      | Int64                |     | YES  |                          | FIELD         |
 | usage_steal        | Int64                |     | YES  |                          | FIELD         |
-| usage_system       | Int64                |     | YES  |                          | FIELD         |
-| usage_user         | Int64                |     | YES  |                          | FIELD         |
+| usage_guest        | Int64                |     | YES  |                          | FIELD         |
+| usage_guest_nice   | Int64                |     | YES  |                          | FIELD         |
+| greptime_timestamp | TimestampMillisecond | PRI | NO   | 1970-01-01 00:00:00+0000 | TIMESTAMP     |
 +--------------------+----------------------+-----+------+--------------------------+---------------+";
     check_output_stream(output, expect).await;
 
@@ -1686,15 +1686,15 @@ async fn test_execute_query_external_table_json_default_ts_column(instance: Arc<
         .await
         .data;
     let expect = "\
-+-------------+---------------------+----------+-------------+------------------+------------+--------------+-----------+------------+---------------+-------------+--------------+------------+
-| environment | greptime_timestamp  | hostname | usage_guest | usage_guest_nice | usage_idle | usage_iowait | usage_irq | usage_nice | usage_softirq | usage_steal | usage_system | usage_user |
-+-------------+---------------------+----------+-------------+------------------+------------+--------------+-----------+------------+---------------+-------------+--------------+------------+
-| test        | 2023-04-01T00:00:00 | host_0   | 59          | 72               | 36         | 61           | 21        | 72         | 53            | 12          | 58           | 32         |
-| staging     | 2023-04-01T00:00:00 | host_1   | 72          | 2                | 50         | 19           | 73        | 84         | 38            | 37          | 32           | 12         |
-| test        | 2023-04-01T00:00:00 | host_2   | 53          | 94               | 40         | 64           | 39        | 95         | 21            | 63          | 5            | 98         |
-| test        | 2023-04-01T00:00:00 | host_3   | 36          | 23               | 7          | 99           | 67        | 48         | 14            | 86          | 95           | 98         |
-| test        | 2023-04-01T00:00:00 | host_4   | 20          | 7                | 11         | 64           | 9         | 53         | 17            | 39          | 44           | 32         |
-+-------------+---------------------+----------+-------------+------------------+------------+--------------+-----------+------------+---------------+-------------+--------------+------------+";
++----------+-------------+------------+--------------+------------+------------+--------------+-----------+---------------+-------------+-------------+------------------+---------------------+
+| hostname | environment | usage_user | usage_system | usage_idle | usage_nice | usage_iowait | usage_irq | usage_softirq | usage_steal | usage_guest | usage_guest_nice | greptime_timestamp  |
++----------+-------------+------------+--------------+------------+------------+--------------+-----------+---------------+-------------+-------------+------------------+---------------------+
+| host_0   | test        | 32         | 58           | 36         | 72         | 61           | 21        | 53            | 12          | 59          | 72               | 2023-04-01T00:00:00 |
+| host_1   | staging     | 12         | 32           | 50         | 84         | 19           | 73        | 38            | 37          | 72          | 2                | 2023-04-01T00:00:00 |
+| host_2   | test        | 98         | 5            | 40         | 95         | 64           | 39        | 21            | 63          | 53          | 94               | 2023-04-01T00:00:00 |
+| host_3   | test        | 98         | 95           | 7          | 48         | 99           | 67        | 14            | 86          | 36          | 23               | 2023-04-01T00:00:00 |
+| host_4   | test        | 32         | 44           | 11         | 53         | 64           | 9         | 17            | 39          | 20          | 7                | 2023-04-01T00:00:00 |
++----------+-------------+------------+--------------+------------+------------+--------------+-----------+---------------+-------------+-------------+------------------+---------------------+";
     check_output_stream(output, expect).await;
 }
 
@@ -3275,28 +3275,32 @@ async fn test_copy_parquet_map_to_json(instance: Arc<dyn MockInstance>) {
         r#"{"complex":"structure","nested":"data"}"#,
     ];
 
-    let binary: Vec<String> = expected_jsons
+    let expected_jsons: std::collections::BTreeMap<usize, serde_json::Value> = expected_jsons
         .iter()
-        .map(|json_str| {
-            let jsonb_value = jsonb::parse_value(json_str.as_bytes()).unwrap();
-            hex::encode(jsonb_value.to_vec())
-        })
+        .enumerate()
+        .map(|(id, json)| (id + 1, serde_json::from_str(json).unwrap()))
         .collect();
 
-    let expected = format!(
-        r#"+----+-----------------------------------------+----------------------------------------------------------------------------------------------+
-| id | json_to_string(map_json_test.map_data)  | map_data                                                                                     |
-+----+-----------------------------------------+----------------------------------------------------------------------------------------------+
-| 1  | {{"a":"1","b":"2","c":"hello"}}           | {:<92} |
-| 2  | {{"x":"42","y":"test"}}                   | {:<92} |
-| 3  | {{}}                                      | {:<92} |
-| 4  | {{"single":"value"}}                      | {:<92} |
-| 5  | {{"complex":"structure","nested":"data"}} | {:<92} |
-+----+-----------------------------------------+----------------------------------------------------------------------------------------------+"#,
-        binary[0], binary[1], binary[2], binary[3], binary[4],
-    );
+    let batches = match output {
+        OutputData::Stream(stream) => util::collect_batches(stream).await.unwrap(),
+        _ => unreachable!(),
+    };
+    let mut actual_jsons = std::collections::BTreeMap::new();
+    for batch in batches.iter() {
+        for (id, json) in batch
+            .iter_column_as_string(0)
+            .zip(batch.iter_column_as_string(1))
+        {
+            let id = id.unwrap().parse::<usize>().unwrap();
+            let json: serde_json::Value = serde_json::from_str(&json.unwrap()).unwrap();
+            assert!(
+                actual_jsons.insert(id, json).is_none(),
+                "duplicate id: {id}"
+            );
+        }
+    }
 
-    check_output_stream(output, &expected).await;
+    assert_eq!(actual_jsons, expected_jsons);
 }
 
 #[apply(standalone_instance_case)]
@@ -3334,16 +3338,33 @@ async fn test_copy_parquet_map_to_binary(instance: Arc<dyn MockInstance>) {
     .await
     .data;
 
-    let expected = r#"+----+-----------------------------------------+
-| id | map_bin_test.map_data                   |
-+----+-----------------------------------------+
-| 1  | {"a":"1","b":"2","c":"hello"}           |
-| 2  | {"x":"42","y":"test"}                   |
-| 3  | {}                                      |
-| 4  | {"single":"value"}                      |
-| 5  | {"complex":"structure","nested":"data"} |
-+----+-----------------------------------------+"#;
-    check_output_stream(output, expected).await;
+    let expected_jsons = [
+        (1, r#"{"a":"1","b":"2","c":"hello"}"#),
+        (2, r#"{"x":"42","y":"test"}"#),
+        (3, r#"{}"#),
+        (4, r#"{"single":"value"}"#),
+        (5, r#"{"complex":"structure","nested":"data"}"#),
+    ]
+    .into_iter()
+    .map(|(id, json)| (id, serde_json::from_str::<serde_json::Value>(json).unwrap()))
+    .collect::<std::collections::BTreeMap<_, _>>();
+
+    let batches = match output {
+        OutputData::Stream(stream) => util::collect_batches(stream).await.unwrap(),
+        _ => unreachable!(),
+    };
+    let mut actual_jsons = std::collections::BTreeMap::new();
+    for batch in batches.iter() {
+        for (id, json) in batch
+            .iter_column_as_string(0)
+            .zip(batch.iter_column_as_string(1))
+        {
+            let id = id.unwrap().parse::<usize>().unwrap();
+            let json = serde_json::from_str(&json.unwrap()).unwrap();
+            assert!(actual_jsons.insert(id, json).is_none(), "duplicate id {id}");
+        }
+    }
+    assert_eq!(actual_jsons, expected_jsons);
 }
 
 #[apply(both_instances_cases)]

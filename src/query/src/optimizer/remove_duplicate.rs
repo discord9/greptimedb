@@ -58,7 +58,7 @@ impl PhysicalOptimizerRule for RemoveDuplicate {
     }
 
     fn name(&self) -> &str {
-        "remove_duplicate"
+        "RemoveDuplicateRule"
     }
 
     fn schema_check(&self) -> bool {
