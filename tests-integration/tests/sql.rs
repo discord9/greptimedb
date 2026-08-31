@@ -707,16 +707,16 @@ pub async fn test_postgres_crud(store_type: StorageType) {
 
         let expected_j = serde_json::json!({
             "code": i,
-            "success": true,
             "payload": {
                 "features": [
                     "serde",
                     "json"
                 ],
                 "homepage": null
-            }
+            },
+            "success": true
         });
-        assert_eq!(json.to_string(), expected_j.to_string());
+        assert_eq!(json, expected_j);
     }
 
     let rows = sqlx::query("select i from demo where i=$1")
