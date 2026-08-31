@@ -19,6 +19,8 @@ WITH(
 -- SQLNESS REPLACE (cpu_usage\.ts_range) ts_range
 -- SQLNESS REPLACE (cpu_usage\.ts) ts
 -- SQLNESS REPLACE (?m)^\|_\|_\|_SortExec:.*\n
+-- SQLNESS REPLACE (?m)^\|_\|_\|_RepartitionExec:.*\n
+-- SQLNESS REPLACE (?m)^\|_\|_\|_SortPreservingMergeExec:.*\n
 -- SQLNESS REPLACE (SeriesScan:.*|SeqScan:.*) ScanExec: REDACTED
 -- SQLNESS REPLACE (peers.*) REDACTED
 -- SQLNESS REPLACE region=\d+\(\d+,\s+\d+\) region=REDACTED

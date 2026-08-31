@@ -57,6 +57,7 @@ jobs:
 
             - name: Warn when Cargo.lock diff exceeds 500 lines
               if: ${{ fromJSON(steps.diff.outputs.total || '0') > 500 }}
+              continue-on-error: true
               uses: marocchino/sticky-pull-request-comment@v2
               with:
                   header: cargo-lock-diff-warning
@@ -73,6 +74,7 @@ jobs:
 
             - name: Hide resolved warning
               if: ${{ fromJSON(steps.diff.outputs.total || '0') <= 500 }}
+              continue-on-error: true
               uses: marocchino/sticky-pull-request-comment@v2
               with:
                   header: cargo-lock-diff-warning

@@ -77,8 +77,8 @@ GROUP BY t."db" ORDER BY c DESC, t."db";
 |               |             Aggregate: groupBy=[[cte_join_logs.db]], aggr=[[count(cte_join_logs.ts) AS count(Int64(1))]] |
 |               |               TableScan: cte_join_logs                                                                   |
 |               | ]]                                                                                                       |
-| physical_plan | SortPreservingMergeExec: [c@1 DESC, db@0 ASC NULLS LAST]                                                 |
-|               |   ProjectionExec: expr=[db@0 as db, count(Int64(1))@1 as c]                                              |
+| physical_plan | ProjectionExec: expr=[db@0 as db, count(Int64(1))@1 as c]                                                |
+|               |   SortPreservingMergeExec: [count(Int64(1))@1 DESC, db@0 ASC NULLS LAST]                                 |
 |               |     SortExec: expr=[count(Int64(1))@1 DESC, db@0 ASC NULLS LAST], preserve_REDACTED
 |               |       AggregateExec: mode=FinalPartitioned, gby=[db@0 as db], aggr=[count(Int64(1))]                     |
 |               |         RepartitionExec: REDACTED
