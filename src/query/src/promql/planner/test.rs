@@ -23,11 +23,14 @@ use common_query::native_histogram::{
     CUSTOM_BUCKETS_SCHEMA, CounterResetHint, NativeHistogram, build_histogram_array,
 };
 use common_query::prelude::{greptime_native_histogram, greptime_timestamp, greptime_value};
-use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
+use common_query::prometheus::{
+    PROMETHEUS_STALE_NAN_BITS, PROMQL_FIELD_ROLE_KEY, PROMQL_METRIC_NAME_ROLE,
+};
 use common_query::test_util::DummyDecoder;
 use common_recordbatch::RecordBatch as GreptimeRecordBatch;
 use datafusion::arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, UInt32Array,
+    UInt64Array,
 };
 use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -36,7 +39,7 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::Extension;
+use datafusion::logical_expr::{Extension, UserDefinedLogicalNode};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema};
 use promql::extension_plan::HistogramFold;
@@ -64,6 +67,121 @@ fn find_instant_manipulate(plan: &LogicalPlan) -> Option<&InstantManipulate> {
     }
 
     plan.inputs().into_iter().find_map(find_instant_manipulate)
+}
+
+fn find_histogram_fold(plan: &LogicalPlan) -> Option<&HistogramFold> {
+    if let LogicalPlan::Extension(Extension { node }) = plan
+        && let Some(histogram_fold) = node.as_any().downcast_ref::<HistogramFold>()
+    {
+        return Some(histogram_fold);
+    }
+
+    plan.inputs().into_iter().find_map(find_histogram_fold)
+}
+
+/// The name of the single `Float64` sample column of `plan`, ignoring the metric-name marker.
+fn float_sample_column(plan: &LogicalPlan) -> String {
+    let marker = PromPlanner::metric_name_column(plan.schema())
+        .unwrap()
+        .map(|marker| marker.name);
+    let mut sample_columns = plan
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| {
+            field.data_type() == &ArrowDataType::Float64 && marker.as_ref() != Some(field.name())
+        })
+        .map(|field| field.name().clone());
+    let sample_column = sample_columns
+        .next()
+        .unwrap_or_else(|| panic!("expected a float sample column: {}", plan.display_indent()));
+    assert!(
+        sample_columns.next().is_none(),
+        "expected exactly one float sample column: {}",
+        plan.display_indent()
+    );
+    sample_column
+}
+
+/// `(series tag, timestamp in milliseconds, sample value)` of every emitted `cv_metric` sample,
+/// sorted by series tag.
+fn cv_rows(batches: &[RecordBatch], value_column: &str) -> Vec<(String, i64, f64)> {
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let tag = batch
+                .column_by_name("k")
+                .expect("no series tag column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the series tag must be a string column");
+            let timestamp = batch
+                .column_by_name("timestamp")
+                .expect("no timestamp column")
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("the time index must be a millisecond timestamp column");
+            let value = batch
+                .column_by_name(value_column)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no sample value column {value_column} in {}",
+                        batch.schema()
+                    )
+                })
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("the sample value must be a float column");
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        tag.value(row).to_string(),
+                        timestamp.value(row),
+                        value.value(row),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+/// The dropped metric-name identity must be gone from the physical batches as well.
+fn assert_metric_name_not_in_batches(batches: &[RecordBatch]) {
+    for batch in batches {
+        let schema = batch.schema();
+        assert!(
+            schema.field_with_name(PROMQL_METRIC_NAME_COLUMN).is_err(),
+            "the metric-name marker must not reach the result batches: {schema:?}"
+        );
+        assert!(
+            schema
+                .fields()
+                .iter()
+                .all(|field| field.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none()),
+            "no result batch field may carry the metric-name role: {schema:?}"
+        );
+    }
+}
+
+/// The kept metric-name identity must still be visible in the result batches' Arrow metadata.
+fn assert_metric_name_in_batches(batches: &[RecordBatch], marker: &str) {
+    assert!(!batches.is_empty(), "expected at least one result batch");
+    for batch in batches {
+        let schema = batch.schema();
+        let field = schema
+            .field_with_name(marker)
+            .unwrap_or_else(|_| panic!("the marker must reach the result batches: {schema:?}"));
+        assert_eq!(
+            field
+                .metadata()
+                .get(PROMQL_FIELD_ROLE_KEY)
+                .map(String::as_str),
+            Some(PROMQL_METRIC_NAME_ROLE),
+            "the result batch must mark the metric-name field: {schema:?}"
+        );
+    }
 }
 
 fn build_query_engine_state() -> QueryEngineState {
@@ -764,28 +882,51 @@ async fn build_missing_le_or_normal_metric_table_provider() -> DfTableSourceProv
     .await
 }
 
+/// Whether a schema field is the metadata-marked PromQL metric-name identity rather than an
+/// ordinary label or sample column.
+fn is_marked_metric_name_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(PROMQL_FIELD_ROLE_KEY)
+        .map(String::as_str)
+        == Some(PROMQL_METRIC_NAME_ROLE)
+}
+
+/// A raw PromQL plan carries the metadata-marked metric-name identity next to exactly four
+/// ordinary fields: the `pod`/`instance` labels, the time index and the sample.
 fn assert_normal_metric_schema(plan: &LogicalPlan) {
-    let fields = plan.schema().fields();
-    assert_eq!(fields.len(), 4, "{fields:?}");
+    let (marked, ordinary): (Vec<_>, Vec<_>) = plan
+        .schema()
+        .fields()
+        .iter()
+        .partition(|field| is_marked_metric_name_field(field));
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    assert_eq!(
+        marked[0].name().as_str(),
+        PROMQL_METRIC_NAME_COLUMN,
+        "{marked:?}"
+    );
+    assert_eq!(marked[0].data_type(), &ArrowDataType::Utf8, "{marked:?}");
+    assert_eq!(ordinary.len(), 4, "{ordinary:?}");
     assert!(
-        fields.iter().any(|field| field.name() == "pod"),
-        "{fields:?}"
+        ordinary.iter().any(|field| field.name() == "pod"),
+        "{ordinary:?}"
     );
     assert!(
-        fields.iter().any(|field| field.name() == "instance"),
-        "{fields:?}"
+        ordinary.iter().any(|field| field.name() == "instance"),
+        "{ordinary:?}"
     );
     assert!(
-        fields
+        ordinary
             .iter()
             .any(|field| field.name() == greptime_timestamp()),
-        "{fields:?}"
+        "{ordinary:?}"
     );
     assert!(
-        fields.iter().any(|field| {
+        ordinary.iter().any(|field| {
             field.name() == greptime_value() && field.data_type() == &ArrowDataType::Float64
         }),
-        "{fields:?}"
+        "{ordinary:?}"
     );
 }
 
@@ -1501,6 +1642,183 @@ async fn build_test_table_provider_with_tsid_tag_fields(
     )
 }
 
+/// The `__tsid` constants used by [`build_cross_logical_table_tsid_provider`]'s physical rows.
+///
+/// `query` does not depend on `metric-engine`, so the fixture cannot call
+/// `metric_engine::row_modifier::TsidGenerator` (which hashes the sorted present label
+/// names and values with `FxHasher`); the values are hand-written instead. What these
+/// tests establish is the binary-match/execution behavior for equal TSIDs across logical
+/// tables (and the absence of a match for distinct TSIDs), not TSID generation itself.
+const CROSS_TABLE_TSID: u64 = 0x0123_4567_89ab_cdef;
+const OTHER_TABLE_TSID: u64 = 0xfedc_ba98_7654_3210;
+
+/// Builds a metric-engine-shaped catalogue with real data: a physical table holding one
+/// sample for each of the two logical tables `left_metric` (table id 1024, value 2.0) and
+/// `right_metric` (table id 1025, value 3.0), both with the same tag `tag_0="a"` and the
+/// same timestamp. `left_tsid`/`right_tsid` set the two rows' `__tsid` so a binary match
+/// pairs the logical tables only when the TSIDs are equal.
+fn build_cross_logical_table_tsid_provider(
+    left_tsid: u64,
+    right_tsid: u64,
+) -> DfTableSourceProvider {
+    const PHYSICAL_TABLE_ID: u32 = 999;
+    const LEFT_TABLE_ID: u32 = 1024;
+    const RIGHT_TABLE_ID: u32 = 1025;
+
+    let catalog = MemoryCatalogManager::with_default_setup();
+
+    // The shared physical table: `__table_id` and `__tsid` are internal columns, and each
+    // row carries the values its logical table would have written.
+    let physical_name = "phy";
+    let columns = vec![
+        ColumnSchema::new(
+            DATA_SCHEMA_TABLE_ID_COLUMN_NAME.to_string(),
+            ConcreteDataType::uint32_datatype(),
+            false,
+        ),
+        ColumnSchema::new(
+            DATA_SCHEMA_TSID_COLUMN_NAME.to_string(),
+            ConcreteDataType::uint64_datatype(),
+            false,
+        ),
+        ColumnSchema::new(
+            "tag_0".to_string(),
+            ConcreteDataType::string_datatype(),
+            false,
+        ),
+        ColumnSchema::new(
+            "timestamp".to_string(),
+            ConcreteDataType::timestamp_millisecond_datatype(),
+            false,
+        )
+        .with_time_index(true),
+        ColumnSchema::new(
+            "field_0".to_string(),
+            ConcreteDataType::float64_datatype(),
+            true,
+        ),
+    ];
+    let schema = Arc::new(Schema::new(columns));
+    let batch = RecordBatch::try_new(
+        schema.arrow_schema().clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![LEFT_TABLE_ID, RIGHT_TABLE_ID])) as Arc<dyn Array>,
+            Arc::new(UInt64Array::from(vec![left_tsid, right_tsid])),
+            Arc::new(StringArray::from(vec!["a", "a"])),
+            Arc::new(TimestampMillisecondArray::from(vec![1_000, 1_000])),
+            Arc::new(Float64Array::from(vec![2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+    let backing = GreptimeMemTable::new_with_catalog(
+        physical_name,
+        GreptimeRecordBatch::from_df_record_batch(schema.clone(), batch),
+        PHYSICAL_TABLE_ID,
+        DEFAULT_CATALOG_NAME.to_string(),
+        DEFAULT_SCHEMA_NAME.to_string(),
+    );
+    let table_meta = TableMetaBuilder::empty()
+        .schema(schema)
+        .primary_key_indices(vec![0, 1, 2])
+        .value_indices(vec![3, 4])
+        .engine(METRIC_ENGINE_NAME.to_string())
+        .next_column_id(1024)
+        .build()
+        .unwrap();
+    let table_info = Arc::new(
+        TableInfoBuilder::default()
+            .table_id(PHYSICAL_TABLE_ID)
+            .name(physical_name)
+            .meta(table_meta)
+            .build()
+            .unwrap(),
+    );
+    let physical = Arc::new(Table::new(
+        table_info,
+        FilterPushDownType::Unsupported,
+        backing.data_source(),
+    ));
+    assert!(
+        catalog
+            .register_table_sync(RegisterTableRequest {
+                catalog: DEFAULT_CATALOG_NAME.to_string(),
+                schema: DEFAULT_SCHEMA_NAME.to_string(),
+                table_name: physical_name.to_string(),
+                table_id: PHYSICAL_TABLE_ID,
+                table: physical,
+            })
+            .is_ok()
+    );
+
+    // The two logical tables only describe the shared label set; their samples live in
+    // the physical table, which the planner scans with a `__table_id` filter.
+    for (table_name, table_id) in [
+        ("left_metric", LEFT_TABLE_ID),
+        ("right_metric", RIGHT_TABLE_ID),
+    ] {
+        let columns = vec![
+            ColumnSchema::new(
+                "tag_0".to_string(),
+                ConcreteDataType::string_datatype(),
+                false,
+            ),
+            ColumnSchema::new(
+                "timestamp".to_string(),
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+            ColumnSchema::new(
+                "field_0".to_string(),
+                ConcreteDataType::float64_datatype(),
+                true,
+            ),
+        ];
+        let schema = Arc::new(Schema::new(columns));
+        let mut options = table::requests::TableOptions::default();
+        options.extra_options.insert(
+            LOGICAL_TABLE_METADATA_KEY.to_string(),
+            physical_name.to_string(),
+        );
+        let table_meta = TableMetaBuilder::empty()
+            .schema(schema)
+            .primary_key_indices(vec![0])
+            .value_indices(vec![2])
+            .engine(METRIC_ENGINE_NAME.to_string())
+            .options(options)
+            .next_column_id(1024)
+            .build()
+            .unwrap();
+        let table_info = TableInfoBuilder::default()
+            .table_id(table_id)
+            .name(table_name)
+            .meta(table_meta)
+            .build()
+            .unwrap();
+        let table = EmptyTable::from_table_info(&table_info);
+
+        assert!(
+            catalog
+                .register_table_sync(RegisterTableRequest {
+                    catalog: DEFAULT_CATALOG_NAME.to_string(),
+                    schema: DEFAULT_SCHEMA_NAME.to_string(),
+                    table_name: table_name.to_string(),
+                    table_id,
+                    table,
+                })
+                .is_ok()
+        );
+    }
+
+    DfTableSourceProvider::new(
+        catalog,
+        false,
+        QueryContext::arc(),
+        DummyDecoder::arc(),
+        false,
+    )
+}
+
 async fn build_test_table_provider_with_fields(
     table_name_tuples: &[(String, String)],
     tags: &[&str],
@@ -1603,13 +1921,15 @@ async fn do_single_instant_function_call(fn_name: &'static str, plan_name: &str)
         .unwrap();
 
     let expected = String::from(
-        "Filter: TEMPLATE(field_0) IS NOT NULL [timestamp:Timestamp(ms), TEMPLATE(field_0):Float64;N, tag_0:Utf8]\
-            \n  Projection: some_metric.timestamp, TEMPLATE(some_metric.field_0) AS TEMPLATE(field_0), some_metric.tag_0 [timestamp:Timestamp(ms), TEMPLATE(field_0):Float64;N, tag_0:Utf8]\
-            \n    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-	            \n          Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"
+        "Projection: some_metric.timestamp, TEMPLATE(field_0), some_metric.tag_0 [timestamp:Timestamp(ms), TEMPLATE(field_0):Float64;N, tag_0:Utf8]\
+            \n  Filter: TEMPLATE(field_0) IS NOT NULL [timestamp:Timestamp(ms), TEMPLATE(field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n    Projection: some_metric.timestamp, TEMPLATE(some_metric.field_0) AS TEMPLATE(field_0), some_metric.tag_0, __promql_metric_name [timestamp:Timestamp(ms), TEMPLATE(field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n      Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n        PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"
     ).replace("TEMPLATE", plan_name);
 
     assert_eq!(plan.display_indent_schema().to_string(), expected);
@@ -1835,11 +2155,12 @@ async fn do_aggregate_expr_plan(fn_name: &str, plan_name: &str) {
     let expected_no_without = String::from(
         "Sort: some_metric.tag_1 ASC NULLS LAST, some_metric.timestamp ASC NULLS LAST [tag_1:Utf8, timestamp:Timestamp(ms), TEMPLATE(some_metric.field_0):Float64;N, TEMPLATE(some_metric.field_1):Float64;N]\
             \n  Aggregate: groupBy=[[some_metric.tag_1, some_metric.timestamp]], aggr=[[TEMPLATE(some_metric.field_0), TEMPLATE(some_metric.field_1)]] [tag_1:Utf8, timestamp:Timestamp(ms), TEMPLATE(some_metric.field_0):Float64;N, TEMPLATE(some_metric.field_1):Float64;N]\
-            \n    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n      PromSeriesDivide: tags=[\"tag_0\", \"tag_1\"] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.tag_1 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n          Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n            TableScan: some_metric [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]"
+            \n    Projection: some_metric.tag_0, some_metric.tag_1, some_metric.timestamp, some_metric.field_0, some_metric.field_1, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\", \"tag_1\"] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.tag_1 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n            Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]"
     ).replace("TEMPLATE", plan_name);
     assert_eq!(
         plan.display_indent_schema().to_string(),
@@ -1864,11 +2185,12 @@ async fn do_aggregate_expr_plan(fn_name: &str, plan_name: &str) {
     let expected_without = String::from(
         "Sort: some_metric.tag_0 ASC NULLS LAST, some_metric.timestamp ASC NULLS LAST [tag_0:Utf8, timestamp:Timestamp(ms), TEMPLATE(some_metric.field_0):Float64;N, TEMPLATE(some_metric.field_1):Float64;N]\
             \n  Aggregate: groupBy=[[some_metric.tag_0, some_metric.timestamp]], aggr=[[TEMPLATE(some_metric.field_0), TEMPLATE(some_metric.field_1)]] [tag_0:Utf8, timestamp:Timestamp(ms), TEMPLATE(some_metric.field_0):Float64;N, TEMPLATE(some_metric.field_1):Float64;N]\
-            \n    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n      PromSeriesDivide: tags=[\"tag_0\", \"tag_1\"] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.tag_1 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n          Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
-            \n            TableScan: some_metric [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]"
+            \n    Projection: some_metric.tag_0, some_metric.tag_1, some_metric.timestamp, some_metric.field_0, some_metric.field_1, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\", \"tag_1\"] [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.tag_1 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n            Filter: some_metric.tag_0 != Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, tag_1:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N]"
     ).replace("TEMPLATE", plan_name);
     assert_eq!(plan.display_indent_schema().to_string(), expected_without);
 }
@@ -1956,6 +2278,132 @@ async fn default_binary_join_uses_tsid_when_available() {
     );
     assert!(
         !plan_str.contains("some_metric.tag_0 = some_alt_metric.tag_0"),
+        "{plan_str}"
+    );
+}
+
+/// Cross-logical-table regression: two logical metric tables whose physical rows share a
+/// tag and a timestamp but carry the same `__tsid` must match on `__tsid` and keep the
+/// complete sample (tag, time, value) through `left_metric + right_metric`.
+#[tokio::test]
+async fn tsid_cross_metric_exec_equal_tsid_keeps_complete_sample() {
+    let state = build_query_engine_state();
+    let table_provider =
+        build_cross_logical_table_tsid_provider(CROSS_TABLE_TSID, CROSS_TABLE_TSID);
+    let plan = PromPlanner::stmt_to_plan(
+        table_provider,
+        &operator_eval_stmt("left_metric + right_metric"),
+        &state,
+    )
+    .await
+    .unwrap();
+
+    let plan_str = plan.display_indent_schema().to_string();
+    // Each side reads only its own logical table's row from the shared physical table.
+    assert_eq!(
+        plan_str.matches("__table_id = UInt32(1024)").count(),
+        1,
+        "{plan_str}"
+    );
+    assert_eq!(
+        plan_str.matches("__table_id = UInt32(1025)").count(),
+        1,
+        "{plan_str}"
+    );
+    // The cross-table match goes through `__tsid`, not the shared `tag_0` label.
+    assert!(
+        plan_str.contains("left_metric.__tsid = right_metric.__tsid"),
+        "{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("left_metric.tag_0 = right_metric.tag_0"),
+        "{plan_str}"
+    );
+
+    let (optimized, batches) = execute(plan, &state).await;
+    let value_column = float_sample_column(&optimized);
+    let rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let tags = batch
+                .column_by_name("tag_0")
+                .expect("no tag column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the tag must be a string column");
+            let timestamps = batch
+                .column_by_name("timestamp")
+                .expect("no timestamp column")
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("the time index must be a millisecond timestamp column");
+            let values = batch
+                .column_by_name(&value_column)
+                .expect("no sample value column")
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("the sample value must be a float column");
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        tags.value(row).to_string(),
+                        timestamps.value(row),
+                        values.value(row),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, vec![("a".to_string(), 1_000, 5.0)], "{plan_str}");
+
+    // The arithmetic result must not keep a metric-name identity marker.
+    assert!(
+        PromPlanner::metric_name_column(optimized.schema())
+            .unwrap()
+            .is_none(),
+        "{plan_str}"
+    );
+    assert_metric_name_not_in_batches(&batches);
+
+    // Neither internal column may leak into the arithmetic result.
+    for field in optimized.schema().fields() {
+        assert_ne!(field.name(), DATA_SCHEMA_TSID_COLUMN_NAME, "{plan_str}");
+        assert_ne!(field.name(), DATA_SCHEMA_TABLE_ID_COLUMN_NAME, "{plan_str}");
+    }
+    for batch in &batches {
+        for field in batch.schema().fields() {
+            assert_ne!(field.name(), DATA_SCHEMA_TSID_COLUMN_NAME, "{plan_str}");
+            assert_ne!(field.name(), DATA_SCHEMA_TABLE_ID_COLUMN_NAME, "{plan_str}");
+        }
+    }
+}
+
+/// Control for [`tsid_cross_metric_exec_equal_tsid_keeps_complete_sample`]: the two rows
+/// still share the tag and the timestamp, but carry distinct `__tsid`s, so the TSID-based
+/// `__tsid` match must not pair the logical tables and the result must stay empty.
+#[tokio::test]
+async fn tsid_cross_metric_exec_distinct_tsid_matches_nothing() {
+    let state = build_query_engine_state();
+    let table_provider =
+        build_cross_logical_table_tsid_provider(CROSS_TABLE_TSID, OTHER_TABLE_TSID);
+    let plan = PromPlanner::stmt_to_plan(
+        table_provider,
+        &operator_eval_stmt("left_metric + right_metric"),
+        &state,
+    )
+    .await
+    .unwrap();
+
+    let plan_str = plan.display_indent_schema().to_string();
+    assert!(
+        plan_str.contains("left_metric.__tsid = right_metric.__tsid"),
+        "{plan_str}"
+    );
+
+    let (_, batches) = execute(plan, &state).await;
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0,
         "{plan_str}"
     );
 }
@@ -3402,20 +3850,26 @@ async fn binary_op_column_column() {
         .unwrap();
 
     let expected = String::from(
-        "Projection: rhs.tag_0, rhs.timestamp, CAST(lhs.field_0 AS Float64) + CAST(rhs.field_0 AS Float64) AS lhs.field_0 + rhs.field_0 [tag_0:Utf8, timestamp:Timestamp(ms), lhs.field_0 + rhs.field_0:Float64;N]\
-            \n  Inner Join: lhs.tag_0 = rhs.tag_0, lhs.timestamp = rhs.timestamp [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    SubqueryAlias: lhs [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: some_metric.tag_0 = Utf8(\"foo\") AND some_metric.tag_0 = Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    SubqueryAlias: rhs [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: some_metric.tag_0 = Utf8(\"bar\") AND some_metric.tag_0 = Utf8(\"foo\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: rhs.tag_0, rhs.timestamp, lhs.field_0 + rhs.field_0 [tag_0:Utf8, timestamp:Timestamp(ms), lhs.field_0 + rhs.field_0:Float64;N]\
+            \n  Projection: rhs.tag_0, rhs.__promql_metric_name, rhs.timestamp, CAST(lhs.field_0 AS Float64) + CAST(rhs.field_0 AS Float64) AS lhs.field_0 + rhs.field_0 [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), lhs.field_0 + rhs.field_0:Float64;N]\
+            \n    Inner Join: lhs.tag_0 = rhs.tag_0, lhs.timestamp = rhs.timestamp [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      SubqueryAlias: lhs [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n        Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n          PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                Filter: some_metric.tag_0 = Utf8(\"foo\") AND some_metric.tag_0 = Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n      SubqueryAlias: rhs [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n        Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n          Filter: prom_assert_unique_match_group(__promql_match_group_count, some_metric.tag_0) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, __promql_match_group_count:Int64]\
+            \n            WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [some_metric.tag_0, some_metric.timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, __promql_match_group_count:Int64]\
+            \n              Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n                PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                    Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                      Filter: some_metric.tag_0 = Utf8(\"bar\") AND some_metric.tag_0 = Utf8(\"foo\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                        TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     assert_eq!(plan.display_indent_schema().to_string(), expected);
@@ -3456,12 +3910,14 @@ async fn indie_query_plan_compare<T: AsRef<str>>(query: &str, expected: T) {
 async fn binary_op_literal_column() {
     let query = r#"1 + some_metric{tag_0="bar"}"#;
     let expected = String::from(
-        "Projection: some_metric.tag_0, some_metric.timestamp, Float64(1) + CAST(some_metric.field_0 AS Float64) AS Float64(1) + field_0 [tag_0:Utf8, timestamp:Timestamp(ms), Float64(1) + field_0:Float64;N]\
-            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Filter: some_metric.tag_0 = Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.tag_0, some_metric.timestamp, Float64(1) + field_0 [tag_0:Utf8, timestamp:Timestamp(ms), Float64(1) + field_0:Float64;N]\
+            \n  Projection: some_metric.tag_0, __promql_metric_name, some_metric.timestamp, Float64(1) + CAST(some_metric.field_0 AS Float64) AS Float64(1) + field_0 [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), Float64(1) + field_0:Float64;N]\
+            \n    Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            Filter: some_metric.tag_0 = Utf8(\"bar\") AND some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -3479,12 +3935,14 @@ async fn binary_op_literal_literal() {
 async fn simple_bool_grammar() {
     let query = "some_metric != bool 1.2345";
     let expected = String::from(
-        "Projection: some_metric.tag_0, some_metric.timestamp, CAST(some_metric.field_0 != Float64(1.2345) AS Float64) AS field_0 != Float64(1.2345) [tag_0:Utf8, timestamp:Timestamp(ms), field_0 != Float64(1.2345):Float64;N]\
-            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.tag_0, some_metric.timestamp, field_0 != Float64(1.2345) [tag_0:Utf8, timestamp:Timestamp(ms), field_0 != Float64(1.2345):Float64;N]\
+            \n  Projection: some_metric.tag_0, __promql_metric_name, some_metric.timestamp, CAST(some_metric.field_0 != Float64(1.2345) AS Float64) AS field_0 != Float64(1.2345) [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), field_0 != Float64(1.2345):Float64;N]\
+            \n    Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -3494,12 +3952,14 @@ async fn simple_bool_grammar() {
 async fn bool_with_additional_arithmetic() {
     let query = "some_metric + (1 == bool 2)";
     let expected = String::from(
-        "Projection: some_metric.tag_0, some_metric.timestamp, CAST(some_metric.field_0 AS Float64) + CAST(Float64(1) = Float64(2) AS Float64) AS field_0 + Float64(1) = Float64(2) [tag_0:Utf8, timestamp:Timestamp(ms), field_0 + Float64(1) = Float64(2):Float64;N]\
-            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.tag_0, some_metric.timestamp, field_0 + Float64(1) = Float64(2) [tag_0:Utf8, timestamp:Timestamp(ms), field_0 + Float64(1) = Float64(2):Float64;N]\
+            \n  Projection: some_metric.tag_0, __promql_metric_name, some_metric.timestamp, CAST(some_metric.field_0 AS Float64) + CAST(Float64(1) = Float64(2) AS Float64) AS field_0 + Float64(1) = Float64(2) [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), field_0 + Float64(1) = Float64(2):Float64;N]\
+            \n    Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -3509,12 +3969,14 @@ async fn bool_with_additional_arithmetic() {
 async fn simple_unary() {
     let query = "-some_metric";
     let expected = String::from(
-        "Projection: some_metric.tag_0, some_metric.timestamp, (- some_metric.field_0) AS (- field_0) [tag_0:Utf8, timestamp:Timestamp(ms), (- field_0):Float64;N]\
-            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.tag_0, some_metric.timestamp, (- field_0) [tag_0:Utf8, timestamp:Timestamp(ms), (- field_0):Float64;N]\
+            \n  Projection: some_metric.tag_0, __promql_metric_name, some_metric.timestamp, (- some_metric.field_0) AS (- field_0) [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), (- field_0):Float64;N]\
+            \n    Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -3524,14 +3986,16 @@ async fn simple_unary() {
 async fn increase_aggr() {
     let query = "increase(some_metric[5m])";
     let expected = String::from(
-        "Filter: prom_increase(timestamp_range,field_0,timestamp,Int64(300000)) IS NOT NULL [timestamp:Timestamp(ms), prom_increase(timestamp_range,field_0,timestamp,Int64(300000)):Float64;N, tag_0:Utf8]\
-            \n  Projection: some_metric.timestamp, prom_increase(timestamp_range, field_0, some_metric.timestamp, Int64(300000)) AS prom_increase(timestamp_range,field_0,timestamp,Int64(300000)), some_metric.tag_0 [timestamp:Timestamp(ms), prom_increase(timestamp_range,field_0,timestamp,Int64(300000)):Float64;N, tag_0:Utf8]\
-            \n    PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[300000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
-            \n      PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-299999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.timestamp, prom_increase(timestamp_range,field_0,timestamp,Int64(300000)), some_metric.tag_0 [timestamp:Timestamp(ms), prom_increase(timestamp_range,field_0,timestamp,Int64(300000)):Float64;N, tag_0:Utf8]\
+            \n  Filter: prom_increase(timestamp_range,field_0,timestamp,Int64(300000)) IS NOT NULL [timestamp:Timestamp(ms), prom_increase(timestamp_range,field_0,timestamp,Int64(300000)):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n    Projection: some_metric.timestamp, prom_increase(timestamp_range, field_0, some_metric.timestamp, Int64(300000)) AS prom_increase(timestamp_range,field_0,timestamp,Int64(300000)), some_metric.tag_0, __promql_metric_name [timestamp:Timestamp(ms), prom_increase(timestamp_range,field_0,timestamp,Int64(300000)):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n      Projection: some_metric.tag_0, some_metric.timestamp, field_0, timestamp_range, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms)), __promql_metric_name:Utf8]\
+            \n        PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[300000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
+            \n          PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                Filter: some_metric.timestamp >= TimestampMillisecond(-299999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -4203,14 +4667,16 @@ async fn mixed_native_histogram_ranges_use_coordinated_udfs() {
     PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[600000], time index=[timestamp], values=["greptime_value", "greptime_native_histogram"] [timestamp:Timestamp(ms), greptime_value:Dictionary(Int64, Float64);N, greptime_native_histogram:Dictionary(Int64, Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64)));N, tag_0:Utf8, timestamp_range:Dictionary(Int64, Timestamp(ms))]
       PromSeriesDivide: tags=["tag_0"] [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8]
         Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8]
-          Filter: greptime_value IS NOT NULL OR greptime_native_histogram IS NOT NULL [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8]
-            Projection: some_metric.timestamp, prom_mixed_range_float(Utf8("rate"), timestamp_range, greptime_value, greptime_native_histogram, some_metric.timestamp, Int64(300000)) AS greptime_value, prom_mixed_range_histogram(Utf8("rate"), timestamp_range, greptime_value, greptime_native_histogram, some_metric.timestamp, Int64(300000)) AS greptime_native_histogram, some_metric.tag_0 [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8]
-              PromRangeManipulate: req range=[-540000..100000000], interval=[60000], eval range=[300000], time index=[timestamp], values=["greptime_native_histogram", "greptime_value"] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Dictionary(Int64, Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64)));N, greptime_value:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]
-                PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
-                  PromSeriesDivide: tags=["tag_0"] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
-                    Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
-                      Filter: some_metric.timestamp >= TimestampMillisecond(-839999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
-                        TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]"#;
+          Projection: some_metric.timestamp, greptime_value, greptime_native_histogram, some_metric.tag_0 [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8]
+            Filter: greptime_value IS NOT NULL OR greptime_native_histogram IS NOT NULL [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8, __promql_metric_name:Utf8]
+              Projection: some_metric.timestamp, prom_mixed_range_float(Utf8("rate"), timestamp_range, greptime_value, greptime_native_histogram, some_metric.timestamp, Int64(300000)) AS greptime_value, prom_mixed_range_histogram(Utf8("rate"), timestamp_range, greptime_value, greptime_native_histogram, some_metric.timestamp, Int64(300000)) AS greptime_native_histogram, some_metric.tag_0, __promql_metric_name [timestamp:Timestamp(ms), greptime_value:Float64;N, greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, tag_0:Utf8, __promql_metric_name:Utf8]
+                Projection: some_metric.tag_0, some_metric.timestamp, greptime_native_histogram, greptime_value, timestamp_range, Utf8("some_metric") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Dictionary(Int64, Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64)));N, greptime_value:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms)), __promql_metric_name:Utf8]
+                  PromRangeManipulate: req range=[-540000..100000000], interval=[60000], eval range=[300000], time index=[timestamp], values=["greptime_native_histogram", "greptime_value"] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Dictionary(Int64, Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64)));N, greptime_value:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]
+                    PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
+                      PromSeriesDivide: tags=["tag_0"] [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
+                        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
+                          Filter: some_metric.timestamp >= TimestampMillisecond(-839999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]
+                            TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), greptime_native_histogram:Struct("schema": Int32, "zero_threshold": Float64, "sum": Float64, "reset_hint": Int32, "start_timestamp": Timestamp(ms), "custom_values": List(Float64), "positive_span_offsets": List(Int32), "positive_span_lengths": List(Int32), "negative_span_offsets": List(Int32), "negative_span_lengths": List(Int32), "count_i64": Int64, "zero_count_i64": Int64, "positive_buckets_i64": List(Int64), "negative_buckets_i64": List(Int64), "count_f64": Float64, "zero_count_f64": Float64, "positive_buckets_f64": List(Float64), "negative_buckets_f64": List(Float64));N, greptime_value:Float64;N]"#;
     assert_eq!(plan, expected);
 }
 
@@ -4396,12 +4862,13 @@ async fn native_histogram_mixed_field_table_behaves() {
 async fn less_filter_on_value() {
     let query = "some_metric < 1.2345";
     let expected = String::from(
-        "Filter: some_metric.field_0 < Float64(1.2345) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Filter: some_metric.field_0 < Float64(1.2345) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n  Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n      PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -4411,14 +4878,16 @@ async fn less_filter_on_value() {
 async fn count_over_time() {
     let query = "count_over_time(some_metric[5m])";
     let expected = String::from(
-        "Filter: prom_count_over_time(timestamp_range,field_0) IS NOT NULL [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
-            \n  Projection: some_metric.timestamp, prom_count_over_time(timestamp_range, field_0) AS prom_count_over_time(timestamp_range,field_0), some_metric.tag_0 [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
-            \n    PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[300000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
-            \n      PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-299999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.timestamp, prom_count_over_time(timestamp_range,field_0), some_metric.tag_0 [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
+            \n  Filter: prom_count_over_time(timestamp_range,field_0) IS NOT NULL [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n    Projection: some_metric.timestamp, prom_count_over_time(timestamp_range, field_0) AS prom_count_over_time(timestamp_range,field_0), some_metric.tag_0, __promql_metric_name [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n      Projection: some_metric.tag_0, some_metric.timestamp, field_0, timestamp_range, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms)), __promql_metric_name:Utf8]\
+            \n        PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[300000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
+            \n          PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                Filter: some_metric.timestamp >= TimestampMillisecond(-299999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -4430,16 +4899,18 @@ async fn count_over_time() {
 async fn count_over_time_subquery() {
     let query = "count_over_time(some_metric[10m:1m])";
     let expected = String::from(
-        "Filter: prom_count_over_time(timestamp_range,field_0) IS NOT NULL [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
-            \n  Projection: some_metric.timestamp, prom_count_over_time(timestamp_range, field_0) AS prom_count_over_time(timestamp_range,field_0), some_metric.tag_0 [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
-            \n    PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[600000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
-            \n      PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          PromInstantManipulate: range=[-540000..100000000], lookback=[1000], interval=[60000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n                Filter: some_metric.timestamp >= TimestampMillisecond(-540999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n                  TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.timestamp, prom_count_over_time(timestamp_range,field_0), some_metric.tag_0 [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8]\
+            \n  Filter: prom_count_over_time(timestamp_range,field_0) IS NOT NULL [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n    Projection: some_metric.timestamp, prom_count_over_time(timestamp_range, field_0) AS prom_count_over_time(timestamp_range,field_0), some_metric.tag_0, __promql_metric_name [timestamp:Timestamp(ms), prom_count_over_time(timestamp_range,field_0):Float64;N, tag_0:Utf8, __promql_metric_name:Utf8]\
+            \n      PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[600000], time index=[timestamp], values=[\"field_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Dictionary(Int64, Float64);N, __promql_metric_name:Utf8, timestamp_range:Dictionary(Int64, Timestamp(ms))]\
+            \n        PromSeriesDivide: tags=[\"tag_0\", \"__promql_metric_name\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, __promql_metric_name ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n            Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n              PromInstantManipulate: range=[-540000..100000000], lookback=[1000], interval=[60000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                    Filter: some_metric.timestamp >= TimestampMillisecond(-540999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                      TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
     indie_query_plan_compare(query, expected).await;
 }
@@ -4478,26 +4949,29 @@ async fn test_hash_join() {
     let plan = PromPlanner::stmt_to_plan(table_provider, &eval_stmt, &build_query_engine_state())
         .await
         .unwrap();
-    let expected = "Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_count.greptime_timestamp, CAST(http_server_requests_seconds_sum.greptime_value AS Float64) / CAST(http_server_requests_seconds_count.greptime_value AS Float64) AS http_server_requests_seconds_sum.greptime_value / http_server_requests_seconds_count.greptime_value\
-            \n  Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.kubernetes_namespace, http_server_requests_seconds_sum.kubernetes_pod_name, http_server_requests_seconds_sum.greptime_timestamp, http_server_requests_seconds_sum.greptime_value, http_server_requests_seconds_count.uri, http_server_requests_seconds_count.kubernetes_namespace, http_server_requests_seconds_count.kubernetes_pod_name, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_count.greptime_value\
-            \n    Filter: prom_assert_unique_match_group(__promql_match_group_count, http_server_requests_seconds_sum.uri)\
-            \n      WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.greptime_timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]]\
-            \n        Inner Join: http_server_requests_seconds_sum.greptime_timestamp = http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_sum.uri = http_server_requests_seconds_count.uri\
-            \n          SubqueryAlias: http_server_requests_seconds_sum\
-            \n            PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp]\
-            \n              PromSeriesDivide: tags=[\"uri\", \"kubernetes_namespace\", \"kubernetes_pod_name\"]\
-            \n                Sort: http_server_requests_seconds_sum.uri ASC NULLS FIRST, http_server_requests_seconds_sum.kubernetes_namespace ASC NULLS FIRST, http_server_requests_seconds_sum.kubernetes_pod_name ASC NULLS FIRST, http_server_requests_seconds_sum.greptime_timestamp ASC NULLS FIRST\
-            \n                  Filter: http_server_requests_seconds_sum.uri = Utf8(\"/accounts/login\") AND http_server_requests_seconds_sum.greptime_timestamp >= TimestampMillisecond(-999, None) AND http_server_requests_seconds_sum.greptime_timestamp <= TimestampMillisecond(100000000, None)\
-            \n                    TableScan: http_server_requests_seconds_sum\
-            \n          SubqueryAlias: http_server_requests_seconds_count\
-            \n            Projection: http_server_requests_seconds_count.uri, http_server_requests_seconds_count.kubernetes_namespace, http_server_requests_seconds_count.kubernetes_pod_name, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_count.greptime_value\
-            \n              Filter: prom_assert_unique_match_group(__promql_match_group_count, http_server_requests_seconds_count.uri)\
-            \n                WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [http_server_requests_seconds_count.uri, http_server_requests_seconds_count.greptime_timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]]\
-            \n                  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp]\
-            \n                    PromSeriesDivide: tags=[\"uri\", \"kubernetes_namespace\", \"kubernetes_pod_name\"]\
-            \n                      Sort: http_server_requests_seconds_count.uri ASC NULLS FIRST, http_server_requests_seconds_count.kubernetes_namespace ASC NULLS FIRST, http_server_requests_seconds_count.kubernetes_pod_name ASC NULLS FIRST, http_server_requests_seconds_count.greptime_timestamp ASC NULLS FIRST\
-            \n                        Filter: http_server_requests_seconds_count.uri = Utf8(\"/accounts/login\") AND http_server_requests_seconds_count.greptime_timestamp >= TimestampMillisecond(-999, None) AND http_server_requests_seconds_count.greptime_timestamp <= TimestampMillisecond(100000000, None)\
-            \n                          TableScan: http_server_requests_seconds_count";
+    let expected = "Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_sum.greptime_value / http_server_requests_seconds_count.greptime_value\
+            \n  Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.__promql_metric_name, http_server_requests_seconds_count.greptime_timestamp, CAST(http_server_requests_seconds_sum.greptime_value AS Float64) / CAST(http_server_requests_seconds_count.greptime_value AS Float64) AS http_server_requests_seconds_sum.greptime_value / http_server_requests_seconds_count.greptime_value\
+            \n    Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.kubernetes_namespace, http_server_requests_seconds_sum.kubernetes_pod_name, http_server_requests_seconds_sum.greptime_timestamp, http_server_requests_seconds_sum.greptime_value, http_server_requests_seconds_sum.__promql_metric_name, http_server_requests_seconds_count.uri, http_server_requests_seconds_count.kubernetes_namespace, http_server_requests_seconds_count.kubernetes_pod_name, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_count.greptime_value, http_server_requests_seconds_count.__promql_metric_name\
+            \n      Filter: prom_assert_unique_match_group(__promql_match_group_count, http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.__promql_metric_name)\
+            \n        WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.__promql_metric_name, http_server_requests_seconds_sum.greptime_timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]]\
+            \n          Inner Join: http_server_requests_seconds_sum.greptime_timestamp = http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_sum.uri = http_server_requests_seconds_count.uri\
+            \n            SubqueryAlias: http_server_requests_seconds_sum\
+            \n              Projection: http_server_requests_seconds_sum.uri, http_server_requests_seconds_sum.kubernetes_namespace, http_server_requests_seconds_sum.kubernetes_pod_name, http_server_requests_seconds_sum.greptime_timestamp, http_server_requests_seconds_sum.greptime_value, Utf8(\"http_server_requests_seconds_sum\") AS __promql_metric_name\
+            \n                PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp]\
+            \n                  PromSeriesDivide: tags=[\"uri\", \"kubernetes_namespace\", \"kubernetes_pod_name\"]\
+            \n                    Sort: http_server_requests_seconds_sum.uri ASC NULLS FIRST, http_server_requests_seconds_sum.kubernetes_namespace ASC NULLS FIRST, http_server_requests_seconds_sum.kubernetes_pod_name ASC NULLS FIRST, http_server_requests_seconds_sum.greptime_timestamp ASC NULLS FIRST\
+            \n                      Filter: http_server_requests_seconds_sum.uri = Utf8(\"/accounts/login\") AND http_server_requests_seconds_sum.greptime_timestamp >= TimestampMillisecond(-999, None) AND http_server_requests_seconds_sum.greptime_timestamp <= TimestampMillisecond(100000000, None)\
+            \n                        TableScan: http_server_requests_seconds_sum\
+            \n            SubqueryAlias: http_server_requests_seconds_count\
+            \n              Projection: http_server_requests_seconds_count.uri, http_server_requests_seconds_count.kubernetes_namespace, http_server_requests_seconds_count.kubernetes_pod_name, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_count.greptime_value, __promql_metric_name\
+            \n                Filter: prom_assert_unique_match_group(__promql_match_group_count, http_server_requests_seconds_count.uri)\
+            \n                  WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [http_server_requests_seconds_count.uri, http_server_requests_seconds_count.greptime_timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]]\
+            \n                    Projection: http_server_requests_seconds_count.uri, http_server_requests_seconds_count.kubernetes_namespace, http_server_requests_seconds_count.kubernetes_pod_name, http_server_requests_seconds_count.greptime_timestamp, http_server_requests_seconds_count.greptime_value, Utf8(\"http_server_requests_seconds_count\") AS __promql_metric_name\
+            \n                      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp]\
+            \n                        PromSeriesDivide: tags=[\"uri\", \"kubernetes_namespace\", \"kubernetes_pod_name\"]\
+            \n                          Sort: http_server_requests_seconds_count.uri ASC NULLS FIRST, http_server_requests_seconds_count.kubernetes_namespace ASC NULLS FIRST, http_server_requests_seconds_count.kubernetes_pod_name ASC NULLS FIRST, http_server_requests_seconds_count.greptime_timestamp ASC NULLS FIRST\
+            \n                            Filter: http_server_requests_seconds_count.uri = Utf8(\"/accounts/login\") AND http_server_requests_seconds_count.greptime_timestamp >= TimestampMillisecond(-999, None) AND http_server_requests_seconds_count.greptime_timestamp <= TimestampMillisecond(100000000, None)\
+            \n                              TableScan: http_server_requests_seconds_count";
     assert_eq!(plan.to_string(), expected);
 }
 
@@ -4853,7 +5327,27 @@ async fn value_matcher() {
             PromPlanner::stmt_to_plan(table_provider, &eval_stmt, &build_query_engine_state())
                 .await
                 .unwrap();
-        let mut fields = plan.schema().field_names();
+        // The raw selector carries its metric-name identity as a metadata-marked field; the
+        // ordinary fields are the value matchers' projection of the table's columns.
+        let marked = plan
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| is_marked_metric_name_field(field))
+            .collect::<Vec<_>>();
+        assert_eq!(marked.len(), 1, "case: {:?}", case.0);
+        assert_eq!(
+            marked[0].name().as_str(),
+            PROMQL_METRIC_NAME_COLUMN,
+            "case: {:?}",
+            case.0
+        );
+        let mut fields = plan
+            .schema()
+            .iter()
+            .filter(|(_, field)| !is_marked_metric_name_field(field))
+            .map(|(qualifier, field)| datafusion_common::qualified_name(qualifier, field.name()))
+            .collect::<Vec<_>>();
         let mut expected = case.1.into_iter().map(String::from).collect::<Vec<_>>();
         fields.sort();
         expected.sort();
@@ -4885,42 +5379,50 @@ async fn value_matcher() {
 async fn custom_schema() {
     let query = "some_alt_metric{__schema__=\"greptime_private\"}";
     let expected = String::from(
-        "PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n  PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: greptime_private.some_alt_metric.tag_0, greptime_private.some_alt_metric.timestamp, greptime_private.some_alt_metric.field_0, Utf8(\"some_alt_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n      Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
 
     let query = "some_alt_metric{__database__=\"greptime_private\"}";
     let expected = String::from(
-        "PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n  PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: greptime_private.some_alt_metric.tag_0, greptime_private.some_alt_metric.timestamp, greptime_private.some_alt_metric.field_0, Utf8(\"some_alt_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n    PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n      Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n        Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n          TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
 
     let query = "some_alt_metric{__schema__=\"greptime_private\"} / some_metric";
     let expected = String::from(
-        "Projection: some_metric.tag_0, some_metric.timestamp, CAST(greptime_private.some_alt_metric.field_0 AS Float64) / CAST(some_metric.field_0 AS Float64) AS greptime_private.some_alt_metric.field_0 / some_metric.field_0 [tag_0:Utf8, timestamp:Timestamp(ms), greptime_private.some_alt_metric.field_0 / some_metric.field_0:Float64;N]\
-            \n  Inner Join: greptime_private.some_alt_metric.tag_0 = some_metric.tag_0, greptime_private.some_alt_metric.timestamp = some_metric.timestamp [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    SubqueryAlias: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n    SubqueryAlias: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n        PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n          Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n            Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
-            \n              TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
+        "Projection: some_metric.tag_0, some_metric.timestamp, greptime_private.some_alt_metric.field_0 / some_metric.field_0 [tag_0:Utf8, timestamp:Timestamp(ms), greptime_private.some_alt_metric.field_0 / some_metric.field_0:Float64;N]\
+            \n  Projection: some_metric.tag_0, some_metric.__promql_metric_name, some_metric.timestamp, CAST(greptime_private.some_alt_metric.field_0 AS Float64) / CAST(some_metric.field_0 AS Float64) AS greptime_private.some_alt_metric.field_0 / some_metric.field_0 [tag_0:Utf8, __promql_metric_name:Utf8, timestamp:Timestamp(ms), greptime_private.some_alt_metric.field_0 / some_metric.field_0:Float64;N]\
+            \n    Inner Join: greptime_private.some_alt_metric.tag_0 = some_metric.tag_0, greptime_private.some_alt_metric.timestamp = some_metric.timestamp [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n      SubqueryAlias: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n        Projection: greptime_private.some_alt_metric.tag_0, greptime_private.some_alt_metric.timestamp, greptime_private.some_alt_metric.field_0, Utf8(\"some_alt_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n          PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n            PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n              Sort: greptime_private.some_alt_metric.tag_0 ASC NULLS FIRST, greptime_private.some_alt_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                Filter: greptime_private.some_alt_metric.timestamp >= TimestampMillisecond(-999, None) AND greptime_private.some_alt_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  TableScan: greptime_private.some_alt_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n      SubqueryAlias: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n        Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n          Filter: prom_assert_unique_match_group(__promql_match_group_count, some_metric.tag_0) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, __promql_match_group_count:Int64]\
+            \n            WindowAggr: windowExpr=[[count(Int64(1)) PARTITION BY [some_metric.tag_0, some_metric.timestamp] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_match_group_count]] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8, __promql_match_group_count:Int64]\
+            \n              Projection: some_metric.tag_0, some_metric.timestamp, some_metric.field_0, Utf8(\"some_metric\") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]\
+            \n                PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                  PromSeriesDivide: tags=[\"tag_0\"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                    Sort: some_metric.tag_0 ASC NULLS FIRST, some_metric.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                      Filter: some_metric.timestamp >= TimestampMillisecond(-999, None) AND some_metric.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]\
+            \n                        TableScan: some_metric [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]",
     );
 
     indie_query_plan_compare(query, expected).await;
@@ -5132,7 +5634,13 @@ async fn test_non_ms_precision() {
     .unwrap();
     assert_eq!(
         plan.display_indent_schema().to_string(),
-        "PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ms)]\n  PromSeriesDivide: tags=[\"tag\"] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n    Sort: metrics.tag ASC NULLS FIRST, metrics.timestamp ASC NULLS FIRST [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n      Filter: metrics.tag = Utf8(\"1\") AND metrics.timestamp > TimestampNanosecond(-1000000000, None) AND metrics.timestamp <= TimestampNanosecond(100000000000000, None) [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n        Projection: metrics.field, metrics.tag, metrics.timestamp [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n          TableScan: metrics [tag:Utf8, timestamp:Timestamp(ns), field:Float64;N]"
+        "Projection: metrics.field, metrics.tag, metrics.timestamp, Utf8(\"metrics\") AS __promql_metric_name [field:Float64;N, tag:Utf8, timestamp:Timestamp(ms), __promql_metric_name:Utf8]\
+            \n  PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ms)]\
+            \n    PromSeriesDivide: tags=[\"tag\"] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n      Sort: metrics.tag ASC NULLS FIRST, metrics.timestamp ASC NULLS FIRST [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n        Filter: metrics.tag = Utf8(\"1\") AND metrics.timestamp > TimestampNanosecond(-1000000000, None) AND metrics.timestamp <= TimestampNanosecond(100000000000000, None) [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n          Projection: metrics.field, metrics.tag, metrics.timestamp [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n            TableScan: metrics [tag:Utf8, timestamp:Timestamp(ns), field:Float64;N]"
     );
     let plan = PromPlanner::stmt_to_plan(
         DfTableSourceProvider::new(
@@ -5157,7 +5665,17 @@ async fn test_non_ms_precision() {
     .unwrap();
     assert_eq!(
         plan.display_indent_schema().to_string(),
-        "Filter: prom_avg_over_time(timestamp_range,field) IS NOT NULL [timestamp:Timestamp(ms), prom_avg_over_time(timestamp_range,field):Float64;N, tag:Utf8]\n  Projection: metrics.timestamp, prom_avg_over_time(timestamp_range, field) AS prom_avg_over_time(timestamp_range,field), metrics.tag [timestamp:Timestamp(ms), prom_avg_over_time(timestamp_range,field):Float64;N, tag:Utf8]\n    PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[5000], time index=[timestamp], values=[\"field\"] [field:Dictionary(Int64, Float64);N, tag:Utf8, timestamp:Timestamp(ms), timestamp_range:Dictionary(Int64, Timestamp(ms))]\n      PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n        PromSeriesDivide: tags=[\"tag\"] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n          Sort: metrics.tag ASC NULLS FIRST, metrics.timestamp ASC NULLS FIRST [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n            Filter: metrics.tag = Utf8(\"1\") AND metrics.timestamp > TimestampNanosecond(-5000000000, None) AND metrics.timestamp <= TimestampNanosecond(100000000000000, None) [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n              Projection: metrics.field, metrics.tag, metrics.timestamp [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\n                TableScan: metrics [tag:Utf8, timestamp:Timestamp(ns), field:Float64;N]"
+        "Projection: metrics.timestamp, prom_avg_over_time(timestamp_range,field), metrics.tag [timestamp:Timestamp(ms), prom_avg_over_time(timestamp_range,field):Float64;N, tag:Utf8]\
+            \n  Filter: prom_avg_over_time(timestamp_range,field) IS NOT NULL [timestamp:Timestamp(ms), prom_avg_over_time(timestamp_range,field):Float64;N, tag:Utf8, __promql_metric_name:Utf8]\
+            \n    Projection: metrics.timestamp, prom_avg_over_time(timestamp_range, field) AS prom_avg_over_time(timestamp_range,field), metrics.tag, __promql_metric_name [timestamp:Timestamp(ms), prom_avg_over_time(timestamp_range,field):Float64;N, tag:Utf8, __promql_metric_name:Utf8]\
+            \n      Projection: field, metrics.tag, metrics.timestamp, timestamp_range, Utf8(\"metrics\") AS __promql_metric_name [field:Dictionary(Int64, Float64);N, tag:Utf8, timestamp:Timestamp(ms), timestamp_range:Dictionary(Int64, Timestamp(ms)), __promql_metric_name:Utf8]\
+            \n        PromRangeManipulate: req range=[0..100000000], interval=[5000], eval range=[5000], time index=[timestamp], values=[\"field\"] [field:Dictionary(Int64, Float64);N, tag:Utf8, timestamp:Timestamp(ms), timestamp_range:Dictionary(Int64, Timestamp(ms))]\
+            \n          PromSeriesNormalize: offset=[0], time index=[timestamp], filter NaN: [true] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n            PromSeriesDivide: tags=[\"tag\"] [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n              Sort: metrics.tag ASC NULLS FIRST, metrics.timestamp ASC NULLS FIRST [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n                Filter: metrics.tag = Utf8(\"1\") AND metrics.timestamp > TimestampNanosecond(-5000000000, None) AND metrics.timestamp <= TimestampNanosecond(100000000000000, None) [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n                  Projection: metrics.field, metrics.tag, metrics.timestamp [field:Float64;N, tag:Utf8, timestamp:Timestamp(ns)]\
+            \n                    TableScan: metrics [tag:Utf8, timestamp:Timestamp(ns), field:Float64;N]"
     );
 }
 
@@ -5212,13 +5730,14 @@ async fn test_label_join() {
         .unwrap();
 
     let expected = r#"
-Filter: up.field_0 IS NOT NULL [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8]
-  Projection: up.timestamp, up.field_0, concat_ws(Utf8(","), up.tag_1, up.tag_2, up.tag_3) AS foo, up.tag_0, up.tag_1, up.tag_2, up.tag_3 [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8]
-    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-      PromSeriesDivide: tags=["tag_0", "tag_1", "tag_2", "tag_3"] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-        Sort: up.tag_0 ASC NULLS FIRST, up.tag_1 ASC NULLS FIRST, up.tag_2 ASC NULLS FIRST, up.tag_3 ASC NULLS FIRST, up.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-          Filter: up.tag_0 = Utf8("api-server") AND up.timestamp >= TimestampMillisecond(-999, None) AND up.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-            TableScan: up [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"#;
+Filter: up.field_0 IS NOT NULL [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, __promql_metric_name:Utf8]
+  Projection: up.timestamp, up.field_0, concat_ws(Utf8(","), up.tag_1, up.tag_2, up.tag_3) AS foo, up.tag_0, up.tag_1, up.tag_2, up.tag_3, __promql_metric_name [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, __promql_metric_name:Utf8]
+    Projection: up.tag_0, up.tag_1, up.tag_2, up.tag_3, up.timestamp, up.field_0, Utf8("up") AS __promql_metric_name [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]
+      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+        PromSeriesDivide: tags=["tag_0", "tag_1", "tag_2", "tag_3"] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+          Sort: up.tag_0 ASC NULLS FIRST, up.tag_1 ASC NULLS FIRST, up.tag_2 ASC NULLS FIRST, up.tag_3 ASC NULLS FIRST, up.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+            Filter: up.tag_0 = Utf8("api-server") AND up.timestamp >= TimestampMillisecond(-999, None) AND up.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+              TableScan: up [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, tag_3:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"#;
 
     let ret = plan.display_indent_schema().to_string();
     assert_eq!(format!("\n{ret}"), expected, "\n{}", ret);
@@ -5247,13 +5766,14 @@ async fn test_label_replace() {
         .unwrap();
 
     let expected = r#"
-Filter: up.field_0 IS NOT NULL [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8]
-  Projection: up.timestamp, up.field_0, regexp_replace(up.tag_0, Utf8("^(?s:(.*):.*)$"), Utf8("$1")) AS foo, up.tag_0 [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8]
-    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-      PromSeriesDivide: tags=["tag_0"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-        Sort: up.tag_0 ASC NULLS FIRST, up.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-          Filter: up.tag_0 = Utf8("a:c") AND up.timestamp >= TimestampMillisecond(-999, None) AND up.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
-            TableScan: up [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"#;
+Filter: up.field_0 IS NOT NULL [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, __promql_metric_name:Utf8]
+  Projection: up.timestamp, up.field_0, regexp_replace(up.tag_0, Utf8("^(?s:(.*):.*)$"), Utf8("$1")) AS foo, up.tag_0, __promql_metric_name [timestamp:Timestamp(ms), field_0:Float64;N, foo:Utf8;N, tag_0:Utf8, __promql_metric_name:Utf8]
+    Projection: up.tag_0, up.timestamp, up.field_0, Utf8("up") AS __promql_metric_name [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, __promql_metric_name:Utf8]
+      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+        PromSeriesDivide: tags=["tag_0"] [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+          Sort: up.tag_0 ASC NULLS FIRST, up.timestamp ASC NULLS FIRST [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+            Filter: up.tag_0 = Utf8("a:c") AND up.timestamp >= TimestampMillisecond(-999, None) AND up.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]
+              TableScan: up [tag_0:Utf8, timestamp:Timestamp(ms), field_0:Float64;N]"#;
 
     let ret = plan.display_indent_schema().to_string();
     assert_eq!(format!("\n{ret}"), expected, "\n{}", ret);
@@ -5318,12 +5838,13 @@ async fn test_matchers_to_expr() {
         .await
         .unwrap();
     let expected = "Sort: prometheus_tsdb_head_series.timestamp ASC NULLS LAST [timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.field_0):Float64;N, sum(prometheus_tsdb_head_series.field_1):Float64;N, sum(prometheus_tsdb_head_series.field_2):Float64;N]\
-        \n  Aggregate: groupBy=[[prometheus_tsdb_head_series.timestamp]], aggr=[[sum(prometheus_tsdb_head_series.field_0), sum(prometheus_tsdb_head_series.field_1), sum(prometheus_tsdb_head_series.field_2)]] [timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.field_0):Float64;N, sum(prometheus_tsdb_head_series.field_1):Float64;N, sum(prometheus_tsdb_head_series.field_2):Float64;N]\
-        \n    PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
-        \n      PromSeriesDivide: tags=[\"tag_0\", \"tag_1\", \"tag_2\"] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
-        \n        Sort: prometheus_tsdb_head_series.tag_0 ASC NULLS FIRST, prometheus_tsdb_head_series.tag_1 ASC NULLS FIRST, prometheus_tsdb_head_series.tag_2 ASC NULLS FIRST, prometheus_tsdb_head_series.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
-        \n          Filter: prometheus_tsdb_head_series.tag_1 ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
-        \n            TableScan: prometheus_tsdb_head_series [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]";
+            \n  Aggregate: groupBy=[[prometheus_tsdb_head_series.timestamp]], aggr=[[sum(prometheus_tsdb_head_series.field_0), sum(prometheus_tsdb_head_series.field_1), sum(prometheus_tsdb_head_series.field_2)]] [timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.field_0):Float64;N, sum(prometheus_tsdb_head_series.field_1):Float64;N, sum(prometheus_tsdb_head_series.field_2):Float64;N]\
+            \n    Projection: prometheus_tsdb_head_series.tag_0, prometheus_tsdb_head_series.tag_1, prometheus_tsdb_head_series.tag_2, prometheus_tsdb_head_series.timestamp, prometheus_tsdb_head_series.field_0, prometheus_tsdb_head_series.field_1, prometheus_tsdb_head_series.field_2, Utf8(\"prometheus_tsdb_head_series\") AS __promql_metric_name [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N, __promql_metric_name:Utf8]\
+            \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[timestamp] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
+            \n        PromSeriesDivide: tags=[\"tag_0\", \"tag_1\", \"tag_2\"] [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
+            \n          Sort: prometheus_tsdb_head_series.tag_0 ASC NULLS FIRST, prometheus_tsdb_head_series.tag_1 ASC NULLS FIRST, prometheus_tsdb_head_series.tag_2 ASC NULLS FIRST, prometheus_tsdb_head_series.timestamp ASC NULLS FIRST [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
+            \n            Filter: prometheus_tsdb_head_series.tag_1 ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.timestamp <= TimestampMillisecond(100000000, None) [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]\
+            \n              TableScan: prometheus_tsdb_head_series [tag_0:Utf8, tag_1:Utf8, tag_2:Utf8, timestamp:Timestamp(ms), field_0:Float64;N, field_1:Float64;N, field_2:Float64;N]";
     assert_eq!(plan.display_indent_schema().to_string(), expected);
 }
 
@@ -5361,16 +5882,17 @@ async fn test_topk_expr() {
         .await
         .unwrap();
     let expected = "Projection: sum(prometheus_tsdb_head_series.greptime_value), prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp [sum(prometheus_tsdb_head_series.greptime_value):Float64;N, ip:Utf8, greptime_timestamp:Timestamp(ms)]\
-        \n  Sort: prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
-        \n    Filter: row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Float64(10) [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
-        \n      WindowAggr: windowExpr=[[row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
-        \n        Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
-        \n          Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[sum(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
-        \n            PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n              PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n                Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n                  Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n                    TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
+            \n  Sort: prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
+            \n    Filter: row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Float64(10) [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
+            \n      WindowAggr: windowExpr=[[row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N, row_number() PARTITION BY [prometheus_tsdb_head_series.greptime_timestamp] ORDER BY [sum(prometheus_tsdb_head_series.greptime_value) DESC NULLS FIRST, prometheus_tsdb_head_series.ip DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64]\
+            \n        Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
+            \n          Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[sum(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
+            \n            Projection: prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prometheus_tsdb_head_series.greptime_value, Utf8(\"prometheus_tsdb_head_series\") AS __promql_metric_name [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N, __promql_metric_name:Utf8]\
+            \n              PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                  Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                    Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                      TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
 
     assert_eq!(plan.display_indent_schema().to_string(), expected);
 }
@@ -5411,11 +5933,12 @@ async fn test_count_values_expr() {
     let expected = "Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST, prometheus_tsdb_head_series.series ASC NULLS LAST [count(prometheus_tsdb_head_series.greptime_value):Int64, ip:Utf8, greptime_timestamp:Timestamp(ms), series:Utf8;N]\
         \n  Projection: count(prometheus_tsdb_head_series.greptime_value), prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prom_float_to_string(prometheus_tsdb_head_series.greptime_value) AS series [count(prometheus_tsdb_head_series.greptime_value):Int64, ip:Utf8, greptime_timestamp:Timestamp(ms), series:Utf8;N]\
         \n    Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prom_float_to_string(prometheus_tsdb_head_series.greptime_value)]], aggr=[[count(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), prom_float_to_string(prometheus_tsdb_head_series.greptime_value):Utf8;N, count(prometheus_tsdb_head_series.greptime_value):Int64]\
-        \n      PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n        PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n          Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n            Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n              TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
+        \n      Projection: prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prometheus_tsdb_head_series.greptime_value, Utf8(\"prometheus_tsdb_head_series\") AS __promql_metric_name [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N, __promql_metric_name:Utf8]\
+        \n        PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+        \n          PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+        \n            Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+        \n              Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+        \n                TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
 
     assert_eq!(plan.display_indent_schema().to_string(), expected);
 }
@@ -5459,11 +5982,12 @@ Projection: count(prometheus_tsdb_head_series.greptime_value) AS my_series, prom
   Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST, prometheus_tsdb_head_series.series ASC NULLS LAST [count(prometheus_tsdb_head_series.greptime_value):Int64, ip:Utf8, greptime_timestamp:Timestamp(ms), series:Utf8;N]
     Projection: count(prometheus_tsdb_head_series.greptime_value), prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prom_float_to_string(prometheus_tsdb_head_series.greptime_value) AS series [count(prometheus_tsdb_head_series.greptime_value):Int64, ip:Utf8, greptime_timestamp:Timestamp(ms), series:Utf8;N]
       Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prom_float_to_string(prometheus_tsdb_head_series.greptime_value)]], aggr=[[count(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), prom_float_to_string(prometheus_tsdb_head_series.greptime_value):Utf8;N, count(prometheus_tsdb_head_series.greptime_value):Int64]
-        PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
-          PromSeriesDivide: tags=["ip"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
-            Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
-              Filter: prometheus_tsdb_head_series.ip ~ Utf8("^(?:(10.0.160.237:8080|10.0.160.237:9090))$") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
-                TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]"#;
+        Projection: prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prometheus_tsdb_head_series.greptime_value, Utf8("prometheus_tsdb_head_series") AS __promql_metric_name [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N, __promql_metric_name:Utf8]
+          PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
+            PromSeriesDivide: tags=["ip"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
+              Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
+                Filter: prometheus_tsdb_head_series.ip ~ Utf8("^(?:(10.0.160.237:8080|10.0.160.237:9090))$") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]
+                  TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]"#;
     assert_eq!(format!("\n{}", plan.display_indent_schema()), expected);
 }
 
@@ -5501,14 +6025,15 @@ async fn test_quantile_expr() {
         .await
         .unwrap();
     let expected = "Sort: prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST [greptime_timestamp:Timestamp(ms), quantile(Float64(0.3),sum(prometheus_tsdb_head_series.greptime_value)):Float64;N]\
-        \n  Aggregate: groupBy=[[prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[quantile(Float64(0.3), sum(prometheus_tsdb_head_series.greptime_value))]] [greptime_timestamp:Timestamp(ms), quantile(Float64(0.3),sum(prometheus_tsdb_head_series.greptime_value)):Float64;N]\
-        \n    Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
-        \n      Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[sum(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
-        \n        PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n          PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n            Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n              Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
-        \n                TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
+            \n  Aggregate: groupBy=[[prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[quantile(Float64(0.3), sum(prometheus_tsdb_head_series.greptime_value))]] [greptime_timestamp:Timestamp(ms), quantile(Float64(0.3),sum(prometheus_tsdb_head_series.greptime_value)):Float64;N]\
+            \n    Sort: prometheus_tsdb_head_series.ip ASC NULLS LAST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS LAST [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
+            \n      Aggregate: groupBy=[[prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp]], aggr=[[sum(prometheus_tsdb_head_series.greptime_value)]] [ip:Utf8, greptime_timestamp:Timestamp(ms), sum(prometheus_tsdb_head_series.greptime_value):Float64;N]\
+            \n        Projection: prometheus_tsdb_head_series.ip, prometheus_tsdb_head_series.greptime_timestamp, prometheus_tsdb_head_series.greptime_value, Utf8(\"prometheus_tsdb_head_series\") AS __promql_metric_name [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N, __promql_metric_name:Utf8]\
+            \n          PromInstantManipulate: range=[0..100000000], lookback=[1000], interval=[5000], time index=[greptime_timestamp] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n            PromSeriesDivide: tags=[\"ip\"] [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n              Sort: prometheus_tsdb_head_series.ip ASC NULLS FIRST, prometheus_tsdb_head_series.greptime_timestamp ASC NULLS FIRST [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                Filter: prometheus_tsdb_head_series.ip ~ Utf8(\"^(?:(10.0.160.237:8080|10.0.160.237:9090))$\") AND prometheus_tsdb_head_series.greptime_timestamp >= TimestampMillisecond(-999, None) AND prometheus_tsdb_head_series.greptime_timestamp <= TimestampMillisecond(100000000, None) [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]\
+            \n                  TableScan: prometheus_tsdb_head_series [ip:Utf8, greptime_timestamp:Timestamp(ms), greptime_value:Float64;N]";
 
     assert_eq!(plan.display_indent_schema().to_string(), expected);
 }
@@ -5528,11 +6053,18 @@ async fn test_or_not_exists_table_label() {
     )
     .await
     .unwrap();
-    assert!(
-        raw.display_indent_schema()
-            .to_string()
-            .contains("__promql_or_match_0@")
+    // `on(absent_label)` names no label either operand carries, so the matching compares the
+    // timestamp alone and the plan generates no internal match key. The result keeps the marked
+    // metric-name identity of its left side.
+    assert_eq!(
+        PromPlanner::metric_name_column(raw.schema())
+            .unwrap()
+            .map(|marker| marker.name),
+        Some(PROMQL_METRIC_NAME_COLUMN.to_string()),
+        "{}",
+        raw.display_indent()
     );
+    assert_no_internal_or_keys(raw.schema());
     let (optimized, batches) = execute(raw, &state).await;
     assert_no_internal_or_keys(optimized.schema());
     assert!(batches.iter().all(|batch| {
@@ -5542,6 +6074,12 @@ async fn test_or_not_exists_table_label() {
             .iter()
             .all(|field| !field.name().starts_with("__promql_or_match_"))
     }));
+    // `missing_metric` does not exist and `normal_metric` holds no rows, so the OR emits none.
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0,
+        "{batches:?}"
+    );
 }
 
 #[tokio::test]
@@ -5715,17 +6253,52 @@ async fn test_direct_or_skips_user_internal_key_name() {
         &or_modifier("lhs or on(missing_label) rhs"),
     )
     .await;
-    assert!(
-        raw.display_indent_schema()
-            .to_string()
-            .contains("__promql_or_match_1@")
-    );
-    let (_, batches) = execute(raw, &build_query_engine_state()).await;
-    assert!(
-        batches
+    // The only column named like an internal match key is the user's own tag column, and the
+    // plan must not reuse that occupied name for a generated key.
+    let user_tag_columns = |schema: &DFSchema| {
+        schema
+            .fields()
             .iter()
-            .all(|batch| batch.column_by_name(USER_TAG).is_some())
+            .filter(|field| field.name().starts_with("__promql_or_match_"))
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        user_tag_columns(raw.schema()),
+        vec![USER_TAG.to_string()],
+        "{}",
+        raw.display_indent_schema()
     );
+    let (optimized, batches) = execute(raw, &build_query_engine_state()).await;
+    assert_eq!(
+        user_tag_columns(optimized.schema()),
+        vec![USER_TAG.to_string()],
+        "{optimized:?}"
+    );
+    // `on(missing_label)` names no label either operand carries, so the matching compares the
+    // timestamp alone; the right row is the left row's match and the `or` returns the left row,
+    // its sample and its own `__promql_or_match_0` tag value.
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1,
+        "{batches:?}"
+    );
+    assert_eq!(values(&batches, "v"), vec![1.0]);
+    for batch in &batches {
+        let tag = batch
+            .column_by_name(USER_TAG)
+            .unwrap_or_else(|| panic!("the user column must be kept: {}", batch.schema()))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            (0..batch.num_rows())
+                .map(|row| tag.value(row).to_string())
+                .collect::<Vec<_>>(),
+            vec!["left".to_string()],
+            "the result must be the left row"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6010,9 +6583,23 @@ async fn test_and_preserves_left_context_when_le_is_missing() {
     )
     .await
     .unwrap();
-    assert!(matches!(&plan, LogicalPlan::EmptyRelation(_)), "{plan:?}");
+    assert!(
+        PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .is_none()
+    );
     assert!(!plan.schema().fields().is_empty());
     assert!(!contains_histogram_fold(&plan), "{plan:?}");
+    // The result must stay empty, not turn into a non-empty plan that just lost its
+    // identity: the plan bottoms out in an `EmptyRelation` (possibly below a projection
+    // that only reshapes the schema), so no sample can be emitted.
+    let mut plans = vec![&plan];
+    let mut is_empty = false;
+    while let Some(next) = plans.pop() {
+        is_empty |= matches!(next, LogicalPlan::EmptyRelation(_));
+        plans.extend(next.inputs());
+    }
+    assert!(is_empty, "the missing `le` case must stay empty: {plan:?}");
 }
 
 async fn build_matching_filter_plan(query: &str) -> String {
@@ -6378,9 +6965,22 @@ async fn test_mixed_binary_operator_aligns_both_alternative_inputs() {
 #[tokio::test]
 async fn test_mixed_binary_operator_reports_only_dropped_samples() {
     for (query, expected_rows, expected_infos) in [
+        // `+`/`-` report the discarded mixed pairs from the float lane's coalesce fallbacks.
         ("(lf or on(tag) lh) + on(tag) (rf or on(tag) rh)", 0, 1),
+        ("(lf or on(tag) lh) - on(tag) (rf or on(tag) rh)", 0, 1),
+        // Compatible float/float and histogram/histogram pairs must not invent an annotation.
         ("(lf or on(tag) lh) + on(tag) (lf or on(tag) lh)", 2, 0),
+        ("(lf or on(tag) lh) - on(tag) (lf or on(tag) lh)", 2, 0),
+        // An unmatched operand has no dropped pair to report.
+        (
+            "(lf or on(tag) lh) + on(tag) (fallback or on(tag) bad_native)",
+            0,
+            0,
+        ),
         ("(lf or on(tag) lh) % on(tag) lh", 0, 1),
+        // A non-bool comparison drops its unsupported pairs through the standalone annotation
+        // filter, not through the lane, so the dropped samples are still reported.
+        ("(lf or on(tag) lh) > on(tag) lh", 0, 1),
     ] {
         let state = build_query_engine_state();
         let annotations = PromqlAnnotationCollector::default();
@@ -7217,10 +7817,31 @@ async fn build_count_values_table_provider_with_values(values: &[f64]) -> DfTabl
 async fn build_count_values_table_provider_with_value_array(
     values: ArrayRef,
 ) -> DfTableSourceProvider {
+    build_count_values_table_provider_with_tag_value_array("k", values).await
+}
+
+/// Like [`build_count_values_table_provider_with_values`] with `[1.0, 1.0, 1.0]`, but with `tag`
+/// as the name of the series tag column, so tests can cover tag names that collide with the
+/// internal metric-name column while keeping the same `k0`/`k1`/`k2` rows: three series with
+/// equal sample values that must stay separate groups.
+async fn build_count_values_collision_table_provider(tag: &str) -> DfTableSourceProvider {
+    build_count_values_table_provider_with_tag_value_array(
+        tag,
+        Arc::new(Float64Array::from(vec![1.0; 3])),
+    )
+    .await
+}
+
+/// Like [`build_count_values_table_provider_with_value_array`], but with a caller provided tag
+/// name.
+async fn build_count_values_table_provider_with_tag_value_array(
+    tag: &str,
+    values: ArrayRef,
+) -> DfTableSourceProvider {
     let value_data_type = ConcreteDataType::from_arrow_type(values.data_type());
     let catalog_list = MemoryCatalogManager::with_default_setup();
     let columns = vec![
-        ColumnSchema::new("k".to_string(), ConcreteDataType::string_datatype(), false),
+        ColumnSchema::new(tag.to_string(), ConcreteDataType::string_datatype(), false),
         ColumnSchema::new(
             "timestamp".to_string(),
             ConcreteDataType::timestamp_millisecond_datatype(),
@@ -7581,5 +8202,2342 @@ async fn test_count_values_groups_by_formatted_value_for_bigint_input() {
     assert_eq!(
         count_values_rows(&batches, "v"),
         vec![("9007199254740992", 2.0)]
+    );
+}
+
+/// Collects `(series tag, metric-name marker, sample value)` triples of every row in `batches`,
+/// one row per emitted sample of the `cv_metric` fixture, sorted by series tag.
+fn metric_name_rows(batches: &[RecordBatch], marker: &str) -> Vec<(String, String, f64)> {
+    metric_name_rows_of(batches, marker, greptime_value())
+}
+
+/// Like [`metric_name_rows`], but reading the sample from `value_column` (range functions name
+/// their output column after the function instead of `greptime_value`).
+fn metric_name_rows_of(
+    batches: &[RecordBatch],
+    marker: &str,
+    value_column: &str,
+) -> Vec<(String, String, f64)> {
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let tag = batch
+                .column_by_name("k")
+                .expect("no series tag column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the series tag must be a string column");
+            let name = batch
+                .column_by_name(marker)
+                .expect("no metric-name marker column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the metric-name marker must be a string column");
+            let value = batch
+                .column_by_name(value_column)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no sample value column {value_column} in {}",
+                        batch.schema()
+                    )
+                })
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("the sample value must be a float column");
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        tag.value(row).to_string(),
+                        name.value(row).to_string(),
+                        value.value(row),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+#[tokio::test]
+async fn test_raw_selector_attaches_metric_name_identity() {
+    let state = build_query_engine_state();
+    for query in [
+        "cv_metric",
+        r#"cv_metric{k=~"k.*"}"#,
+        r#"{__name__="cv_metric"}"#,
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the selector must attach its metric name"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_eq!(
+            metric_name_rows(&batches, &marker.name),
+            vec![
+                ("k0".to_string(), "cv_metric".to_string(), 1.0),
+                ("k1".to_string(), "cv_metric".to_string(), 2.0),
+                ("k2".to_string(), "cv_metric".to_string(), 1.0),
+            ],
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_collision_metric_name_label_is_preserved() {
+    let plan = PromPlanner::stmt_to_plan(
+        build_test_table_provider_with_distinct_tags(&[(
+            "collision_metric",
+            &[PROMQL_METRIC_NAME_COLUMN, "job"],
+        )])
+        .await,
+        &operator_eval_stmt("collision_metric"),
+        &build_query_engine_state(),
+    )
+    .await
+    .unwrap();
+
+    // The label physically named like the marker keeps its name and metadata; the marker
+    // moves to a suffixed column instead of overwriting it.
+    let physical = plan
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == PROMQL_METRIC_NAME_COLUMN)
+        .expect("the physical label must be preserved");
+    assert!(
+        physical.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none(),
+        "the physical label must not carry the marker role"
+    );
+    let marker = PromPlanner::metric_name_column(plan.schema())
+        .unwrap()
+        .expect("the selector must attach its metric name");
+    assert_eq!(
+        marker.name,
+        format!("{PROMQL_METRIC_NAME_COLUMN}_"),
+        "{}",
+        plan.display_indent()
+    );
+}
+
+#[tokio::test]
+async fn test_dropping_identity_keeps_physical_column_with_the_same_name() {
+    // Dropping the identity must remove only the marked column, never the physical label
+    // that happens to be spelled the same way.
+    let plan = PromPlanner::stmt_to_plan(
+        build_test_table_provider_with_distinct_tags(&[(
+            "collision_metric",
+            &[PROMQL_METRIC_NAME_COLUMN, "job"],
+        )])
+        .await,
+        // Unary minus drops the metric name of its operand.
+        &operator_eval_stmt("-collision_metric"),
+        &build_query_engine_state(),
+    )
+    .await
+    .unwrap();
+
+    let schema = plan.schema();
+    assert!(
+        PromPlanner::metric_name_column(schema).unwrap().is_none(),
+        "the identity must be dropped: {}",
+        plan.display_indent()
+    );
+    assert!(
+        schema
+            .field_with_name(None, PROMQL_METRIC_NAME_COLUMN)
+            .is_ok(),
+        "the physical label must survive the drop: {}",
+        plan.display_indent()
+    );
+    assert!(
+        schema
+            .field_with_name(None, &format!("{PROMQL_METRIC_NAME_COLUMN}_"))
+            .is_err(),
+        "the marker column must be gone: {}",
+        plan.display_indent()
+    );
+}
+
+#[tokio::test]
+async fn test_unary_sign_controls_metric_name_identity() {
+    let state = build_query_engine_state();
+    // The parser returns the operand of unary plus unchanged and wraps unary minus in a
+    // negation, which drops the metric name.
+    for (sign, negated) in [("-", true), ("+", false)] {
+        let query = format!("{sign}cv_metric");
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(&query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.is_some(),
+            !negated,
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        // The negated sample column is aliased after the negation expression and no longer
+        // carries the source field name, so identify it by type. The fixture has a single
+        // `Float64` column; the tag, time index and marker are not `Float64`.
+        let marker_name = marker.as_ref().map(|marker| marker.name.clone());
+        let sample_columns = plan
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| {
+                field.data_type() == &ArrowDataType::Float64
+                    && marker_name.as_ref() != Some(field.name())
+            })
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sample_columns.len(),
+            1,
+            "{query}: expected exactly one float sample column: {}",
+            plan.display_indent()
+        );
+        let sample_column = sample_columns.into_iter().next().unwrap();
+
+        let (_, batches) = execute(plan, &state).await;
+        match marker {
+            Some(marker) => assert_eq!(
+                metric_name_rows(&batches, &marker.name),
+                vec![
+                    ("k0".to_string(), "cv_metric".to_string(), 1.0),
+                    ("k1".to_string(), "cv_metric".to_string(), 2.0),
+                    ("k2".to_string(), "cv_metric".to_string(), 1.0),
+                ],
+                "{query}"
+            ),
+            None => {
+                let mut values = values(&batches, &sample_column);
+                values.sort_by(f64::total_cmp);
+                assert_eq!(values, vec![-2.0, -1.0, -1.0], "{query}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_ordinary_functions_drop_metric_name_from_their_result() {
+    let state = build_query_engine_state();
+    for query in ["abs(cv_metric)", "ceil(cv_metric)"] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            PromPlanner::metric_name_column(plan.schema())
+                .unwrap()
+                .is_none(),
+            "{query}: an ordinary function must drop the metric name: {}",
+            plan.display_indent()
+        );
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_not_in_batches(&batches);
+        assert_eq!(
+            cv_rows(&batches, &sample_column),
+            vec![
+                ("k0".to_string(), 1_000, 1.0),
+                ("k1".to_string(), 1_000, 2.0),
+                ("k2".to_string(), 1_000, 1.0),
+            ],
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sort_functions_keep_metric_name_identity() {
+    let state = build_query_engine_state();
+    for (query, expected_values) in [
+        ("sort(cv_metric)", vec![1.0, 1.0, 2.0]),
+        ("sort_desc(cv_metric)", vec![2.0, 1.0, 1.0]),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: sort keeps the metric name"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            metric_name_rows(&batches, &marker.name),
+            vec![
+                ("k0".to_string(), "cv_metric".to_string(), 1.0),
+                ("k1".to_string(), "cv_metric".to_string(), 2.0),
+                ("k2".to_string(), "cv_metric".to_string(), 1.0),
+            ],
+            "{query}"
+        );
+        assert_eq!(values(&batches, &sample_column), expected_values, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn test_sort_by_label_resolves_semantic_name_to_the_marker() {
+    let state = build_query_engine_state();
+    // `__name__` is not a physical column: it resolves to the marked identity column, while
+    // ordinary labels keep their existing lookup.
+    for (query, sort_column, direction) in [
+        (
+            r#"sort_by_label(cv_metric, "__name__")"#,
+            "__promql_metric_name",
+            "ASC",
+        ),
+        (r#"sort_by_label_desc(cv_metric, "k")"#, "k", "DESC"),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let plan_text = plan.display_indent().to_string();
+        assert!(
+            plan_text.contains(&format!("{sort_column} {direction}")),
+            "{query}: {plan_text}"
+        );
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: sort_by_label keeps the metric name"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            metric_name_rows(&batches, &marker.name),
+            vec![
+                ("k0".to_string(), "cv_metric".to_string(), 1.0),
+                ("k1".to_string(), "cv_metric".to_string(), 2.0),
+                ("k2".to_string(), "cv_metric".to_string(), 1.0),
+            ],
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_range_functions_control_metric_name_identity() {
+    let state = build_query_engine_state();
+    // The fixture's only samples sit at `ts=1000`; the evaluation point is the same second.
+    for (query, keeps_name) in [
+        ("last_over_time(cv_metric[5m])", true),
+        ("sum_over_time(cv_metric[5m])", false),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.is_some(),
+            keeps_name,
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        assert_eq!(
+            cv_rows(&batches, &sample_column),
+            vec![
+                ("k0".to_string(), 1_000, 1.0),
+                ("k1".to_string(), 1_000, 2.0),
+                ("k2".to_string(), 1_000, 1.0),
+            ],
+            "{query}"
+        );
+        match marker {
+            Some(marker) => {
+                assert_metric_name_in_batches(&batches, &marker.name);
+                assert_eq!(
+                    metric_name_rows_of(&batches, &marker.name, &sample_column),
+                    vec![
+                        ("k0".to_string(), "cv_metric".to_string(), 1.0),
+                        ("k1".to_string(), "cv_metric".to_string(), 2.0),
+                        ("k2".to_string(), "cv_metric".to_string(), 1.0),
+                    ],
+                    "{query}"
+                );
+            }
+            None => assert_metric_name_not_in_batches(&batches),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_histogram_quantile_folds_with_identity_then_drops_it() {
+    let state = build_query_engine_state();
+    let plan = PromPlanner::stmt_to_plan(
+        classic_and_native_histogram_table_provider("native", None, direct_or_histogram()),
+        &operator_eval_stmt("histogram_quantile(0.5, mixed_histogram)"),
+        &state,
+    )
+    .await
+    .unwrap();
+
+    // The completed result drops the metric name ...
+    assert!(
+        PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .is_none(),
+        "{}",
+        plan.display_indent()
+    );
+    // ... while the fold still groups by the input's identity.
+    let fold = find_histogram_fold(&plan).expect("the plan must contain a HistogramFold");
+    assert!(
+        PromPlanner::metric_name_column(fold.inputs()[0].schema())
+            .unwrap()
+            .is_some(),
+        "the fold must see the input metric identity: {}",
+        plan.display_indent()
+    );
+
+    let value_field = float_sample_column(&plan);
+    let (_, batches) = execute(plan, &state).await;
+    assert_metric_name_not_in_batches(&batches);
+    let mut actual = batches
+        .iter()
+        .flat_map(|batch| {
+            let tags = batch
+                .column_by_name("tag")
+                .expect("no series tag column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the series tag must be a string column");
+            let values = batch
+                .column_by_name(&value_field)
+                .expect("no sample value column")
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("the sample value must be a float column");
+            (0..batch.num_rows())
+                .map(|row| (tags.value(row).to_string(), values.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    actual.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        actual,
+        vec![("classic".to_string(), 1.0), ("native".to_string(), 0.0)]
+    );
+}
+
+#[tokio::test]
+async fn test_sort_by_label_semantic_name_without_marker_keeps_missing_label_error() {
+    let state = build_query_engine_state();
+    let provider = || async {
+        build_test_table_provider_with_distinct_tags(&[("collision_metric", &["__name__", "job"])])
+            .await
+    };
+    let plan = PromPlanner::stmt_to_plan(
+        provider().await,
+        &operator_eval_stmt("abs(collision_metric)"),
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        plan.schema()
+            .field_with_unqualified_name("__name__")
+            .is_ok()
+    );
+    assert!(
+        PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .is_none()
+    );
+    for function in ["sort_by_label", "sort_by_label_desc"] {
+        let query = format!(r#"{function}(abs(collision_metric), "__name__")"#);
+        let error =
+            PromPlanner::stmt_to_plan(provider().await, &operator_eval_stmt(&query), &state)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::promql::error::Error::DataFusionPlanning { .. }
+            ),
+            "{error}"
+        );
+        let query = format!(r#"{function}(collision_metric, "__name__")"#);
+        let plan = PromPlanner::stmt_to_plan(provider().await, &operator_eval_stmt(&query), &state)
+            .await
+            .unwrap();
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap();
+        assert!(
+            plan.display_indent()
+                .to_string()
+                .contains(&format!("Sort: {}", marker.name))
+        );
+    }
+}
+
+/// Aggregations follow the metric-name lifecycle: the semantic `__name__` resolves through the
+/// marked identity column only. An explicit `by (__name__, ...)` retains the name, every other
+/// modifier drops it.
+#[tokio::test]
+async fn test_aggregation_metric_name_lifecycle() {
+    let state = build_query_engine_state();
+    // (query, metric-name column of the result, sorted sample values)
+    for (query, expected_marker, expected_values) in [
+        ("sum(cv_metric)", None, vec![4.0]),
+        ("sum without (k) (cv_metric)", None, vec![4.0]),
+        ("sum by (k) (cv_metric)", None, vec![1.0, 1.0, 2.0]),
+        (
+            "sum by (__name__) (cv_metric)",
+            Some(PROMQL_METRIC_NAME_COLUMN),
+            vec![4.0],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let sample_column = float_sample_column(&plan);
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .map(|marker| marker.name);
+        assert_eq!(
+            marker.as_deref(),
+            expected_marker,
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let (_, batches) = execute(plan, &state).await;
+        let mut actual = values(&batches, &sample_column);
+        actual.sort_by(f64::total_cmp);
+        assert_eq!(actual, expected_values, "{query}");
+        match expected_marker {
+            // An explicit `by (__name__, ...)` groups by the marked identity column, so the result
+            // keeps the name of the input series as the metric name of each result series.
+            Some(marker) => {
+                assert_metric_name_in_batches(&batches, marker);
+                assert_eq!(
+                    count_values_rows(&batches, marker),
+                    vec![("cv_metric", 4.0)],
+                    "{query}"
+                );
+            }
+            None => assert_metric_name_not_in_batches(&batches),
+        }
+    }
+}
+
+/// `topk`/`bottomk` are aggregation operators that select a subset of the original samples with
+/// their labels, so the metric-name identity and the samples must survive.
+#[tokio::test]
+async fn test_topk_bottomk_preserve_metric_name_and_samples() {
+    let state = build_query_engine_state();
+    for (query, expected) in [
+        (
+            "topk(1, cv_metric)",
+            vec![("k2".to_string(), "cv_metric".to_string(), 3.0)],
+        ),
+        (
+            "bottomk(1, cv_metric)",
+            vec![("k0".to_string(), "cv_metric".to_string(), 1.0)],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider_with_values(&[1.0, 2.0, 3.0]).await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the metric name must survive"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            metric_name_rows(&batches, &marker.name),
+            expected,
+            "{query}"
+        );
+    }
+}
+
+/// `count_values("__name__", ...)` overwrites the identity of its input with the formatted
+/// sample value: the result carries exactly one marked column, holding the sample value, and
+/// the identity of the input must not survive as a second marker.
+#[tokio::test]
+async fn test_count_values_semantic_name_overwrites_metric_identity() {
+    let state = build_query_engine_state();
+    // (query, expected `(generated name, aggregated value)` rows)
+    for (query, expected) in [
+        (
+            r#"count_values("__name__", cv_metric)"#,
+            vec![("1", 2.0), ("2", 1.0)],
+        ),
+        (
+            r#"count_values("__name__", cv_metric) by (__name__)"#,
+            vec![("1", 2.0), ("2", 1.0)],
+        ),
+        (
+            r#"sum by (__name__) (count_values("__name__", cv_metric))"#,
+            vec![("1", 2.0), ("2", 1.0)],
+        ),
+        // Without an input identity the generated column must take neither the name of a
+        // physical field of the input nor the semantic `__name__` itself.
+        (
+            r#"count_values("__name__", abs(cv_metric))"#,
+            vec![("1", 2.0), ("2", 1.0)],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let markers = plan
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(PROMQL_FIELD_ROLE_KEY)
+                    .map(String::as_str)
+                    == Some(PROMQL_METRIC_NAME_ROLE)
+            })
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![PROMQL_METRIC_NAME_COLUMN.to_string()],
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, PROMQL_METRIC_NAME_COLUMN);
+        assert_eq!(
+            count_values_rows(&batches, PROMQL_METRIC_NAME_COLUMN),
+            expected,
+            "{query}"
+        );
+    }
+}
+
+/// `count_values("__name__", ...)` writes the semantic metric name, which lives in the marked
+/// identity column and never in a physical column of the input: a physical `__name__` label (or a
+/// physical column occupying the internal marker name) survives unmarked, while the generated
+/// name moves to the sole marked column, suffixed on collision.
+#[tokio::test]
+async fn test_count_values_semantic_name_keeps_physical_collision_columns() {
+    let state = build_query_engine_state();
+    // (physical tag columns, physical column that must survive, generated name column, query)
+    for (tags, physical, generated, query) in [
+        (
+            vec![METRIC_NAME, "job"],
+            METRIC_NAME,
+            PROMQL_METRIC_NAME_COLUMN.to_string(),
+            r#"count_values("__name__", collision_metric) without(job)"#,
+        ),
+        (
+            vec![PROMQL_METRIC_NAME_COLUMN, "job"],
+            PROMQL_METRIC_NAME_COLUMN,
+            format!("{PROMQL_METRIC_NAME_COLUMN}_"),
+            r#"count_values("__name__", abs(collision_metric)) without(job)"#,
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_test_table_provider_with_distinct_tags(&[("collision_metric", tags.as_slice())])
+                .await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let field = plan
+            .schema()
+            .field_with_unqualified_name(physical)
+            .unwrap_or_else(|_| panic!("{query}: the physical `{physical}` column must survive"));
+        assert!(
+            field.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none(),
+            "{query}: the physical `{physical}` column must stay unmarked: {}",
+            plan.display_indent()
+        );
+        let marked = plan
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(PROMQL_FIELD_ROLE_KEY)
+                    .map(String::as_str)
+                    == Some(PROMQL_METRIC_NAME_ROLE)
+            })
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked,
+            vec![generated],
+            "{query}: {}",
+            plan.display_indent()
+        );
+    }
+}
+
+/// A physical `__name__` label is an ordinary label, not the semantic metric name: with
+/// `without(...)` grouping `count_values("__name__", ...)` keeps it and the generated name goes to
+/// the sole marked column. Distinct physical labels with equal sample values must still be
+/// separate groups.
+#[tokio::test]
+async fn test_count_values_keeps_distinct_physical_name_labels() {
+    let state = build_query_engine_state();
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_collision_table_provider(METRIC_NAME).await,
+        &operator_eval_stmt(r#"count_values("__name__", cv_metric) without(job)"#),
+        &state,
+    )
+    .await
+    .unwrap();
+
+    let physical = plan
+        .schema()
+        .field_with_unqualified_name(METRIC_NAME)
+        .expect("the physical `__name__` label must survive");
+    assert!(physical.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none());
+    let marker = PromPlanner::metric_name_column(plan.schema())
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "the generated name must be marked: {}",
+                plan.display_indent()
+            )
+        });
+    assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN);
+
+    let (_, batches) = execute(plan, &state).await;
+    assert_metric_name_in_batches(&batches, &marker.name);
+    // `k0`, `k1` and `k2` share one sample value and one timestamp: a single group would mean the
+    // physical `__name__` label was dropped from the grouping key.
+    assert_eq!(
+        count_values_rows(&batches, &marker.name),
+        vec![("1", 1.0), ("1", 1.0), ("1", 1.0)]
+    );
+    let mut physical_labels = batches
+        .iter()
+        .flat_map(|batch| {
+            let labels = batch
+                .column_by_name(METRIC_NAME)
+                .expect("the physical `__name__` label must be projected")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the physical `__name__` label must be a string column");
+            (0..batch.num_rows())
+                .map(|row| labels.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    physical_labels.sort();
+    assert_eq!(physical_labels, vec!["k0", "k1", "k2"]);
+}
+
+/// `absent()` drops the metric-name identity of its input - even when the selector matched no
+/// series - and must still emit one 1-valued sample per evaluation timestamp instead of an
+/// empty result.
+#[tokio::test]
+async fn test_absent_drops_metric_name_and_emits_one_sample() {
+    let state = build_query_engine_state();
+    for query in [
+        // A metric that does not exist at all.
+        "abs(absent(nonexistent_metric))",
+        // An equality label of an existing metric matching no series.
+        r#"absent(cv_metric{k="missing"})"#,
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        assert!(
+            PromPlanner::metric_name_column(plan.schema())
+                .unwrap()
+                .is_none(),
+            "{query}: {}",
+            plan.display_indent()
+        );
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_not_in_batches(&batches);
+        assert_eq!(
+            values(&batches, &sample_column),
+            vec![1.0],
+            "{query}: absent must emit one 1-valued sample"
+        );
+    }
+}
+
+/// Binary operations between a vector and a scalar follow the metric-name lifecycle: arithmetic
+/// and `bool` comparisons build a new identity and drop the name, while comparison filters
+/// without `bool` keep the vector side, including its name and its sample values.
+#[tokio::test]
+async fn test_binary_scalar_metric_name_lifecycle() {
+    let state = build_query_engine_state();
+    // (query, whether the metric-name identity survives, `(series tag, sample value)` at ts=1000)
+    for (query, keeps_marker, expected) in [
+        (
+            "cv_metric + 1",
+            false,
+            vec![("k0", 2.0), ("k1", 3.0), ("k2", 2.0)],
+        ),
+        (
+            "1 + cv_metric",
+            false,
+            vec![("k0", 2.0), ("k1", 3.0), ("k2", 2.0)],
+        ),
+        (
+            "cv_metric > bool 1",
+            false,
+            vec![("k0", 0.0), ("k1", 1.0), ("k2", 0.0)],
+        ),
+        (
+            "1 < bool cv_metric",
+            false,
+            vec![("k0", 0.0), ("k1", 1.0), ("k2", 0.0)],
+        ),
+        ("cv_metric > 1", true, vec![("k1", 2.0)]),
+        ("1 < cv_metric", true, vec![("k1", 2.0)]),
+        // Computed scalars join instead of projecting against a literal.
+        (
+            "cv_metric + scalar(sum(cv_metric))",
+            false,
+            vec![("k0", 5.0), ("k1", 6.0), ("k2", 5.0)],
+        ),
+        (
+            "scalar(sum(cv_metric)) + cv_metric",
+            false,
+            vec![("k0", 5.0), ("k1", 6.0), ("k2", 5.0)],
+        ),
+        (
+            "cv_metric > scalar(min(cv_metric))",
+            true,
+            vec![("k1", 2.0)],
+        ),
+        (
+            "scalar(min(cv_metric)) < cv_metric",
+            true,
+            vec![("k1", 2.0)],
+        ),
+        // The ordinary path: `abs` already dropped the name, `sort` keeps it and must lose it.
+        (
+            "abs(cv_metric) + 1",
+            false,
+            vec![("k0", 2.0), ("k1", 3.0), ("k2", 2.0)],
+        ),
+        (
+            "sort(cv_metric) + 1",
+            false,
+            vec![("k0", 2.0), ("k1", 3.0), ("k2", 2.0)],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let sample_column = float_sample_column(&plan);
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.is_some(),
+            keeps_marker,
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let (_, batches) = execute(plan, &state).await;
+        if keeps_marker {
+            assert_metric_name_in_batches(&batches, PROMQL_METRIC_NAME_COLUMN);
+            // A comparison filter keeps the vector side's value (2.0), never the scalar's (1).
+            assert_eq!(
+                metric_name_rows(&batches, PROMQL_METRIC_NAME_COLUMN),
+                expected
+                    .iter()
+                    .map(|(tag, value)| (tag.to_string(), "cv_metric".to_string(), *value))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+        } else {
+            assert_metric_name_not_in_batches(&batches);
+            assert_eq!(
+                cv_rows(&batches, &sample_column),
+                expected
+                    .iter()
+                    .map(|(tag, value)| (tag.to_string(), 1_000, *value))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+        }
+    }
+}
+
+/// A binary island plans a repeated selector once and computes a new sample per series, so its
+/// result must not keep the metric name of the underlying selector.
+#[tokio::test]
+async fn test_binary_island_drops_metric_name_of_nested_arithmetic() {
+    let state = build_query_engine_state();
+    let query = "(cv_metric + 1) * (cv_metric + 2)";
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_table_provider().await,
+        &operator_eval_stmt(query),
+        &state,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+    // One underlying scan, aliased once: the island reused the shared selector.
+    let plan_str = plan.display_indent_schema().to_string();
+    assert_eq!(
+        plan_str.matches("SubqueryAlias: __prom_v0").count(),
+        1,
+        "{plan_str}"
+    );
+    assert_eq!(
+        plan_str.matches("TableScan: cv_metric").count(),
+        1,
+        "{plan_str}"
+    );
+
+    assert!(
+        PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .is_none(),
+        "{query}: {}",
+        plan.display_indent()
+    );
+
+    let sample_column = float_sample_column(&plan);
+    let (_, batches) = execute(plan, &state).await;
+    assert_metric_name_not_in_batches(&batches);
+    assert_eq!(
+        cv_rows(&batches, &sample_column),
+        vec![
+            ("k0".to_string(), 1_000, 6.0),
+            ("k1".to_string(), 1_000, 12.0),
+            ("k2".to_string(), 1_000, 6.0),
+        ],
+        "{query}"
+    );
+}
+
+/// Table provider with two single-series metrics that share the ordinary label `tag="shared"` at
+/// `ts=1000`: `left_metric` holds 2.0 and `right_metric` 3.0, so a vector operation of the two
+/// matches them on that label alone.
+fn binary_metric_name_table_provider() -> DfTableSourceProvider {
+    let catalog = MemoryCatalogManager::with_default_setup();
+    let tables = [
+        operator_metric_table(
+            "left_metric",
+            2_101,
+            "shared",
+            None,
+            DirectOrValue::Float64(2.0),
+        ),
+        operator_metric_table(
+            "right_metric",
+            2_102,
+            "shared",
+            None,
+            DirectOrValue::Float64(3.0),
+        ),
+    ];
+    for table in tables {
+        let info = table.table_info();
+        catalog
+            .register_table_sync(RegisterTableRequest {
+                catalog: DEFAULT_CATALOG_NAME.to_string(),
+                schema: DEFAULT_SCHEMA_NAME.to_string(),
+                table_name: info.name.clone(),
+                table_id: info.ident.table_id,
+                table,
+            })
+            .unwrap();
+    }
+    DfTableSourceProvider::new(
+        catalog,
+        false,
+        QueryContext::arc(),
+        DummyDecoder::arc(),
+        false,
+    )
+}
+
+/// `(series tag, metric name, sample value)` rows of a binary result, sorted. A label or an
+/// identity the operation dropped reads as `None`, and so does a column the operation dropped
+/// entirely, as `ignoring(tag)` or `on(__name__)` drop the only ordinary label.
+fn binary_result_rows(
+    batches: &[RecordBatch],
+    marker: Option<&str>,
+    tag_column: &str,
+    value_column: &str,
+) -> Vec<(Option<String>, Option<String>, f64)> {
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let tag = batch
+                .column_by_name(tag_column)
+                .map(|column| column.as_any().downcast_ref::<StringArray>().unwrap());
+            let name = marker.map(|marker| {
+                batch
+                    .column_by_name(marker)
+                    .unwrap_or_else(|| {
+                        panic!("no metric-name column {marker} in {}", batch.schema())
+                    })
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the metric-name column must be a string column")
+            });
+            let value = batch
+                .column_by_name(value_column)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no sample value column {value_column} in {}",
+                        batch.schema()
+                    )
+                })
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("the sample value must be a float column");
+            (0..batch.num_rows())
+                .map(|row| {
+                    assert!(value.is_valid(row), "the sample value must be valid");
+                    let tag = tag
+                        .filter(|tag| tag.is_valid(row))
+                        .map(|tag| tag.value(row).to_string());
+                    let name = name
+                        .filter(|name| name.is_valid(row))
+                        .map(|name| name.value(row).to_string());
+                    (tag, name, value.value(row))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.partial_cmp(right).unwrap());
+    rows
+}
+
+/// Expected rows of a binary result as `(series tag, metric name, sample value)`.
+type BinaryResultRow = (Option<&'static str>, Option<&'static str>, f64);
+
+fn expected_binary_result_rows(
+    expected: &[BinaryResultRow],
+) -> Vec<(Option<String>, Option<String>, f64)> {
+    expected
+        .iter()
+        .map(|(tag, name, value)| (tag.map(str::to_string), name.map(str::to_string), *value))
+        .collect()
+}
+
+/// Vector-vector binary operations derive the metric-name identity from their matching: the
+/// default and `ignoring(...)` matching compare every ordinary label, `on(...)` keeps only the
+/// named ones, and a group modifier copies `__name__` from the "one" side. Arithmetic and `bool`
+/// comparisons build a new identity and drop the name, while a comparison that filters keeps the
+/// projected side - name and sample values included.
+#[tokio::test]
+async fn test_binary_vector_metric_name_lifecycle() {
+    let state = build_query_engine_state();
+    // (query, whether the plan keeps the identity, expected result rows)
+    for (query, keeps_marker, expected) in [
+        // Different metric names, same ordinary label: the default matching ignores the name.
+        (
+            "left_metric + right_metric",
+            false,
+            vec![(Some("shared"), None, 5.0)],
+        ),
+        (
+            "left_metric < bool right_metric",
+            false,
+            vec![(Some("shared"), None, 1.0)],
+        ),
+        // A comparison that filters keeps the left side, its name and its sample value.
+        (
+            "left_metric < right_metric",
+            true,
+            vec![(Some("shared"), Some("left_metric"), 2.0)],
+        ),
+        // `on(tag)` drops the identity from the result labels.
+        (
+            "left_metric + on(tag) right_metric",
+            false,
+            vec![(Some("shared"), None, 5.0)],
+        ),
+        (
+            "left_metric < on(tag) right_metric",
+            false,
+            vec![(Some("shared"), None, 2.0)],
+        ),
+        // `ignoring(tag)` keeps the identity in the result labels, and the matching no longer
+        // compares `tag`, so the two operands still match.
+        (
+            "left_metric < ignoring(tag) right_metric",
+            true,
+            vec![(None, Some("left_metric"), 2.0)],
+        ),
+        // An explicit `on(__name__)` distinguishes different names and matches equal ones.
+        ("left_metric < on(__name__) right_metric", true, vec![]),
+        (
+            "left_metric <= on(__name__) left_metric",
+            true,
+            vec![(None, Some("left_metric"), 2.0)],
+        ),
+        // `group_left(__name__)`/`group_right(__name__)` copy the "one" side's name.
+        (
+            "left_metric < on(tag) group_left(__name__) right_metric",
+            true,
+            vec![(Some("shared"), Some("right_metric"), 2.0)],
+        ),
+        (
+            "left_metric < on(tag) group_right(__name__) right_metric",
+            true,
+            vec![(Some("shared"), Some("left_metric"), 2.0)],
+        ),
+        // A "one" side that dropped its own name clears the identity.
+        (
+            "left_metric < on(tag) group_left(__name__) abs(right_metric)",
+            true,
+            vec![(Some("shared"), None, 2.0)],
+        ),
+        // The set operators keep the left operand's identity, and match on `__name__` when asked.
+        (
+            "left_metric and right_metric",
+            true,
+            vec![(Some("shared"), Some("left_metric"), 2.0)],
+        ),
+        // `or` matches like the default and keeps the row it selected, with that row's own name.
+        (
+            "left_metric or right_metric",
+            true,
+            vec![(Some("shared"), Some("left_metric"), 2.0)],
+        ),
+        ("left_metric and on(__name__) right_metric", true, vec![]),
+        (
+            "left_metric unless on(__name__) right_metric",
+            true,
+            vec![(Some("shared"), Some("left_metric"), 2.0)],
+        ),
+        ("left_metric unless right_metric", true, vec![]),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            binary_metric_name_table_provider(),
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.as_ref().map(|marker| marker.name.as_str()),
+            keeps_marker.then_some(PROMQL_METRIC_NAME_COLUMN),
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        if !batches.is_empty() {
+            if keeps_marker {
+                assert_metric_name_in_batches(&batches, PROMQL_METRIC_NAME_COLUMN);
+            } else {
+                assert_metric_name_not_in_batches(&batches);
+            }
+        }
+        assert_eq!(
+            binary_result_rows(
+                &batches,
+                marker.as_ref().map(|marker| marker.name.as_str()),
+                "tag",
+                &sample_column,
+            ),
+            expected_binary_result_rows(&expected),
+            "{query}"
+        );
+    }
+}
+
+/// A private physical column that already occupies the internal marker name is an ordinary label:
+/// the identity is attached under the next free name, `on(__name__)` compares that identity and
+/// never the physical column, and the set and binary operators keep the two apart.
+#[tokio::test]
+async fn test_binary_metric_name_private_collision() {
+    let state = build_query_engine_state();
+    let collision_marker = format!("{PROMQL_METRIC_NAME_COLUMN}_");
+    // The collision metric holds three series at `ts=1000` with the sample value 1.0 each, so
+    // `sum by (__name__)` holds 3.0.
+    for (query, keeps_marker, expected) in [
+        (
+            "cv_metric + cv_metric",
+            false,
+            vec![
+                (Some("k0"), None, 2.0),
+                (Some("k1"), None, 2.0),
+                (Some("k2"), None, 2.0),
+            ],
+        ),
+        (
+            "abs(cv_metric) or cv_metric",
+            true,
+            vec![
+                (Some("k0"), None, 1.0),
+                (Some("k1"), None, 1.0),
+                (Some("k2"), None, 1.0),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_collision_table_provider(PROMQL_METRIC_NAME_COLUMN).await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.as_ref().map(|marker| marker.name.as_str()),
+            keeps_marker.then_some(collision_marker.as_str()),
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        if !batches.is_empty() {
+            if keeps_marker {
+                assert_metric_name_in_batches(&batches, &collision_marker);
+            } else {
+                // The fixture's ordinary label is named like the marker itself, so the role, not
+                // the name, tells whether a result field is the identity.
+                for batch in &batches {
+                    let schema = batch.schema();
+                    assert!(
+                        schema.field_with_name(&collision_marker).is_err(),
+                        "the metric-name marker must not reach the result batches: {schema:?}"
+                    );
+                    assert!(
+                        schema
+                            .fields()
+                            .iter()
+                            .all(|field| field.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none()),
+                        "no result field may carry the metric-name role: {schema:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            binary_result_rows(
+                &batches,
+                marker.as_ref().map(|marker| marker.name.as_str()),
+                PROMQL_METRIC_NAME_COLUMN,
+                &sample_column,
+            ),
+            expected_binary_result_rows(&expected),
+            "{query}"
+        );
+    }
+
+    // `on(__name__)` resolves to the marked identity, never to the physical private column.
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_collision_table_provider(PROMQL_METRIC_NAME_COLUMN).await,
+        &operator_eval_stmt("cv_metric == on(__name__) cv_metric"),
+        &state,
+    )
+    .await
+    .unwrap();
+    let plan_str = plan.display_indent_schema().to_string();
+    let join = plan_str
+        .lines()
+        .find(|line| line.contains("Inner Join:"))
+        .unwrap_or_else(|| panic!("{plan_str}"));
+    assert!(
+        join.contains("__promql_metric_name_ ="),
+        "`on(__name__)` must compare the marked identity: {plan_str}"
+    );
+    assert!(
+        !join.contains("__promql_metric_name ="),
+        "`on(__name__)` must not compare the physical private label: {plan_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_name_only_vector_matching_does_not_broadcast() {
+    let state = build_query_engine_state();
+
+    for (query, expected_tag, expected_name, expected_value) in [
+        (
+            "sum by (__name__) (left_metric) < on(__name__) sum by (__name__) (right_metric)",
+            None,
+            None,
+            None,
+        ),
+        (
+            "sum by (__name__) (left_metric) <= on(__name__) sum by (__name__) (left_metric)",
+            None,
+            Some("left_metric"),
+            Some(2.0),
+        ),
+        (
+            "left_metric < on() group_left(__name__) sum by (__name__) (right_metric)",
+            Some("shared"),
+            Some("right_metric"),
+            Some(2.0),
+        ),
+        (
+            "left_metric < on() group_left(__name__) sum(right_metric)",
+            Some("shared"),
+            None,
+            Some(2.0),
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            binary_metric_name_table_provider(),
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        let sample = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        let rows = binary_result_rows(
+            &batches,
+            marker.as_ref().map(|marker| marker.name.as_str()),
+            "tag",
+            &sample,
+        );
+        match expected_value {
+            Some(value) => {
+                assert_eq!(
+                    rows,
+                    expected_binary_result_rows(&[(expected_tag, expected_name, value)]),
+                    "{query}"
+                );
+            }
+            None => assert!(rows.is_empty(), "{query}: {rows:?}"),
+        }
+    }
+}
+
+/// `or` keeps every chosen row's own identity, including the typed NULL of an operand that
+/// dropped its name, and never invents an identity when neither operand has one.
+#[tokio::test]
+async fn test_or_preserves_metric_name_identity() {
+    let state = build_query_engine_state();
+    for (query, keeps_marker, expected) in [
+        (
+            "lf or rf",
+            true,
+            vec![(Some("a"), Some("lf"), 2.0), (Some("b"), Some("rf"), 3.0)],
+        ),
+        (
+            "abs(lf) or rf",
+            true,
+            vec![(Some("a"), None, 2.0), (Some("b"), Some("rf"), 3.0)],
+        ),
+        (
+            "abs(lf) or abs(rf)",
+            false,
+            vec![(Some("a"), None, 2.0), (Some("b"), None, 3.0)],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            operator_table_provider(),
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+        let marker = PromPlanner::metric_name_column(plan.schema()).unwrap();
+        assert_eq!(
+            marker.as_ref().map(|marker| marker.name.as_str()),
+            keeps_marker.then_some(PROMQL_METRIC_NAME_COLUMN),
+            "{query}: {}",
+            plan.display_indent()
+        );
+
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        if keeps_marker {
+            assert_metric_name_in_batches(&batches, PROMQL_METRIC_NAME_COLUMN);
+        } else {
+            assert_metric_name_not_in_batches(&batches);
+        }
+        assert_eq!(
+            binary_result_rows(
+                &batches,
+                marker.as_ref().map(|marker| marker.name.as_str()),
+                "tag",
+                &sample_column,
+            ),
+            expected_binary_result_rows(&expected),
+            "{query}"
+        );
+    }
+}
+
+/// `(series tag, value)` pairs of the string column `column` of `batches`, sorted by series
+/// tag; a NULL value is `None`. The row order of a plan is not stable, so pairs are used
+/// whenever the identity of a row matters.
+fn tagged_string_rows(batches: &[RecordBatch], column: &str) -> Vec<(String, Option<String>)> {
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let tag = batch
+                .column_by_name("k")
+                .expect("no series tag column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the series tag must be a string column");
+            let values = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("no column {column} in {}", batch.schema()))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("column {column} is not a string column"));
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        tag.value(row).to_string(),
+                        (!values.is_null(row)).then(|| values.value(row).to_string()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+/// Every value of the string column `column` of `batches`, row by row: `None` is a NULL.
+fn string_values(batches: &[RecordBatch], column: &str) -> Vec<Option<String>> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("no column {column} in {}", batch.schema()))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("column {column} is not a string column"));
+            (0..batch.num_rows())
+                .map(|row| (!values.is_null(row)).then(|| values.value(row).to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The semantic `__name__` is a source for ordinary labels: it resolves through the marked
+/// identity of the input, never through the sample or a physical column of that name, and the
+/// identity itself stays attached to the result.
+#[tokio::test]
+async fn test_label_functions_semantic_name_source_into_ordinary_label() {
+    let state = build_query_engine_state();
+    // (query, expected values of the new ordinary label, one per series)
+    for (query, expected) in [
+        (
+            r#"label_replace(cv_metric, "name_copy", "$1", "__name__", "(.*)")"#,
+            vec!["cv_metric", "cv_metric", "cv_metric"],
+        ),
+        (
+            r#"label_join(cv_metric, "name_copy", "/", "__name__", "missing_label")"#,
+            vec!["cv_metric/", "cv_metric/", "cv_metric/"],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the identity must survive"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            string_values(&batches, "name_copy"),
+            expected
+                .iter()
+                .map(|value| Some(value.to_string()))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        assert_eq!(
+            cv_rows(&batches, greptime_value()),
+            vec![
+                ("k0".to_string(), 1_000, 1.0),
+                ("k1".to_string(), 1_000, 2.0),
+                ("k2".to_string(), 1_000, 1.0),
+            ],
+            "{query}: the samples must be untouched"
+        );
+    }
+}
+
+/// The semantic `__name__` is a destination: it overwrites the marked identity of the input in
+/// place. A matching regex writes the replacement, a non-match keeps the identity of the input,
+/// and a missing source label is the empty string the regex is matched against. The samples keep
+/// their series and their values either way.
+#[tokio::test]
+async fn test_label_functions_semantic_name_destination_overwrites_identity() {
+    let state = build_query_engine_state();
+    // (query, expected `(series tag, identity, sample value)` rows)
+    for (query, expected) in [
+        // Matches one series only.
+        (
+            r#"label_replace(cv_metric, "__name__", "renamed", "k", "k1")"#,
+            vec![
+                ("k0", "cv_metric", 1.0),
+                ("k1", "renamed", 2.0),
+                ("k2", "cv_metric", 1.0),
+            ],
+        ),
+        // Matches nothing: the input keeps its identity.
+        (
+            r#"label_replace(cv_metric, "__name__", "renamed", "k", "nomatch")"#,
+            vec![
+                ("k0", "cv_metric", 1.0),
+                ("k1", "cv_metric", 2.0),
+                ("k2", "cv_metric", 1.0),
+            ],
+        ),
+        // The replacement expands the captured value.
+        (
+            r#"label_replace(cv_metric, "__name__", "renamed_$1", "k", "k(.)")"#,
+            vec![
+                ("k0", "renamed_0", 1.0),
+                ("k1", "renamed_1", 2.0),
+                ("k2", "renamed_2", 1.0),
+            ],
+        ),
+        // A missing source label is the empty string, so a regex matching it replaces the name.
+        (
+            r#"label_replace(cv_metric, "__name__", "empty_source", "missing_label", "()")"#,
+            vec![
+                ("k0", "empty_source", 1.0),
+                ("k1", "empty_source", 2.0),
+                ("k2", "empty_source", 1.0),
+            ],
+        ),
+        // ... and a regex that does not match it leaves the identity alone.
+        (
+            r#"label_replace(cv_metric, "__name__", "empty_source", "missing_label", "nomatch")"#,
+            vec![
+                ("k0", "cv_metric", 1.0),
+                ("k1", "cv_metric", 2.0),
+                ("k2", "cv_metric", 1.0),
+            ],
+        ),
+        // `label_join` writes the joined label, and a missing component keeps its separator.
+        (
+            r#"label_join(cv_metric, "__name__", "/", "k", "missing_label")"#,
+            vec![("k0", "k0/", 1.0), ("k1", "k1/", 2.0), ("k2", "k2/", 1.0)],
+        ),
+        // The identity is a source of the joined label as well.
+        (
+            r#"label_join(cv_metric, "__name__", "/", "__name__", "k")"#,
+            vec![
+                ("k0", "cv_metric/k0", 1.0),
+                ("k1", "cv_metric/k1", 2.0),
+                ("k2", "cv_metric/k2", 1.0),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the destination must be marked"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            metric_name_rows(&batches, &marker.name),
+            expected
+                .iter()
+                .map(|(tag, name, value)| (tag.to_string(), name.to_string(), *value))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+    }
+}
+
+/// An input without a marked identity gets a fresh internal identity column: the replacement
+/// writes it on a match, and a non-matching regex leaves it unset - a typed NULL - instead of
+/// manufacturing the replacement.
+#[tokio::test]
+async fn test_label_functions_semantic_name_destination_without_input_identity() {
+    let state = build_query_engine_state();
+    // (query, expected identity values, `None` for an unset identity)
+    for (query, expected) in [
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "renamed_$1", "k", "(.*)")"#,
+            vec![Some("renamed_k0"), Some("renamed_k1"), Some("renamed_k2")],
+        ),
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "renamed", "k", "nomatch")"#,
+            vec![None, None, None],
+        ),
+        // The semantic source of an input without an identity is the empty string.
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "was_empty", "__name__", "()")"#,
+            vec![Some("was_empty"), Some("was_empty"), Some("was_empty")],
+        ),
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "was_empty", "__name__", "nomatch")"#,
+            vec![None, None, None],
+        ),
+        (
+            r#"label_join(abs(cv_metric), "__name__", "/", "__name__", "k")"#,
+            vec![Some("/k0"), Some("/k1"), Some("/k2")],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the destination must be marked"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+        // The input functions rename the sample column after themselves.
+        let sample_column = float_sample_column(&plan);
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            tagged_string_rows(&batches, &marker.name),
+            expected
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (format!("k{index}"), value.map(|value| value.to_string())))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        assert_eq!(
+            cv_rows(&batches, &sample_column),
+            vec![
+                ("k0".to_string(), 1_000, 1.0),
+                ("k1".to_string(), 1_000, 2.0),
+                ("k2".to_string(), 1_000, 1.0),
+            ],
+            "{query}: the samples must be untouched"
+        );
+    }
+}
+
+/// A physical label named `__name__` is an ordinary label, not the semantic metric name: the
+/// semantic source resolves through the marked identity instead, and the semantic destination
+/// overwrites the identity, while the physical label keeps its values and its unmarked metadata.
+#[tokio::test]
+async fn test_label_functions_semantic_name_keeps_physical_name_label() {
+    let state = build_query_engine_state();
+    // (query, ordinary destination to check with its expected values, expected identity values)
+    for (query, ordinary, expected_identity) in [
+        (
+            // The semantic source is the identity, never the physical `__name__` label.
+            r#"label_replace(cv_metric, "name_copy", "$1", "__name__", "(.*)")"#,
+            Some(("name_copy", vec!["cv_metric", "cv_metric", "cv_metric"])),
+            vec!["cv_metric", "cv_metric", "cv_metric"],
+        ),
+        (
+            // ... and the semantic destination replaces the identity (matching regex) ...
+            r#"label_replace(cv_metric, "__name__", "renamed", "__name__", "(.*)")"#,
+            None,
+            vec!["renamed", "renamed", "renamed"],
+        ),
+        (
+            // ... or keeps it (non-matching regex), including for `label_join`.
+            r#"label_join(cv_metric, "__name__", "/", "__name__", "missing_label")"#,
+            None,
+            vec!["cv_metric/", "cv_metric/", "cv_metric/"],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            // The metric carries a physical label named `__name__`.
+            build_count_values_collision_table_provider(METRIC_NAME).await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the identity must be attached"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+        let physical = plan
+            .schema()
+            .field_with_unqualified_name(METRIC_NAME)
+            .unwrap_or_else(|_| panic!("{query}: the physical `__name__` label must survive"));
+        assert!(
+            physical.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none(),
+            "{query}: the physical `__name__` label must stay unmarked",
+        );
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        // Every row keeps the physical label and the sample value of its series.
+        let mut rows = batches
+            .iter()
+            .flat_map(|batch| {
+                let physical = batch
+                    .column_by_name(METRIC_NAME)
+                    .expect("the physical `__name__` label must be projected")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the physical `__name__` label must be a string column");
+                let identity = batch
+                    .column_by_name(&marker.name)
+                    .expect("the identity must be projected")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the identity must be a string column");
+                let value = batch
+                    .column_by_name(greptime_value())
+                    .expect("the sample value must be projected")
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("the sample value must be a float column");
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            physical.value(row).to_string(),
+                            identity.value(row).to_string(),
+                            value.value(row),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            rows,
+            ["k0", "k1", "k2"]
+                .iter()
+                .enumerate()
+                .map(|(index, label)| (
+                    label.to_string(),
+                    expected_identity[index].to_string(),
+                    1.0
+                ))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        if let Some((column, expected)) = ordinary {
+            assert_eq!(
+                string_values(&batches, column),
+                expected
+                    .iter()
+                    .map(|value| Some(value.to_string()))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+        }
+    }
+}
+
+/// An input whose physical columns occupy the internal identity name gets a suffixed internal
+/// identity column: the physical column keeps its name, its values and its unmarked metadata.
+#[tokio::test]
+async fn test_label_functions_semantic_name_destination_avoids_physical_collision() {
+    let state = build_query_engine_state();
+    let query =
+        r#"label_replace(abs(cv_metric), "__name__", "renamed", "__promql_metric_name", "(.*)")"#;
+    let plan = PromPlanner::stmt_to_plan(
+        // The physical label occupies the internal identity name.
+        build_count_values_collision_table_provider(PROMQL_METRIC_NAME_COLUMN).await,
+        &operator_eval_stmt(query),
+        &state,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+    let marker = PromPlanner::metric_name_column(plan.schema())
+        .unwrap()
+        .unwrap_or_else(|| panic!("{query}: the destination must be marked"));
+    assert_eq!(
+        marker.name,
+        format!("{PROMQL_METRIC_NAME_COLUMN}_"),
+        "{query}: {}",
+        plan.display_indent()
+    );
+    let physical = plan
+        .schema()
+        .field_with_unqualified_name(PROMQL_METRIC_NAME_COLUMN)
+        .unwrap_or_else(|_| panic!("{query}: the physical column must survive"));
+    assert!(
+        physical.metadata().get(PROMQL_FIELD_ROLE_KEY).is_none(),
+        "{query}: the physical column must stay unmarked",
+    );
+
+    let (_, batches) = execute(plan, &state).await;
+    assert_metric_name_in_batches(&batches, &marker.name);
+    assert_eq!(
+        string_values(&batches, &marker.name),
+        vec![
+            Some("renamed".to_string()),
+            Some("renamed".to_string()),
+            Some("renamed".to_string()),
+        ],
+        "{query}"
+    );
+    let mut physical_values = string_values(&batches, PROMQL_METRIC_NAME_COLUMN);
+    physical_values.sort();
+    assert_eq!(
+        physical_values,
+        vec![
+            Some("k0".to_string()),
+            Some("k1".to_string()),
+            Some("k2".to_string()),
+        ],
+        "{query}: the physical column must keep its values"
+    );
+}
+
+/// An ordinary `label_replace`/`label_join` - neither source nor destination names `__name__` -
+/// keeps the existing handling: the destination label receives `regexp_replace` output even
+/// without a match, a missing component of a join is NULL and skipped, the historical shortcuts
+/// stay in place, and an already present destination is still refused.
+#[tokio::test]
+async fn test_label_functions_ordinary_only_keeps_existing_behavior() {
+    let state = build_query_engine_state();
+    // (query, destination column, expected `(series tag, destination value)` rows)
+    for (query, column, expected) in [
+        // The anchored regex matches the captured series suffix.
+        (
+            r#"label_replace(cv_metric, "copy", "renamed_$1", "k", "k(.)")"#,
+            "copy",
+            vec![
+                Some("renamed_0".to_string()),
+                Some("renamed_1".to_string()),
+                Some("renamed_2".to_string()),
+            ],
+        ),
+        // The anchored regex matches nothing, so the destination keeps the source it replaced.
+        (
+            r#"label_replace(cv_metric, "copy", "renamed", "k", "nomatch")"#,
+            "copy",
+            vec![
+                Some("k0".to_string()),
+                Some("k1".to_string()),
+                Some("k2".to_string()),
+            ],
+        ),
+        // A missing source with a non-empty replacement keeps the existing shortcut.
+        (
+            r#"label_replace(cv_metric, "copy", "addressed", "missing_label", "nomatch")"#,
+            "copy",
+            vec![
+                Some("addressed".to_string()),
+                Some("addressed".to_string()),
+                Some("addressed".to_string()),
+            ],
+        ),
+        // A missing component of an ordinary join is skipped, so it contributes no separator.
+        (
+            r#"label_join(cv_metric, "joined", ",", "k", "missing_label")"#,
+            "joined",
+            vec![
+                Some("k0".to_string()),
+                Some("k1".to_string()),
+                Some("k2".to_string()),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_eq!(
+            tagged_string_rows(&batches, column),
+            expected
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (format!("k{index}"), value.clone()))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+    }
+
+    // A present source and an empty regex still add no destination label at all.
+    let query = r#"label_replace(cv_metric, "copy", "renamed", "k", "")"#;
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_table_provider().await,
+        &operator_eval_stmt(query),
+        &state,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{query}: {err}"));
+    assert!(
+        plan.schema().field_with_unqualified_name("copy").is_err(),
+        "{query}: {}",
+        plan.display_indent()
+    );
+    let sample_column = float_sample_column(&plan);
+    let (_, batches) = execute(plan, &state).await;
+    assert_eq!(
+        cv_rows(&batches, &sample_column),
+        vec![
+            ("k0".to_string(), 1_000, 1.0),
+            ("k1".to_string(), 1_000, 2.0),
+            ("k2".to_string(), 1_000, 1.0),
+        ],
+        "{query}"
+    );
+
+    // An already present destination is still refused on the ordinary path.
+    let query = r#"label_replace(cv_metric, "k", "x", "k", "(.*)")"#;
+    let err = PromPlanner::stmt_to_plan(
+        build_count_values_table_provider().await,
+        &operator_eval_stmt(query),
+        &state,
+    )
+    .await
+    .expect_err(query)
+    .to_string();
+    assert!(
+        err.contains("labelset"),
+        "{query}: expected the same-label-set refusal, got {err}"
+    );
+}
+
+/// A semantic `__name__` replacement into an ordinary label leaves that label NULL on the rows
+/// the regex does not match; a following function that uses such a label as its source reads it
+/// as the empty string, and the samples and the identity of the input survive.
+#[tokio::test]
+async fn test_label_functions_nulled_ordinary_source_is_empty() {
+    let state = build_query_engine_state();
+    // The inner replacement matches nothing, so `extra` is NULL on every row of its result.
+    let null_extra = r#"label_replace(cv_metric, "extra", "x", "__name__", "nomatch")"#;
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_table_provider().await,
+        &operator_eval_stmt(null_extra),
+        &state,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{null_extra}: {err}"));
+    let marker = PromPlanner::metric_name_column(plan.schema())
+        .unwrap()
+        .expect("the input identity must survive");
+    let (_, batches) = execute(plan, &state).await;
+    assert_metric_name_in_batches(&batches, &marker.name);
+    assert_eq!(
+        tagged_string_rows(&batches, "extra"),
+        vec![
+            ("k0".to_string(), None),
+            ("k1".to_string(), None),
+            ("k2".to_string(), None),
+        ],
+        "{null_extra}"
+    );
+
+    // (query, expected `(series tag, semantic name)` rows)
+    for (query, expected) in [
+        // The NULL ordinary label is the empty string the semantic destination matches.
+        (
+            format!(r#"label_replace({null_extra}, "__name__", "renamed", "extra", "()")"#),
+            vec![("k0", "renamed"), ("k1", "renamed"), ("k2", "renamed")],
+        ),
+        // The NULL ordinary label joins as the empty string, next to a series tag.
+        (
+            format!(r#"label_join({null_extra}, "__name__", "/", "extra", "k")"#),
+            vec![("k0", "/k0"), ("k1", "/k1"), ("k2", "/k2")],
+        ),
+        // ... and next to the identity of the input, which the inner replacement kept.
+        (
+            format!(r#"label_join({null_extra}, "__name__", "/", "extra", "__name__")"#),
+            vec![
+                ("k0", "/cv_metric"),
+                ("k1", "/cv_metric"),
+                ("k2", "/cv_metric"),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(&query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .expect("the destination must be marked");
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+        let sample_column = float_sample_column(&plan);
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            tagged_string_rows(&batches, &marker.name),
+            expected
+                .iter()
+                .map(|(tag, value)| ((*tag).to_string(), Some((*value).to_string())))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        // The samples of every series are kept.
+        assert_eq!(
+            cv_rows(&batches, &sample_column),
+            vec![
+                ("k0".to_string(), 1_000, 1.0),
+                ("k1".to_string(), 1_000, 2.0),
+                ("k2".to_string(), 1_000, 1.0),
+            ],
+            "{query}"
+        );
+    }
+}
+
+/// A marked identity a prior function left NULL is the empty string when it is used as a source:
+/// the regex is matched against it and it joins with the separator it contributes, while a
+/// destination left unset still stays NULL.
+#[tokio::test]
+async fn test_label_functions_null_identity_source_is_empty() {
+    let state = build_query_engine_state();
+    // A `label_replace` that matches nothing leaves the freshly attached identity NULL on every
+    // row instead of keeping it.
+    let unset_identity = r#"label_replace(abs(cv_metric), "__name__", "x", "k", "nomatch")"#;
+    // (query, destination column, expected `(series tag, destination value)` rows)
+    for (query, column, expected) in [
+        (
+            format!(r#"label_replace({unset_identity}, "copy", "[$1]", "__name__", "(.*)")"#),
+            "copy",
+            vec![("k0", Some("[]")), ("k1", Some("[]")), ("k2", Some("[]"))],
+        ),
+        (
+            format!(r#"label_join({unset_identity}, "joined", ",", "__name__", "k")"#),
+            "joined",
+            vec![
+                ("k0", Some(",k0")),
+                ("k1", Some(",k1")),
+                ("k2", Some(",k2")),
+            ],
+        ),
+        (
+            format!(r#"label_replace({unset_identity}, "copy", "z", "__name__", "nomatch")"#),
+            "copy",
+            vec![("k0", None), ("k1", None), ("k2", None)],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(&query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_eq!(
+            tagged_string_rows(&batches, column),
+            expected
+                .iter()
+                .map(|(tag, value)| ((*tag).to_string(), value.map(str::to_string)))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+    }
+}
+
+/// An empty regex is anchored like any other: it matches the empty source - a label the input
+/// does not carry, or a marked identity a prior function left NULL - and nothing else.
+#[tokio::test]
+async fn test_label_replace_empty_regex_matches_empty_source() {
+    let state = build_query_engine_state();
+    // (query, expected `(series tag, identity value)` rows, `None` for an unset identity)
+    for (query, expected) in [
+        // The input carries no identity at all, and none of the labels the source could name.
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "renamed", "__name__", "")"#,
+            vec![
+                ("k0", Some("renamed")),
+                ("k1", Some("renamed")),
+                ("k2", Some("renamed")),
+            ],
+        ),
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "renamed", "missing_label", "")"#,
+            vec![
+                ("k0", Some("renamed")),
+                ("k1", Some("renamed")),
+                ("k2", Some("renamed")),
+            ],
+        ),
+        // A marked identity a prior function left NULL is the empty string, so it matches ...
+        (
+            r#"label_replace(label_replace(abs(cv_metric), "__name__", "x", "k", "nomatch"), "__name__", "renamed", "__name__", "")"#,
+            vec![
+                ("k0", Some("renamed")),
+                ("k1", Some("renamed")),
+                ("k2", Some("renamed")),
+            ],
+        ),
+        // ... a non-matching regex leaves the destination unset ...
+        (
+            r#"label_replace(abs(cv_metric), "__name__", "renamed", "missing_label", "nomatch")"#,
+            vec![("k0", None), ("k1", None), ("k2", None)],
+        ),
+        // ... and an identity the input does carry is not empty, so it is kept.
+        (
+            r#"label_replace(cv_metric, "__name__", "renamed", "__name__", "")"#,
+            vec![
+                ("k0", Some("cv_metric")),
+                ("k1", Some("cv_metric")),
+                ("k2", Some("cv_metric")),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{query}: the destination must be marked"));
+        assert_eq!(marker.name, PROMQL_METRIC_NAME_COLUMN, "{query}");
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        assert_eq!(
+            tagged_string_rows(&batches, &marker.name),
+            expected
+                .iter()
+                .map(|(tag, value)| ((*tag).to_string(), value.map(str::to_string)))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+    }
+}
+
+/// Replacing the semantic name into a label the input already carries overwrites that label in
+/// place: a matching regex writes the replacement without projecting the label twice, and a
+/// non-matching one keeps the label and the samples of every series.
+#[tokio::test]
+async fn test_label_replace_semantic_source_into_existing_ordinary_label() {
+    let state = build_query_engine_state();
+    // (query, expected `k` values, one per series)
+    for (query, expected_k) in [
+        (
+            r#"label_replace(cv_metric, "k", "$1", "__name__", "(.*)")"#,
+            vec!["cv_metric", "cv_metric", "cv_metric"],
+        ),
+        (
+            r#"label_replace(cv_metric, "k", "renamed_$1", "__name__", "nomatch(.*)")"#,
+            vec!["k0", "k1", "k2"],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        // The replaced label keeps its single projected column.
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == "k")
+                .count(),
+            1,
+            "{query}: {}",
+            plan.display_indent()
+        );
+        let marker = PromPlanner::metric_name_column(plan.schema())
+            .unwrap()
+            .expect("the input identity must survive");
+        let sample_column = float_sample_column(&plan);
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_metric_name_in_batches(&batches, &marker.name);
+        let mut labels = string_values(&batches, "k");
+        labels.sort();
+        assert_eq!(
+            labels,
+            expected_k
+                .iter()
+                .map(|value| Some((*value).to_string()))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+        let mut names = string_values(&batches, &marker.name);
+        names.sort();
+        assert_eq!(names, vec![Some("cv_metric".to_string()); 3], "{query}");
+        let mut samples = values(&batches, &sample_column);
+        samples.sort_by(f64::total_cmp);
+        assert_eq!(samples, vec![1.0, 1.0, 2.0], "{query}");
+    }
+}
+
+/// The ordinary `label_replace` destination keeps its historical value when the anchored regex
+/// does not match: the un-replaced source label, not a NULL. This is the pre-existing behavior
+/// of the function on its ordinary path.
+#[tokio::test]
+async fn test_label_replace_ordinary_destination_keeps_existing_value() {
+    let state = build_query_engine_state();
+    // (query, expected `(series tag, destination value)` rows)
+    for (query, expected) in [
+        (
+            r#"label_replace(cv_metric, "copy", "renamed_$1", "k", "k(.)")"#,
+            vec![
+                Some("renamed_0".to_string()),
+                Some("renamed_1".to_string()),
+                Some("renamed_2".to_string()),
+            ],
+        ),
+        // No match: the destination holds the source value the replacement did not change.
+        (
+            r#"label_replace(cv_metric, "copy", "renamed", "k", "nomatch")"#,
+            vec![
+                Some("k0".to_string()),
+                Some("k1".to_string()),
+                Some("k2".to_string()),
+            ],
+        ),
+        // A source the input does not carry keeps the historical shortcut.
+        (
+            r#"label_replace(cv_metric, "copy", "addressed", "missing_label", "nomatch")"#,
+            vec![
+                Some("addressed".to_string()),
+                Some("addressed".to_string()),
+                Some("addressed".to_string()),
+            ],
+        ),
+    ] {
+        let plan = PromPlanner::stmt_to_plan(
+            build_count_values_table_provider().await,
+            &operator_eval_stmt(query),
+            &state,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+
+        let (_, batches) = execute(plan, &state).await;
+        assert_eq!(
+            tagged_string_rows(&batches, "copy"),
+            expected
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (format!("k{index}"), value.clone()))
+                .collect::<Vec<_>>(),
+            "{query}"
+        );
+    }
+
+    // An empty replacement with a missing source keeps everything unchanged, so no destination
+    // label exists at all and the samples stay untouched.
+    let query = r#"label_replace(cv_metric, "copy", "", "missing_label", "nomatch")"#;
+    let plan = PromPlanner::stmt_to_plan(
+        build_count_values_table_provider().await,
+        &operator_eval_stmt(query),
+        &state,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{query}: {err}"));
+    assert!(
+        plan.schema().field_with_unqualified_name("copy").is_err(),
+        "{query}: {}",
+        plan.display_indent()
+    );
+    let sample_column = float_sample_column(&plan);
+    let (_, batches) = execute(plan, &state).await;
+    assert_eq!(
+        cv_rows(&batches, &sample_column),
+        vec![
+            ("k0".to_string(), 1_000, 1.0),
+            ("k1".to_string(), 1_000, 2.0),
+            ("k2".to_string(), 1_000, 1.0),
+        ],
+        "{query}"
     );
 }
