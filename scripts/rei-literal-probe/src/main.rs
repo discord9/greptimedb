@@ -356,7 +356,7 @@ fn main() {
         let filter_ns = median(&mut filtered_times).as_nanos();
         let build_ns = build_time.as_nanos();
         println!(
-            "timing case={} scan_ns_per_query={} signature_plus_exact_ns_per_query={} construction_ns={} baseline_total_ns_1={} indexed_total_ns_1={} baseline_total_ns_10={} indexed_total_ns_10={} baseline_total_ns_100={} indexed_total_ns_100={} indexed_amortized_ns_per_query_1={} indexed_amortized_ns_per_query_10={} indexed_amortized_ns_per_query_100={}",
+            "timing case={} scan_ns_per_query={} signature_plus_exact_ns_per_query={} construction_ns={} calculated_baseline_total_ns_1={} calculated_indexed_total_ns_1={} calculated_baseline_total_ns_10={} calculated_indexed_total_ns_10={} calculated_baseline_total_ns_100={} calculated_indexed_total_ns_100={} calculated_indexed_amortized_ns_per_query_1={} calculated_indexed_amortized_ns_per_query_10={} calculated_indexed_amortized_ns_per_query_100={}",
             case.name,
             scan_ns,
             filter_ns,
