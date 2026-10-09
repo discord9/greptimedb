@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, ListArray, RecordBatch};
@@ -408,6 +408,67 @@ fn flat_raw(left: &RecordBatch, right: &RecordBatch) -> Result<(Vec<Row>, Agg, u
     Ok((rows, aggs, pairs, pushed))
 }
 
+/// Fair flat baseline: hash-build the right side, push A>=2 before probing,
+/// project A+1, and aggregate qualifying join pairs without materializing rows.
+/// Counters report actual hash entries, probes, and matched pair visits.
+fn stream_raw(left: &RecordBatch, right: &RecordBatch) -> Result<(Agg, usize, usize, usize)> {
+    let (lk, lv) = raw_columns(left)?;
+    let (rk, rv) = raw_columns(right)?;
+    let mut index: HashMap<i64, Vec<Option<i64>>> = HashMap::new();
+    let mut build_entries = 0;
+    for j in 0..right.num_rows() {
+        if rk.is_null(j) {
+            continue;
+        }
+        index
+            .entry(rk.value(j))
+            .or_default()
+            .push(rv.is_valid(j).then(|| rv.value(j)));
+        build_entries += 1;
+    }
+    let mut out: Agg = BTreeMap::new();
+    let mut lookups = 0;
+    let mut pair_visits = 0;
+    for i in 0..left.num_rows() {
+        if lk.is_null(i) || lv.is_null(i) || lv.value(i) < 2 {
+            continue;
+        }
+        lookups += 1;
+        let Some(matches) = index.get(&lk.value(i)) else {
+            continue;
+        };
+        let projected = lv
+            .value(i)
+            .checked_add(1)
+            .ok_or_else(|| err("projection overflow"))?;
+        for b in matches {
+            pair_visits += 1;
+            let entry = out.entry(lk.value(i)).or_insert((None, 0, 0));
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or_else(|| err("COUNT(*) overflow"))?;
+            entry.2 = entry
+                .2
+                .checked_add(1)
+                .ok_or_else(|| err("COUNT(A') overflow"))?;
+            if let Some(b) = b {
+                let value = projected
+                    .checked_add(*b)
+                    .ok_or_else(|| err("pair sum overflow"))?;
+                entry.0 = Some(
+                    entry
+                        .0
+                        .unwrap_or(0)
+                        .checked_add(value)
+                        .ok_or_else(|| err("SUM overflow"))?,
+                );
+            }
+        }
+    }
+    Ok((out, build_entries, lookups, pair_visits))
+}
+
 fn run() -> Result<()> {
     let s = batch(
         vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -468,9 +529,11 @@ fn run() -> Result<()> {
 
     // Shape-derived synthetic data: host equality join, compact GROUP BY host,
     // then the existing INT64 A>=2 / A'=A+1 and SUM(A'+B), COUNT aggregates.
-    for (name, keys, left_width, right_width) in
-        [("raw-host-join", 16, 24, 20), ("raw-one-hot", 1, 128, 128)]
-    {
+    for (name, keys, left_width, right_width) in [
+        ("raw-host-join", 16, 24, 20),
+        ("raw-one-hot", 1, 128, 128),
+        ("raw-low-fanout", 16, 1, 1),
+    ] {
         let mut left_keys = Vec::new();
         let mut left_values = Vec::new();
         let mut right_keys = Vec::new();
@@ -478,11 +541,23 @@ fn run() -> Result<()> {
         for key in (0..keys).rev() {
             for n in 0..left_width {
                 left_keys.push(Some(key));
-                left_values.push(if n % 7 == 0 { None } else { Some(n - 4) });
+                left_values.push(if name == "raw-low-fanout" {
+                    Some(3)
+                } else if n % 7 == 0 {
+                    None
+                } else {
+                    Some(n - 4)
+                });
             }
             for n in 0..right_width {
                 right_keys.push(Some(key));
-                right_values.push(if n % 6 == 0 { None } else { Some(n + 1) });
+                right_values.push(if name == "raw-low-fanout" {
+                    Some(5)
+                } else if n % 6 == 0 {
+                    None
+                } else {
+                    Some(n + 1)
+                });
             }
         }
         left_keys.extend([Some(99), None]);
@@ -496,7 +571,12 @@ fn run() -> Result<()> {
         let result = aggregate(&projected_grouped)?;
         let (candidate_rows, candidate_agg) = flat(&projected_grouped, false, false)?;
         let (oracle_rows, oracle_agg, raw_pairs, pushed_pairs) = flat_raw(&left, &right)?;
-        if candidate_rows != oracle_rows || result != oracle_agg || candidate_agg != oracle_agg {
+        let (stream_agg, build_entries, lookups, pair_visits) = stream_raw(&left, &right)?;
+        if candidate_rows != oracle_rows
+            || result != oracle_agg
+            || candidate_agg != oracle_agg
+            || stream_agg != oracle_agg
+        {
             return Err(err(
                 "raw grouped candidate differs from independent flat oracle",
             ));
@@ -506,7 +586,7 @@ fn run() -> Result<()> {
             .map(|i| a.value_length(i) as usize + b.value_length(i) as usize)
             .sum::<usize>();
         println!(
-            "{name} synthetic shape: raw_left_rows={}, raw_right_rows={}, matched_groups={}, matched_child_entries_including_null_payloads={}, raw_join_pairs={}, pushed_flat_pairs={}, aggregate_groups={}, source_array_memory_bytes={}, compact_array_memory_bytes={}",
+            "{name} synthetic shape: raw_left_rows={}, raw_right_rows={}, matched_groups={}, matched_child_entries_including_null_payloads={}, raw_join_pairs={}, pushed_flat_pairs={}, aggregate_groups={}, stream_hash_entries={}, stream_left_lookups={}, stream_pair_visits={}, source_array_memory_bytes={}, compact_array_memory_bytes={}",
             left.num_rows(),
             right.num_rows(),
             grouped.num_rows(),
@@ -514,6 +594,9 @@ fn run() -> Result<()> {
             raw_pairs,
             pushed_pairs,
             oracle_agg.len(),
+            build_entries,
+            lookups,
+            pair_visits,
             left.get_array_memory_size() + right.get_array_memory_size(),
             grouped.get_array_memory_size()
         );
@@ -538,6 +621,7 @@ mod tests {
         let p = projected(&grouped).unwrap();
         let (candidate_rows, candidate_agg) = flat(&p, false, false).unwrap();
         let (oracle_rows, oracle_agg, _, _) = flat_raw(left, right).unwrap();
+        assert_eq!(stream_raw(left, right).unwrap().0, oracle_agg);
         assert_eq!(candidate_rows, oracle_rows);
         assert_eq!(aggregate(&p).unwrap(), oracle_agg);
         assert_eq!(candidate_agg, oracle_agg);
@@ -593,6 +677,7 @@ mod tests {
         let max_matching = raw_batch(vec![Some(1)], vec![Some(i64::MAX)]);
         let max_right = raw_batch(vec![Some(1)], vec![Some(3)]);
         assert!(flat_raw(&max_matching, &max_right).is_err());
+        assert!(stream_raw(&max_matching, &max_right).is_err());
         assert!(projected(&group_raw(&max_matching, &max_right).unwrap()).is_err());
         let sliced_left = raw_batch(
             vec![Some(90), Some(6), Some(91)],
