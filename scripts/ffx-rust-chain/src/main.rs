@@ -427,8 +427,14 @@ mod tests {
         ];
         for (av, bv, succeeds) in cases {
             let source = batch(vec![Some(1)], vec![av], vec![bv]);
-            assert_eq!(aggregate(&projected(&source).unwrap()).is_ok(), succeeds);
-            assert_eq!(flat(&source, false, true).is_ok(), succeeds);
+            let raw = flat(&source, false, true);
+            let candidate = aggregate(&projected(&source).unwrap());
+            if succeeds {
+                assert_eq!(candidate.unwrap(), raw.unwrap().1);
+            } else {
+                assert!(candidate.is_err());
+                assert!(raw.is_err());
+            }
         }
         let projection_overflow = batch(
             vec![Some(1)],
@@ -461,6 +467,33 @@ mod tests {
         );
         let sliced = base.slice(1, 1);
         compare(&sliced);
+        let renamed_nullable = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new(
+                    "A",
+                    DataType::List(Arc::new(Field::new("values", DataType::Int64, false))),
+                    false,
+                ),
+                Field::new("B", type_list(), false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(7)])),
+                Arc::new(ListArray::new(
+                    Arc::new(Field::new("values", DataType::Int64, false)),
+                    OffsetBuffer::new(vec![0_i32, 2].into()),
+                    Arc::new(Int64Array::from(vec![Some(2), Some(3)])),
+                    None,
+                )),
+                Arc::new(
+                    batch(vec![Some(1)], vec![vec![Some(4)]], vec![vec![Some(4)]])
+                        .column(2)
+                        .clone(),
+                ),
+            ],
+        )
+        .unwrap();
+        compare(&renamed_nullable);
         let keys = Int64Array::from(vec![Some(1)]);
         let values = Int64Array::from(vec![Some(2)]);
         let offsets = OffsetBuffer::new(vec![0_i32, 1].into());
