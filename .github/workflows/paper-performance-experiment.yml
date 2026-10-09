@@ -35,6 +35,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-05-06
+          components: rustfmt
 
       - name: Capture run metadata
         env:
