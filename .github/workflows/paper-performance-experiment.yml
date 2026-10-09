@@ -1,0 +1,92 @@
+name: Paper Performance Experiment
+
+on:
+  push:
+    branches:
+      - experiment/paper-performance-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  literal-crate:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        package:
+          - ffx-rust-chain
+          - rei-literal-probe
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ runner.temp }}/target-${{ matrix.package }}
+      CRATE_MANIFEST: scripts/${{ matrix.package }}/Cargo.toml
+      RESULT_DIR: ${{ runner.temp }}/paper-performance-${{ matrix.package }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-06
+
+      - name: Capture run metadata
+        run: |
+          mkdir -p "$RESULT_DIR"
+          {
+            printf 'github.sha=%s\n' "$GITHUB_SHA"
+            printf 'profile=release\n'
+            printf '\nrustc --version\n'
+            rustc --version
+            printf '\nuname -a\n'
+            uname -a
+            printf '\nlscpu\n'
+            lscpu
+          } | tee "$RESULT_DIR/metadata.txt"
+
+      - name: Check formatting
+        run: |
+          set -o pipefail
+          cargo fmt --manifest-path "$CRATE_MANIFEST" -- --check 2>&1 | tee "$RESULT_DIR/fmt.log"
+
+      - name: Check crate
+        run: |
+          set -o pipefail
+          cargo check --locked --manifest-path "$CRATE_MANIFEST" 2>&1 | tee "$RESULT_DIR/check.log"
+
+      - name: Test crate
+        run: |
+          set -o pipefail
+          cargo test --locked --manifest-path "$CRATE_MANIFEST" 2>&1 | tee "$RESULT_DIR/test.log"
+
+      - name: Run release benchmark
+        run: |
+          set -o pipefail
+          cargo run --release --locked --manifest-path "$CRATE_MANIFEST" -- --bench 2>&1 | tee "$RESULT_DIR/bench.log"
+
+      - name: Write run summary
+        if: always()
+        env:
+          ARTIFACT_NAME: paper-performance-${{ matrix.package }}
+        run: |
+          {
+            printf '### %s\n\n' "$ARTIFACT_NAME"
+            printf -- '- Commit: `%s`\n- Runner: `ubuntu-24.04`\n- Rust: `nightly-2026-05-06`\n- Profile: `release`\n- Benchmark stdout/stderr and test logs: [download artifact](https://github.com/%s/actions/runs/%s#artifacts)\n' "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf '\nMetadata (`rustc`, `uname`, `lscpu`) and complete command logs are included in the artifact.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload complete run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-performance-${{ matrix.package }}
+          path: ${{ runner.temp }}/paper-performance-${{ matrix.package }}
+          if-no-files-found: warn
+          retention-days: 14
