@@ -22,7 +22,8 @@ jobs:
           - ffx-rust-chain
           - rei-literal-probe
     env:
-      CARGO_INCREMENTAL: 0
+      RUSTUP_TOOLCHAIN: nightly-2026-05-06
+      CARGO_INCREMENTAL: '0'
       CARGO_TARGET_DIR: ${{ runner.temp }}/target-${{ matrix.package }}
       CRATE_MANIFEST: scripts/${{ matrix.package }}/Cargo.toml
       RESULT_DIR: ${{ runner.temp }}/paper-performance-${{ matrix.package }}
