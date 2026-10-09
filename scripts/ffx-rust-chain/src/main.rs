@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hint::black_box;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array, ListArray, RecordBatch};
 use arrow::buffer::OffsetBuffer;
@@ -24,6 +26,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::{ArrowError, Result};
 
 type Agg = BTreeMap<i64, (Option<i64>, i64, i64)>;
+type RawGroup = (Vec<Option<i64>>, Vec<Option<i64>>);
 type Row = (i64, Option<i64>, Option<i64>);
 fn err(s: &str) -> ArrowError {
     ArrowError::ComputeError(s.into())
@@ -321,7 +324,7 @@ fn raw_columns(batch: &RecordBatch) -> Result<(Int64Array, Int64Array)> {
 fn group_raw(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
     let (left_keys, left_values) = raw_columns(left)?;
     let (right_keys, right_values) = raw_columns(right)?;
-    let mut groups: BTreeMap<i64, (Vec<Option<i64>>, Vec<Option<i64>>)> = BTreeMap::new();
+    let mut groups: BTreeMap<i64, RawGroup> = BTreeMap::new();
     for i in 0..left.num_rows() {
         if !left_keys.is_null(i) {
             groups
@@ -469,6 +472,104 @@ fn stream_raw(left: &RecordBatch, right: &RecordBatch) -> Result<(Agg, usize, us
     Ok((out, build_entries, lookups, pair_visits))
 }
 
+fn raw_fixture(
+    name: &str,
+    keys: i64,
+    left_width: i64,
+    right_width: i64,
+) -> (RecordBatch, RecordBatch) {
+    let mut left_keys = Vec::new();
+    let mut left_values = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut right_values = Vec::new();
+    for key in (0..keys).rev() {
+        for n in 0..left_width {
+            left_keys.push(Some(key));
+            left_values.push(if name == "raw-low-fanout" {
+                Some(3)
+            } else if n % 7 == 0 {
+                None
+            } else {
+                Some(n - 4)
+            });
+        }
+        for n in 0..right_width {
+            right_keys.push(Some(key));
+            right_values.push(if name == "raw-low-fanout" {
+                Some(5)
+            } else if n % 6 == 0 {
+                None
+            } else {
+                Some(n + 1)
+            });
+        }
+    }
+    left_keys.extend([Some(99), None]);
+    left_values.extend([Some(5), Some(8)]);
+    right_keys.extend([Some(100), None]);
+    right_values.extend([Some(9), Some(9)]);
+    (
+        raw_batch(left_keys, left_values),
+        raw_batch(right_keys, right_values),
+    )
+}
+
+fn run_bench(fixtures: &[(&str, RecordBatch, RecordBatch)]) -> Result<()> {
+    const ROUNDS: usize = 11;
+    const QUERIES_PER_ROUND: usize = 64;
+    for (name, left, right) in fixtures {
+        let (oracle_rows, oracle, raw_pairs, pushed_pairs) = flat_raw(left, right)?;
+        let (expected, _, _, _) = stream_raw(left, right)?;
+        let grouped = group_raw(left, right)?;
+        let projected_grouped = projected(&grouped)?;
+        let candidate = aggregate(&projected_grouped)?;
+        let (candidate_rows, candidate_flat_agg) = flat(&projected_grouped, false, false)?;
+        if expected != oracle
+            || candidate != oracle
+            || candidate_flat_agg != oracle
+            || candidate_rows != oracle_rows
+        {
+            return Err(err(
+                "benchmark paths differ from independent raw flat oracle",
+            ));
+        }
+        let groups = expected.len();
+        let mut samples = [Vec::new(), Vec::new()];
+        // Warm both paths on the same immutable raw Arrow batches.
+        black_box(stream_raw(left, right)?.0);
+        let grouped = group_raw(left, right)?;
+        black_box(aggregate(&projected(&grouped)?)?);
+        for round in 0..ROUNDS {
+            let order = [round % 2, 1 - round % 2];
+            for path in order {
+                let start = Instant::now();
+                for _ in 0..QUERIES_PER_ROUND {
+                    let result = if path == 0 {
+                        stream_raw(black_box(left), black_box(right))?.0
+                    } else {
+                        let grouped = group_raw(black_box(left), black_box(right))?;
+                        aggregate(&projected(&grouped)?)?
+                    };
+                    black_box(result);
+                }
+                samples[path].push(start.elapsed() / QUERIES_PER_ROUND as u32);
+            }
+        }
+        let median = |values: &mut [Duration]| {
+            values.sort_unstable();
+            values[values.len() / 2].as_nanos()
+        };
+        println!(
+            "{name} --bench: left_rows={}, right_rows={}, groups={groups}, raw_pairs={raw_pairs}, pushed_pairs={pushed_pairs}, rounds={ROUNDS}, queries_per_round={QUERIES_PER_ROUND}, stream_median_ns_per_query={}, candidate_median_ns_per_query={}, construction_included=true",
+            left.num_rows(),
+            right.num_rows(),
+            median(&mut samples[0]),
+            median(&mut samples[1]),
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let s = batch(
         vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -534,38 +635,7 @@ fn run() -> Result<()> {
         ("raw-one-hot", 1, 128, 128),
         ("raw-low-fanout", 16, 1, 1),
     ] {
-        let mut left_keys = Vec::new();
-        let mut left_values = Vec::new();
-        let mut right_keys = Vec::new();
-        let mut right_values = Vec::new();
-        for key in (0..keys).rev() {
-            for n in 0..left_width {
-                left_keys.push(Some(key));
-                left_values.push(if name == "raw-low-fanout" {
-                    Some(3)
-                } else if n % 7 == 0 {
-                    None
-                } else {
-                    Some(n - 4)
-                });
-            }
-            for n in 0..right_width {
-                right_keys.push(Some(key));
-                right_values.push(if name == "raw-low-fanout" {
-                    Some(5)
-                } else if n % 6 == 0 {
-                    None
-                } else {
-                    Some(n + 1)
-                });
-            }
-        }
-        left_keys.extend([Some(99), None]);
-        left_values.extend([Some(5), Some(8)]);
-        right_keys.extend([Some(100), None]);
-        right_values.extend([Some(9), Some(9)]);
-        let left = raw_batch(left_keys, left_values);
-        let right = raw_batch(right_keys, right_values);
+        let (left, right) = raw_fixture(name, keys, left_width, right_width);
         let grouped = group_raw(&left, &right)?;
         let projected_grouped = projected(&grouped)?;
         let result = aggregate(&projected_grouped)?;
@@ -604,7 +674,21 @@ fn run() -> Result<()> {
     Ok(())
 }
 fn main() {
-    if let Err(e) = run() {
+    let result = if std::env::args().nth(1).as_deref() == Some("--bench") {
+        let fixtures = [
+            ("raw-host-join", 16, 24, 20),
+            ("raw-one-hot", 1, 128, 128),
+            ("raw-low-fanout", 16, 1, 1),
+        ]
+        .map(|(name, keys, left_width, right_width)| {
+            let (left, right) = raw_fixture(name, keys, left_width, right_width);
+            (name, left, right)
+        });
+        run_bench(&fixtures)
+    } else {
+        run()
+    };
+    if let Err(e) = result {
         eprintln!("{e}");
         std::process::exit(1)
     }
