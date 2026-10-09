@@ -279,6 +279,135 @@ fn batch(
     )
     .unwrap()
 }
+fn raw_batch(keys: Vec<Option<i64>>, values: Vec<Option<i64>>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("value", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+fn raw_columns(batch: &RecordBatch) -> Result<(Int64Array, Int64Array)> {
+    if batch.num_columns() != 2
+        || batch.column(0).data_type() != &DataType::Int64
+        || batch.column(1).data_type() != &DataType::Int64
+    {
+        return Err(err("expected key:Int64, value:Int64"));
+    }
+    Ok((
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| err("invalid raw key"))?
+            .clone(),
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| err("invalid raw value"))?
+            .clone(),
+    ))
+}
+
+/// Raw SQL-shape approximation: equality INNER JOIN followed by GROUP BY key.
+/// Payloads (including NULLs) and duplicates are retained in compact child lists; NULL keys do not join.
+fn group_raw(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
+    let (left_keys, left_values) = raw_columns(left)?;
+    let (right_keys, right_values) = raw_columns(right)?;
+    let mut groups: BTreeMap<i64, (Vec<Option<i64>>, Vec<Option<i64>>)> = BTreeMap::new();
+    for i in 0..left.num_rows() {
+        if !left_keys.is_null(i) {
+            groups
+                .entry(left_keys.value(i))
+                .or_default()
+                .0
+                .push(left_values.is_valid(i).then(|| left_values.value(i)));
+        }
+    }
+    for i in 0..right.num_rows() {
+        if !right_keys.is_null(i) {
+            groups
+                .entry(right_keys.value(i))
+                .or_default()
+                .1
+                .push(right_values.is_valid(i).then(|| right_values.value(i)));
+        }
+    }
+    let mut keys = Vec::new();
+    let mut as_ = Vec::new();
+    let mut bs = Vec::new();
+    for (key, (a, b)) in groups {
+        if !a.is_empty() && !b.is_empty() {
+            keys.push(Some(key));
+            as_.push(a);
+            bs.push(b);
+        }
+    }
+    Ok(batch(keys, as_, bs))
+}
+
+/// Independent direct raw-pair oracle; it does not consume the grouped candidate.
+fn flat_raw(left: &RecordBatch, right: &RecordBatch) -> Result<(Vec<Row>, Agg, usize, usize)> {
+    let (lk, lv) = raw_columns(left)?;
+    let (rk, rv) = raw_columns(right)?;
+    let mut rows = Vec::new();
+    let mut sums: BTreeMap<i64, (i64, i64, i64, bool)> = BTreeMap::new();
+    let mut pairs = 0;
+    let mut pushed = 0;
+    for i in 0..left.num_rows() {
+        if lk.is_null(i) {
+            continue;
+        }
+        for j in 0..right.num_rows() {
+            if rk.is_null(j) || lk.value(i) != rk.value(j) {
+                continue;
+            }
+            pairs += 1;
+            let a = lv.is_valid(i).then(|| lv.value(i));
+            let b = rv.is_valid(j).then(|| rv.value(j));
+            let projected = a
+                .filter(|v| *v >= 2)
+                .map(|v| v.checked_add(1).ok_or_else(|| err("projection overflow")))
+                .transpose()?;
+            if projected.is_none() {
+                continue;
+            }
+            pushed += 1;
+            let key = lk.value(i);
+            rows.push((key, projected, b));
+            let entry = sums.entry(key).or_insert((0, 0, 0, false));
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or_else(|| err("COUNT(*) overflow"))?;
+            entry.2 = entry
+                .2
+                .checked_add(1)
+                .ok_or_else(|| err("COUNT(A') overflow"))?;
+            if let (Some(x), Some(y)) = (projected, b) {
+                entry.0 = entry
+                    .0
+                    .checked_add(x.checked_add(y).ok_or_else(|| err("pair sum overflow"))?)
+                    .ok_or_else(|| err("SUM overflow"))?;
+                entry.3 = true;
+            }
+        }
+    }
+    rows.sort();
+    let aggs = sums
+        .into_iter()
+        .map(|(k, (s, n, c, has_sum))| (k, (has_sum.then_some(s), n, c)))
+        .collect();
+    Ok((rows, aggs, pairs, pushed))
+}
+
 fn run() -> Result<()> {
     let s = batch(
         vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -336,6 +465,59 @@ fn run() -> Result<()> {
             p.get_array_memory_size()
         )
     }
+
+    // Shape-derived synthetic data: host equality join, compact GROUP BY host,
+    // then the existing INT64 A>=2 / A'=A+1 and SUM(A'+B), COUNT aggregates.
+    for (name, keys, left_width, right_width) in
+        [("raw-host-join", 16, 24, 20), ("raw-one-hot", 1, 128, 128)]
+    {
+        let mut left_keys = Vec::new();
+        let mut left_values = Vec::new();
+        let mut right_keys = Vec::new();
+        let mut right_values = Vec::new();
+        for key in (0..keys).rev() {
+            for n in 0..left_width {
+                left_keys.push(Some(key));
+                left_values.push(if n % 7 == 0 { None } else { Some(n - 4) });
+            }
+            for n in 0..right_width {
+                right_keys.push(Some(key));
+                right_values.push(if n % 6 == 0 { None } else { Some(n + 1) });
+            }
+        }
+        left_keys.extend([Some(99), None]);
+        left_values.extend([Some(5), Some(8)]);
+        right_keys.extend([Some(100), None]);
+        right_values.extend([Some(9), Some(9)]);
+        let left = raw_batch(left_keys, left_values);
+        let right = raw_batch(right_keys, right_values);
+        let grouped = group_raw(&left, &right)?;
+        let projected_grouped = projected(&grouped)?;
+        let result = aggregate(&projected_grouped)?;
+        let (candidate_rows, candidate_agg) = flat(&projected_grouped, false, false)?;
+        let (oracle_rows, oracle_agg, raw_pairs, pushed_pairs) = flat_raw(&left, &right)?;
+        if candidate_rows != oracle_rows || result != oracle_agg || candidate_agg != oracle_agg {
+            return Err(err(
+                "raw grouped candidate differs from independent flat oracle",
+            ));
+        }
+        let (_, a, b) = lists(&grouped)?;
+        let child_entries = (0..grouped.num_rows())
+            .map(|i| a.value_length(i) as usize + b.value_length(i) as usize)
+            .sum::<usize>();
+        println!(
+            "{name} synthetic shape: raw_left_rows={}, raw_right_rows={}, matched_groups={}, matched_child_entries_including_null_payloads={}, raw_join_pairs={}, pushed_flat_pairs={}, aggregate_groups={}, source_array_memory_bytes={}, compact_array_memory_bytes={}",
+            left.num_rows(),
+            right.num_rows(),
+            grouped.num_rows(),
+            child_entries,
+            raw_pairs,
+            pushed_pairs,
+            oracle_agg.len(),
+            left.get_array_memory_size() + right.get_array_memory_size(),
+            grouped.get_array_memory_size()
+        );
+    }
     Ok(())
 }
 fn main() {
@@ -350,6 +532,82 @@ mod tests {
     use arrow::buffer::NullBuffer;
 
     use super::*;
+
+    fn compare_raw(left: &RecordBatch, right: &RecordBatch) {
+        let grouped = group_raw(left, right).unwrap();
+        let p = projected(&grouped).unwrap();
+        let (candidate_rows, candidate_agg) = flat(&p, false, false).unwrap();
+        let (oracle_rows, oracle_agg, _, _) = flat_raw(left, right).unwrap();
+        assert_eq!(candidate_rows, oracle_rows);
+        assert_eq!(aggregate(&p).unwrap(), oracle_agg);
+        assert_eq!(candidate_agg, oracle_agg);
+        assert_eq!(
+            flat(&p, true, false).unwrap().0,
+            flat_raw(left, right)
+                .unwrap()
+                .0
+                .into_iter()
+                .filter(|(_, a, b)| matches!((a, b), (Some(x), Some(y)) if x < y))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn raw_join_groups_bag_before_projection_and_aggregation() {
+        let left = raw_batch(
+            vec![Some(8), Some(2), Some(8), Some(8), Some(4), Some(99), None],
+            vec![Some(3), Some(1), Some(3), None, Some(2), Some(9), Some(8)],
+        );
+        let right = raw_batch(
+            vec![Some(8), Some(2), Some(8), Some(4), Some(100), None],
+            vec![Some(4), Some(5), None, Some(7), Some(3), Some(3)],
+        );
+        compare_raw(&left, &right);
+        let grouped = group_raw(&left, &right).unwrap();
+        let (keys, a, b) = lists(&grouped).unwrap();
+        assert_eq!(
+            keys.values().iter().copied().collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        assert_eq!(a.value_length(2), 3);
+        assert_eq!(b.value_length(2), 2);
+        assert_eq!(a.value(2).null_count(), 1);
+        assert_eq!(b.value(2).null_count(), 1);
+        let empty_after_filter = raw_batch(vec![Some(1)], vec![Some(1)]);
+        let matching = raw_batch(vec![Some(1)], vec![Some(5)]);
+        compare_raw(&empty_after_filter, &matching);
+        assert!(
+            aggregate(&projected(&group_raw(&empty_after_filter, &matching).unwrap()).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let absent = raw_batch(vec![Some(3)], vec![Some(3)]);
+        compare_raw(&absent, &matching);
+        assert!(group_raw(&absent, &matching).unwrap().num_rows() == 0);
+        let empty = raw_batch(vec![], vec![]);
+        let null_keys = raw_batch(vec![None, None], vec![Some(3), Some(4)]);
+        compare_raw(&empty, &matching);
+        compare_raw(&null_keys, &matching);
+        let max_unmatched = raw_batch(vec![Some(i64::MAX)], vec![Some(i64::MAX)]);
+        compare_raw(&max_unmatched, &matching);
+        let max_matching = raw_batch(vec![Some(1)], vec![Some(i64::MAX)]);
+        let max_right = raw_batch(vec![Some(1)], vec![Some(3)]);
+        assert!(flat_raw(&max_matching, &max_right).is_err());
+        assert!(projected(&group_raw(&max_matching, &max_right).unwrap()).is_err());
+        let sliced_left = raw_batch(
+            vec![Some(90), Some(6), Some(91)],
+            vec![Some(90), Some(4), Some(91)],
+        )
+        .slice(1, 1);
+        let sliced_right = raw_batch(
+            vec![Some(90), Some(6), Some(91)],
+            vec![Some(90), Some(7), Some(91)],
+        )
+        .slice(1, 1);
+        compare_raw(&sliced_left, &sliced_right);
+        let wrong = batch(vec![Some(1)], vec![vec![]], vec![vec![]]);
+        assert!(group_raw(&wrong, &matching).is_err());
+    }
 
     fn compare(source: &RecordBatch) {
         let p = projected(source).unwrap();
