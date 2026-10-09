@@ -24,9 +24,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-05-06
       CARGO_INCREMENTAL: '0'
-      CARGO_TARGET_DIR: ${{ runner.temp }}/target-${{ matrix.package }}
       CRATE_MANIFEST: scripts/${{ matrix.package }}/Cargo.toml
-      RESULT_DIR: ${{ runner.temp }}/paper-performance-${{ matrix.package }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,8 +37,13 @@ jobs:
           toolchain: nightly-2026-05-06
 
       - name: Capture run metadata
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-${{ matrix.package }}
+          RESULT_DIR: ${{ runner.temp }}/paper-performance-${{ matrix.package }}
         run: |
           mkdir -p "$RESULT_DIR"
+          printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          printf 'RESULT_DIR=%s\n' "$RESULT_DIR" >> "$GITHUB_ENV"
           {
             printf 'github.sha=%s\n' "$GITHUB_SHA"
             printf 'profile=release\n'
