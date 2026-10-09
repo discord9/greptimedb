@@ -1,0 +1,9 @@
+[package]
+name = "ffx-rust-chain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = { version = "=59.2.0", default-features = false }
+
+[workspace]
