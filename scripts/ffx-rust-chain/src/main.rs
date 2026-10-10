@@ -17,10 +17,10 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array, ListArray, RecordBatch};
+use arrow::array::{Array, Float64Array, Int64Array, ListArray, RecordBatch};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::filter;
-use arrow::compute::kernels::aggregate::{max, min, sum_checked};
+use arrow::compute::kernels::aggregate::{max, min, sum, sum_checked};
 use arrow::compute::kernels::numeric::add;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::{ArrowError, Result};
@@ -570,6 +570,456 @@ fn run_bench(fixtures: &[(&str, RecordBatch, RecordBatch)]) -> Result<()> {
     Ok(())
 }
 
+type Weighted = BTreeMap<(i64, Option<i64>), (Option<f64>, i64, i64, Option<f64>)>;
+type WeightedAccum = (f64, i64, i64);
+type FactFactor = (Option<f64>, i64, i64);
+type TopWeighted = Vec<((i64, Option<i64>), Option<f64>)>;
+type StreamIndex = HashMap<i64, Vec<(Option<i64>, Option<f64>)>>;
+
+fn weighted_batch(
+    hosts: Vec<Option<i64>>,
+    labels: Vec<Option<i64>>,
+    values: Vec<Option<f64>>,
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("host", DataType::Int64, true),
+            Field::new("area", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(hosts)),
+            Arc::new(Int64Array::from(labels)),
+            Arc::new(Float64Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+fn weighted_columns(batch: &RecordBatch) -> Result<(Int64Array, Int64Array, Float64Array)> {
+    if batch.num_columns() != 3
+        || batch.column(0).data_type() != &DataType::Int64
+        || batch.column(1).data_type() != &DataType::Int64
+        || batch.column(2).data_type() != &DataType::Float64
+    {
+        return Err(err("expected host:Int64, area:Int64, value:Float64"));
+    }
+    Ok((
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| err("invalid host"))?
+            .clone(),
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| err("invalid area"))?
+            .clone(),
+        batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| err("invalid value"))?
+            .clone(),
+    ))
+}
+
+fn factor_sum(values: Vec<Option<f64>>) -> Result<(Option<f64>, i64, i64)> {
+    let array = Float64Array::from(values);
+    let total = sum(&array);
+    if total.is_some_and(|v| !v.is_finite()) {
+        return Err(err("non-finite factor sum unsupported"));
+    }
+    Ok((
+        total,
+        (array.len() - array.null_count()) as i64,
+        array.len() as i64,
+    ))
+}
+
+fn weighted_finite(values: &Float64Array) -> Result<()> {
+    if values.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(err("non-finite Float64 input unsupported"));
+    }
+    Ok(())
+}
+
+/// Factor candidate: each fact value and each dimension weight is aggregated once per host/area.
+/// It never constructs or visits fact/dimension product pairs. NULL area is represented by Option,
+/// not a sentinel, so every Int64 label remains representable.
+fn weighted_candidate(facts: &RecordBatch, dims: &RecordBatch) -> Result<Weighted> {
+    let (fh, _, fv) = weighted_columns(facts)?;
+    let (dh, da, dw) = weighted_columns(dims)?;
+    weighted_finite(&fv)?;
+    weighted_finite(&dw)?;
+    let mut fact_values: BTreeMap<i64, Vec<Option<f64>>> = BTreeMap::new();
+    let mut dim_factors: BTreeMap<(i64, Option<i64>), Vec<Option<f64>>> = BTreeMap::new();
+    for i in 0..facts.num_rows() {
+        if !fh.is_null(i) {
+            fact_values
+                .entry(fh.value(i))
+                .or_default()
+                .push(fv.is_valid(i).then(|| fv.value(i)));
+        }
+    }
+    for j in 0..dims.num_rows() {
+        if !dh.is_null(j) {
+            dim_factors
+                .entry((dh.value(j), da.is_valid(j).then(|| da.value(j))))
+                .or_default()
+                .push(dw.is_valid(j).then(|| dw.value(j)));
+        }
+    }
+    let mut fact_factors: BTreeMap<i64, FactFactor> = BTreeMap::new();
+    for (host, values) in fact_values {
+        fact_factors.insert(host, factor_sum(values)?);
+    }
+    let mut out = BTreeMap::new();
+    for ((host, area), weights) in dim_factors {
+        let Some((sum_a, count_a, len_a)) = fact_factors.get(&host) else {
+            continue;
+        };
+        let (sum_w, count_w, len_w) = factor_sum(weights)?;
+        let count = count_a
+            .checked_mul(count_w)
+            .ok_or_else(|| err("COUNT(product) overflow"))?;
+        let all = len_a
+            .checked_mul(len_w)
+            .ok_or_else(|| err("COUNT(*) overflow"))?;
+        // Keep matched groups even when all products are NULL; SUM/AVG stay NULL at count zero.
+        let total = if count == 0 {
+            None
+        } else {
+            let (Some(a), Some(w)) = (*sum_a, sum_w) else {
+                return Err(err("factor count/SUM inconsistency"));
+            };
+            let numerator = a * w;
+            if !numerator.is_finite() {
+                return Err(err(
+                    "factorized weighted SUM unsupported for overflowing finite factors",
+                ));
+            }
+            Some(numerator)
+        };
+        let avg = total.map(|s| s / count as f64);
+        out.insert((host, area), (total, all, count, avg));
+    }
+    Ok(out)
+}
+
+/// Fair streaming hash baseline; hashes dimension rows then visits matching pairs directly into groups.
+/// No joined-row vector or raw pair list is materialized.
+fn weighted_stream(facts: &RecordBatch, dims: &RecordBatch) -> Result<Weighted> {
+    let (fh, _, fv) = weighted_columns(facts)?;
+    let (dh, da, dw) = weighted_columns(dims)?;
+    weighted_finite(&fv)?;
+    weighted_finite(&dw)?;
+    let mut index: StreamIndex = HashMap::new();
+    for j in 0..dims.num_rows() {
+        if !dh.is_null(j) {
+            index.entry(dh.value(j)).or_default().push((
+                da.is_valid(j).then(|| da.value(j)),
+                dw.is_valid(j).then(|| dw.value(j)),
+            ));
+        }
+    }
+    let mut accum: BTreeMap<(i64, Option<i64>), WeightedAccum> = BTreeMap::new();
+    for i in 0..facts.num_rows() {
+        if fh.is_null(i) {
+            continue;
+        }
+        if let Some(matches) = index.get(&fh.value(i)) {
+            for (area, weight) in matches {
+                let entry = accum.entry((fh.value(i), *area)).or_insert((0.0, 0, 0));
+                entry.2 += 1;
+                if let (Some(a), Some(w)) = (fv.is_valid(i).then(|| fv.value(i)), weight) {
+                    let product = a * *w;
+                    if !product.is_finite() {
+                        return Err(err("weighted AVG requires finite products"));
+                    }
+                    entry.0 += product;
+                    if !entry.0.is_finite() {
+                        return Err(err("weighted SUM overflow"));
+                    }
+                    entry.1 += 1;
+                }
+            }
+        }
+    }
+    Ok(accum
+        .into_iter()
+        .map(|(k, (s, n, all))| {
+            (
+                k,
+                ((n > 0).then_some(s), all, n, (n > 0).then(|| s / n as f64)),
+            )
+        })
+        .collect())
+}
+
+/// Independent nested-loop raw-pair oracle; used only for validation, never timing.
+fn weighted_oracle(facts: &RecordBatch, dims: &RecordBatch) -> Result<Weighted> {
+    let (fh, _, fv) = weighted_columns(facts)?;
+    let (dh, da, dw) = weighted_columns(dims)?;
+    weighted_finite(&fv)?;
+    weighted_finite(&dw)?;
+    let mut accum: BTreeMap<(i64, Option<i64>), WeightedAccum> = BTreeMap::new();
+    for i in 0..facts.num_rows() {
+        for j in 0..dims.num_rows() {
+            if fh.is_null(i) || dh.is_null(j) || fh.value(i) != dh.value(j) {
+                continue;
+            }
+            let entry = accum
+                .entry((fh.value(i), da.is_valid(j).then(|| da.value(j))))
+                .or_insert((0.0, 0, 0));
+            entry.2 += 1;
+            if let (Some(a), Some(w)) = (
+                fv.is_valid(i).then(|| fv.value(i)),
+                dw.is_valid(j).then(|| dw.value(j)),
+            ) {
+                let product = a * w;
+                if !product.is_finite() {
+                    return Err(err("weighted AVG requires finite products"));
+                }
+                entry.0 += product;
+                if !entry.0.is_finite() {
+                    return Err(err("weighted SUM overflow"));
+                }
+                entry.1 += 1;
+            }
+        }
+    }
+    Ok(accum
+        .into_iter()
+        .map(|(k, (s, n, all))| {
+            (
+                k,
+                ((n > 0).then_some(s), all, n, (n > 0).then(|| s / n as f64)),
+            )
+        })
+        .collect())
+}
+
+fn weighted_top10(groups: &Weighted) -> TopWeighted {
+    let mut rows = groups
+        .iter()
+        .map(|(key, value)| (*key, value.3))
+        .collect::<Vec<_>>();
+    rows.sort_by(|(ka, va), (kb, vb)| match (va, vb) {
+        (Some(a), Some(b)) => b
+            .total_cmp(a)
+            .then_with(|| ka.0.cmp(&kb.0))
+            .then_with(|| ka.1.cmp(&kb.1)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => ka.0.cmp(&kb.0).then_with(|| ka.1.cmp(&kb.1)),
+    });
+    rows.truncate(10);
+    rows
+}
+
+fn weighted_fixture(shape: &str) -> (RecordBatch, RecordBatch) {
+    let (fact_count, dim_count) = match shape {
+        "hot" => (128, 128),
+        "low" => (16, 16),
+        _ => (256, 64),
+    };
+    let facts = (0..fact_count)
+        .map(|i| {
+            let host = if shape == "hot" { 0 } else { i % 16 };
+            (Some(host as i64), Some((1 + (i * 37) % 499) as f64))
+        })
+        .collect::<Vec<_>>();
+    let dims = (0..dim_count)
+        .map(|i| {
+            let host = match shape {
+                "hot" => 0,
+                "low" => i,
+                _ => i / 4,
+            };
+            let area = if shape == "hot" {
+                i / 32
+            } else if shape == "low" {
+                0
+            } else {
+                i % 4
+            };
+            (
+                Some(host as i64),
+                Some(area as i64),
+                Some((1 + (i * 13) % 97) as f64 / 10.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    (
+        weighted_batch(
+            facts.iter().map(|x| x.0).collect(),
+            vec![None; facts.len()],
+            facts.iter().map(|x| x.1).collect(),
+        ),
+        weighted_batch(
+            dims.iter().map(|x| x.0).collect(),
+            dims.iter().map(|x| x.1).collect(),
+            dims.iter().map(|x| x.2).collect(),
+        ),
+    )
+}
+
+fn weighted_filtered(
+    facts: &RecordBatch,
+    dims: &RecordBatch,
+    start: usize,
+    end: usize,
+    rare_area: i64,
+) -> Result<(RecordBatch, RecordBatch)> {
+    let (fh, fa, fv) = weighted_columns(facts)?;
+    let (dh, da, dw) = weighted_columns(dims)?;
+    let fact_mask = arrow::array::BooleanArray::from(
+        (0..facts.num_rows())
+            .map(|i| i >= start && i < end)
+            .collect::<Vec<_>>(),
+    );
+    let dim_mask = arrow::array::BooleanArray::from(
+        (0..dims.num_rows())
+            .map(|i| da.is_valid(i) && da.value(i) == rare_area)
+            .collect::<Vec<_>>(),
+    );
+    let f = |a: &dyn Array, m: &arrow::array::BooleanArray| arrow::compute::filter(a, m);
+    let facts = weighted_batch(
+        f(&fh, &fact_mask)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+        f(&fa, &fact_mask)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+        f(&fv, &fact_mask)?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+    );
+    let dims = weighted_batch(
+        f(&dh, &dim_mask)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+        f(&da, &dim_mask)?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+        f(&dw, &dim_mask)?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .collect(),
+    );
+    Ok((facts, dims))
+}
+
+fn assert_weighted_close(actual: &Weighted, expected: &Weighted) -> Result<()> {
+    if actual.len() != expected.len() {
+        return Err(err("weighted groups differ"));
+    }
+    for (key, a) in actual {
+        let Some(e) = expected.get(key) else {
+            return Err(err("weighted group key differs"));
+        };
+        if a.1 != e.1
+            || a.2 != e.2
+            || a.0.is_some() != e.0.is_some()
+            || a.3.is_some() != e.3.is_some()
+        {
+            return Err(err("weighted count/NULL status differs"));
+        }
+        for (x, y) in [(a.0, e.0), (a.3, e.3)] {
+            if x.is_some_and(|v| !v.is_finite()) || y.is_some_and(|v| !v.is_finite()) {
+                return Err(err("non-finite result in weighted comparison"));
+            }
+            if let (Some(x), Some(y)) = (x, y)
+                && (x - y).abs() > 1e-12_f64.max(y.abs() * 1e-12)
+            {
+                return Err(err("weighted Float64 value outside abs/relative tolerance"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_weighted_top10_close(actual: &Weighted, expected: &Weighted) -> Result<()> {
+    let a = weighted_top10(actual);
+    let e = weighted_top10(expected);
+    if a.len() != e.len()
+        || a.iter().zip(&e).any(|((ka, va), (ke, ve))| {
+            ka != ke
+                || match (va, ve) {
+                    (Some(x), Some(y)) => {
+                        !x.is_finite()
+                            || !y.is_finite()
+                            || (x - y).abs() > 1e-12_f64.max(y.abs() * 1e-12)
+                    }
+                    (None, None) => false,
+                    _ => true,
+                }
+        })
+    {
+        return Err(err("weighted TOP10 differs"));
+    }
+    Ok(())
+}
+
+fn run_weighted_bench(fixtures: &[(&str, RecordBatch, RecordBatch)]) -> Result<()> {
+    const ROUNDS: usize = 11;
+    const QUERIES: usize = 64;
+    for (name, facts, dims) in fixtures {
+        let oracle = weighted_oracle(facts, dims)?;
+        assert_weighted_close(&weighted_candidate(facts, dims)?, &oracle)?;
+        assert_weighted_close(&weighted_stream(facts, dims)?, &oracle)?;
+        assert_weighted_top10_close(&weighted_candidate(facts, dims)?, &oracle)?;
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..ROUNDS {
+            for path in [round % 2, 1 - round % 2] {
+                let start = Instant::now();
+                for _ in 0..QUERIES {
+                    let result = if path == 0 {
+                        weighted_stream(black_box(facts), black_box(dims))?
+                    } else {
+                        weighted_candidate(black_box(facts), black_box(dims))?
+                    };
+                    black_box(result);
+                }
+                samples[path].push(start.elapsed() / QUERIES as u32);
+            }
+        }
+        let median = |v: &mut [Duration]| {
+            v.sort_unstable();
+            v[v.len() / 2].as_nanos()
+        };
+        println!(
+            "{name} weighted-AVG --bench: fact_rows={}, dim_rows={}, groups={}, rounds={ROUNDS}, queries_per_round={QUERIES}, stream_median_ns_per_query={}, factor_median_ns_per_query={}, construction_included=true, tolerance=1e-12_abs_rel",
+            facts.num_rows(),
+            dims.num_rows(),
+            oracle.len(),
+            median(&mut samples[0]),
+            median(&mut samples[1])
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let s = batch(
         vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -671,6 +1121,35 @@ fn run() -> Result<()> {
             grouped.get_array_memory_size()
         );
     }
+    for shape in ["balanced", "hot", "low"] {
+        let (facts, dims) = weighted_fixture(shape);
+        let oracle = weighted_oracle(&facts, &dims)?;
+        let candidate = weighted_candidate(&facts, &dims)?;
+        assert_weighted_close(&candidate, &oracle)?;
+        assert_weighted_close(&weighted_stream(&facts, &dims)?, &oracle)?;
+        for (start, end, area) in [(0, 16, 0), (0, 16, 99), (64, 128, 2), (256, 256, 0)] {
+            let (filtered_facts, filtered_dims) =
+                weighted_filtered(&facts, &dims, start, end, area)?;
+            let filtered_oracle = weighted_oracle(&filtered_facts, &filtered_dims)?;
+            assert_weighted_close(
+                &weighted_candidate(&filtered_facts, &filtered_dims)?,
+                &filtered_oracle,
+            )?;
+            assert_weighted_close(
+                &weighted_stream(&filtered_facts, &filtered_dims)?,
+                &filtered_oracle,
+            )?;
+        }
+        let top10 = weighted_top10(&candidate);
+        assert_weighted_top10_close(&candidate, &oracle)?;
+        println!("weighted-{shape} top10={top10:?}");
+        println!(
+            "weighted-{shape}: fact_rows={}, dim_rows={}, groups={}, formula=AVG(product)=SUM(fact*weight)/COUNT(product), float_tolerance=1e-12_abs_rel",
+            facts.num_rows(),
+            dims.num_rows(),
+            oracle.len()
+        );
+    }
     Ok(())
 }
 fn main() {
@@ -684,7 +1163,24 @@ fn main() {
             let (left, right) = raw_fixture(name, keys, left_width, right_width);
             (name, left, right)
         });
-        run_bench(&fixtures)
+        run_bench(&fixtures).and_then(|_| {
+            let balanced = weighted_fixture("balanced");
+            let hot = weighted_fixture("hot");
+            let low = weighted_fixture("low");
+            let (wide_f, wide_d) = weighted_filtered(&balanced.0, &balanced.1, 0, 16, 1)?;
+            let (narrow_f, narrow_d) = weighted_filtered(&balanced.0, &balanced.1, 64, 128, 0)?;
+            for (f, d) in [(&wide_f, &wide_d), (&narrow_f, &narrow_d)] {
+                let oracle = weighted_oracle(f, d)?;
+                assert_weighted_close(&weighted_candidate(f, d)?, &oracle)?;
+                assert_weighted_close(&weighted_stream(f, d)?, &oracle)?;
+            }
+            let weighted = [
+                ("balanced", balanced.0, balanced.1),
+                ("hot", hot.0, hot.1),
+                ("low", low.0, low.1),
+            ];
+            run_weighted_bench(&weighted)
+        })
     } else {
         run()
     };
@@ -718,6 +1214,141 @@ mod tests {
                 .filter(|(_, a, b)| matches!((a, b), (Some(x), Some(y)) if x < y))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn weighted_filters_and_ordering_are_stable() {
+        let (facts, dims) = weighted_fixture("balanced");
+        for (start, end, area) in [(0, 16, 0), (0, 16, 99), (64, 128, 2), (256, 256, 0)] {
+            let (f, d) = weighted_filtered(&facts, &dims, start, end, area).unwrap();
+            let oracle = weighted_oracle(&f, &d).unwrap();
+            assert_weighted_close(&weighted_candidate(&f, &d).unwrap(), &oracle).unwrap();
+            assert_weighted_close(&weighted_stream(&f, &d).unwrap(), &oracle).unwrap();
+        }
+        let mut groups = BTreeMap::new();
+        for (key, score) in [(1, 1.0), (2, 1.0 + 0.75e-12), (3, 1.0 + 1.5e-12)] {
+            groups.insert((key, Some(0)), (Some(score), 1, 1, Some(score)));
+        }
+        for key in 4..=10 {
+            groups.insert((key, Some(0)), (Some(0.5), 1, 1, Some(0.5)));
+        }
+        groups.insert(
+            (11, Some(0)),
+            (Some(1.0 + 2.5e-12), 1, 1, Some(1.0 + 2.5e-12)),
+        );
+        let top = weighted_top10(&groups);
+        assert_eq!(top[0].0, (11, Some(0)));
+        assert_eq!(top[1].0, (3, Some(0)));
+        assert_eq!(top[2].0, (2, Some(0)));
+        assert_eq!(top[3].0, (1, Some(0)));
+        assert!(top.iter().any(|row| row.0.0 == 4));
+        assert!(!top.iter().any(|row| row.0.0 == 10)); // cutoff membership is deterministic
+    }
+
+    #[test]
+    fn weighted_factorization_documents_float_cancellation_boundary() {
+        let facts = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![None; 2],
+            vec![Some(1e16), Some(-1e16)],
+        );
+        let dims = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![Some(0), Some(0)],
+            vec![Some(1.0), Some(1e-16)],
+        );
+        let stream = weighted_stream(&facts, &dims).unwrap();
+        let oracle = weighted_oracle(&facts, &dims).unwrap();
+        let factor = weighted_candidate(&facts, &dims).unwrap();
+        assert_eq!(stream, oracle);
+        assert_eq!(oracle[&(1, Some(0))].0, Some(-1.0));
+        assert_eq!(oracle[&(1, Some(0))].3, Some(-0.25));
+        assert_eq!(factor[&(1, Some(0))].0, Some(0.0));
+        // Algebraic factorization is not bitwise-safe under cancellation; this finite-input case is intentionally unsupported.
+        assert!(assert_weighted_close(&factor, &oracle).is_err());
+        let negatives = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![None; 2],
+            vec![Some(-2.25), Some(0.5)],
+        );
+        let fractions = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![Some(0), Some(0)],
+            vec![Some(0.4), Some(1.2)],
+        );
+        assert_weighted_close(
+            &weighted_candidate(&negatives, &fractions).unwrap(),
+            &weighted_oracle(&negatives, &fractions).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn weighted_avg_matches_raw_join_with_nulls_duplicates_and_null_groups() {
+        let facts = weighted_batch(
+            vec![Some(1), Some(1), Some(1), Some(99), None],
+            vec![None; 5],
+            vec![Some(2.0), Some(-1e-15), None, Some(9.0), Some(3.0)],
+        );
+        let dims = weighted_batch(
+            vec![Some(1), Some(1), Some(1), Some(98), Some(1)],
+            vec![Some(4), Some(4), None, Some(7), Some(8)],
+            vec![Some(3.0), Some(3.0), None, None, Some(2.0)],
+        );
+        let expected = weighted_oracle(&facts, &dims).unwrap();
+        let actual = weighted_candidate(&facts, &dims).unwrap();
+        assert_weighted_close(&actual, &expected).unwrap();
+        assert_weighted_close(&weighted_stream(&facts, &dims).unwrap(), &expected).unwrap();
+        assert_weighted_top10_close(&actual, &expected).unwrap();
+        assert_eq!(actual[&(1, Some(4))].1, 6); // duplicate pair multiplicity retained
+        assert_eq!(actual[&(1, Some(4))].2, 4);
+        assert_eq!(actual[&(1, None)].1, 3);
+        assert_eq!(actual[&(1, None)].2, 0); // group remains with NULL AVG
+        assert!(!actual.contains_key(&(99, Some(7)))); // unmatched NULL host never joins
+        let nonfinite = weighted_batch(vec![Some(1)], vec![None], vec![Some(f64::INFINITY)]);
+        let finite_dim = weighted_batch(vec![Some(1)], vec![Some(1)], vec![Some(1.0)]);
+        assert!(weighted_candidate(&nonfinite, &finite_dim).is_err());
+        assert!(weighted_stream(&nonfinite, &finite_dim).is_err());
+        for bad in [f64::NAN, f64::NEG_INFINITY] {
+            let invalid_fact = weighted_batch(vec![Some(1)], vec![None], vec![Some(1.0)]);
+            let invalid_dim = weighted_batch(vec![Some(1)], vec![Some(0)], vec![Some(bad)]);
+            assert!(weighted_candidate(&invalid_fact, &invalid_dim).is_err());
+            assert!(weighted_stream(&invalid_fact, &invalid_dim).is_err());
+            assert!(weighted_oracle(&invalid_fact, &invalid_dim).is_err());
+        }
+        let overflow_facts = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![None; 2],
+            vec![Some(1e308), Some(1e308)],
+        );
+        let overflow_dims = weighted_batch(vec![Some(1)], vec![Some(0)], vec![Some(1.0)]);
+        assert!(weighted_candidate(&overflow_facts, &overflow_dims).is_err());
+        assert!(weighted_stream(&overflow_facts, &overflow_dims).is_err());
+        assert!(weighted_oracle(&overflow_facts, &overflow_dims).is_err());
+        let all_null_facts = weighted_batch(vec![Some(1), Some(1)], vec![None; 2], vec![None; 2]);
+        let null_group_dims = weighted_batch(vec![Some(1)], vec![None], vec![Some(1.0)]);
+        let null_groups = weighted_candidate(&all_null_facts, &null_group_dims).unwrap();
+        assert_eq!(null_groups[&(1, None)].1, 2);
+        assert_eq!(null_groups[&(1, None)].2, 0);
+        assert_eq!(null_groups[&(1, None)].3, None);
+        let empty = weighted_batch(vec![], vec![], vec![]);
+        assert!(weighted_candidate(&empty, &empty).unwrap().is_empty());
+        assert!(weighted_stream(&empty, &empty).unwrap().is_empty());
+
+        let min_area = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![None, Some(1)],
+            vec![Some(2.0), Some(3.0)],
+        );
+        let min_dims = weighted_batch(
+            vec![Some(1), Some(1)],
+            vec![Some(i64::MIN), None],
+            vec![Some(1.0), Some(1.0)],
+        );
+        let distinct = weighted_candidate(&min_area, &min_dims).unwrap();
+        assert!(distinct.contains_key(&(1, None)));
+        assert!(distinct.contains_key(&(1, Some(i64::MIN))));
+        assert_eq!(distinct.len(), 2);
     }
 
     #[test]
