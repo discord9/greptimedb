@@ -200,8 +200,18 @@ def component_command(target: RunTarget, name: str) -> list[str]:
             "--log-dir", str(log_dir),
         ]
     if name == "datanode":
+        config_file = target.work_dir / "range-cache-off.toml"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            '[[region_engine]]\n[region_engine.mito]\nrange_result_cache_size = "0B"\n\n'
+            '[[region_engine]]\n[region_engine.file]\n\n'
+            '[[region_engine]]\n[region_engine.metric]\n',
+            encoding="utf-8",
+        )
+        print(f"datanode config ({config_file}):\n{config_file.read_text(encoding='utf-8')}")
         return [
             str(target.binary), "datanode", "start",
+            "--config-file", str(config_file),
             "--grpc-bind-addr", f"127.0.0.1:{target.datanode_rpc_port}",
             "--grpc-server-addr", f"127.0.0.1:{target.datanode_rpc_port}",
             "--http-addr", f"127.0.0.1:{target.datanode_http_port}",
