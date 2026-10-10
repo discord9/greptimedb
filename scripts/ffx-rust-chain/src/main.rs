@@ -874,8 +874,8 @@ fn weighted_filtered(
     end: usize,
     rare_area: i64,
 ) -> Result<(RecordBatch, RecordBatch)> {
-    let (fh, fa, fv) = weighted_columns(facts)?;
-    let (dh, da, dw) = weighted_columns(dims)?;
+    weighted_columns(facts)?;
+    let (_, areas, _) = weighted_columns(dims)?;
     let fact_mask = arrow::array::BooleanArray::from(
         (0..facts.num_rows())
             .map(|i| i >= start && i < end)
@@ -883,50 +883,11 @@ fn weighted_filtered(
     );
     let dim_mask = arrow::array::BooleanArray::from(
         (0..dims.num_rows())
-            .map(|i| da.is_valid(i) && da.value(i) == rare_area)
+            .map(|i| areas.is_valid(i) && areas.value(i) == rare_area)
             .collect::<Vec<_>>(),
     );
-    let f = |a: &dyn Array, m: &arrow::array::BooleanArray| arrow::compute::filter(a, m);
-    let facts = weighted_batch(
-        f(&fh, &fact_mask)?
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-        f(&fa, &fact_mask)?
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-        f(&fv, &fact_mask)?
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-    );
-    let dims = weighted_batch(
-        f(&dh, &dim_mask)?
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-        f(&da, &dim_mask)?
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-        f(&dw, &dim_mask)?
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .iter()
-            .collect(),
-    );
+    let facts = arrow::compute::filter_record_batch(facts, &fact_mask)?;
+    let dims = arrow::compute::filter_record_batch(dims, &dim_mask)?;
     Ok((facts, dims))
 }
 
@@ -1167,9 +1128,10 @@ fn main() {
             let balanced = weighted_fixture("balanced");
             let hot = weighted_fixture("hot");
             let low = weighted_fixture("low");
-            let (wide_f, wide_d) = weighted_filtered(&balanced.0, &balanced.1, 0, 16, 1)?;
-            let (narrow_f, narrow_d) = weighted_filtered(&balanced.0, &balanced.1, 64, 128, 0)?;
-            for (f, d) in [(&wide_f, &wide_d), (&narrow_f, &narrow_d)] {
+            // Synthetic row-index windows plus area equality filter; these are not product time predicates or rare-area skew.
+            let (short_f, short_d) = weighted_filtered(&balanced.0, &balanced.1, 0, 16, 1)?;
+            let (long_f, long_d) = weighted_filtered(&balanced.0, &balanced.1, 64, 128, 0)?;
+            for (f, d) in [(&short_f, &short_d), (&long_f, &long_d)] {
                 let oracle = weighted_oracle(f, d)?;
                 assert_weighted_close(&weighted_candidate(f, d)?, &oracle)?;
                 assert_weighted_close(&weighted_stream(f, d)?, &oracle)?;
