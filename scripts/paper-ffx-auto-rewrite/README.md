@@ -24,3 +24,12 @@ cargo nextest run --locked --manifest-path scripts/paper-ffx-auto-rewrite/Cargo.
 cargo run --locked --manifest-path scripts/paper-ffx-auto-rewrite/Cargo.toml
 cargo run --locked --release --manifest-path scripts/paper-ffx-auto-rewrite/Cargo.toml -- --bench
 ```
+
+For the release-only COUNT fanout applicability sweep, run
+`cargo run --release --locked --manifest-path scripts/paper-ffx-auto-rewrite/Cargo.toml -- --sweep`.
+It retains the three `--bench` cases and adds hot (512/2048 rows, one host),
+balanced (512/2048 rows, 16 hosts), and spread (512/2048 rows, one host
+per row) fixtures. Each uses the original full-result SQL/oracle and the same
+three warmups plus nine alternating timed samples. Sample arrays remain in
+chronological order; medians are computed from a sorted copy. This is a bounded
+DataFusion experiment, not GreptimeDB product performance or a runtime selector.

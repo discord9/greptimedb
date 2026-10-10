@@ -269,8 +269,8 @@ async fn run_case(name: &str, fixture: Fixture, bench: bool) -> datafusion::erro
         optimized_ns.drain(..3);
         println!(
             "benchmark={name} baseline_samples_ns={baseline_ns:?} optimized_samples_ns={optimized_ns:?} baseline_median_ns={} optimized_median_ns={}",
-            median(&mut baseline_ns),
-            median(&mut optimized_ns)
+            median(&baseline_ns),
+            median(&optimized_ns)
         );
     }
     Ok(())
@@ -291,15 +291,30 @@ async fn measure(
     Ok(elapsed)
 }
 
-fn median(samples: &mut [u128]) -> u128 {
-    samples.sort_unstable();
-    samples[samples.len() / 2]
+fn median(samples: &[u128]) -> u128 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
 }
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let bench = std::env::args().any(|arg| arg == "--bench");
-    if bench {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--sweep") {
+        for (name, fact_rows, dim_rows, hosts, areas) in [
+            ("balanced", 256, 64, 16, 4),
+            ("hot", 128, 128, 1, 4),
+            ("low-overlap", 16, 16, 16, 1),
+            ("hot512", 512, 512, 1, 4),
+            ("hot2048", 2048, 2048, 1, 4),
+            ("balanced512", 512, 512, 16, 4),
+            ("balanced2048", 2048, 2048, 16, 4),
+            ("spread512", 512, 512, 512, 1),
+            ("spread2048", 2048, 2048, 2048, 1),
+        ] {
+            run_case(name, fixture(fact_rows, dim_rows, hosts, areas), true).await?;
+        }
+    } else if args.iter().any(|arg| arg == "--bench") {
         run_case("balanced", fixture(256, 64, 16, 4), true).await?;
         run_case("hot", fixture(128, 128, 1, 4), true).await?;
         run_case("low-overlap", fixture(16, 16, 16, 1), true).await?;

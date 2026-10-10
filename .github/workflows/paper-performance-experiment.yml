@@ -1,4 +1,4 @@
-name: Paper FFX DataFusion Experiment
+name: Paper FFX COUNT Fanout Sweep
 
 on:
   workflow_dispatch:
@@ -17,7 +17,6 @@ jobs:
       matrix:
         package:
           - paper-ffx-auto-rewrite
-          - paper-ffx-datafusion
     env:
       RUSTUP_TOOLCHAIN: '1.99.0'
       CARGO_INCREMENTAL: '0'
@@ -43,7 +42,7 @@ jobs:
           printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
           printf 'RESULT_DIR=%s\n' "$RESULT_DIR" >> "$GITHUB_ENV"
           {
-            printf 'github.sha=%s\nprofile=release\nscope=bounded in-memory DataFusion experiment, not GreptimeDB product performance\n' "$GITHUB_SHA"
+            printf 'github.sha=%s\nprofile=release\nscope=bounded in-memory COUNT fanout applicability experiment, not GreptimeDB product performance\n' "$GITHUB_SHA"
             rustc --version
             cargo --version
             uname -a
@@ -68,7 +67,7 @@ jobs:
       - name: Run release experiment
         run: |
           set -o pipefail
-          cargo run --release --locked --manifest-path "$CRATE_MANIFEST" -- --bench 2>&1 | tee "$RESULT_DIR/bench.log"
+          cargo run --release --locked --manifest-path "$CRATE_MANIFEST" -- --sweep 2>&1 | tee "$RESULT_DIR/bench.log"
 
       - name: Write run summary
         if: always()
@@ -76,7 +75,7 @@ jobs:
           {
             printf '### %s\n\n' '${{ matrix.package }}'
             printf -- '- Commit: `%s`\n- Runner: `ubuntu-24.04`\n- Rust: `1.99.0`\n- Profile: `release`\n' "$GITHUB_SHA"
-            printf '\nBounded in-memory DataFusion experiment, **not GreptimeDB product performance**. Available logs are uploaded; failed or skipped steps may leave logs absent.\n'
+            printf '\nBounded in-memory DataFusion COUNT fanout applicability experiment, **not GreptimeDB product performance** or a runtime selector. Available logs are uploaded; failed or skipped steps may leave logs absent.\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload complete run artifacts
