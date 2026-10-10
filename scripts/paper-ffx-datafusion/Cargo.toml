@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 arrow-array = "=59.2.0"
 arrow-schema = "=59.2.0"
-datafusion = { git = "https://github.com/GreptimeTeam/datafusion", rev = "4bd567a884dcbfd89d0f0a7859ef8367e38fff97", default-features = false, features = ["sql"] }
+datafusion = { git = "https://github.com/GreptimeTeam/datafusion", rev = "4bd567a884dcbfd89d0f0a7859ef8367e38fff97", default-features = false, features = [
+    "sql",
+] }
 futures = "=0.3.31"
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }
 
