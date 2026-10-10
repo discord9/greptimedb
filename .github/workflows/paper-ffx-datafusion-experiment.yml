@@ -1,0 +1,89 @@
+name: Paper FFX DataFusion Experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  datafusion-crate:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        package:
+          - paper-ffx-auto-rewrite
+          - paper-ffx-datafusion
+    env:
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      CARGO_INCREMENTAL: '0'
+      CRATE_MANIFEST: scripts/${{ matrix.package }}/Cargo.toml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt
+
+      - name: Capture run metadata
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-${{ matrix.package }}
+          RESULT_DIR: ${{ runner.temp }}/paper-ffx-${{ matrix.package }}
+        run: |
+          mkdir -p "$RESULT_DIR"
+          printf 'CARGO_TARGET_DIR=%s\n' "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          printf 'RESULT_DIR=%s\n' "$RESULT_DIR" >> "$GITHUB_ENV"
+          {
+            printf 'github.sha=%s\nprofile=release\nscope=bounded in-memory DataFusion experiment, not GreptimeDB product performance\n' "$GITHUB_SHA"
+            rustc --version
+            cargo --version
+            uname -a
+            lscpu
+          } | tee "$RESULT_DIR/metadata.txt"
+
+      - name: Check formatting
+        run: |
+          set -o pipefail
+          cargo fmt --manifest-path "$CRATE_MANIFEST" -- --check 2>&1 | tee "$RESULT_DIR/fmt.log"
+
+      - name: Check crate
+        run: |
+          set -o pipefail
+          cargo check --locked --manifest-path "$CRATE_MANIFEST" 2>&1 | tee "$RESULT_DIR/check.log"
+
+      - name: Test complete results and boundaries
+        run: |
+          set -o pipefail
+          cargo test --locked --manifest-path "$CRATE_MANIFEST" 2>&1 | tee "$RESULT_DIR/test.log"
+
+      - name: Run release experiment
+        run: |
+          set -o pipefail
+          cargo run --release --locked --manifest-path "$CRATE_MANIFEST" -- --bench 2>&1 | tee "$RESULT_DIR/bench.log"
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            printf '### %s\n\n' '${{ matrix.package }}'
+            printf -- '- Commit: `%s`\n- Runner: `ubuntu-24.04`\n- Rust: `1.99.0`\n- Profile: `release`\n' "$GITHUB_SHA"
+            printf '\nBounded in-memory DataFusion experiment, **not GreptimeDB product performance**. Available logs are uploaded; failed or skipped steps may leave logs absent.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload complete run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-ffx-${{ matrix.package }}
+          path: ${{ runner.temp }}/paper-ffx-${{ matrix.package }}
+          if-no-files-found: warn
+          retention-days: 14
