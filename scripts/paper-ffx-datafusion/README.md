@@ -52,3 +52,22 @@ only to bounded, one-partition `(Int64, Float64)` fact and
 compares the complete grouped result with a plain session over the same batches
 and prints both plan texts with `RawFactorExec` present or absent. The command
 makes no performance claims.
+
+## `--count --bench` end-to-end timing
+
+`cargo run --release --locked -- --count --bench` (optionally
+`--count --bench WARMUPS SAMPLES` for a shorter smoke run) times the *original*
+COUNT SQL on the balanced/hot/low/hot2048 fixtures, where `hot2048` is the
+one-hot-host 2048x2048 fanout shape of the COUNT sweep experiment. Every timed
+iteration runs `ctx.sql(COUNT_QUERY).collect()` on a fresh plan for both arms —
+the `count_session` arm, whose samples therefore include the SQL planning and
+factorized-selection work of the automatic rewrite, and a plain same-config
+session arm — alternating the arm order per iteration and reporting per-arm
+sample vectors with medians after the warmups. Complete-result equality with the
+plain baseline is re-checked once untimed before any timing and after every timed
+iteration.
+
+These are fixture-local numbers produced by this bounded in-memory harness on a
+CI runner: they are evidence about this experiment and its fixtures only, not
+claims about GreptimeDB product performance, and the timing includes full SQL
+planning and selection overhead on both arms.
