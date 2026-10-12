@@ -254,12 +254,46 @@ fn string_rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     rows
 }
 
+/// Asserts that two complete grouped results hold the same rows with `to_bits`-equal
+/// scores.
+///
+/// Scores compare with `to_bits`, so `+0.0` and `-0.0` are distinguished and no
+/// rounding difference can hide behind `==`. Both sides are in the canonical
+/// `(host, area)` order produced by [`avg_rows`], which fixes the row alignment.
+fn assert_scores_bitwise(left: &[AvgRow], right: &[AvgRow], context: &str) {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "{context}: group count differs: {left:?} vs {right:?}"
+    );
+    for (left, right) in left.iter().zip(right) {
+        assert_eq!(left.0, right.0, "{context}: host differs");
+        assert_eq!(left.1, right.1, "{context}: grouping differs");
+        let key = (left.0, left.1);
+        match (left.2, right.2) {
+            (Some(left), Some(right)) => assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "{context}: score bits differ for {key:?}"
+            ),
+            (None, None) => {}
+            (left, right) => panic!("{context}: NULL mismatch for {key:?}: {left:?} vs {right:?}"),
+        }
+    }
+}
+
 /// Exact rational oracle for the mean of the joined products.
 ///
 /// Payload sums are accumulated independently per group in quarters (integers),
 /// so the expected value is one correctly-rounded division of the exact rational
-/// mean: `(4 * sum_v) * (4 * sum_w) / (16 * pairs)`. It never replays the factorized
-/// formula pairwise. Only the null-free exact-domain fixtures are fed to it.
+/// mean: `(4 * sum_v) * (4 * sum_w) / (16 * valid)`. It never replays the factorized
+/// formula pairwise. NULL rows are skipped exactly as the baseline `AVG` skips NULL
+/// products and `valid` counts the joined pairs with a non-null product, so fixtures
+/// that mix NULL and non-null payloads are handled. Only admitted exact-domain
+/// fixtures are fed to it: there every group keeps at least one valid entry, whereas
+/// a group without one would score NULL and is omitted here. An exactly zero score
+/// is `+0.0`, matching both plans, because the integer numerator is zero and the
+/// divisor is positive.
 fn oracle_avg(facts: &RecordBatch, dims: &RecordBatch) -> Vec<AvgRow> {
     let fact_host = facts
         .column(0)
@@ -345,22 +379,12 @@ async fn exact_domain_avg_is_factorized_and_bitwise_equal() {
     assert_eq!(plan.schema().field(2).name(), "avg");
     assert_eq!(plan.schema().field(2).data_type(), &DataType::Float64);
 
-    // Complete result equality, bitwise on every score.
+    // Complete result equality, bitwise on every score: the factorized plan against
+    // the authoritative baseline, and both against the exact rational oracle.
     let factorized = avg_rows(&batches);
     let expected = avg_rows(&baseline_batches);
-    assert_eq!(factorized, expected);
-    assert_eq!(factorized, oracle_avg(&facts, &dims));
-    for (row, expected) in factorized.iter().zip(&expected) {
-        match (row.2, expected.2) {
-            (Some(left), Some(right)) => assert_eq!(
-                left.to_bits(),
-                right.to_bits(),
-                "score bits differ for {:?}",
-                (row.0, row.1)
-            ),
-            (left, right) => assert_eq!(left, right),
-        }
-    }
+    assert_scores_bitwise(&factorized, &expected, "baseline");
+    assert_scores_bitwise(&factorized, &oracle_avg(&facts, &dims), "oracle");
     // The fixture's exact rational scores, computed by hand:
     //   host 0/area 0: (2+5+7+11+2)*0.5/10 = 1.35
     //   host 0/area 1: 27*7.5/15 = 13.5
@@ -372,7 +396,7 @@ async fn exact_domain_avg_is_factorized_and_bitwise_equal() {
         (Some(1), Some(2), Some(1.625)),
         (Some(2), Some(0), Some(2_250_000.0)),
     ];
-    assert_eq!(factorized, expected_rows);
+    assert_scores_bitwise(&factorized, &expected_rows, "hand-computed scores");
 }
 
 #[tokio::test]
@@ -615,4 +639,131 @@ async fn swapped_operand_order_is_still_the_exact_avg_shape() {
     let (_, baseline_batches) = plan_and_collect(&baseline, query).await;
     assert_eq!(avg_rows(&batches), avg_rows(&baseline_batches));
     assert_eq!(avg_rows(&batches), vec![(Some(1), Some(0), Some(1.5625))]);
+}
+
+/// Admitted composite fixture that still sits inside the exact domain.
+///
+/// * host 0/area 0 mixes NULL and non-null values *and* weights, so its factor sums
+///   and its `valid` count both come from the non-null rows only (`valid = 4 > 0`);
+/// * host 0's NULL-area dimension row is an ordinary `(0, NULL)` group of host 0's
+///   facts, not a dropped row;
+/// * host 1's values cancel exactly under a positive weight, so baseline, oracle,
+///   and factor path all produce `+0.0`;
+/// * host 2's value is a zero under a negative weight, so its only joined product is
+///   `-0.0` in both arms while its grouped score is `+0.0`.
+fn mixed_payload_fixture() -> (RecordBatch, RecordBatch) {
+    let facts = facts_batch(
+        vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(2)],
+        vec![
+            Some(4.0),
+            None,
+            Some(-1.0),
+            Some(5.0),
+            Some(-5.0),
+            Some(0.0),
+        ],
+    );
+    let dims = dims_batch(
+        vec![Some(0), Some(0), Some(0), Some(0), Some(1), Some(2)],
+        vec![Some(0), Some(0), Some(0), None, Some(0), Some(0)],
+        vec![
+            Some(0.5),
+            None,
+            Some(2.0),
+            Some(-1.0),
+            Some(1.0),
+            Some(-0.5),
+        ],
+    );
+    (facts, dims)
+}
+
+#[tokio::test]
+async fn composite_fixture_with_nulls_and_zero_signs_matches_bitwise() {
+    let (facts, dims) = mixed_payload_fixture();
+    let ctx = count_session(facts.clone(), dims.clone()).unwrap();
+    let (plan, batches) = plan_and_collect(&ctx, FULL_AVG).await;
+    assert!(is_factorized(&plan), "{}", plan_text(&plan));
+
+    // hand-computed exact scores:
+    //   host 0/1.875 = (4 + -1) * (0.5 + 2.0) / valid, valid = 2 * 2
+    //   host 0 NULL area = (4 + -1) * -1.0 / 2
+    //   host 1 = (5 + -5) * 1.0 / 2 = +0.0
+    //   host 2 = 0.0 * -0.5 / 1 = +0.0 (the product is -0.0, the running sum is not)
+    let expected = vec![
+        (Some(0), None, Some(-1.5)),
+        (Some(0), Some(0), Some(1.875)),
+        (Some(1), Some(0), Some(0.0)),
+        (Some(2), Some(0), Some(0.0)),
+    ];
+    let factorized = avg_rows(&batches);
+    assert_scores_bitwise(&factorized, &expected, "hand-computed scores");
+    // Both zero rows are positive zero: an exact cancellation and a single `-0.0`
+    // product both enter a `+0.0` running sum, so signed zero never reaches the
+    // result.
+    assert_eq!(factorized[2].2.unwrap().to_bits(), 0.0f64.to_bits());
+    assert_eq!(factorized[3].2.unwrap().to_bits(), 0.0f64.to_bits());
+    // Complete result equality against the authoritative baseline, bitwise on every
+    // score, including NULL payload rows, the NULL-area group, and the zero results.
+    let baseline = baseline_context(facts.clone(), dims.clone()).await;
+    let (_, baseline_batches) = plan_and_collect(&baseline, FULL_AVG).await;
+    let baseline_rows = avg_rows(&baseline_batches);
+    assert_scores_bitwise(&baseline_rows, &expected, "baseline vs hand-computed");
+    assert_scores_bitwise(&factorized, &baseline_rows, "baseline");
+    assert_scores_bitwise(&factorized, &oracle_avg(&facts, &dims), "oracle");
+}
+
+#[tokio::test]
+async fn fixture_tables_refuse_mutations_and_keep_the_avg_admission() {
+    let (facts, dims) = exact_domain();
+    let ctx = count_session(facts.clone(), dims.clone()).unwrap();
+    let (before_plan, _) = plan_and_collect(&ctx, FULL_AVG).await;
+    let before_text = plan_text(&before_plan);
+
+    // An out-of-domain payload must not be able to enter the admitted session.
+    let insert = "INSERT INTO facts VALUES (CAST(0 AS BIGINT), CAST(1000001 AS DOUBLE))";
+    let error = ctx
+        .sql(insert)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("the fixture table accepted an insert");
+    assert!(error.to_string().contains("not implemented"), "{error}");
+
+    // DataFusion plans UPDATE through a separate provider hook, which also refuses.
+    let update = "UPDATE facts SET value = CAST(1000001 AS DOUBLE) WHERE host = CAST(0 AS BIGINT)";
+    let error = ctx
+        .sql(update)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("the fixture table accepted an update");
+    assert!(error.to_string().contains("not supported"), "{error}");
+
+    // The blocked mutations left the admission, the plan, and the results untouched.
+    let (after_plan, after_batches) = plan_and_collect(&ctx, FULL_AVG).await;
+    assert!(is_factorized(&after_plan), "{}", plan_text(&after_plan));
+    assert_eq!(plan_text(&after_plan), before_text);
+    let baseline = baseline_context(facts.clone(), dims.clone()).await;
+    let (_, baseline_batches) = plan_and_collect(&baseline, FULL_AVG).await;
+    assert_scores_bitwise(
+        &avg_rows(&after_batches),
+        &avg_rows(&baseline_batches),
+        "after blocked mutations",
+    );
+
+    // Premise of the guard: the same SQL succeeds against an ordinary `MemTable`
+    // session and changes its AVG result, so the refusal above is what keeps the
+    // admission honest rather than a property of the statement.
+    let mutable = baseline_context(facts, dims).await;
+    let (_, mutable_before) = plan_and_collect(&mutable, FULL_AVG).await;
+    mutable.sql(insert).await.unwrap().collect().await.unwrap();
+    let (_, mutable_after) = plan_and_collect(&mutable, FULL_AVG).await;
+    assert_ne!(
+        avg_rows(&mutable_after),
+        avg_rows(&mutable_before),
+        "the insert did not reach the mutable baseline table"
+    );
 }

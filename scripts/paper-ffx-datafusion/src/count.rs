@@ -29,23 +29,24 @@
 //! place of the ordinary join/aggregate subtree; every other shape — including a
 //! matching `AVG` shape whose batches are outside the exact domain — delegates to
 //! the default planner and returns its baseline plan unchanged. There is no
-//! execution-time retry, replay, or approximation.
+//! execution-time retry, replay, or approximation, and the two registered fixture
+//! providers refuse mutations, so the setup-time admission cannot go stale.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Column, DFSchema, DataFusionError, Result};
+use datafusion::common::{Column, Constraints, DFSchema, DataFusionError, Result};
 use datafusion::datasource::{MemTable, source_as_provider};
 use datafusion::execution::context::{QueryPlanner, SessionConfig, SessionContext};
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::utils::COUNT_STAR_EXPANSION;
 use datafusion::logical_expr::{
-    Aggregate, Expr, Join, JoinConstraint, JoinType, LogicalPlan, Operator,
+    Aggregate, Expr, Join, JoinConstraint, JoinType, LogicalPlan, Operator, TableType,
 };
 use datafusion::physical_expr::expressions::Column as PhysicalColumn;
 use datafusion::physical_plan::PhysicalExpr;
@@ -88,6 +89,10 @@ pub fn count_session(facts: RecordBatch, dims: RecordBatch) -> Result<SessionCon
 /// session and `count_session(facts, dims)` is
 /// `count_session_full(facts, dims, true)`. `COUNT(*)` admission is unchanged and
 /// never depends on `allow_avg`.
+///
+/// Both tables are registered as read-only fixtures: a later `INSERT INTO` (or any
+/// other mutation of `facts`/`dims`) is refused at planning time, so data cannot
+/// appear after the decision made here and invalidate it.
 pub fn count_session_full(
     facts: RecordBatch,
     dims: RecordBatch,
@@ -107,10 +112,14 @@ pub fn count_session_full(
     // only be narrowed by the caller's `allow_avg`.
     let allow_avg = selected && allow_avg && exact_avg_domain(&facts, &dims);
 
-    let facts: Arc<dyn TableProvider> =
-        Arc::new(MemTable::try_new(facts.schema(), vec![vec![facts]])?);
-    let dims: Arc<dyn TableProvider> =
-        Arc::new(MemTable::try_new(dims.schema(), vec![vec![dims]])?);
+    let facts: Arc<dyn TableProvider> = Arc::new(ImmutableTable::new(MemTable::try_new(
+        facts.schema(),
+        vec![vec![facts]],
+    )?));
+    let dims: Arc<dyn TableProvider> = Arc::new(ImmutableTable::new(MemTable::try_new(
+        dims.schema(),
+        vec![vec![dims]],
+    )?));
     let config = count_config();
     if !selected {
         let ctx = SessionContext::new_with_config(config);
@@ -141,6 +150,54 @@ pub fn count_session_full(
     ctx.register_table("facts", facts)?;
     ctx.register_table("dims", dims)?;
     Ok(ctx)
+}
+
+/// One of the two registered fixture tables, read-only.
+///
+/// [`count_session_full`] decides admission once, from the batches it registers, and
+/// the installed selection then trusts that decision for the whole session. A
+/// [`MemTable`] supports `INSERT INTO` (and other mutations), so a later mutation
+/// could add out-of-domain payloads to a session that is already serving the exact
+/// `AVG` shape. Holding the raw table by value keeps it private and leaves the
+/// mutation methods at their default trait implementations, which refuse with a
+/// clean planning error instead of silently invalidating the admission, while
+/// `scan` delegates unchanged. The same `Arc` is registered and held by
+/// [`CountQueryPlanner`], so provider identity — and therefore matching — is
+/// unaffected.
+#[derive(Debug)]
+struct ImmutableTable {
+    inner: MemTable,
+}
+
+impl ImmutableTable {
+    fn new(inner: MemTable) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl TableProvider for ImmutableTable {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
 }
 
 /// Refuses setup when the join can produce more pairs than an `i64` count holds.
@@ -280,12 +337,10 @@ fn match_factor_aggregate<'a>(
     }
     let aggregate_expr = &aggregate.aggr_expr[0];
     if is_plain_count_star(aggregate_expr) {
-        return match_join_input(&aggregate.input, facts, dims, false)
+        return match_join_input(&aggregate.input, facts, dims)
             .map(|_| (aggregate, FactorAggregate::Pairs));
     }
-    if is_avg_product(aggregate_expr, &aggregate.input)
-        && match_join_input(&aggregate.input, facts, dims, true).is_some()
-    {
+    if is_avg_product(aggregate_expr) && match_join_input(&aggregate.input, facts, dims).is_some() {
         return Some((aggregate, FactorAggregate::ExactAvg));
     }
     None
@@ -296,40 +351,22 @@ fn match_factor_aggregate<'a>(
 /// The optimizer inserts a plain column-selection projection between the
 /// aggregate and the join to drop unreferenced columns; such a projection keeps
 /// every remaining column under its own name, so `host`/`area` resolve to the
-/// same join columns. Any other input plan is refused.
-///
-/// When `allow_product` is set, a single boolean multiplication of a column of
-/// each registered provider is also accepted: that is the projection the logical
-/// `AVG(facts.value * dims.weight)` carries as its input, and the factor payload
-/// already reads both payload columns, so the match does not change what is read.
+/// same join columns. Any other input plan is refused, including a projection
+/// whose whole output is the payload product: the grouped shape needs both
+/// `host` and `area` from this same input, which a single product column cannot
+/// supply, and [`is_avg_product`] therefore only accepts the inline product.
 fn match_join_input<'a>(
     plan: &'a LogicalPlan,
     facts: &Arc<dyn TableProvider>,
     dims: &Arc<dyn TableProvider>,
-    allow_product: bool,
 ) -> Option<&'a Join> {
     match plan {
         LogicalPlan::Join(join) => join_matches(join, facts, dims).then_some(join),
-        LogicalPlan::Projection(projection)
-            if is_column_selection(projection)
-                || (allow_product && is_payload_product(projection)) =>
-        {
-            match_join_input(&projection.input, facts, dims, false)
+        LogicalPlan::Projection(projection) if is_column_selection(projection) => {
+            match_join_input(&projection.input, facts, dims)
         }
         _ => None,
     }
-}
-
-/// True when the projection drops everything except one `facts.value *
-/// dims.weight` multiplication, in either operand order.
-fn is_payload_product(projection: &datafusion::logical_expr::Projection) -> bool {
-    if projection.expr.len() != 1 || projection.schema.fields().len() != 1 {
-        return false;
-    }
-    let Expr::Alias(alias) = &projection.expr[0] else {
-        return false;
-    };
-    is_payload_product_expr(&alias.expr)
 }
 
 /// True for `facts.value * dims.weight` (either operand order) as a plain
@@ -415,12 +452,11 @@ fn is_plain_count_star(expr: &Expr) -> bool {
 /// filter, ordering, or null treatment, and one uncast `value * weight` product
 /// of the two registered payload columns in either operand order.
 ///
-/// This DataFusion keeps the multiplication inline in the aggregate argument. A
-/// column that resolves — through the aggregate input projection — to exactly that
-/// product is accepted too, so both planner layouts are recognized. Casts,
-/// literals, additional arithmetic, and other payload columns keep the baseline
-/// plan.
-fn is_avg_product(expr: &Expr, input: &LogicalPlan) -> bool {
+/// This DataFusion keeps the multiplication inline in the aggregate argument, so
+/// only that inline product is accepted. Casts, literals, additional arithmetic,
+/// other payload columns, and an argument that is merely a column referring to a
+/// projected product keep the baseline plan.
+fn is_avg_product(expr: &Expr) -> bool {
     let expr = match expr {
         Expr::Alias(alias) => alias.expr.as_ref(),
         other => other,
@@ -439,27 +475,7 @@ fn is_avg_product(expr: &Expr, input: &LogicalPlan) -> bool {
     let [argument] = aggregate.params.args.as_slice() else {
         return false;
     };
-    if is_payload_product_expr(argument) {
-        return true;
-    }
-    let Some(column) = as_column(argument) else {
-        return false;
-    };
-    let LogicalPlan::Projection(projection) = input else {
-        return false;
-    };
-    let Some(index) = projection
-        .schema
-        .fields()
-        .iter()
-        .position(|field| field.name() == &column.name)
-    else {
-        return false;
-    };
-    let Expr::Alias(alias) = &projection.expr[index] else {
-        return false;
-    };
-    is_payload_product_expr(&alias.expr)
+    is_payload_product_expr(argument)
 }
 
 /// Requires an inner equi-join of the two registered providers on `host` without a
@@ -590,20 +606,25 @@ fn schema_matches(physical: &Schema, logical: &DFSchema) -> bool {
 ///   payload row, so no group is empty and no score is NULL;
 /// * a conservative pair bound over every group keeps the scaled sums below
 ///   `2^53`: with `max_n_f` the largest per-host fact count, `max_n_w` the largest
-///   per-`(host, area)` weight count, `M_f = 1_000_000`, and `M_w = 4` (the value
-///   bound, in quarters), `4 * max_n_f * M_f * max_n_w * M_w + HEADROOM` stays
+///   per-`(host, area)` weight count, `M_f = 1_000_000` the fact magnitude bound,
+///   and `M_w = 4` the weight magnitude bound, the scaled weight sum contributes
+///   `16 = 4 * M_w` per row, and `max_n_f * M_f * max_n_w * 16 + HEADROOM` stays
 ///   below `2^53`.
 ///
 /// Then each fact sum is at most `max_n_f * M_f < 2^53`, each weight sum scaled by
-/// 4 is at most `max_n_w * M_w < 2^53`, their product fits in binary64, and the
-/// factorized `sum * (4 * dim_sum) / 4 / valid` is a single exact division
-/// producing exactly the baseline `AVG`. NULL `host`/`area` rows are fine because
-/// they never match the join, and a group may mix NULL payloads with non-null ones
-/// as long as it retains at least one valid entry: the factor path's `valid` count
-/// is exactly the number of joined pairs whose product is non-null, so partition
-/// and score both agree with the baseline. Unlike `COUNT(*)`, which keeps counting
-/// NULL payloads as pairs, a group whose value or weight list is *entirely* NULL
-/// is refused here because its score would be NULL instead of a division.
+/// 4 is at most `max_n_w * 16 < 2^53`, their product fits in binary64, and the
+/// factorized `sum * (4 * dim_sum) / 4 / valid` is a single correctly-rounded
+/// division producing the baseline `AVG` bit for bit. An exactly zero result is
+/// `+0.0` in both arms: both add into a running sum that starts at `+0.0`, so a
+/// `-0.0` product cannot flip the sign of the result. A NULL `host` row never
+/// matches the join and never forms a group; a NULL `area` row on a matched host is
+/// an ordinary `(host, NULL)` group of that host's facts, exactly as in the
+/// baseline. A group may mix NULL payloads with non-null ones as long as it retains
+/// at least one valid entry: the factor path's `valid` count is exactly the number
+/// of joined pairs whose product is non-null, so partition and score both agree with
+/// the baseline. Unlike `COUNT(*)`, which keeps counting NULL payloads as pairs, a
+/// group whose value or weight list is *entirely* NULL is refused here because its
+/// score would be NULL instead of a division.
 ///
 /// The grouping is computed from the actual batches in one pass each, so the
 /// classifier is `O(rows)`; the bounds live in `u128`, and the final comparison is
@@ -674,13 +695,14 @@ pub(crate) fn exact_avg_domain(facts: &RecordBatch, dims: &RecordBatch) -> bool 
     }
 
     // Conservative global bound over every group, so no lookup of a specific
-    // host/area pairing is needed: 4 * max_n_f * M_f * max_n_w * M_w < 2^53.
+    // host/area pairing is needed: max_n_f * M_f * max_n_w * 4 * M_w < 2^53, where
+    // the `4 * M_w` is the largest quarter-scaled weight sum contributed per row.
     let max_n_f = hosts.values().map(|facts| facts.n).max().unwrap_or(0);
     let max_n_w = groups.values().map(|weights| weights.n).max().unwrap_or(0);
-    (4 * max_n_f)
+    max_n_f
         .checked_mul(MAX_FACT_BOUND)
         .and_then(|scaled| scaled.checked_mul(max_n_w))
-        .and_then(|scaled| scaled.checked_mul(MAX_QUARTER_BOUND))
+        .and_then(|scaled| scaled.checked_mul(4 * MAX_WEIGHT_BOUND))
         .is_some_and(|scaled| scaled + HEADROOM < (1u128 << 53))
 }
 
@@ -706,10 +728,12 @@ struct DimWeights {
 const MAX_FACT_MAGNITUDE: f64 = 1_000_000.0;
 /// [`MAX_FACT_MAGNITUDE`] as the integer used by the size bound.
 const MAX_FACT_BOUND: u128 = 1_000_000;
-/// Largest magnitude accepted for a non-null dimension weight.
+/// Largest magnitude accepted for a non-null dimension weight (`M_w`).
 const MAX_WEIGHT_MAGNITUDE: f64 = 4.0;
-/// [`MAX_WEIGHT_MAGNITUDE`] in quarters, `M_w` of the size bound.
-const MAX_QUARTER_BOUND: u128 = 4;
+/// [`MAX_WEIGHT_MAGNITUDE`] as the integer `M_w` of the size bound. The quarter
+/// scaling that keeps weight sums exact adds a factor of 4, so one weight
+/// contributes at most `4 * M_w = 16` to a scaled weight sum.
+const MAX_WEIGHT_BOUND: u128 = 4;
 /// Distance kept below `2^53` so the additions forming each sum stay exact.
 const HEADROOM: u128 = 1 << 20;
 
@@ -893,20 +917,27 @@ mod exact_avg_domain_tests {
     }
 
     /// The conservative pair bound is what keeps the scaled sums inside 2^53.
+    ///
+    /// The classifier accepts while `max_n_f * max_n_w * 16 * 10^6 + 2^20 < 2^53`,
+    /// so with one fully populated host group and one fully populated
+    /// `(host, area)` group the cutoff sits between 23_726 and 23_727 rows per side.
+    /// No join is materialized: only the two batch sides are built.
     #[test]
     fn size_bound_rejects_wide_groups_without_overflowing() {
-        let facts = facts_batch(&[Some(1); 20_000], &[Some(1.0); 20_000]);
+        // Accepted: 23_726^2 * 16 * 10^6 + 2^20 < 2^53.
+        let facts = facts_batch(&[Some(1); 23_726], &[Some(1.0); 23_726]);
         let dims = dims_batch(
-            &[Some(1); 20_000],
-            &[Some(0); 20_000],
-            &[Some(0.25); 20_000],
+            &[Some(1); 23_726],
+            &[Some(0); 23_726],
+            &[Some(0.25); 23_726],
         );
         assert!(exact_avg_domain(&facts, &dims));
-        let facts = facts_batch(&[Some(1); 24_000], &[Some(1.0); 24_000]);
+        // Rejected: 23_727^2 * 16 * 10^6 + 2^20 > 2^53.
+        let facts = facts_batch(&[Some(1); 23_727], &[Some(1.0); 23_727]);
         let dims = dims_batch(
-            &[Some(1); 24_000],
-            &[Some(0); 24_000],
-            &[Some(0.25); 24_000],
+            &[Some(1); 23_727],
+            &[Some(0); 23_727],
+            &[Some(0.25); 23_727],
         );
         assert!(!exact_avg_domain(&facts, &dims));
     }

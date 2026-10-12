@@ -48,8 +48,11 @@ dimension weights leave the session on the default planner,
 `fact_rows * dim_rows > i64::MAX` refuses setup, and row totals above the Arrow
 `List` offset capacity (`i32::MAX`) skip the selection. The factor path applies
 only to bounded, one-partition `(Int64, Float64)` fact and
-`(Int64, Int64, Float64)` dimension inputs; anything else falls back. `--count`
-compares the complete grouped result with a plain session over the same batches
+`(Int64, Int64, Float64)` dimension inputs; anything else falls back. The two
+registered tables are read-only: a later `INSERT INTO` (or any other mutation) is
+refused at planning time instead of silently invalidating a decision the setup
+preflight already made. `--count` compares the complete grouped result with a plain
+session over the same batches
 and prints both plan texts with `RawFactorExec` present or absent. The command
 makes no performance claims.
 
@@ -87,14 +90,18 @@ factorized:
 * every non-null weight is a multiple of `1/4` with `|w| <= 4`;
 * each host group and each `(host, area)` group keeps at least one non-null
   payload row (an all-NULL value or weight group would score `NULL`);
-* the conservative global size bound `4 * max_n_f * 1_000_000 * max_n_w * 4` stays
+* the conservative global size bound `max_n_f * 1_000_000 * max_n_w * 16` stays
   below `2^53` with headroom, using `u128`/checked arithmetic, where `max_n_f` and
-  `max_n_w` are the largest per-host fact and per-`(host, area)` dimension counts.
+  `max_n_w` are the largest per-host fact and per-`(host, area)` dimension counts
+  and `16` is the quarter-scaled weight magnitude (`4 * |w|max`, with `|w|max = 4`).
 
 Inside that domain the per-group fact sum, quarter-scaled dimension sum, their
 product, and the valid pair count are all exactly representable in binary64, so the
 factorized `sum(values) * sum(weights) / valid` and the baseline mean of the joined
-products are the same single division and agree bitwise. Outside it — general
+products are the same single, correctly-rounded division and agree bitwise (an
+exactly zero result is `+0.0` in both arms). A NULL `host` row never matches the
+join, while a NULL `area` row forms the ordinary `(host, NULL)` group, so neither
+needs a special case beyond the per-group validity rule above. Outside it — general
 floats, non-quarter weights, larger magnitudes, all-NULL payload groups, or a
 larger pair bound — the wrapper returns the delegated baseline plan unchanged and
 never errors or approximates; `COUNT(*)` admission is unaffected by these rules,
