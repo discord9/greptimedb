@@ -20,7 +20,8 @@
 mod count;
 
 pub use count::{
-    checked_pair_bound, count_config, count_session, payload_rows_fit, select_factor_plan,
+    checked_pair_bound, count_config, count_session, count_session_full, payload_rows_fit,
+    select_factor_plan,
 };
 
 use std::collections::HashMap;

@@ -71,3 +71,31 @@ These are fixture-local numbers produced by this bounded in-memory harness on a
 CI runner: they are evidence about this experiment and its fixtures only, not
 claims about GreptimeDB product performance, and the timing includes full SQL
 planning and selection overhead on both arms.
+
+## Exact-domain `AVG(value * weight)` admission
+
+Alongside `COUNT(*)`, the same wrapper recognizes the aggregate shape
+`AVG(f.value * d.weight)` over the same join and `GROUP BY (host, area)` — a single
+`avg` whose argument is exactly the `value * weight` product (either operand order)
+of the two registered providers. That shape is served by the same
+`RawFactorExec` + `FactorAggregateExec` splice, projecting `(host, area, score)` as
+the aggregate. Admission is *not* automatic for every such query: the session
+classifies the actual batches first, and only the exact-equivalence domain is
+factorized:
+
+* every non-null fact value is an integer with `|v| <= 1_000_000`;
+* every non-null weight is a multiple of `1/4` with `|w| <= 4`;
+* each host group and each `(host, area)` group keeps at least one non-null
+  payload row (an all-NULL value or weight group would score `NULL`);
+* the conservative global size bound `4 * max_n_f * 1_000_000 * max_n_w * 4` stays
+  below `2^53` with headroom, using `u128`/checked arithmetic, where `max_n_f` and
+  `max_n_w` are the largest per-host fact and per-`(host, area)` dimension counts.
+
+Inside that domain the per-group fact sum, quarter-scaled dimension sum, their
+product, and the valid pair count are all exactly representable in binary64, so the
+factorized `sum(values) * sum(weights) / valid` and the baseline mean of the joined
+products are the same single division and agree bitwise. Outside it — general
+floats, non-quarter weights, larger magnitudes, all-NULL payload groups, or a
+larger pair bound — the wrapper returns the delegated baseline plan unchanged and
+never errors or approximates; `COUNT(*)` admission is unaffected by these rules,
+and `count_session_full(facts, dims, false)` disables the `AVG` shape entirely.
