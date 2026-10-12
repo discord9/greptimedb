@@ -17,6 +17,12 @@
 //! These plans retain per-host input payloads once. They intentionally target bounded,
 //! one-partition fixtures and are not a general-purpose optimizer rewrite.
 
+mod count;
+
+pub use count::{
+    checked_pair_bound, count_config, count_session, payload_rows_fit, select_factor_plan,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;

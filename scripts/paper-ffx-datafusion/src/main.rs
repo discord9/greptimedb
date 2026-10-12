@@ -25,10 +25,12 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
-use paper_ffx_datafusion::{FactorAggregateExec, RawFactorExec};
+use paper_ffx_datafusion::{FactorAggregateExec, RawFactorExec, count_config, count_session};
 
 const QUERY: &str = "SELECT f.host, d.area, COUNT(*) AS pairs, COUNT(f.value * d.weight) AS valid, AVG(f.value * d.weight) AS score FROM facts f JOIN dims d ON f.host = d.host GROUP BY f.host, d.area ORDER BY score DESC NULLS LAST, f.host ASC NULLS LAST, d.area ASC NULLS LAST LIMIT 10";
+const COUNT_QUERY: &str = "SELECT f.host, d.area, COUNT(*) AS pairs FROM facts f JOIN dims d ON f.host = d.host GROUP BY f.host, d.area";
 type Row = (Option<i64>, Option<i64>, i64, i64, Option<f64>);
+type CountRow = (Option<i64>, Option<i64>, i64);
 
 fn fixture(shape: &str) -> datafusion::common::Result<(RecordBatch, RecordBatch, usize)> {
     let (fact_hosts, dim_hosts): (Vec<i64>, Vec<i64>) = match shape {
@@ -275,12 +277,91 @@ async fn run_case(name: &str, warmups: usize, samples: usize) -> datafusion::com
     Ok(())
 }
 
+/// Complete grouped `COUNT(*)` rows ordered by (host, area).
+fn count_rows(batches: &[RecordBatch]) -> datafusion::common::Result<Vec<CountRow>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let h = as_int64_array(batch.column(0).as_ref())?;
+        let a = as_int64_array(batch.column(1).as_ref())?;
+        let p = as_int64_array(batch.column(2).as_ref())?;
+        for i in 0..batch.num_rows() {
+            rows.push((
+                (!h.is_null(i)).then_some(h.value(i)),
+                (!a.is_null(i)).then_some(a.value(i)),
+                p.value(i),
+            ));
+        }
+    }
+    rows.sort();
+    Ok(rows)
+}
+
+/// `--count` fixture check: plans the plain COUNT SQL through `ctx.sql` on a
+/// session built by `count_session`, compares every group against a plain session
+/// with the same configuration, and prints both plan texts. No timing claims.
+async fn run_count_case(name: &str) -> datafusion::common::Result<()> {
+    let (facts, dims, logical_pairs) = fixture(name)?;
+    let fact_rows = facts.num_rows();
+    let dim_rows = dims.num_rows();
+    let ctx = count_session(facts.clone(), dims.clone())?;
+    let plan = ctx.sql(COUNT_QUERY).await?.create_physical_plan().await?;
+    let factor_batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+
+    let plain = SessionContext::new_with_config(count_config());
+    plain.register_table(
+        "facts",
+        Arc::new(MemTable::try_new(
+            facts.schema(),
+            vec![vec![facts.clone()]],
+        )?),
+    )?;
+    plain.register_table(
+        "dims",
+        Arc::new(MemTable::try_new(dims.schema(), vec![vec![dims.clone()]])?),
+    )?;
+    let baseline = plain.sql(COUNT_QUERY).await?.create_physical_plan().await?;
+    let baseline_batches = collect(Arc::clone(&baseline), plain.task_ctx()).await?;
+
+    let factor_rows = count_rows(&factor_batches)?;
+    let baseline_rows = count_rows(&baseline_batches)?;
+    if factor_rows != baseline_rows {
+        return Err(datafusion::common::DataFusionError::Execution(format!(
+            "{name}: COUNT(*) selection changed the complete grouped result"
+        )));
+    }
+    let counted = factor_rows.iter().map(|row| row.2).sum::<i64>();
+    if counted != logical_pairs as i64 {
+        return Err(datafusion::common::DataFusionError::Execution(format!(
+            "{name}: counted pairs {counted} differ from fixture pairs {logical_pairs}"
+        )));
+    }
+    let factor_text = displayable(plan.as_ref()).indent(true).to_string();
+    let baseline_text = displayable(baseline.as_ref()).indent(true).to_string();
+    if !factor_text.contains("RawFactorExec") || !factor_text.contains("FactorAggregateExec") {
+        return Err(datafusion::common::DataFusionError::Execution(format!(
+            "{name}: COUNT(*) SQL did not select the factorized plan"
+        )));
+    }
+    println!(
+        "case={name} fact_rows={fact_rows} dim_rows={dim_rows} logical_pairs={logical_pairs} groups={} complete_result_equals_baseline=true\nselected plan (RawFactorExec present: {}):\n{factor_text}baseline plan (RawFactorExec present: {}):\n{baseline_text}",
+        factor_rows.len(),
+        factor_text.contains("RawFactorExec"),
+        baseline_text.contains("RawFactorExec"),
+    );
+    Ok(())
+}
+
 async fn run() -> datafusion::common::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let (warmups, samples) = if args.as_slice() == ["--help"] || args.as_slice() == ["-h"] {
         println!(
-            "paper-ffx-datafusion [--bench]\nDefault runs bounded correctness and timing fixtures. --bench enables 3 warmups and 9 alternating samples per fixture."
+            "paper-ffx-datafusion [--bench | --count]\nDefault runs bounded correctness and timing fixtures. --bench enables 3 warmups and 9 alternating samples per fixture. --count runs the COUNT(*) auto-selection check on the balanced/hot/low fixtures with complete-result comparison and no timing output."
         );
+        return Ok(());
+    } else if args.as_slice() == ["--count"] {
+        for case in ["balanced", "hot", "low"] {
+            run_count_case(case).await?;
+        }
         return Ok(());
     } else if args.is_empty() {
         (0, 1)
@@ -288,7 +369,7 @@ async fn run() -> datafusion::common::Result<()> {
         (3, 9)
     } else {
         return Err(datafusion::common::DataFusionError::Plan(
-            "usage: paper-ffx-datafusion [--bench]".into(),
+            "usage: paper-ffx-datafusion [--bench | --count]".into(),
         ));
     };
     for case in ["balanced", "hot", "low"] {
