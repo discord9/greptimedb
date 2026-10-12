@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use datafusion::execution::{SessionStateBuilder, context::SessionContext};
+use datafusion::functions_aggregate::count::Count;
 use datafusion::prelude::SessionConfig;
 use datafusion_common::{
     Column, DataFusionError, NullEquality, Result, tree_node::Transformed,
@@ -26,7 +27,6 @@ use datafusion_expr::{
     Expr, LogicalPlan,
     logical_plan::{Aggregate, Join, JoinConstraint, JoinType},
 };
-use datafusion_functions_aggregate::count::Count;
 use datafusion_optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
 
 /// Rewrites only the fixture query shape supported by this experiment.

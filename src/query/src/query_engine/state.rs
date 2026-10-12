@@ -685,6 +685,10 @@ impl MemoryPool for MetricsMemoryPool {
 }
 
 #[cfg(test)]
+#[path = "state/ffx_count_tests.rs"]
+mod ffx_count_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
