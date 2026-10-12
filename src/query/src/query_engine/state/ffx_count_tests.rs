@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[path = "../../../../../scripts/paper-ffx-auto-rewrite/src/lib.rs"]
-mod rewrite_experiment;
-
 use std::sync::Arc;
 
 use arrow::util::display::array_value_to_string;
@@ -36,6 +33,7 @@ use datatypes::vectors::{Float64Vector, StringVector, TimestampMillisecondVector
 use session::context::QueryContext;
 use table::test_util::MemTable;
 
+use crate::optimizer::count_join::CountJoinRewrite;
 use crate::options::QueryOptions as EngineOptions;
 use crate::parser::QueryLanguageParser;
 use crate::query_engine::QueryEngineFactory;
@@ -45,9 +43,23 @@ fn engine(
     fact: RecordBatch,
     dim: RecordBatch,
 ) -> crate::query_engine::QueryEngineRef {
+    // The pair bound is rule state, so the rule is built from the real row
+    // counts of the fixtures it will be asked to rewrite.
+    let rule =
+        with_rewrite.then(|| CountJoinRewrite::new(fact.num_rows() as u64, dim.num_rows() as u64));
+    engine_with_rule(rule, fact, dim)
+}
+
+/// Builds a query engine and, when given, installs `rule` on it.
+///
+/// The rule is never part of the default engine construction: the caller hands
+/// over the exact instance, and therefore the exact bound, to use.
+fn engine_with_rule(
+    rule: Option<CountJoinRewrite>,
+    fact: RecordBatch,
+    dim: RecordBatch,
+) -> crate::query_engine::QueryEngineRef {
     let catalog = catalog::memory::new_memory_catalog_manager().unwrap();
-    let fact_rows = fact.num_rows() as u64;
-    let dim_rows = dim.num_rows() as u64;
     for (name, table_id, batch) in [("fact", 101, fact), ("dim", 102, dim)] {
         let table = MemTable::new_with_catalog(
             name,
@@ -79,17 +91,11 @@ fn engine(
         },
     )
     .query_engine();
-    if with_rewrite {
-        engine.engine_state().df_context.add_optimizer_rule(
-            rewrite_experiment::experiment_session(fact_rows, dim_rows)
-                .unwrap()
-                .state()
-                .optimizers()
-                .iter()
-                .find(|rule| rule.name() == "bounded_count_join_rewrite")
-                .unwrap()
-                .clone(),
-        );
+    if let Some(rule) = rule {
+        engine
+            .engine_state()
+            .df_context
+            .add_optimizer_rule(Arc::new(rule));
     }
     engine
 }
@@ -172,8 +178,16 @@ async fn original_count_sql_matches_independent_counts_and_physical_plan() {
             (Some("orphan"), None),
         ],
     );
+    let fact_rows = fact.num_rows() as u64;
+    let dim_rows = dim.num_rows() as u64;
+    let rule = CountJoinRewrite::new(fact_rows, dim_rows);
+    assert_eq!(
+        Some(fact_rows * dim_rows),
+        rule.pair_bound(),
+        "the fixture pair bound must be provable by the rule"
+    );
     let baseline = engine(false, fact.clone(), dim.clone());
-    let candidate = engine(true, fact, dim);
+    let candidate = engine_with_rule(Some(rule), fact, dim);
     assert_rule_installation(&baseline, &candidate);
 
     let (base_schema, base_rows, _base_plan) = run(&baseline, COUNT_SQL).await;
@@ -255,6 +269,54 @@ async fn original_count_sql_top_ten_preserves_group_ties_and_empty_schema() {
     assert_eq!(base_schema, candidate_schema);
     assert!(base_rows.is_empty());
     assert_eq!(base_rows, candidate_rows);
+}
+
+/// A pair bound that cannot prove the join stays inside `COUNT(*)`'s `Int64`
+/// result must make the rule refuse to rewrite. The refused plan keeps the
+/// unrewritten shape and still returns the same rows as the baseline.
+#[tokio::test]
+async fn unsatisfiable_pair_bound_refuses_rewrite_and_keeps_results() {
+    // Exactly at the representable bound the rewrite is still allowed; one pair
+    // more, a `u64` multiplication overflow, or a symmetric overflow are not.
+    assert_eq!(
+        Some(i64::MAX as u64),
+        CountJoinRewrite::new(i64::MAX as u64, 1).pair_bound()
+    );
+    assert_eq!(
+        None,
+        CountJoinRewrite::new(i64::MAX as u64 + 1, 1).pair_bound()
+    );
+    assert_eq!(None, CountJoinRewrite::new(u64::MAX, 2).pair_bound());
+    assert_eq!(None, CountJoinRewrite::new(2, u64::MAX).pair_bound());
+
+    let (fact, dim) = batches(
+        &[Some("a"), Some("a"), Some("b"), None],
+        &[None, None, Some(1.0), Some(2.0)],
+        &[
+            (Some("a"), Some("west")),
+            (Some("a"), Some("west")),
+            (Some("b"), Some("east")),
+            (Some("b"), Some("west")),
+            (None, Some("null-key")),
+            (Some("orphan"), None),
+        ],
+    );
+    let refusing = CountJoinRewrite::new(u64::MAX, 2);
+    assert_eq!(None, refusing.pair_bound());
+    let baseline = engine(false, fact.clone(), dim.clone());
+    let candidate = engine_with_rule(Some(refusing), fact, dim);
+    // The rule is installed, it simply declines to rewrite with this bound.
+    assert_rule_installation(&baseline, &candidate);
+
+    let (base_schema, base_rows, _base_plan) = run(&baseline, COUNT_SQL).await;
+    let (candidate_schema, candidate_rows, candidate_plan) = run(&candidate, COUNT_SQL).await;
+    assert_eq!(expected_schema(), base_schema);
+    assert_eq!(base_schema, candidate_schema);
+    assert_eq!(base_rows, candidate_rows);
+    assert_eq!(vec!["a|west|4", "b|east|1", "b|west|1"], candidate_rows);
+    assert_baseline_logical_shape(&optimized_logical(&baseline, COUNT_SQL).await);
+    assert_unrewritten_logical_shape(&optimized_logical(&candidate, COUNT_SQL).await);
+    assert_unrewritten_physical_shape(candidate_plan.as_ref());
 }
 
 fn expected_schema() -> Vec<(String, String, bool)> {
