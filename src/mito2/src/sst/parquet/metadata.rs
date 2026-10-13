@@ -28,7 +28,21 @@ use store_api::metadata::RegionMetadata;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 
 use crate::error::{self, Result};
+use crate::sst::parquet::SERIES_RUNS_METADATA_KEY;
 use crate::sst::parquet::reader::MetadataCacheMetrics;
+use crate::sst::parquet::writer::SeriesRun;
+
+/// Decodes native per-series run descriptors from a Parquet footer.
+pub(crate) fn decode_series_runs(metadata: &ParquetMetaData) -> Option<Vec<SeriesRun>> {
+    let value = metadata
+        .file_metadata()
+        .key_value_metadata()?
+        .iter()
+        .find(|kv| kv.key == SERIES_RUNS_METADATA_KEY)?
+        .value
+        .as_deref()?;
+    serde_json::from_str(value).ok()
+}
 
 /// The estimated size of the footer and metadata need to read from the end of parquet file.
 const DEFAULT_PREFETCH_SIZE: u64 = 64 * 1024;
@@ -205,7 +219,7 @@ mod tests {
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
     use super::*;
-    use crate::sst::parquet::PARQUET_METADATA_KEY;
+    use crate::sst::parquet::{PARQUET_METADATA_KEY, SERIES_RUNS_METADATA_KEY};
     use crate::test_util::sst_util::sst_region_metadata;
 
     fn build_test_parquet_bytes(
@@ -239,8 +253,34 @@ mod tests {
             PARQUET_METADATA_KEY.to_string(),
             region_metadata.to_json().unwrap(),
         );
+        let runs = vec![
+            SeriesRun {
+                pk: "YQ==".to_string(),
+                start: 0,
+                count: 2,
+                first_timestamp_ms: 10,
+                timestamp_step: Some(5),
+                value_column: Some("v".to_string()),
+                value_first_bits: Some(1.0f64.to_bits()),
+                value_step_bits: Some(2.0f64.to_bits()),
+            },
+            SeriesRun {
+                pk: "Yg==".to_string(),
+                start: 2,
+                count: 2,
+                first_timestamp_ms: 20,
+                timestamp_step: Some(5),
+                value_column: None,
+                value_first_bits: None,
+                value_step_bits: None,
+            },
+        ];
+        let run_metadata = KeyValue::new(
+            SERIES_RUNS_METADATA_KEY.to_string(),
+            serde_json::to_string(&runs).unwrap(),
+        );
         let props = WriterProperties::builder()
-            .set_key_value_metadata(Some(vec![key_value]))
+            .set_key_value_metadata(Some(vec![key_value, run_metadata]))
             .set_statistics_enabled(stats_enabled)
             .build();
 
@@ -281,6 +321,43 @@ mod tests {
         .metadata()
         .as_ref()
         .clone()
+    }
+
+    #[test]
+    fn test_series_runs_metadata_round_trips_and_decodes() {
+        let metadata = build_test_metadata(
+            true,
+            &[b"a", b"a", b"b", b"b"],
+            &[2, 2],
+            EnabledStatistics::Page,
+        );
+        let kv = metadata.file_metadata().key_value_metadata().unwrap();
+        assert!(kv.iter().any(|entry| entry.key == SERIES_RUNS_METADATA_KEY));
+        let runs = decode_series_runs(&metadata).unwrap();
+        assert_eq!(2, runs.len());
+        assert_eq!(
+            ("YQ==", 0, 2, 10, Some(5)),
+            (
+                runs[0].pk.as_str(),
+                runs[0].start,
+                runs[0].count,
+                runs[0].first_timestamp_ms,
+                runs[0].timestamp_step
+            )
+        );
+        assert_eq!(Some("v"), runs[0].value_column.as_deref());
+        assert_eq!(Some(1.0f64.to_bits()), runs[0].value_first_bits);
+        assert_eq!(Some(2.0f64.to_bits()), runs[0].value_step_bits);
+        assert_eq!(
+            ("Yg==", 2, 2, None, None),
+            (
+                runs[1].pk.as_str(),
+                runs[1].start,
+                runs[1].count,
+                runs[1].value_column.as_deref(),
+                runs[1].value_first_bits
+            )
+        );
     }
 
     #[tokio::test]

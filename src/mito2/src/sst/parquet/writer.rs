@@ -23,16 +23,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use base64::Engine;
+
 use bytes::Bytes;
 use common_telemetry::debug;
 use common_time::Timestamp;
 use datatypes::arrow::array::{
-    ArrayRef, BinaryArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    Array as _, ArrayRef, BinaryArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
 };
 use datatypes::arrow::compute::{max, min};
 use datatypes::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::data_type::DataType as _;
 use datatypes::extension::json::is_json2_extension_type;
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
@@ -40,6 +43,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
@@ -62,8 +66,8 @@ use crate::sst::parquet::flat_format::{
 };
 use crate::sst::parquet::format::{PrimaryKeyArray, PrimaryKeyWriteFormat};
 use crate::sst::parquet::{
-    COLUMN_INDEX_TRUNCATE_LENGTH, PARQUET_METADATA_KEY, SstInfo, WriteOptions,
-    apply_float_field_encoding,
+    COLUMN_INDEX_TRUNCATE_LENGTH, PARQUET_METADATA_KEY, SERIES_RUNS_METADATA_KEY, SstInfo,
+    WriteOptions, apply_float_field_encoding,
 };
 use crate::sst::{
     DEFAULT_WRITE_CONCURRENCY, FlatSchemaOptions, SeriesEstimator, maybe_wrap_schema,
@@ -305,6 +309,20 @@ where
                 }
             }
             current_writer.flush().await.context(WriteParquetSnafu)?;
+            if stats.series_runs.len() <= MAX_SERIES_RUNS {
+                let json = serde_json::to_string(&stats.series_runs).unwrap();
+                current_writer.append_key_value_metadata(KeyValue::new(
+                    SERIES_RUNS_METADATA_KEY.to_string(),
+                    json,
+                ));
+            } else {
+                debug!(
+                    "Skipping series-run footer metadata for file {}: {} runs exceed cap {}",
+                    self.current_file,
+                    stats.series_runs.len(),
+                    MAX_SERIES_RUNS
+                );
+            }
 
             let parquet_metadata = current_writer.close().await.context(WriteParquetSnafu)?;
             let file_size = self.bytes_written.load(Ordering::Relaxed) as u64;
@@ -496,6 +514,7 @@ where
                 .context(WriteParquetSnafu)?;
             self.metrics.write_batch += start.elapsed();
 
+            append_series_runs(stats, batch, &self.metadata)?;
             stats.update_flat(batch)?;
             if matches!(self.index_config.build_mode, IndexBuildMode::Sync) {
                 let start = Instant::now();
@@ -606,6 +625,100 @@ struct SourceStats {
     last_primary_key: Option<Bytes>,
     /// Series estimator for computing num_series.
     series_estimator: SeriesEstimator,
+    /// Per-series descriptors for the current file.
+    series_runs: Vec<SeriesRun>,
+}
+
+const MAX_SERIES_RUNS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SeriesRun {
+    pub(crate) pk: String,
+    pub(crate) start: usize,
+    pub(crate) count: usize,
+    pub(crate) first_timestamp_ms: i64,
+    pub(crate) timestamp_step: Option<i128>,
+    pub(crate) value_column: Option<String>,
+    pub(crate) value_first_bits: Option<u64>,
+    pub(crate) value_step_bits: Option<u64>,
+}
+
+fn exact_float_affine(values: &[f64]) -> Option<(u64, u64)> {
+    let first = *values.first()?;
+    let step = values.get(1).map_or(0.0, |value| *value - first);
+    values
+        .iter()
+        .enumerate()
+        .all(|(i, value)| (first + step * i as f64).to_bits() == value.to_bits())
+        .then_some((first.to_bits(), step.to_bits()))
+}
+
+fn append_series_runs(
+    stats: &mut SourceStats,
+    batch: &RecordBatch,
+    metadata: &store_api::metadata::RegionMetadata,
+) -> Result<()> {
+    if stats.series_runs.len() > MAX_SERIES_RUNS || batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let (keys, values) = encoded_primary_keys(batch)?;
+    let ts_idx = time_index_column_index(batch.num_columns());
+    let ts = batch.column(ts_idx);
+    // Only collect runs for millisecond timestamps; other units would need lossy/overflow-prone conversion.
+    let DataType::Timestamp(TimeUnit::Millisecond, _) = ts.data_type() else {
+        return Ok(());
+    };
+    let timestamps: &[i64] = ts
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap()
+        .values();
+    // Deterministically pick the first Float64 field column for value affine detection.
+    let value_col = metadata
+        .field_columns()
+        .find(|c| c.column_schema.data_type.as_arrow_type() == DataType::Float64)
+        .map(|c| c.column_schema.name.clone());
+    let value_array = value_col.as_deref().and_then(|name| {
+        batch.schema().index_of(name).ok().and_then(|idx| {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::Float64Array>()
+        })
+    });
+    let mut offset = 0;
+    while offset < batch.num_rows() {
+        let pk = values.value(keys.value(offset) as usize);
+        let mut end = offset + 1;
+        while end < batch.num_rows() && values.value(keys.value(end) as usize) == pk {
+            end += 1;
+        }
+        let ts_run = &timestamps[offset..end];
+        let ts_step = ts_run
+            .get(1)
+            .map_or(0, |next| *next as i128 - ts_run[0] as i128);
+        let timestamp_step = ts_run
+            .iter()
+            .enumerate()
+            .all(|(i, value)| *value as i128 == ts_run[0] as i128 + ts_step * i as i128)
+            .then_some(ts_step);
+        // Emit value params only when the slice has no nulls and is exactly affine.
+        let affine = value_array
+            .filter(|a| a.slice(offset, end - offset).null_count() == 0)
+            .and_then(|a| exact_float_affine(&a.values()[offset..end]));
+        stats.series_runs.push(SeriesRun {
+            pk: base64::engine::general_purpose::STANDARD.encode(pk),
+            start: stats.num_rows + offset,
+            count: end - offset,
+            first_timestamp_ms: ts_run[0],
+            timestamp_step,
+            value_column: affine.map(|_| value_col.clone().unwrap()),
+            value_first_bits: affine.map(|v| v.0),
+            value_step_bits: affine.map(|v| v.1),
+        });
+        offset = end;
+    }
+    Ok(())
 }
 
 impl SourceStats {

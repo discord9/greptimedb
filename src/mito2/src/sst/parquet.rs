@@ -52,6 +52,9 @@ pub mod writer;
 /// Key of metadata in parquet SST.
 pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 
+/// Key of per-series run descriptors in Parquet SST metadata.
+pub const SERIES_RUNS_METADATA_KEY: &str = "greptime.series_runs";
+
 /// Default batch size to read parquet files.
 ///
 /// This is a runtime-only scan granularity, so we align it with DataFusion's
