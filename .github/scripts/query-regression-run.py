@@ -302,6 +302,29 @@ def load_plan(fixture_generator: Path, case_path: Path) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+def _proc_memory_kb(pid: int) -> tuple[int, int]:
+    status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    fields: dict[str, int] = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in {"VmRSS", "VmHWM"}:
+            parts = value.split()
+            if len(parts) != 2 or parts[1] != "kB":
+                raise RuntimeError(f"invalid /proc/{pid}/status {key} field")
+            try:
+                fields[key] = int(parts[0])
+            except ValueError as err:
+                raise RuntimeError(f"invalid /proc/{pid}/status {key} value") from err
+    if "VmRSS" not in fields or "VmHWM" not in fields:
+        raise RuntimeError(f"missing VmRSS/VmHWM in /proc/{pid}/status")
+    return fields["VmRSS"], fields["VmHWM"]
+
+
+def _reset_and_read_memory(pid: int) -> tuple[int, int]:
+    Path(f"/proc/{pid}/clear_refs").write_text("5", encoding="ascii")
+    return _proc_memory_kb(pid)
+
+
 def run_direct_case(
     args: argparse.Namespace,
     case_path: Path,
@@ -313,13 +336,20 @@ def run_direct_case(
 ) -> int:
     ports = allocate_ports(16)
     targets = [
-        make_target("base", base_bin, work_dir, ports[:8]),
-        make_target("candidate", candidate_bin, work_dir, ports[8:]),
+        make_target("base", base_bin, work_dir, ports[:8], work_dir / "base" / "frontend-factorized-join.toml"),
+        make_target("candidate", candidate_bin, work_dir, ports[8:], work_dir / "candidate" / "frontend-factorized-join.toml"),
     ]
     for target in targets:
         if target.work_dir.exists() and any(target.work_dir.iterdir()):
             raise RuntimeError(f"target work_dir exists and is non-empty: {target.work_dir}")
         target.work_dir.mkdir(parents=True, exist_ok=True)
+    for target, enabled in zip(targets, (False, True)):
+        if target.frontend_config is None:
+            raise RuntimeError(f"direct target has no frontend config path: {target.name}")
+        target.frontend_config.write_text(
+            f"[query]\nexperimental_enable_factorized_join_agg = {str(enabled).lower()}\n",
+            encoding="utf-8",
+        )
 
     procs: dict[tuple[str, str], subprocess.Popen[bytes]] = {}
     try:
@@ -380,11 +410,41 @@ def run_direct_case(
             "--output", str(work_dir / "query-regression-report.json"),
             "--http-timeout", str(args.http_timeout),
         ]
+        interval_start = {"monotonic": time.monotonic(), "wall_time": time.time()}
+        memory: list[dict[str, Any]] = []
+        for target in targets:
+            for component in ("frontend", "datanode"):
+                proc = procs.get((target.name, component))
+                if proc is None or proc.poll() is not None:
+                    raise RuntimeError(f"{target.name} {component} process is not live")
+                rss, hwm = _reset_and_read_memory(proc.pid)
+                memory.append({
+                    "target": target.name, "component": component, "pid": proc.pid,
+                    "units": "kB", "initial_rss": rss, "initial_hwm_after_reset": hwm,
+                    "reset_status": "success",
+                })
         status = subprocess.run(measure, check=False).returncode
-        if status != 0:
-            for target in targets:
-                restart_component(target, "frontend", procs)
-            status = subprocess.run(measure, check=False).returncode
+        for record in memory:
+            proc = procs.get((record["target"], record["component"]))
+            if proc is None or proc.pid != record["pid"] or proc.poll() is not None:
+                raise RuntimeError(f"{record['target']} {record['component']} process changed/exited during measurement")
+            _, record["final_hwm"] = _proc_memory_kb(proc.pid)
+            if proc.poll() is not None:
+                raise RuntimeError(f"{record['target']} {record['component']} process exited during final memory capture")
+            record["status"] = "complete"
+        interval_end = {"monotonic": time.monotonic(), "wall_time": time.time()}
+        for target in targets:
+            (target.work_dir / "logs").mkdir(parents=True, exist_ok=True)
+            (target.work_dir / "logs" / "factorized-join-memory.json").write_text(
+                json.dumps({
+                    "scope": "Kernel-reported approximate process RSS/HWM during the complete combined base/candidate measure invocation, including table validation, first query, warmups, repetitions, EXPLAIN, and background activity. Not isolated query/operator memory; do not subtract or sum component peaks or thread RSS.",
+                    "interval_scope": "enclosing_capture_interval; component resets and reads are sequential",
+                    "interval_start": interval_start, "interval_end": interval_end,
+                    "measure_return_code": status,
+                    "components": [record for record in memory if record["target"] == target.name],
+                }, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         return status
     finally:
         stop_all(targets, procs)

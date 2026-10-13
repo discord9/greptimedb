@@ -1,0 +1,90 @@
+[case]
+name = "factorized_join_agg_sum_low"
+description = "Direct-SST join aggregation factorized switch comparison"
+
+[scenario]
+kind = "direct_readable_sst"
+seed = 2048
+
+[[scenario.tables]]
+database = "public"
+name = "factorized_join_agg_sum_low_fact"
+engine = "mito"
+append_mode = true
+sst_format = "flat"
+primary_key = ["host"]
+time_index = "ts"
+
+[[scenario.tables.columns]]
+name = "host"
+type = "STRING"
+semantic = "tag"
+distribution = { kind = "cardinality", values = 2048, prefix = "host" }
+
+[[scenario.tables.columns]]
+name = "value"
+type = "DOUBLE"
+semantic = "field"
+distribution = { kind = "deterministic_wave", min = 2.0, max = 2.0 }
+
+[[scenario.tables.columns]]
+name = "ts"
+type = "TIMESTAMP(9)"
+semantic = "timestamp"
+
+[[scenario.tables]]
+database = "public"
+name = "factorized_join_agg_sum_low_dim"
+engine = "mito"
+append_mode = true
+sst_format = "flat"
+primary_key = ["host", "area"]
+time_index = "ts"
+
+[[scenario.tables.columns]]
+name = "host"
+type = "STRING"
+semantic = "tag"
+distribution = { kind = "cardinality", values = 2048, prefix = "host" }
+
+[[scenario.tables.columns]]
+name = "area"
+type = "STRING"
+semantic = "tag"
+distribution = { kind = "cardinality", values = 4, prefix = "area" }
+
+[[scenario.tables.columns]]
+name = "weight"
+type = "DOUBLE"
+semantic = "field"
+distribution = { kind = "deterministic_wave", min = 3.0, max = 3.0 }
+
+[[scenario.tables.columns]]
+name = "ts"
+type = "TIMESTAMP(9)"
+semantic = "timestamp"
+
+[scenario.layout]
+regions = 1
+sst_count = 1
+rows_per_sst = 2048
+row_group_size = 256
+series_count = 2048
+start_unix_nanos = 1704067200000000000
+step_nanos = 1000000000
+time_range_layout = "non_overlapping_per_sst"
+series_layout = "round_robin"
+
+[[scenario.queries]]
+name = "sum_join"
+kind = "sql"
+query = "SELECT f.host, d.area, SUM(f.value * d.weight) AS result FROM factorized_join_agg_sum_low_fact f JOIN factorized_join_agg_sum_low_dim d ON f.host = d.host GROUP BY f.host, d.area"
+warmup = 3
+iterations = 11
+
+[[scenario.queries]]
+name = "explain_join"
+kind = "sql"
+query = "EXPLAIN SELECT f.host, d.area, SUM(f.value * d.weight) AS result FROM factorized_join_agg_sum_low_fact f JOIN factorized_join_agg_sum_low_dim d ON f.host = d.host GROUP BY f.host, d.area"
+warmup = 0
+iterations = 1
