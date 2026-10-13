@@ -29,6 +29,7 @@ snapshot isolation). It implements the `RegionEngine` trait from `store-api`.
 | `series_index` | `src/mito2/src/series_index/` | Series index writer/searcher, bucket planning, catalogs, worker-owned reconciliation (`maintenance.rs`), shared approximate usage (`task.rs`), catalogs, and index lifecycle |
 | `read` | `src/mito2/src/read/` | `ScanRegion`, merge, dedup, projection, streaming |
 | Auxiliary series records | `src/mito2/src/read/research_series_native.rs`, `research_series_major.rs`, `research_series_coalesced.rs` | Opt-in immutable metadata; source identity and visibility checks precede output; value decoding stays in `sst/parquet/research_sidecar.rs` |
+| Parquet series POC | `src/mito2/src/read/research_parquet_series.rs` | Query-local visible Parquet preload for existing series programs; reuses ordinary merge/dedup and requires no sample sidecars |
 | `manifest` | `src/mito2/src/manifest/` | `RegionManifestManager`, manifest actions/edits |
 | `cache` | `src/mito2/src/cache.rs` | Write/file/page caches |
 | `gc` | `src/mito2/src/gc.rs`, `src/mito2/src/gc/` | Dropped-file cleanup worker |

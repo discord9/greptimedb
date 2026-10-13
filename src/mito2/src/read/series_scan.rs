@@ -25,6 +25,7 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
 use common_telemetry::warn;
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::array::BinaryArray;
@@ -592,6 +593,89 @@ fn new_candidate_channel_list(
     (senders, receivers, active_receivers)
 }
 
+impl SeriesScan {
+    pub(crate) async fn prepare_parquet_series_source(
+        stream_ctx: Arc<StreamContext>,
+        partitions: Vec<Vec<PartitionRange>>,
+    ) -> Result<Option<Arc<dyn store_api::region_engine::PreparedSeriesSource>>> {
+        if !is_sparse_metric_metadata(stream_ctx.input.region_metadata())
+            || partitions.len() != 1
+            || stream_ctx.input.num_memtables() != 0
+            || stream_ctx.input.append_mode
+            || stream_ctx.input.compaction
+            || stream_ctx.input.sequence_range.is_some()
+            || stream_ctx.input.snapshot_sequence.is_some()
+            || stream_ctx.input.series_row_selector.is_some()
+        {
+            return Ok(None);
+        }
+
+        let query_pruner = Arc::new(Pruner::new_with_options(
+            stream_ctx.clone(),
+            common_stat::get_total_cpu_cores().max(1),
+            PrunerOptions {
+                retain_builders: true,
+                enable_predicate_prefilter: false,
+            },
+        ));
+        let metrics_set = ExecutionPlanMetricsSet::default();
+        let part_metrics = new_partition_metrics(
+            &stream_ctx,
+            false,
+            &metrics_set,
+            0,
+            &Arc::new(PartitionMetricsList::default()),
+        );
+        let semaphore = Arc::new(Semaphore::new(partitions.len()));
+        let candidate_scanner = SeriesCandidateScanner::try_new(
+            stream_ctx.clone(),
+            partitions.clone(),
+            query_pruner,
+            semaphore.clone(),
+            stream_ctx.input.scan_memory_pool.clone(),
+            metrics_set.clone(),
+            part_metrics.clone(),
+        )?;
+        let partition_pruner = candidate_scanner.partition_pruner();
+        let mut candidates = candidate_scanner.build_stream().await?;
+        let mut collector = SeriesBatchCollector::new(1).context(InvalidSenderSnafu)?;
+        let reservation = MemoryConsumer::new("research-parquet-series-candidates")
+            .register(&stream_ctx.input.scan_memory_pool);
+        while let Some(batch) = candidates.try_next().await? {
+            let bytes = batch
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::series_index::MetricSeriesId>())
+                .saturating_mul(2);
+            reservation.try_grow(bytes).map_err(|error| {
+                UnexpectedSnafu {
+                    reason: format!("Failed to reserve Parquet series candidates: {error}"),
+                }
+                .build()
+            })?;
+            collector.push(batch);
+        }
+        let Some(assigned_series) = collector.finish(false).into_iter().next() else {
+            return Ok(None);
+        };
+        if assigned_series.series().is_empty() {
+            return Ok(None);
+        }
+        let all_ranges = partitions.iter().flatten().copied().collect();
+        let reader = SeriesReader::try_new(
+            stream_ctx.clone(),
+            all_ranges,
+            assigned_series,
+            partition_pruner,
+            semaphore,
+            part_metrics,
+        )?;
+        let source =
+            crate::read::research_parquet_series::prepare(reader, stream_ctx.clone()).await?;
+        drop(reservation);
+        Ok(source)
+    }
+}
+
 impl RegionScanner for SeriesScan {
     fn name(&self) -> &str {
         "SeriesScan"
@@ -704,6 +788,26 @@ impl RegionScanner for SeriesScan {
             return Box::pin(async { Ok(None) });
         }
         let context = self.stream_ctx.clone();
+        if std::env::var_os("GT_RESEARCH_PARQUET_SERIES_PROGRAM").is_some() {
+            if std::env::var_os("GT_RESEARCH_BLOCK_SCAN").is_none()
+                || std::env::var_os("GT_RESEARCH_NATIVE_SERIES").is_some()
+                || std::env::var_os("GT_RESEARCH_SERIES_MAJOR").is_some()
+                || std::env::var_os("GT_RESEARCH_SERIES_DIRECTORY").is_some()
+                || std::env::var_os("GT_RESEARCH_NATIVE_SOURCE_BINDING").is_some()
+                || std::env::var_os("GT_RESEARCH_COALESCED_SERIES").is_some()
+                || std::env::var_os("GT_RESEARCH_SST_SIDECAR").is_some()
+            {
+                return Box::pin(async { Ok(None) });
+            }
+            let partitions = self.properties.partitions.clone();
+            return Box::pin(async move {
+                crate::read::series_scan::SeriesScan::prepare_parquet_series_source(
+                    context, partitions,
+                )
+                .await
+                .map_err(BoxedError::new)
+            });
+        }
         Box::pin(async move {
             crate::read::research_series_major::NativeSeriesScan::prepare_program_source(context)
                 .await

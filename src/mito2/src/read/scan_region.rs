@@ -317,6 +317,31 @@ impl ScanRegion {
     pub(crate) async fn prepare_series_source(
         self,
     ) -> Result<Option<Arc<dyn store_api::region_engine::PreparedSeriesSource>>> {
+        if std::env::var_os("GT_RESEARCH_PARQUET_SERIES_PROGRAM").is_some() {
+            if (std::env::var_os("GT_RESEARCH_QUERY_PROGRAM").is_none()
+                && std::env::var_os("GT_RESEARCH_SERIES_PROGRAM").is_none())
+                || std::env::var_os("GT_RESEARCH_BLOCK_SCAN").is_none()
+                || std::env::var_os("GT_RESEARCH_NATIVE_SERIES").is_some()
+                || std::env::var_os("GT_RESEARCH_SERIES_MAJOR").is_some()
+                || std::env::var_os("GT_RESEARCH_SERIES_DIRECTORY").is_some()
+                || std::env::var_os("GT_RESEARCH_NATIVE_SOURCE_BINDING").is_some()
+                || std::env::var_os("GT_RESEARCH_COALESCED_SERIES").is_some()
+                || std::env::var_os("GT_RESEARCH_SST_SIDECAR").is_some()
+                || std::env::var_os("GT_RESEARCH_MAX_SUMMARY").is_some()
+                || !self.experimental_series_scan_v2
+                || !native_source_snapshot_admitted(&self.version, &self.request)
+            {
+                return Ok(None);
+            }
+            #[cfg(feature = "enterprise")]
+            if self.extension_range_provider.is_some() {
+                return Ok(None);
+            }
+            let input = self.scan_input().await?;
+            let context = Arc::new(StreamContext::seq_scan_ctx(input));
+            let partitions = vec![context.partition_ranges()];
+            return SeriesScan::prepare_parquet_series_source(context, partitions).await;
+        }
         if std::env::var_os("GT_RESEARCH_QUERY_PROGRAM").is_none()
             || std::env::var_os("GT_RESEARCH_BLOCK_SCAN").is_none()
             || std::env::var_os("GT_RESEARCH_MAX_SUMMARY").is_some()

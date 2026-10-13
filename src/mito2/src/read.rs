@@ -30,6 +30,7 @@ pub mod range_cache;
 #[cfg(not(feature = "test"))]
 pub(crate) mod range_cache;
 pub mod read_columns;
+pub(crate) mod research_parquet_series;
 pub(crate) mod research_series_coalesced;
 pub(crate) mod research_series_major;
 pub(crate) mod research_series_native;
