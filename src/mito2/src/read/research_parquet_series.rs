@@ -27,10 +27,14 @@ use store_api::region_engine::{
     PreparedSeriesSource, SeriesBlockProcessor, VisibleSeriesBlock, VisibleSeriesValues,
 };
 
+use base64::Engine;
+
 use crate::error::{Result, UnexpectedSnafu};
 use crate::read::scan_region::StreamContext;
 use crate::read::series_reader::SeriesReader;
 use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
+use crate::sst::parquet::metadata::{MetadataLoader, decode_series_runs};
+use crate::sst::parquet::reader::MetadataCacheMetrics;
 
 struct SeriesData {
     key: Vec<u8>,
@@ -49,6 +53,82 @@ fn invalid(reason: impl Into<String>) -> crate::error::Error {
         reason: reason.into(),
     }
     .build()
+}
+
+/// Builds series blocks from footer series-run descriptors when every run is
+/// exactly affine in both timestamp and value. Returns `None` if any file
+/// lacks footer metadata or contains a non-affine run, so the caller falls
+/// back to ordinary column reads.
+async fn try_prepare_from_footer(
+    context: &Arc<StreamContext>,
+    memory: &mut MemoryReservation,
+) -> Result<Option<Vec<SeriesData>>> {
+    let access_layer = context.input.access_layer();
+    let table_dir = access_layer.table_dir();
+    let path_type = access_layer.path_type();
+    let object_store = access_layer.object_store().clone();
+    let mut series: Vec<SeriesData> = Vec::new();
+    for handle in &context.input.files {
+        let file_path = handle.file_path(table_dir, path_type);
+        let mut cache_metrics = MetadataCacheMetrics::default();
+        let loader = MetadataLoader::new(object_store.clone(), &file_path, handle.size());
+        let parquet_meta = loader.load(&mut cache_metrics).await?;
+        let Some(runs) = decode_series_runs(&parquet_meta) else {
+            return Ok(None);
+        };
+        if runs.is_empty() {
+            continue;
+        }
+        // Every run must be affine in both timestamp and value.
+        if runs.iter().any(|run| {
+            run.timestamp_step.is_none()
+                || run.value_first_bits.is_none()
+                || run.value_step_bits.is_none()
+        }) {
+            return Ok(None);
+        }
+        for run in &runs {
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(&run.pk)
+                .map_err(|e| invalid(e.to_string()))?;
+            let first_value = f64::from_bits(run.value_first_bits.unwrap());
+            let step_value = f64::from_bits(run.value_step_bits.unwrap());
+            let values: Vec<f64> = (0..run.count)
+                .map(|i| first_value + step_value * i as f64)
+                .collect();
+            let values_array = Float64Array::from(values);
+            let block = VisibleSeriesBlock {
+                first_timestamp: run.first_timestamp_ms,
+                timestamp_step: run.timestamp_step.unwrap(),
+                values: VisibleSeriesValues::Dense(values_array),
+            };
+            let slot = if series.last().is_some_and(|item| item.key == key) {
+                series.len() - 1
+            } else {
+                memory
+                    .try_grow(key.len() + std::mem::size_of::<SeriesData>())
+                    .map_err(|e| invalid(e.to_string()))?;
+                series.push(SeriesData {
+                    key,
+                    blocks: Vec::new(),
+                });
+                series.len() - 1
+            };
+            memory
+                .try_grow(std::mem::size_of::<VisibleSeriesBlock>())
+                .map_err(|e| invalid(e.to_string()))?;
+            series[slot].blocks.push(block);
+        }
+    }
+    if series.is_empty() {
+        return Ok(None);
+    }
+    common_telemetry::debug!(
+        series = series.len(),
+        files = context.input.files.len(),
+        "Research footer series source prepared"
+    );
+    Ok(Some(series))
 }
 
 fn append_timestamp_runs(
@@ -116,9 +196,19 @@ pub(crate) async fn prepare(
     {
         return Ok(None);
     }
-    let mut stream = reader.build_stream().await?;
     let pool = context.input.scan_memory_pool.clone();
     let mut memory = MemoryConsumer::new("research-parquet-series").register(&pool);
+    // Fast path: reconstruct series from footer run descriptors without
+    // decoding data columns, when every run is exactly affine.
+    if let Some(series) = try_prepare_from_footer(&context, &mut memory).await? {
+        return Ok(Some(Arc::new(ParquetSeriesSource {
+            codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
+            context,
+            series,
+            _memory: memory,
+        })));
+    }
+    let mut stream = reader.build_stream().await?;
     let mut series: Vec<SeriesData> = Vec::new();
     let mut rows = 0usize;
     while let Some(batch) = stream.try_next().await? {

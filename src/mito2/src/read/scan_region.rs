@@ -1199,6 +1199,11 @@ impl ScanInput {
         self.batch_size
     }
 
+    /// Returns the access layer for SST file paths and object store.
+    pub(crate) fn access_layer(&self) -> &AccessLayerRef {
+        &self.access_layer
+    }
+
     /// Interprets file statistics using this scan's pinned schema.
     pub(crate) fn primary_key_mapper(&self) -> &PrimaryKeyRangeMapper {
         self.primary_key_mapper
