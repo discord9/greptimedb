@@ -34,7 +34,7 @@ use crate::error::{Result, UnexpectedSnafu};
 use crate::read::scan_region::StreamContext;
 use crate::read::series_reader::SeriesReader;
 use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
-use crate::sst::parquet::metadata::{MetadataLoader, decode_series_runs};
+use crate::sst::parquet::metadata::{decode_series_runs, MetadataLoader};
 use crate::sst::parquet::reader::MetadataCacheMetrics;
 
 struct SeriesData {
@@ -472,6 +472,86 @@ mod tests {
     use datatypes::arrow::array::{Float64Array, TimestampMillisecondArray};
 
     use super::append_timestamp_runs;
+    use crate::sst::parquet::writer::SeriesRun;
+    use base64::Engine;
+
+    fn run(
+        start: usize,
+        count: usize,
+        first_timestamp_ms: i64,
+        timestamp_step: i128,
+        first_value: f64,
+        value_step: f64,
+    ) -> SeriesRun {
+        SeriesRun {
+            pk: String::new(),
+            start,
+            count,
+            first_timestamp_ms,
+            timestamp_step: Some(timestamp_step),
+            value_column: Some("value".to_string()),
+            value_first_bits: Some(first_value.to_bits()),
+            value_step_bits: Some(value_step.to_bits()),
+            all_put: true,
+        }
+    }
+
+    #[test]
+    fn test_footer_run_metadata_preserves_complete_pk_and_all_put() {
+        let mut descriptor = run(0, 3, -10, 5, 1.0, 0.25);
+        descriptor.pk = base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4]);
+        let encoded = postcard::to_allocvec(&descriptor).unwrap();
+        let decoded: SeriesRun = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, descriptor);
+        assert!(decoded.all_put);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(decoded.pk)
+                .unwrap(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn test_footer_affine_crop_keeps_original_value_index_bits() {
+        let descriptor = run(0, 6, -9, 3, -0.0, 0.1);
+        // A nonzero crop offset must use the original affine index, not a newly
+        // rebased first value and step (which may change floating-point bits).
+        let cropped = (2..5)
+            .map(|index| {
+                f64::from_bits(descriptor.value_first_bits.unwrap())
+                    + f64::from_bits(descriptor.value_step_bits.unwrap()) * index as f64
+            })
+            .map(f64::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cropped,
+            vec![
+                0.2f64.to_bits(),
+                0.30000000000000004f64.to_bits(),
+                0.4f64.to_bits()
+            ]
+        );
+        let cropped_first_timestamp =
+            descriptor.first_timestamp_ms as i128 + descriptor.timestamp_step.unwrap() * 2;
+        assert_eq!(cropped_first_timestamp, -3);
+    }
+
+    #[test]
+    fn test_footer_descriptor_rejects_unsafe_runs() {
+        let duplicate_time = run(0, 2, 1, 0, 1.0, 1.0);
+        assert!(duplicate_time.count > 1 && duplicate_time.timestamp_step.unwrap() <= 0);
+        let deleted = SeriesRun {
+            all_put: false,
+            ..run(0, 1, 1, 0, 1.0, 0.0)
+        };
+        assert!(!deleted.all_put);
+        let incomplete = SeriesRun {
+            value_column: None,
+            ..run(0, 1, 1, 0, 1.0, 0.0)
+        };
+        assert!(incomplete.value_column.is_none());
+    }
 
     #[test]
     fn test_regular_series_and_singleton_runs_preserve_values() {
