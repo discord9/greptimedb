@@ -225,7 +225,7 @@ impl SeriesBatchCollector {
 
 /// Immutable allow-list for one partition's metric series.
 #[derive(Clone, Debug)]
-struct MetricSeriesFilter {
+pub(crate) struct MetricSeriesFilter {
     range: SeriesRange,
     series: Arc<HashSet<MetricSeriesId>>,
     sorted_series: Arc<Vec<MetricSeriesId>>,
@@ -233,6 +233,10 @@ struct MetricSeriesFilter {
 }
 
 impl MetricSeriesFilter {
+    pub(crate) fn contains_id(&self, table_id: u32, tsid: u64) -> bool {
+        self.series.contains(&MetricSeriesId { table_id, tsid })
+    }
+
     fn new(assigned: &AssignedSeriesBatch) -> Self {
         let mut sorted_series = assigned.series().to_vec();
         sorted_series.sort_unstable();
@@ -338,6 +342,10 @@ pub(crate) struct SeriesReader {
 }
 
 impl SeriesReader {
+    pub(crate) fn series_filter(&self) -> &MetricSeriesFilter {
+        &self.filter
+    }
+
     pub(crate) async fn try_build_projected_block_stream(
         &self,
         processor: Option<SharedScanProcessor>,

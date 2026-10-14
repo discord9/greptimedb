@@ -15,6 +15,7 @@
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use base64::Engine;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -41,7 +42,10 @@ pub(crate) fn decode_series_runs(metadata: &ParquetMetaData) -> Option<Vec<Serie
         .find(|kv| kv.key == SERIES_RUNS_METADATA_KEY)?
         .value
         .as_deref()?;
-    serde_json::from_str(value).ok()
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()?;
+    postcard::from_bytes(&bytes).ok()
 }
 
 /// The estimated size of the footer and metadata need to read from the end of parquet file.
@@ -263,6 +267,7 @@ mod tests {
                 value_column: Some("v".to_string()),
                 value_first_bits: Some(1.0f64.to_bits()),
                 value_step_bits: Some(2.0f64.to_bits()),
+                all_put: true,
             },
             SeriesRun {
                 pk: "Yg==".to_string(),
@@ -273,11 +278,12 @@ mod tests {
                 value_column: None,
                 value_first_bits: None,
                 value_step_bits: None,
+                all_put: false,
             },
         ];
         let run_metadata = KeyValue::new(
             SERIES_RUNS_METADATA_KEY.to_string(),
-            serde_json::to_string(&runs).unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(postcard::to_allocvec(&runs).unwrap()),
         );
         let props = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![key_value, run_metadata]))

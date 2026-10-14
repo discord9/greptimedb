@@ -309,12 +309,18 @@ where
                 }
             }
             current_writer.flush().await.context(WriteParquetSnafu)?;
-            if stats.series_runs.len() <= MAX_SERIES_RUNS {
-                let json = serde_json::to_string(&stats.series_runs).unwrap();
-                current_writer.append_key_value_metadata(KeyValue::new(
-                    SERIES_RUNS_METADATA_KEY.to_string(),
-                    json,
-                ));
+            if !stats.series_runs_unsupported
+                && !stats.series_runs.is_empty()
+                && stats.series_runs.len() <= MAX_SERIES_RUNS
+            {
+                let encoded = postcard::to_allocvec(&stats.series_runs).unwrap();
+                if encoded.len() <= 64 * 1024 {
+                    let value = base64::engine::general_purpose::STANDARD.encode(encoded);
+                    current_writer.append_key_value_metadata(KeyValue::new(
+                        SERIES_RUNS_METADATA_KEY.to_string(),
+                        value,
+                    ));
+                }
             } else {
                 debug!(
                     "Skipping series-run footer metadata for file {}: {} runs exceed cap {}",
@@ -627,6 +633,7 @@ struct SourceStats {
     series_estimator: SeriesEstimator,
     /// Per-series descriptors for the current file.
     series_runs: Vec<SeriesRun>,
+    series_runs_unsupported: bool,
 }
 
 const MAX_SERIES_RUNS: usize = 4096;
@@ -641,6 +648,8 @@ pub(crate) struct SeriesRun {
     pub(crate) value_column: Option<String>,
     pub(crate) value_first_bits: Option<u64>,
     pub(crate) value_step_bits: Option<u64>,
+    #[serde(default)]
+    pub(crate) all_put: bool,
 }
 
 fn exact_float_affine(values: &[f64]) -> Option<(u64, u64)> {
@@ -658,7 +667,10 @@ fn append_series_runs(
     batch: &RecordBatch,
     metadata: &store_api::metadata::RegionMetadata,
 ) -> Result<()> {
-    if stats.series_runs.len() > MAX_SERIES_RUNS || batch.num_rows() == 0 {
+    if stats.series_runs_unsupported
+        || stats.series_runs.len() > MAX_SERIES_RUNS
+        || batch.num_rows() == 0
+    {
         return Ok(());
     }
     let (keys, values) = encoded_primary_keys(batch)?;
@@ -666,6 +678,9 @@ fn append_series_runs(
     let ts = batch.column(ts_idx);
     // Only collect runs for millisecond timestamps; other units would need lossy/overflow-prone conversion.
     let DataType::Timestamp(TimeUnit::Millisecond, _) = ts.data_type() else {
+        // A partial footer would describe only the millisecond batches, not the SST.
+        stats.series_runs_unsupported = true;
+        stats.series_runs.clear();
         return Ok(());
     };
     let timestamps: &[i64] = ts
@@ -673,6 +688,18 @@ fn append_series_runs(
         .downcast_ref::<TimestampMillisecondArray>()
         .unwrap()
         .values();
+    let op_types = batch
+        .column(crate::sst::parquet::flat_format::op_type_column_index(
+            batch.num_columns(),
+        ))
+        .as_any()
+        .downcast_ref::<datatypes::arrow::array::UInt8Array>()
+        .ok_or_else(|| {
+            UnexpectedSnafu {
+                reason: "Flat batch must end with UInt8 __op_type".to_string(),
+            }
+            .build()
+        })?;
     // Deterministically pick the first Float64 field column for value affine detection.
     let value_col = metadata
         .field_columns()
@@ -697,11 +724,15 @@ fn append_series_runs(
         let ts_step = ts_run
             .get(1)
             .map_or(0, |next| *next as i128 - ts_run[0] as i128);
-        let timestamp_step = ts_run
-            .iter()
-            .enumerate()
-            .all(|(i, value)| *value as i128 == ts_run[0] as i128 + ts_step * i as i128)
-            .then_some(ts_step);
+        let timestamp_step = (ts_run.len() == 1 || ts_step > 0)
+            .then(|| {
+                ts_run
+                    .iter()
+                    .enumerate()
+                    .all(|(i, value)| *value as i128 == ts_run[0] as i128 + ts_step * i as i128)
+                    .then_some(ts_step)
+            })
+            .flatten();
         // Emit value params only when the slice has no nulls and is exactly affine.
         let affine = value_array
             .filter(|a| a.slice(offset, end - offset).null_count() == 0)
@@ -715,6 +746,9 @@ fn append_series_runs(
             value_column: affine.map(|_| value_col.clone().unwrap()),
             value_first_bits: affine.map(|v| v.0),
             value_step_bits: affine.map(|v| v.1),
+            all_put: op_types.values()[offset..end]
+                .iter()
+                .all(|op| *op == api::v1::OpType::Put as u8),
         });
         offset = end;
     }

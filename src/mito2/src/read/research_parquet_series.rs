@@ -14,6 +14,7 @@
 
 //! Query-local bridge from ordinary visible flat Parquet reads to series programs.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -60,14 +61,48 @@ fn invalid(reason: impl Into<String>) -> crate::error::Error {
 /// lacks footer metadata or contains a non-affine run, so the caller falls
 /// back to ordinary column reads.
 async fn try_prepare_from_footer(
+    reader: &SeriesReader,
     context: &Arc<StreamContext>,
     memory: &mut MemoryReservation,
 ) -> Result<Option<Vec<SeriesData>>> {
+    if !context.input.memtables.is_empty()
+        || context.input.append_mode
+        || context.input.compaction
+        || context.input.sequence_range.is_some()
+        || context.input.snapshot_sequence.is_some()
+        || context.input.series_row_selector.is_some()
+        || context.input.predicate.predicate().is_some()
+        || context.input.predicate.region_partition_expr().is_some()
+    {
+        return Ok(None);
+    }
     let access_layer = context.input.access_layer();
     let table_dir = access_layer.table_dir();
     let path_type = access_layer.path_type();
     let object_store = access_layer.object_store().clone();
-    let mut series: Vec<SeriesData> = Vec::new();
+    let mapper = &context.input.mapper;
+    let fields = mapper
+        .batch_schema()
+        .iter()
+        .filter(|(id, _)| {
+            mapper
+                .metadata()
+                .column_by_id(*id)
+                .is_some_and(|column| column.semantic_type == api::v1::SemanticType::Field)
+        })
+        .collect::<Vec<_>>();
+    if fields.len() != 1 {
+        return Ok(None);
+    }
+    let field_name = mapper
+        .metadata()
+        .column_by_id(fields[0].0)
+        .map(|c| c.column_schema.name.clone())
+        .ok_or_else(|| invalid("Missing field column"))?;
+    let mut by_key: BTreeMap<Vec<u8>, Vec<crate::sst::parquet::writer::SeriesRun>> =
+        BTreeMap::new();
+    let filter = reader.series_filter();
+    let codec = SparsePrimaryKeyCodec::new(context.input.region_metadata());
     for handle in &context.input.files {
         let file_path = handle.file_path(table_dir, path_type);
         let mut cache_metrics = MetadataCacheMetrics::default();
@@ -76,53 +111,144 @@ async fn try_prepare_from_footer(
         let Some(runs) = decode_series_runs(&parquet_meta) else {
             return Ok(None);
         };
-        if runs.is_empty() {
-            continue;
-        }
-        // Every run must be affine in both timestamp and value.
-        if runs.iter().any(|run| {
-            run.timestamp_step.is_none()
-                || run.value_first_bits.is_none()
-                || run.value_step_bits.is_none()
-        }) {
+        let row_count = parquet_meta.file_metadata().num_rows();
+        let mut ordered = runs.clone();
+        ordered.sort_by_key(|run| run.start);
+        if row_count < 0
+            || (row_count > 0 && ordered.is_empty())
+            || ordered.iter().any(|run| run.count == 0)
+        {
             return Ok(None);
         }
-        for run in &runs {
+        let mut covered = 0usize;
+        for run in &ordered {
+            if run.start != covered {
+                return Ok(None);
+            }
+            covered = match covered.checked_add(run.count) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+        }
+        if covered != row_count as usize {
+            return Ok(None);
+        }
+        for run in runs {
             let key = base64::engine::general_purpose::STANDARD
                 .decode(&run.pk)
                 .map_err(|e| invalid(e.to_string()))?;
-            let first_value = f64::from_bits(run.value_first_bits.unwrap());
-            let step_value = f64::from_bits(run.value_step_bits.unwrap());
-            let values: Vec<f64> = (0..run.count)
-                .map(|i| first_value + step_value * i as f64)
-                .collect();
-            let values_array = Float64Array::from(values);
-            let block = VisibleSeriesBlock {
-                first_timestamp: run.first_timestamp_ms,
-                timestamp_step: run.timestamp_step.unwrap(),
-                values: VisibleSeriesValues::Dense(values_array),
+            let Ok((table_id, tsid)) = codec.decode_ids(&key) else {
+                return Ok(None);
             };
-            let slot = if series.last().is_some_and(|item| item.key == key) {
-                series.len() - 1
-            } else {
-                memory
-                    .try_grow(key.len() + std::mem::size_of::<SeriesData>())
-                    .map_err(|e| invalid(e.to_string()))?;
-                series.push(SeriesData {
-                    key,
-                    blocks: Vec::new(),
-                });
-                series.len() - 1
+            if !filter.contains_id(table_id, tsid) {
+                continue;
+            }
+            let Ok(mito_codec::row_converter::CompositeValues::Sparse(decoded)) =
+                codec.decode(&key)
+            else {
+                return Ok(None);
             };
-            memory
-                .try_grow(std::mem::size_of::<VisibleSeriesBlock>())
-                .map_err(|e| invalid(e.to_string()))?;
-            series[slot].blocks.push(block);
+            let _ = decoded;
+            if !run.all_put
+                || run.timestamp_step.is_none()
+                || run.value_first_bits.is_none()
+                || run.value_step_bits.is_none()
+                || run.value_column.as_deref() != Some(field_name.as_str())
+            {
+                return Ok(None);
+            }
+            let step = run.timestamp_step.unwrap();
+            if run.count > 1 && step <= 0 {
+                return Ok(None);
+            }
+            let last = i128::from(run.first_timestamp_ms)
+                .checked_add(
+                    step.checked_mul((run.count - 1) as i128)
+                        .ok_or_else(|| invalid("timestamp overflow"))?,
+                )
+                .ok_or_else(|| invalid("timestamp overflow"))?;
+            if i64::try_from(last).is_err() {
+                return Ok(None);
+            }
+            let entries = by_key.entry(key).or_default();
+            entries.push(run);
         }
     }
-    if series.is_empty() {
-        return Ok(None);
+    let mut series: Vec<SeriesData> = Vec::new();
+    let time_range = context.input.time_range;
+    for (key, mut runs) in by_key {
+        runs.sort_by_key(|run| run.first_timestamp_ms);
+        let mut previous_last: Option<i128> = None;
+        let mut blocks = Vec::new();
+        for run in runs {
+            let step = run.timestamp_step.unwrap();
+            let first = i128::from(run.first_timestamp_ms);
+            let last = first + step * (run.count - 1) as i128;
+            if previous_last.is_some_and(|prev| prev >= first) {
+                return Ok(None);
+            }
+            previous_last = Some(last);
+            let start_ms = match time_range.and_then(|r| *r.start()) {
+                Some(bound) if bound.unit() == common_time::timestamp::TimeUnit::Millisecond => {
+                    Some(bound.value())
+                }
+                Some(_) => return Ok(None),
+                None => None,
+            };
+            let end_ms = match time_range.and_then(|r| *r.end()) {
+                Some(bound) if bound.unit() == common_time::timestamp::TimeUnit::Millisecond => {
+                    Some(bound.value())
+                }
+                Some(_) => return Ok(None),
+                None => None,
+            };
+            let (lo, hi) = if run.count == 1 {
+                let in_range = start_ms.is_none_or(|bound| run.first_timestamp_ms >= bound)
+                    && end_ms.is_none_or(|bound| run.first_timestamp_ms < bound);
+                (0, i128::from(in_range))
+            } else {
+                let ceil_div =
+                    |value: i128| value.div_euclid(step) + i128::from(value.rem_euclid(step) != 0);
+                let lo = start_ms.map_or(0i128, |bound| {
+                    ceil_div(i128::from(bound) - first).clamp(0, run.count as i128)
+                });
+                let hi = end_ms.map_or(run.count as i128, |bound| {
+                    ceil_div(i128::from(bound) - first).clamp(0, run.count as i128)
+                });
+                (lo, hi)
+            };
+            if lo >= hi {
+                continue;
+            }
+            let values = (lo..hi)
+                .map(|i| {
+                    f64::from_bits(run.value_first_bits.unwrap())
+                        + f64::from_bits(run.value_step_bits.unwrap()) * i as f64
+                })
+                .collect::<Vec<_>>();
+            memory
+                .try_grow(
+                    values.len().saturating_mul(std::mem::size_of::<f64>())
+                        + std::mem::size_of::<VisibleSeriesBlock>(),
+                )
+                .map_err(|e| invalid(e.to_string()))?;
+            let clipped_first = first + step * lo;
+            let clipped_first =
+                i64::try_from(clipped_first).map_err(|_| invalid("clipped timestamp overflow"))?;
+            blocks.push(VisibleSeriesBlock {
+                first_timestamp: clipped_first,
+                timestamp_step: step,
+                values: VisibleSeriesValues::Dense(Float64Array::from(values)),
+            });
+        }
+        if !blocks.is_empty() {
+            memory
+                .try_grow(key.len() + std::mem::size_of::<SeriesData>())
+                .map_err(|e| invalid(e.to_string()))?;
+            series.push(SeriesData { key, blocks });
+        }
     }
+
     common_telemetry::debug!(
         series = series.len(),
         files = context.input.files.len(),
@@ -179,7 +305,6 @@ pub(crate) async fn prepare(
     context: Arc<StreamContext>,
 ) -> Result<Option<Arc<dyn PreparedSeriesSource>>> {
     let mapper = &context.input.mapper;
-    let field = mapper.field_column_start();
     let fields = mapper
         .batch_schema()
         .iter()
@@ -192,25 +317,20 @@ pub(crate) async fn prepare(
         .collect::<Vec<_>>();
     if fields.len() != 1
         || fields[0].1 != datatypes::prelude::ConcreteDataType::float64_datatype()
-        || field >= mapper.batch_schema().len()
+        || mapper.field_column_start() >= mapper.batch_schema().len()
     {
         return Ok(None);
     }
     let pool = context.input.scan_memory_pool.clone();
     let mut memory = MemoryConsumer::new("research-parquet-series").register(&pool);
-    // TODO: footer fast path disabled pending correctness fixes (oracle105):
-    // - must enforce assigned-series selection and visibility/dedup
-    // - must validate value_column matches requested field
-    // - must handle multi-file key ordering and timestamp overlap
-    // - must fix memory accounting (reservation rollback on fallback)
-    // if let Some(series) = try_prepare_from_footer(&context, &mut memory).await? {
-    //     return Ok(Some(Arc::new(ParquetSeriesSource {
-    //         codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
-    //         context,
-    //         series,
-    //         _memory: memory,
-    //     })));
-    // }
+    if let Some(series) = try_prepare_from_footer(&reader, &context, &mut memory).await? {
+        return Ok(Some(Arc::new(ParquetSeriesSource {
+            codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
+            context,
+            series,
+            _memory: memory,
+        })));
+    }
     let mut stream = reader.build_stream().await?;
     let mut series: Vec<SeriesData> = Vec::new();
     let mut rows = 0usize;
