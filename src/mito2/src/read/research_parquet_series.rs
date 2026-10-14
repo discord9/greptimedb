@@ -63,8 +63,9 @@ fn invalid(reason: impl Into<String>) -> crate::error::Error {
 async fn try_prepare_from_footer(
     reader: &SeriesReader,
     context: &Arc<StreamContext>,
-    memory: &mut MemoryReservation,
-) -> Result<Option<Vec<SeriesData>>> {
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> Result<Option<(Vec<SeriesData>, MemoryReservation)>> {
+    let memory = MemoryConsumer::new("research-parquet-series-footer").register(pool);
     if !context.input.memtables.is_empty()
         || context.input.append_mode
         || context.input.compaction
@@ -134,9 +135,10 @@ async fn try_prepare_from_footer(
             return Ok(None);
         }
         for run in runs {
-            let key = base64::engine::general_purpose::STANDARD
-                .decode(&run.pk)
-                .map_err(|e| invalid(e.to_string()))?;
+            let key = base64::engine::general_purpose::STANDARD.decode(&run.pk);
+            let Ok(key) = key else {
+                return Ok(None);
+            };
             let Ok((table_id, tsid)) = codec.decode_ids(&key) else {
                 return Ok(None);
             };
@@ -161,12 +163,12 @@ async fn try_prepare_from_footer(
             if run.count > 1 && step <= 0 {
                 return Ok(None);
             }
-            let last = i128::from(run.first_timestamp_ms)
-                .checked_add(
-                    step.checked_mul((run.count - 1) as i128)
-                        .ok_or_else(|| invalid("timestamp overflow"))?,
-                )
-                .ok_or_else(|| invalid("timestamp overflow"))?;
+            let Some(delta) = step.checked_mul((run.count - 1) as i128) else {
+                return Ok(None);
+            };
+            let Some(last) = i128::from(run.first_timestamp_ms).checked_add(delta) else {
+                return Ok(None);
+            };
             if i64::try_from(last).is_err() {
                 return Ok(None);
             }
@@ -220,21 +222,30 @@ async fn try_prepare_from_footer(
             if lo >= hi {
                 continue;
             }
-            let values = (lo..hi)
-                .map(|i| {
-                    f64::from_bits(run.value_first_bits.unwrap())
-                        + f64::from_bits(run.value_step_bits.unwrap()) * i as f64
-                })
-                .collect::<Vec<_>>();
-            memory
-                .try_grow(
-                    values.len().saturating_mul(std::mem::size_of::<f64>())
-                        + std::mem::size_of::<VisibleSeriesBlock>(),
-                )
-                .map_err(|e| invalid(e.to_string()))?;
+            let Ok(value_count) = usize::try_from(hi - lo) else {
+                return Ok(None);
+            };
+            let Some(payload_bytes) = value_count
+                .checked_mul(std::mem::size_of::<f64>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<VisibleSeriesBlock>()))
+            else {
+                return Ok(None);
+            };
+            if memory.try_grow(payload_bytes).is_err() {
+                return Ok(None);
+            }
+            let mut values = Vec::new();
+            if values.try_reserve_exact(value_count).is_err() {
+                return Ok(None);
+            }
+            values.extend((lo..hi).map(|i| {
+                f64::from_bits(run.value_first_bits.unwrap())
+                    + f64::from_bits(run.value_step_bits.unwrap()) * i as f64
+            }));
             let clipped_first = first + step * lo;
-            let clipped_first =
-                i64::try_from(clipped_first).map_err(|_| invalid("clipped timestamp overflow"))?;
+            let Ok(clipped_first) = i64::try_from(clipped_first) else {
+                return Ok(None);
+            };
             blocks.push(VisibleSeriesBlock {
                 first_timestamp: clipped_first,
                 timestamp_step: step,
@@ -242,9 +253,13 @@ async fn try_prepare_from_footer(
             });
         }
         if !blocks.is_empty() {
-            memory
-                .try_grow(key.len() + std::mem::size_of::<SeriesData>())
-                .map_err(|e| invalid(e.to_string()))?;
+            let Some(series_bytes) = key.len().checked_add(std::mem::size_of::<SeriesData>())
+            else {
+                return Ok(None);
+            };
+            if memory.try_grow(series_bytes).is_err() {
+                return Ok(None);
+            }
             series.push(SeriesData { key, blocks });
         }
     }
@@ -254,7 +269,7 @@ async fn try_prepare_from_footer(
         files = context.input.files.len(),
         "Research footer series source prepared"
     );
-    Ok(Some(series))
+    Ok(Some((series, memory)))
 }
 
 fn append_timestamp_runs(
@@ -322,8 +337,7 @@ pub(crate) async fn prepare(
         return Ok(None);
     }
     let pool = context.input.scan_memory_pool.clone();
-    let mut memory = MemoryConsumer::new("research-parquet-series").register(&pool);
-    if let Some(series) = try_prepare_from_footer(&reader, &context, &mut memory).await? {
+    if let Some((series, memory)) = try_prepare_from_footer(&reader, &context, &pool).await? {
         return Ok(Some(Arc::new(ParquetSeriesSource {
             codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
             context,
@@ -331,6 +345,7 @@ pub(crate) async fn prepare(
             _memory: memory,
         })));
     }
+    let mut memory = MemoryConsumer::new("research-parquet-series").register(&pool);
     let mut stream = reader.build_stream().await?;
     let mut series: Vec<SeriesData> = Vec::new();
     let mut rows = 0usize;

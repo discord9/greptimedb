@@ -56,9 +56,9 @@ itertools.workspace = true
 jsonb.workspace = true
 lazy_static.workspace = true
 log-query.workspace = true
-moka = { workspace = true, features = ["future"] }
 meter-core.workspace = true
 meter-macros.workspace = true
+moka = { workspace = true, features = ["future"] }
 object-store.workspace = true
 once_cell.workspace = true
 partition.workspace = true
@@ -71,8 +71,8 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
-snap.workspace = true
 snafu.workspace = true
+snap.workspace = true
 sql.workspace = true
 sqlparser.workspace = true
 store-api.workspace = true
