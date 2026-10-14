@@ -198,16 +198,19 @@ pub(crate) async fn prepare(
     }
     let pool = context.input.scan_memory_pool.clone();
     let mut memory = MemoryConsumer::new("research-parquet-series").register(&pool);
-    // Fast path: reconstruct series from footer run descriptors without
-    // decoding data columns, when every run is exactly affine.
-    if let Some(series) = try_prepare_from_footer(&context, &mut memory).await? {
-        return Ok(Some(Arc::new(ParquetSeriesSource {
-            codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
-            context,
-            series,
-            _memory: memory,
-        })));
-    }
+    // TODO: footer fast path disabled pending correctness fixes (oracle105):
+    // - must enforce assigned-series selection and visibility/dedup
+    // - must validate value_column matches requested field
+    // - must handle multi-file key ordering and timestamp overlap
+    // - must fix memory accounting (reservation rollback on fallback)
+    // if let Some(series) = try_prepare_from_footer(&context, &mut memory).await? {
+    //     return Ok(Some(Arc::new(ParquetSeriesSource {
+    //         codec: SparsePrimaryKeyCodec::new(context.input.region_metadata()),
+    //         context,
+    //         series,
+    //         _memory: memory,
+    //     })));
+    // }
     let mut stream = reader.build_stream().await?;
     let mut series: Vec<SeriesData> = Vec::new();
     let mut rows = 0usize;
