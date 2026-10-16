@@ -603,28 +603,30 @@ async fn raw_series_admission_preserves_unrelated_context_and_consumes_marker() 
     let fixture = fixture(EngineAction::Return(None), None);
     let mut request = logical_request(&fixture.raw);
     let raw_value = fixture.raw.to_extension_value().unwrap();
-    let mut header = RegionRequestHeader::default();
-    header.query_context = Some(ApiQueryContext {
-        current_catalog: "observability".to_string(),
-        current_schema: "metrics".to_string(),
-        timezone: "Asia/Tokyo".to_string(),
-        channel: session::context::Channel::Internal as u32,
-        snapshot_seqs: Some(SnapshotSequences {
-            snapshot_seqs: std::collections::HashMap::from([(
-                fixture.raw.physical_metadata.region_id.as_u64(),
-                41,
-            )]),
-            sst_min_sequences: std::collections::HashMap::from([(
-                fixture.raw.physical_metadata.region_id.as_u64(),
-                35,
-            )]),
+    let header = RegionRequestHeader {
+        query_context: Some(ApiQueryContext {
+            current_catalog: "observability".to_string(),
+            current_schema: "metrics".to_string(),
+            timezone: "Asia/Tokyo".to_string(),
+            channel: session::context::Channel::Internal as u32,
+            snapshot_seqs: Some(SnapshotSequences {
+                snapshot_seqs: std::collections::HashMap::from([(
+                    fixture.raw.physical_metadata.region_id.as_u64(),
+                    41,
+                )]),
+                sst_min_sequences: std::collections::HashMap::from([(
+                    fixture.raw.physical_metadata.region_id.as_u64(),
+                    35,
+                )]),
+            }),
+            extensions: std::collections::HashMap::from([
+                (RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(), raw_value),
+                ("unrelated.extension".to_string(), "kept".to_string()),
+            ]),
+            explain: None,
         }),
-        extensions: std::collections::HashMap::from([
-            (RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(), raw_value),
-            ("unrelated.extension".to_string(), "kept".to_string()),
-        ]),
-        explain: None,
-    });
+        ..Default::default()
+    };
     request.header = Some(header);
     fixture
         .server
@@ -633,10 +635,7 @@ async fn raw_series_admission_preserves_unrelated_context_and_consumes_marker() 
         .unwrap();
     let ctx = fixture.engine.context.lock().unwrap().clone().unwrap();
     assert!(ctx.extension(RAW_SERIES_REQUEST_EXTENSION_KEY).is_none());
-    assert_eq!(
-        ctx.extension("unrelated.extension").as_deref(),
-        Some("kept")
-    );
+    assert_eq!(ctx.extension("unrelated.extension"), Some("kept"));
     assert_eq!(ctx.current_catalog(), "observability");
     assert_eq!(ctx.current_schema(), "metrics");
     assert_eq!(

@@ -346,11 +346,10 @@ impl Stream for InputStream {
                 .pending
                 .as_ref()
                 .is_some_and(|previous| previous.primary_key.as_slice() != key.as_slice())
+                && let Some(mut complete) = this.pending.take()
             {
-                if let Some(mut complete) = this.pending.take() {
-                    complete.is_last = true;
-                    return Poll::Ready(Some(Ok(complete)));
-                }
+                complete.is_last = true;
+                return Poll::Ready(Some(Ok(complete)));
             }
             let mut end = start + 1;
             while end < batch.num_rows() && rows.row(end).as_ref() == key {

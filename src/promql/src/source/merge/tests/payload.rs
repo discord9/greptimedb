@@ -619,7 +619,7 @@ async fn merge_retains_sliced_float_time_and_histogram_owners_until_output_drop(
     };
     assert_histogram(remainder_histogram, 12.5);
     assert!(
-        matches!(remainder.fields.get(1).unwrap().sample(0), SampleRef::Histogram(h) if h.sum.to_bits() == 12.5_f64.to_bits() && h.custom_values == &[1.5, 4.5] && h.positive.span_offsets == &[1] && h.positive.span_lengths == &[2] && h.positive.buckets == &[3.25, 7.5] && h.negative.span_offsets == &[-2] && h.negative.span_lengths == &[1] && h.negative.buckets == &[0.75])
+        matches!(remainder.fields.get(1).unwrap().sample(0), SampleRef::Histogram(h) if h.sum.to_bits() == 12.5_f64.to_bits() && h.custom_values == [1.5, 4.5] && h.positive.span_offsets == [1] && h.positive.span_lengths == [2] && h.positive.buckets == [3.25, 7.5] && h.negative.span_offsets == [-2] && h.negative.span_lengths == [1] && h.negative.buckets == [0.75])
     );
     drop(remainder);
     drop(interleaved);

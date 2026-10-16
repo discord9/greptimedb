@@ -275,25 +275,25 @@ impl OrderedRawMerge {
             .ok_or_else(|| invalid("raw merge chunk has no timestamp"))?;
         let mut end = chunk.time.len();
         for input in &self.streams {
-            if let Some(head) = &input.head {
-                if head.primary_key.as_slice() == key {
-                    let next = head
-                        .time
-                        .timestamp(0)
-                        .ok_or_else(|| invalid("raw merge chunk has no timestamp"))?;
-                    if next == start {
-                        return Err(invalid(
-                            "raw merge inputs contain duplicate timestamps for a complete read key",
-                        ));
-                    }
-                    if next > start {
-                        end = end.min(
-                            chunk
-                                .time
-                                .as_buffer()
-                                .partition_point(|timestamp| *timestamp < next),
-                        );
-                    }
+            if let Some(head) = &input.head
+                && head.primary_key.as_slice() == key
+            {
+                let next = head
+                    .time
+                    .timestamp(0)
+                    .ok_or_else(|| invalid("raw merge chunk has no timestamp"))?;
+                if next == start {
+                    return Err(invalid(
+                        "raw merge inputs contain duplicate timestamps for a complete read key",
+                    ));
+                }
+                if next > start {
+                    end = end.min(
+                        chunk
+                            .time
+                            .as_buffer()
+                            .partition_point(|timestamp| *timestamp < next),
+                    );
                 }
             }
         }

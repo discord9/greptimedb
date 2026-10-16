@@ -2338,14 +2338,16 @@ mod tests {
         let server = mock_region_server();
         let mut raw = raw_series_fixture();
         raw.physical_metadata.region_id = RegionId::new(2, 1);
-        let mut header = RegionRequestHeader::default();
-        header.query_context = Some(ApiQueryContext {
-            extensions: HashMap::from([(
-                RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
-                raw.to_extension_value().unwrap(),
-            )]),
+        let header = RegionRequestHeader {
+            query_context: Some(ApiQueryContext {
+                extensions: HashMap::from([(
+                    RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
+                    raw.to_extension_value().unwrap(),
+                )]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let request = api::v1::region::QueryRequest {
             header: Some(header),
             region_id: RegionId::new(1, 1).as_u64(),
@@ -2362,20 +2364,22 @@ mod tests {
         ));
 
         let raw = raw_series_fixture();
-        let mut header = RegionRequestHeader::default();
-        header.query_context = Some(ApiQueryContext {
-            extensions: HashMap::from([
-                (
-                    RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
-                    raw.to_extension_value().unwrap(),
-                ),
-                (
-                    INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY.to_string(),
-                    "{}".to_string(),
-                ),
-            ]),
+        let header = RegionRequestHeader {
+            query_context: Some(ApiQueryContext {
+                extensions: HashMap::from([
+                    (
+                        RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
+                        raw.to_extension_value().unwrap(),
+                    ),
+                    (
+                        INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY.to_string(),
+                        "{}".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let request = api::v1::region::QueryRequest {
             header: Some(header),
             region_id: raw.physical_metadata.region_id.as_u64(),
@@ -2392,14 +2396,16 @@ mod tests {
         ));
 
         let raw = raw_series_fixture();
-        let mut header = RegionRequestHeader::default();
-        header.query_context = Some(ApiQueryContext {
-            extensions: HashMap::from([(
-                RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
-                raw.to_extension_value().unwrap(),
-            )]),
+        let header = RegionRequestHeader {
+            query_context: Some(ApiQueryContext {
+                extensions: HashMap::from([(
+                    RAW_SERIES_REQUEST_EXTENSION_KEY.to_string(),
+                    raw.to_extension_value().unwrap(),
+                )]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let request = api::v1::region::QueryRequest {
             header: Some(header),
             region_id: raw.physical_metadata.region_id.as_u64(),

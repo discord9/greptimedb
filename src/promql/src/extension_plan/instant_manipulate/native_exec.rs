@@ -432,7 +432,7 @@ impl Stream for NativeInstantStream {
                     };
                     if self.pending.len() == self.pending.capacity() {
                         let old_capacity = self.pending.capacity();
-                        let new_capacity = old_capacity.checked_mul(2).unwrap_or(usize::MAX).max(4);
+                        let new_capacity = old_capacity.saturating_mul(2).max(4);
                         let slot_growth =
                             new_capacity.checked_sub(old_capacity).and_then(|slots| {
                                 slots.checked_mul(std::mem::size_of::<RawSeriesChunk>())

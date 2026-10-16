@@ -492,32 +492,34 @@ mod tests {
             "../../tests/compatibility/wire/raw_series_request/v1_request.json"
         ))
         .unwrap();
-        let mut header = RegionRequestHeader::default();
-        header.tracing_context = std::collections::HashMap::from([(
-            "traceparent".to_string(),
-            "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
-        )]);
-        header.query_context = Some(ProtoQueryContext {
-            current_catalog: "custom_catalog".to_string(),
-            current_schema: "custom_schema".to_string(),
-            timezone: "Asia/Shanghai".to_string(),
-            channel: common_base::protocol::Channel::Mysql as u32,
-            snapshot_seqs: Some(SnapshotSequences {
-                snapshot_seqs: std::collections::HashMap::from([(
-                    binding.physical_metadata.region_id.as_u64(),
-                    77,
-                )]),
-                sst_min_sequences: std::collections::HashMap::new(),
+        let header = RegionRequestHeader {
+            tracing_context: std::collections::HashMap::from([(
+                "traceparent".to_string(),
+                "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+            )]),
+            query_context: Some(ProtoQueryContext {
+                current_catalog: "custom_catalog".to_string(),
+                current_schema: "custom_schema".to_string(),
+                timezone: "Asia/Shanghai".to_string(),
+                channel: common_base::protocol::Channel::Mysql as u32,
+                snapshot_seqs: Some(SnapshotSequences {
+                    snapshot_seqs: std::collections::HashMap::from([(
+                        binding.physical_metadata.region_id.as_u64(),
+                        77,
+                    )]),
+                    sst_min_sequences: std::collections::HashMap::new(),
+                }),
+                extensions: std::collections::HashMap::from([
+                    ("raw-series-unrelated".to_string(), "preserved".to_string()),
+                    (
+                        session::hints::READ_PREFERENCE_EXTENSION_KEY.to_string(),
+                        "follower".to_string(),
+                    ),
+                ]),
+                explain: None,
             }),
-            extensions: std::collections::HashMap::from([
-                ("raw-series-unrelated".to_string(), "preserved".to_string()),
-                (
-                    session::hints::READ_PREFERENCE_EXTENSION_KEY.to_string(),
-                    "follower".to_string(),
-                ),
-            ]),
-            explain: None,
-        });
+            ..Default::default()
+        };
         let request = || QueryRequest {
             header: Some(header.clone()),
             region_id: binding.physical_metadata.region_id,

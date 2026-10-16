@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use datatypes::arrow::array::{Float64Array, UInt32Array};
@@ -236,7 +237,7 @@ fn invalid_manual_inputs_are_rejected() {
     let mismatched = SeriesFields::one(Samples::from_float(Float64Array::from(vec![Some(1.0)])));
     assert!(select(&[10, 20], &mismatched, 0..=10, 1, 0, 0).is_err());
     assert!(select(&[10, 20], &fields, 0..=10, 0, 0, 0).is_err());
-    assert!(select(&[10, 20], &fields, 10..=0, 1, 0, 0).is_err());
+    assert!(select(&[10, 20], &fields, RangeInclusive::new(10, 0), 1, 0, 0).is_err());
     assert!(select(&[10, 20], &fields, 0..=10, 1, -1, 0).is_err());
 }
 

@@ -174,11 +174,12 @@ impl Stream for TestStream {
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
-        if let Some(gate) = &self.gate {
-            if self.items.is_empty() && self.release.as_ref().unwrap().load(Ordering::SeqCst) == 0 {
-                *gate.lock().unwrap() = Some(_cx.waker().clone());
-                return Poll::Pending;
-            }
+        if let Some(gate) = &self.gate
+            && self.items.is_empty()
+            && self.release.as_ref().unwrap().load(Ordering::SeqCst) == 0
+        {
+            *gate.lock().unwrap() = Some(_cx.waker().clone());
+            return Poll::Pending;
         }
         self.items.pop_front().unwrap_or(Poll::Ready(None))
     }
@@ -1278,7 +1279,7 @@ async fn sparse_complete_keys_keep_tag_and_internal_identity_distinct() {
     let key_one = sparse_key(42, 9, "rack-a", "sensor-1");
     let key_two = sparse_key(42, 9, "rack-a", "sensor-2");
     let key_three = sparse_key(43, 9, "rack-a", "sensor-1");
-    let mut key_records = vec![
+    let mut key_records = [
         (key_one.clone(), 42, 9, "sensor-1"),
         (key_two.clone(), 42, 9, "sensor-2"),
         (key_three.clone(), 43, 9, "sensor-1"),

@@ -5189,7 +5189,8 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
         .iter()
         .map(|(key, time, f1, f0, _)| (key.to_vec(), *time, *f1, *f0))
         .collect::<Vec<_>>();
-    let sort_native = |rows: &mut Vec<(Vec<u8>, String, i64, f64, Option<f64>, bool)>| {
+    type NativeRow = (Vec<u8>, String, i64, f64, Option<f64>, bool);
+    let sort_native = |rows: &mut Vec<NativeRow>| {
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
     };
     sort_native(&mut native_visible);

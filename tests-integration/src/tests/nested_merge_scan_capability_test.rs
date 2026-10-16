@@ -1908,7 +1908,6 @@ async fn test_native_raw_series_through_production_datanode_trait() {
         .datanode(&Peer {
             id: node_id,
             addr: address.clone(),
-            ..Default::default()
         })
         .await;
     let list_response = datanode
