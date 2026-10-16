@@ -1414,3 +1414,602 @@ mod fault_acceptance {
         });
     }
 }
+
+/// Multi-`Float64` acceptance of the whole-table native instant mapping, on a standalone frontend
+/// and on the real two-datanode cluster.
+///
+/// Both shapes of this module declare their `Float64` fields in a deliberately non-lexical order
+/// (`z_first`, `a_second`, optionally `m_third`), so a mapping that sorts or reorders field names
+/// fails the fixture instead of a plan string, and the fixture makes the staleness rule of the
+/// ordinary selector observable from the complete result alone: the checked first field alone
+/// decides whether a sample is stale, whatever the other fields carry.
+///
+/// * the stale marker in the unchecked second field at 3000 must keep its exact bits in the row
+///   the evaluation point returns;
+/// * the stale marker in the checked first field at 4000 must suppress that evaluation point
+///   without reviving the older sample of 3000;
+/// * the `NULL` first field at 5000 keeps a row whose first field is `NULL` and whose second field
+///   keeps its ordinary `NaN` payload.
+///
+/// The sparse `beta` series has one sample in each partition of the distributed shapes and none in
+/// between, so the lookback of 2000, 3000 and 4000 is carried by its first sample while its 5000
+/// sample lives in the region of the other datanode.
+mod multifloat_acceptance {
+    use api::v1::helper::{field_column_schema, tag_column_schema, time_index_column_schema};
+    use api::v1::value::ValueData;
+    use api::v1::{ColumnDataType, Row, RowInsertRequest, RowInsertRequests, Rows, Value};
+    use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
+
+    use crate::standalone::GreptimeDbStandaloneBuilder;
+    use crate::test_util::execute_sql;
+
+    use super::*;
+
+    /// One table shape: the `Float64` fields in their declared, deliberately non-lexical order.
+    ///
+    /// The order is the fixture of the staleness rule: a mapping that sorts field names would check
+    /// `a_second` or `m_third` at 3000 instead of `z_first`.
+    struct Shape {
+        table: &'static str,
+        fields: &'static [&'static str],
+    }
+
+    /// The two shapes of this lane: two and three `Float64` fields.
+    const SHAPES: &[Shape] = &[
+        Shape {
+            table: "native_multifloat_two",
+            fields: &["z_first", "a_second"],
+        },
+        Shape {
+            table: "native_multifloat_three",
+            fields: &["z_first", "a_second", "m_third"],
+        },
+    ];
+
+    /// The exact bit patterns of the fixture and of its expectation: no cell is ever compared
+    /// through `f64` equality, which would hide a `NaN` payload or a signed zero.
+    const NEGATIVE_ZERO: u64 = 0x8000_0000_0000_0000;
+    const POSITIVE_ZERO: u64 = 0x0000_0000_0000_0000;
+    const TWO: u64 = 0x4000_0000_0000_0000;
+    const THREE: u64 = 0x4008_0000_0000_0000;
+    const FOUR: u64 = 0x4010_0000_0000_0000;
+    const SEVEN: u64 = 0x401c_0000_0000_0000;
+    const EIGHT: u64 = 0x4020_0000_0000_0000;
+    const NINE: u64 = 0x4022_0000_0000_0000;
+    /// An ordinary quiet `NaN` that is not the Prometheus stale marker.
+    const ORDINARY_NAN_ONE: u64 = 0x7ff8_0000_0000_0001;
+    /// A second ordinary quiet `NaN`, so the two planted payloads cannot be confused.
+    const ORDINARY_NAN_TWO: u64 = 0x7ff8_0000_0000_0002;
+
+    /// The planted bits of every fixture row in insertion order; `None` is a stored `NULL`.
+    ///
+    /// `alpha` fills the evaluation grid with the three staleness cases, and the sparse `beta`
+    /// series carries the lookback across the partition at 3000. The third slot is only planted
+    /// into the three-field shape.
+    const FIXTURE: &[(i64, &str, [Option<u64>; 3])] = &[
+        (
+            1_000,
+            "alpha",
+            [Some(NEGATIVE_ZERO), Some(POSITIVE_ZERO), None],
+        ),
+        (2_000, "alpha", [Some(ORDINARY_NAN_ONE), None, Some(TWO)]),
+        (
+            3_000,
+            "alpha",
+            [
+                Some(THREE),
+                Some(PROMETHEUS_STALE_NAN_BITS),
+                Some(NEGATIVE_ZERO),
+            ],
+        ),
+        (
+            4_000,
+            "alpha",
+            [Some(PROMETHEUS_STALE_NAN_BITS), Some(FOUR), Some(FOUR)],
+        ),
+        (
+            5_000,
+            "alpha",
+            [None, Some(ORDINARY_NAN_TWO), Some(POSITIVE_ZERO)],
+        ),
+        (1_000, "beta", [Some(SEVEN), None, None]),
+        (5_000, "beta", [Some(EIGHT), Some(NINE), None]),
+    ];
+
+    /// The complete result of `TQL EVAL (1, 5, '1s')` over any shape, in the only sort order the
+    /// comparison uses: `(timestamp, host)`.
+    ///
+    /// Every cell is the exact `to_bits` of the source row its evaluation point selected, and
+    /// `alpha` has no row at 4000 at all. The third slot is only compared by the three-field shape.
+    const EXPECTED_RESULT: &[(i64, &str, [Option<u64>; 3])] = &[
+        (
+            1_000,
+            "alpha",
+            [Some(NEGATIVE_ZERO), Some(POSITIVE_ZERO), None],
+        ),
+        (1_000, "beta", [Some(SEVEN), None, None]),
+        (2_000, "alpha", [Some(ORDINARY_NAN_ONE), None, Some(TWO)]),
+        (2_000, "beta", [Some(SEVEN), None, None]),
+        (
+            3_000,
+            "alpha",
+            [
+                Some(THREE),
+                Some(PROMETHEUS_STALE_NAN_BITS),
+                Some(NEGATIVE_ZERO),
+            ],
+        ),
+        (3_000, "beta", [Some(SEVEN), None, None]),
+        (4_000, "beta", [Some(SEVEN), None, None]),
+        (
+            5_000,
+            "alpha",
+            [None, Some(ORDINARY_NAN_TWO), Some(POSITIVE_ZERO)],
+        ),
+        (5_000, "beta", [Some(EIGHT), Some(NINE), None]),
+    ];
+
+    /// One `Float64` cell of a planted row: the exact bits, or a stored `NULL`.
+    fn float_cell(bits: Option<u64>) -> Value {
+        bits.map(|bits| ValueData::F64Value(f64::from_bits(bits)).into())
+            .unwrap_or_default()
+    }
+
+    /// The partition clause of the distributed shapes: both regions split every series at 3000 ms,
+    /// so the first samples of every series live in another region than the last ones.
+    const PARTITION: &str =
+        " PARTITION ON COLUMNS (ts) (ts < '1970-01-01 00:00:03', ts >= '1970-01-01 00:00:03')";
+
+    /// The complete `DDL` of `shape`; a distributed shape appends [`PARTITION`].
+    fn create_table_sql(shape: &Shape, partitioned: bool) -> String {
+        let fields = shape
+            .fields
+            .iter()
+            .map(|field| format!("{field} DOUBLE"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let partition = if partitioned { PARTITION } else { "" };
+        format!(
+            "CREATE TABLE {} (ts TIMESTAMP(3), host STRING, {fields}, TIME INDEX (ts), PRIMARY \
+             KEY (host)){partition} ENGINE=mito",
+            shape.table
+        )
+    }
+
+    /// The `TQL EVAL` of one shape: the grid evaluates every planted second from 1000 to 5000.
+    fn eval_sql(shape: &Shape) -> String {
+        format!("TQL EVAL (1, 5, '1s') {}", shape.table)
+    }
+
+    /// The `TQL ANALYZE VERBOSE` of one shape.
+    fn analyze_sql(shape: &Shape) -> String {
+        format!("TQL ANALYZE VERBOSE (1, 5, '1s') {}", shape.table)
+    }
+
+    /// The complete column list of a result of `shape`, in the declared field order.
+    fn planned_columns(shape: &Shape) -> Vec<(String, DataType)> {
+        let mut columns = vec![
+            (
+                "ts".to_string(),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            ("host".to_string(), DataType::Utf8),
+        ];
+        columns.extend(
+            shape
+                .fields
+                .iter()
+                .map(|field| ((*field).to_string(), DataType::Float64)),
+        );
+        columns
+    }
+
+    /// Reads every planned field of `batches` by name and keeps the exact bits of every cell:
+    /// `None` is a `NULL` and every other cell is its `to_bits`, so no `f64` equality can hide a
+    /// payload. The rows are sorted only by `(timestamp, host)`, the order of every expectation.
+    fn bit_rows(
+        batches: &RecordBatches,
+        shape: &Shape,
+    ) -> Vec<(i64, Option<String>, Vec<Option<u64>>)> {
+        assert_eq!(
+            2 + shape.fields.len(),
+            batches.schema().arrow_schema().fields().len(),
+            "unexpected result column count of {}",
+            shape.table
+        );
+        let mut rows: Vec<(i64, Option<String>, Vec<Option<u64>>)> = Vec::new();
+        for batch in batches.iter() {
+            let batch = batch.df_record_batch();
+            let ts = batch
+                .column_by_name("ts")
+                .unwrap_or_else(|| panic!("the result of {} must carry ts", shape.table))
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let host = batch
+                .column_by_name("host")
+                .unwrap_or_else(|| panic!("the result of {} must carry host", shape.table))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let fields = shape
+                .fields
+                .iter()
+                .map(|field| {
+                    batch
+                        .column_by_name(field)
+                        .unwrap_or_else(|| {
+                            panic!("the result of {} must carry {field}", shape.table)
+                        })
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for index in 0..batch.num_rows() {
+                rows.push((
+                    ts.value(index),
+                    (!host.is_null(index)).then(|| host.value(index).to_string()),
+                    fields
+                        .iter()
+                        .map(|field| (!field.is_null(index)).then(|| field.value(index).to_bits()))
+                        .collect(),
+                ));
+            }
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        rows
+    }
+
+    /// The complete stored fixture of `shape` in the order of the stored check (`ts`, `host`).
+    fn fixture_stored_rows(shape: &Shape) -> Vec<(i64, Option<String>, Vec<Option<u64>>)> {
+        let mut rows = FIXTURE
+            .iter()
+            .map(|(ts, host, bits)| {
+                (
+                    *ts,
+                    Some((*host).to_string()),
+                    bits[..shape.fields.len()].to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        rows
+    }
+
+    /// The complete expected result of `shape`, with one slot per planned field.
+    fn fixture_result_rows(shape: &Shape) -> Vec<(i64, Option<String>, Vec<Option<u64>>)> {
+        EXPECTED_RESULT
+            .iter()
+            .map(|(ts, host, bits)| {
+                (
+                    *ts,
+                    Some((*host).to_string()),
+                    bits[..shape.fields.len()].to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Seeds `shape` through the row-insert API of `frontend`: every planted `Float64` keeps its
+    /// exact bits, which no text protocol and no `SQL` literal can guarantee.
+    ///
+    /// The complete `DDL` above predeclares every column, so the insert never accommodates a
+    /// dynamic schema.
+    async fn ingest(frontend: &Arc<Instance>, shape: &Shape) {
+        let mut schema = vec![
+            time_index_column_schema("ts", ColumnDataType::TimestampMillisecond),
+            tag_column_schema("host", ColumnDataType::String),
+        ];
+        schema.extend(
+            shape
+                .fields
+                .iter()
+                .map(|field| field_column_schema(field, ColumnDataType::Float64)),
+        );
+        let rows = FIXTURE
+            .iter()
+            .map(|(ts, host, bits)| Row {
+                values: std::iter::once(ValueData::TimestampMillisecondValue(*ts).into())
+                    .chain(std::iter::once(
+                        ValueData::StringValue((*host).to_string()).into(),
+                    ))
+                    .chain(bits[..shape.fields.len()].iter().copied().map(float_cell))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let output = frontend
+            .handle_row_inserts(
+                RowInsertRequests {
+                    inserts: vec![RowInsertRequest {
+                        table_name: shape.table.to_string(),
+                        rows: Some(Rows { schema, rows }),
+                    }],
+                },
+                QueryContext::arc(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("inserting the fixture of {} failed: {error}", shape.table)
+            });
+        assert!(
+            matches!(output.data, OutputData::AffectedRows(rows) if rows == FIXTURE.len()),
+            "expected the row insert of {} to affect {} rows",
+            shape.table,
+            FIXTURE.len()
+        );
+    }
+
+    /// Reads the whole stored fixture of `shape` through ordinary `SQL` before any `TQL`
+    /// assertion: the exact column list, the exact `NULL`s and the exact bits of every planted
+    /// float prove that the row insert reached the region(s) without normalizing a payload.
+    async fn assert_stored(frontend: &Arc<Instance>, shape: &Shape) {
+        let sql = format!(
+            "SELECT ts, host, {} FROM {} ORDER BY ts, host",
+            shape.fields.join(", "),
+            shape.table
+        );
+        let stored = query_batches(frontend, &sql).await;
+        assert_eq!(planned_columns(shape), columns(&stored));
+        assert_eq!(
+            fixture_stored_rows(shape),
+            bit_rows(&stored, shape),
+            "unexpected stored fixture of {}",
+            shape.table
+        );
+    }
+
+    /// Runs the native `TQL EVAL` of `shape` once, proves its complete result against the planted
+    /// bits and returns it for the schema comparison with the ordinary result.
+    async fn eval_native(frontend: &Arc<Instance>, shape: &Shape) -> RecordBatches {
+        let native = query_batches(frontend, &eval_sql(shape)).await;
+        assert_eq!(planned_columns(shape), columns(&native));
+        assert_eq!(
+            fixture_result_rows(shape),
+            bit_rows(&native, shape),
+            "unexpected native result of {}",
+            shape.table
+        );
+        native
+    }
+
+    /// Runs one native and one ordinary eval of `shape` and proves both complete results against
+    /// the planted bits: the ordinary result is the independent oracle of the literals, and the
+    /// complete public schema of the two must be unchanged, nullability and metadata included.
+    async fn assert_eval(enabled: &Arc<Instance>, ordinary: &Arc<Instance>, shape: &Shape) {
+        let native = eval_native(enabled, shape).await;
+        let normal = query_batches(ordinary, &eval_sql(shape)).await;
+        assert_eq!(planned_columns(shape), columns(&normal));
+        assert_eq!(
+            fixture_result_rows(shape),
+            bit_rows(&normal, shape),
+            "unexpected ordinary result of {}",
+            shape.table
+        );
+        assert_eq!(columns(&native), columns(&normal));
+        assert_eq!(native.schema(), normal.schema());
+        assert_eq!(
+            native.schema().arrow_schema(),
+            normal.schema().arrow_schema()
+        );
+    }
+
+    /// The `ANALYZE VERBOSE` plan of `shape` on `frontend`.
+    async fn analyze_plan(frontend: &Arc<Instance>, shape: &Shape) -> String {
+        query_pretty(frontend, &analyze_sql(shape)).await
+    }
+
+    /// Proves the native plan of `shape`: the native instant manipulation always, and the
+    /// raw-series merge only when `raw_merge` states it, because only the distributed shapes span
+    /// two datanodes and must merge their regions.
+    async fn assert_native_plan(frontend: &Arc<Instance>, shape: &Shape, raw_merge: Option<bool>) {
+        let plan = analyze_plan(frontend, shape).await;
+        assert!(
+            plan.contains("NativeInstantManipulateExec"),
+            "the native instant manipulation is missing for the multi-Float64 shape {}:\n{plan}",
+            shape.table
+        );
+        if let Some(raw_merge) = raw_merge {
+            assert_eq!(
+                raw_merge,
+                plan.contains("NativeRawMergeExec"),
+                "the raw-series merge of {} must be {raw_merge} for this deployment:\n{plan}",
+                shape.table
+            );
+        }
+    }
+
+    /// Proves that the flag-free `frontend` keeps the ordinary plan of `shape`.
+    async fn assert_ordinary_plan(frontend: &Arc<Instance>, shape: &Shape) {
+        let plan = analyze_plan(frontend, shape).await;
+        assert!(
+            !plan.contains("NativeInstantManipulateExec"),
+            "the flag-free frontend unexpectedly used the native instant manipulation for {}:\n\
+             {plan}",
+            shape.table
+        );
+    }
+
+    /// Proves that the time partition of `shape` produced two regions, one leader per datanode,
+    /// and returns the leader of every region.
+    async fn assert_two_datanode_regions(
+        frontend: &Arc<Instance>,
+        shape: &Shape,
+    ) -> BTreeMap<u64, u64> {
+        let leaders = region_leaders(frontend, shape.table).await;
+        assert_eq!(
+            2,
+            leaders.len(),
+            "expected one region per time partition of {}, actual region leaders: {leaders:?}",
+            shape.table
+        );
+        assert_eq!(
+            BTreeSet::from([1_u64, 2_u64]),
+            leaders.values().copied().collect::<BTreeSet<u64>>(),
+            "expected the time partitions of {} to be served by both datanodes, actual region \
+             leaders: {leaders:?}",
+            shape.table
+        );
+        leaders
+    }
+
+    /// The raw-series counters of every datanode that leads a region of one shape.
+    fn rpc_snapshot(
+        cluster: &GreptimeDbCluster,
+        leaders: &BTreeMap<u64, u64>,
+    ) -> BTreeMap<u64, (usize, usize)> {
+        leaders
+            .values()
+            .map(|datanode| {
+                (
+                    *datanode,
+                    (
+                        rpc_requests(cluster, *datanode),
+                        prepare_requests(cluster, *datanode),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Proves that everything since `baseline` read and preflighted every region it covers
+    /// exactly once: one raw read and one named preflight per datanode, so one eval of any shape
+    /// costs exactly one Flight `DoGet` and one Flight `DoAction` per region leader.
+    fn assert_one_raw_rpc_per_node(
+        cluster: &GreptimeDbCluster,
+        baseline: &BTreeMap<u64, (usize, usize)>,
+    ) {
+        for (datanode, (do_get, prepare)) in baseline {
+            assert_eq!(
+                do_get + 1,
+                rpc_requests(cluster, *datanode),
+                "expected exactly one raw-series read at the datanode {datanode} since the baseline"
+            );
+            assert_eq!(
+                prepare + 1,
+                prepare_requests(cluster, *datanode),
+                "expected exactly one raw-series preflight at the datanode {datanode} since the \
+                 baseline"
+            );
+        }
+    }
+
+    /// Flushes `shape` and proves that the same grid is still served by the native plan: a
+    /// normalizing write or read path of a flushed value could only fail here.
+    async fn flush_shape(frontend: &Arc<Instance>, shape: &Shape, raw_merge: Option<bool>) {
+        execute_sql(frontend, &format!("ADMIN FLUSH_TABLE('{}')", shape.table)).await;
+        assert_native_plan(frontend, shape, raw_merge).await;
+    }
+
+    /// Runs the standalone case at parallelism 1 for both shapes.
+    ///
+    /// The standalone table carries no partition clause, so the whole table is one region; the
+    /// plan of that local route is asserted through the native instant manipulation only. The
+    /// second instance keeps the flag off and supplies the ordinary result of the same fixture.
+    async fn run_standalone_case(name: &str) {
+        common_telemetry::init_default_ut_logging();
+
+        let enabled = GreptimeDbStandaloneBuilder::new(&format!("{name}_enabled"))
+            .with_query_options(QueryOptions {
+                parallelism: 1,
+                experimental_native_promql: true,
+                ..Default::default()
+            })
+            .build()
+            .await;
+        let ordinary = GreptimeDbStandaloneBuilder::new(&format!("{name}_ordinary"))
+            .with_query_options(QueryOptions {
+                parallelism: 1,
+                experimental_native_promql: false,
+                ..Default::default()
+            })
+            .build()
+            .await;
+        let enabled_frontend = enabled.fe_instance().clone();
+        let ordinary_frontend = ordinary.fe_instance().clone();
+
+        for shape in SHAPES {
+            execute_sql(&enabled_frontend, &create_table_sql(shape, false)).await;
+            execute_sql(&ordinary_frontend, &create_table_sql(shape, false)).await;
+            ingest(&enabled_frontend, shape).await;
+            ingest(&ordinary_frontend, shape).await;
+
+            // The ordinary read proves the stored bits of the whole table before any `TQL` runs.
+            assert_stored(&enabled_frontend, shape).await;
+
+            assert_native_plan(&enabled_frontend, shape, None).await;
+            assert_ordinary_plan(&ordinary_frontend, shape).await;
+
+            assert_eval(&enabled_frontend, &ordinary_frontend, shape).await;
+
+            // The flush moves the samples of every series from the memtable into an SST; the same
+            // grid must still be served natively and must still return the exact same bits.
+            flush_shape(&enabled_frontend, shape, None).await;
+            eval_native(&enabled_frontend, shape).await;
+        }
+    }
+
+    /// Runs the two-datanode case at `parallelism` for both shapes.
+    ///
+    /// The frontend carries the flag while every datanode keeps its default, exactly like a
+    /// deployment where the planning node opted in, and the datanodes are reachable at the
+    /// addresses of the table routes, so both its named preflight and its raw-series read are
+    /// counted. A second, flag-free cluster serves the same fixture and supplies the ordinary
+    /// result the complete public schema is compared with.
+    async fn run_cluster_case(name: &str, parallelism: usize) {
+        common_telemetry::init_default_ut_logging();
+
+        let enabled = build_cluster(&format!("{name}_enabled"), parallelism, true).await;
+        let disabled = build_cluster(&format!("{name}_disabled"), parallelism, false).await;
+        let enabled_frontend = enabled.fe_instance().clone();
+        let disabled_frontend = disabled.fe_instance().clone();
+
+        for shape in SHAPES {
+            execute_sql(&enabled_frontend, &create_table_sql(shape, true)).await;
+            execute_sql(&disabled_frontend, &create_table_sql(shape, true)).await;
+            ingest(&enabled_frontend, shape).await;
+            ingest(&disabled_frontend, shape).await;
+
+            // Each shape is one region per time partition, and the two regions must be served by
+            // the two different datanodes: only then does every series span both of them.
+            let leaders = assert_two_datanode_regions(&enabled_frontend, shape).await;
+
+            // The ordinary read proves the seeded rows of both datanodes are complete and
+            // bit-exact before any `TQL` runs.
+            assert_stored(&enabled_frontend, shape).await;
+
+            assert_native_plan(&enabled_frontend, shape, Some(true)).await;
+            assert_ordinary_plan(&disabled_frontend, shape).await;
+
+            // Seeding and planning are done: from here on only the `TQL EVAL` below may move the
+            // counters, so the baseline is taken after the analyze and before the eval.
+            let baseline = rpc_snapshot(&enabled, &leaders);
+            assert_eval(&enabled_frontend, &disabled_frontend, shape).await;
+            assert_one_raw_rpc_per_node(&enabled, &baseline);
+
+            // The flushed regions must still be served by the native path; a fallback below would
+            // make the repeat eval vacuous.
+            flush_shape(&enabled_frontend, shape, Some(true)).await;
+            let flushed_baseline = rpc_snapshot(&enabled, &leaders);
+            eval_native(&enabled_frontend, shape).await;
+            assert_one_raw_rpc_per_node(&enabled, &flushed_baseline);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_native_promql_multifloat_standalone_p1() {
+        run_standalone_case("native_promql_multifloat_standalone_p1").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_native_promql_multifloat_cluster_p1() {
+        run_cluster_case("native_promql_multifloat_cluster_p1", 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_native_promql_multifloat_cluster_p4() {
+        run_cluster_case("native_promql_multifloat_cluster_p4", 4).await;
+    }
+}

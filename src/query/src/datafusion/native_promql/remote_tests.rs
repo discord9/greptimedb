@@ -251,6 +251,110 @@ fn binding(region_id: RegionId) -> RawSeriesRequest {
     }
 }
 
+/// The ordered, deliberately non-lexical field names of the multifloat fixtures.
+const MULTIFLOAT_FIELD_NAMES: [&str; 3] = ["value", "a_second", "m_third"];
+
+/// The physical identifiers of the multifloat fields, in declared field order.
+const MULTIFLOAT_FIELD_IDS: [ColumnId; 3] = [
+    VALUE_COLUMN_ID,
+    SECOND_VALUE_COLUMN_ID,
+    THIRD_VALUE_COLUMN_ID,
+];
+
+/// The physical identifier of the second ordered field of the multifloat fixtures.
+const SECOND_VALUE_COLUMN_ID: ColumnId = 3;
+
+/// The physical identifier of the third ordered field of the multifloat fixtures.
+const THIRD_VALUE_COLUMN_ID: ColumnId = 4;
+
+/// A reserved physical identifier no field column may carry.
+const RESERVED_FIELD_ID: ColumnId = store_api::storage::consts::ReservedColumnId::version();
+
+/// The declared fields of a multifloat fixture with the given field count.
+fn multifloat_fields(field_count: usize) -> Vec<(&'static str, ColumnId)> {
+    MULTIFLOAT_FIELD_NAMES
+        .iter()
+        .copied()
+        .zip(MULTIFLOAT_FIELD_IDS)
+        .take(field_count)
+        .collect()
+}
+
+/// The authorized frontend table of an ordered-field fixture, in declared field order.
+fn multifloat_table(fields: &[(&str, ColumnId)]) -> TableRef {
+    let mut columns = vec![
+        ColumnSchema::new(
+            "ts",
+            ConcreteDataType::timestamp_millisecond_datatype(),
+            false,
+        )
+        .with_time_index(true),
+        ColumnSchema::new("host", ConcreteDataType::string_datatype(), true),
+    ];
+    columns.extend(
+        fields
+            .iter()
+            .map(|(name, _)| ColumnSchema::new(*name, ConcreteDataType::float64_datatype(), false)),
+    );
+    let mut column_ids = vec![TS_COLUMN_ID, HOST_COLUMN_ID];
+    column_ids.extend(fields.iter().map(|(_, id)| *id));
+    let value_indices = (2..2 + fields.len()).collect::<Vec<_>>();
+    fe_table_with(
+        MITO_ENGINE,
+        Arc::new(Schema::new(columns)),
+        column_ids,
+        vec![1],
+        value_indices,
+    )
+}
+
+/// The region metadata one frozen leader reports for an ordered-field fixture.
+fn multifloat_region_metadata(
+    region_id: RegionId,
+    fields: &[(&str, ColumnId)],
+) -> Arc<RegionMetadata> {
+    let mut builder = RegionMetadataBuilder::new(region_id);
+    builder
+        .push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            semantic_type: SemanticType::Timestamp,
+            column_id: TS_COLUMN_ID,
+        })
+        .push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new("host", ConcreteDataType::string_datatype(), true),
+            semantic_type: SemanticType::Tag,
+            column_id: HOST_COLUMN_ID,
+        });
+    for (name, id) in fields {
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(*name, ConcreteDataType::float64_datatype(), false),
+            semantic_type: SemanticType::Field,
+            column_id: *id,
+        });
+    }
+    builder.primary_key(vec![HOST_COLUMN_ID]);
+    Arc::new(builder.build().unwrap())
+}
+
+/// The binding one frozen peer approves for an ordered-field fixture: every declared field in
+/// declared, non-lexical order.
+fn multifloat_binding(region_id: RegionId, fields: &[(&str, ColumnId)]) -> RawSeriesRequest {
+    RawSeriesRequest {
+        version: 1,
+        physical_metadata: (*multifloat_region_metadata(region_id, fields)).clone(),
+        metric_name: METRIC_NAME.to_string(),
+        logical_tags: vec![RawSeriesTag {
+            column_id: HOST_COLUMN_ID,
+            name: "host".to_string(),
+        }],
+        field_ids: fields.iter().map(|(_, id)| *id).collect(),
+    }
+}
+
 /// One bounded instant declaration of the fixture.
 #[derive(Clone, Copy)]
 struct Instant {
@@ -1005,29 +1109,213 @@ fn authorize_declines_tables_it_cannot_identify() {
     let logical = logical_plan(seconds);
     let shape = RemoteShape::discover(&logical).expect("discoverable");
     assert!(authorize(&shape, &table_name()).is_none());
+}
 
-    // A second field is outside the single-field instant evaluation.
-    let two_fields = Arc::new(Schema::new(vec![
-        ColumnSchema::new(
-            "ts",
-            ConcreteDataType::timestamp_millisecond_datatype(),
-            false,
-        )
-        .with_time_index(true),
-        ColumnSchema::new("host", ConcreteDataType::string_datatype(), true),
-        ColumnSchema::new("v", ConcreteDataType::float64_datatype(), false),
-        ColumnSchema::new("v2", ConcreteDataType::float64_datatype(), false),
-    ]));
-    let table = fe_table_with(
-        MITO_ENGINE,
-        two_fields,
-        vec![TS_COLUMN_ID, HOST_COLUMN_ID, VALUE_COLUMN_ID, 3],
-        vec![1],
-        vec![2, 3],
-    );
-    let logical = logical_plan(table);
+#[test]
+fn multifloat_ordered_fields_are_authorized_and_bound() {
+    // A second field is no longer outside the bounded instant evaluation, so the reclaimed
+    // rejection becomes an accepted control for the declared field order.
+    for field_count in [2, 3] {
+        let fields = multifloat_fields(field_count);
+        let logical = logical_plan(multifloat_table(&fields));
+        let shape = RemoteShape::discover(&logical).expect("discoverable");
+        let authorized = authorize(&shape, &table_name()).unwrap_or_else(|| {
+            panic!("{field_count} ordered Float64 fields are authorized, not declined")
+        });
+        let approved = multifloat_binding(region(1), &fields);
+        assert_eq!(
+            approved.field_ids,
+            MULTIFLOAT_FIELD_IDS[..field_count].to_vec(),
+            "every declared field travels in declared, non-lexical order"
+        );
+        assert!(
+            binding_matches(&approved, &authorized, region(1)),
+            "{field_count} complete ordered approvals are accepted"
+        );
+    }
+}
+
+#[test]
+fn multifloat_binding_mutations_and_illegal_tables_are_rejected() {
+    let fields = multifloat_fields(3);
+    let logical = logical_plan(multifloat_table(&fields));
     let shape = RemoteShape::discover(&logical).expect("discoverable");
-    assert!(authorize(&shape, &table_name()).is_none());
+    let authorized = authorize(&shape, &table_name()).expect("three ordered fields are authorized");
+    let approved = multifloat_binding(region(1), &fields);
+    assert!(binding_matches(&approved, &authorized, region(1)));
+
+    let mut only_first = approved.clone();
+    only_first.field_ids = vec![VALUE_COLUMN_ID];
+    let mut only_second = approved.clone();
+    only_second.field_ids = vec![SECOND_VALUE_COLUMN_ID];
+    let mut missing_last = approved.clone();
+    missing_last.field_ids = vec![VALUE_COLUMN_ID, SECOND_VALUE_COLUMN_ID];
+    let mut extra = approved.clone();
+    extra.field_ids = vec![
+        VALUE_COLUMN_ID,
+        SECOND_VALUE_COLUMN_ID,
+        THIRD_VALUE_COLUMN_ID,
+        99,
+    ];
+    let mut duplicated = approved.clone();
+    duplicated.field_ids = vec![
+        VALUE_COLUMN_ID,
+        SECOND_VALUE_COLUMN_ID,
+        SECOND_VALUE_COLUMN_ID,
+    ];
+    let mut lexically_ordered = approved.clone();
+    lexically_ordered.field_ids = vec![
+        SECOND_VALUE_COLUMN_ID,
+        THIRD_VALUE_COLUMN_ID,
+        VALUE_COLUMN_ID,
+    ];
+    let mut reversed = approved.clone();
+    reversed.field_ids = vec![
+        THIRD_VALUE_COLUMN_ID,
+        SECOND_VALUE_COLUMN_ID,
+        VALUE_COLUMN_ID,
+    ];
+    let mut renamed = approved.clone();
+    column(&mut renamed, SECOND_VALUE_COLUMN_ID)
+        .column_schema
+        .name = "renamed".to_string();
+    let mut wrong_semantics = approved.clone();
+    column(&mut wrong_semantics, SECOND_VALUE_COLUMN_ID).semantic_type = SemanticType::Tag;
+    let mut wrong_type = approved.clone();
+    column(&mut wrong_type, THIRD_VALUE_COLUMN_ID)
+        .column_schema
+        .data_type = ConcreteDataType::timestamp_millisecond_datatype();
+
+    for (reason, mutation) in [
+        ("an approval that approves only the first field", only_first),
+        (
+            "an approval that approves only the second field",
+            only_second,
+        ),
+        ("an approval that drops the last field", missing_last),
+        ("an approval with an extra field identifier", extra),
+        ("an approval with a duplicated field identifier", duplicated),
+        (
+            "an approval ordered by field name instead of declared order",
+            lexically_ordered,
+        ),
+        ("an approval in reverse declared order", reversed),
+        ("an approval with a renamed field column", renamed),
+        (
+            "an approval with a field column of another semantic type",
+            wrong_semantics,
+        ),
+        (
+            "an approval with a field column of another type",
+            wrong_type,
+        ),
+    ] {
+        assert!(
+            !binding_matches(&mutation, &authorized, region(1)),
+            "{reason}"
+        );
+    }
+
+    // The field identifiers of the table itself must stay distinct, non-reserved and free of
+    // internal columns, so no ordered binding can be authorized from them.
+    let illegal_tables: [(&str, &[(&str, ColumnId)]); 5] = [
+        (
+            "a second field that collides with the timestamp identifier",
+            &[("value", VALUE_COLUMN_ID), ("a_second", TS_COLUMN_ID)][..],
+        ),
+        (
+            "a second field that collides with another field identifier",
+            &[("value", VALUE_COLUMN_ID), ("a_second", VALUE_COLUMN_ID)][..],
+        ),
+        (
+            "an internal field name",
+            &[
+                ("value", VALUE_COLUMN_ID),
+                ("__sequence", SECOND_VALUE_COLUMN_ID),
+            ][..],
+        ),
+        (
+            "a metric-engine internal field name",
+            &[
+                ("value", VALUE_COLUMN_ID),
+                ("__tsid", SECOND_VALUE_COLUMN_ID),
+            ][..],
+        ),
+        (
+            "a reserved field identifier",
+            &[("value", VALUE_COLUMN_ID), ("a_second", RESERVED_FIELD_ID)][..],
+        ),
+    ];
+    for (reason, fields) in illegal_tables {
+        let logical = logical_plan(multifloat_table(fields));
+        let shape = RemoteShape::discover(&logical).expect("discoverable");
+        assert!(authorize(&shape, &table_name()).is_none(), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn multifloat_approvals_prepare_and_a_contradicting_second_field_is_terminal() {
+    let fields = multifloat_fields(2);
+    let logical = logical_plan(multifloat_table(&fields));
+    let shape = RemoteShape::discover(&logical).expect("discoverable");
+    let authorized = authorize(&shape, &table_name()).expect("two ordered fields are authorized");
+    let plan = remote_plan(&shape);
+    let query_ctx = query_context();
+
+    // The accepted control: every frozen region approves the same complete ordered binding.
+    let accepting = Arc::new(FakeHandler::new(vec![
+        FakeRegion::new(
+            REGION_ONE_PEER,
+            Some(multifloat_binding(region(1), &fields)),
+        ),
+        FakeRegion::new(
+            REGION_TWO_PEER,
+            Some(multifloat_binding(region(2), &fields)),
+        ),
+    ]));
+    let handler: RegionQueryHandlerRef = accepting.clone();
+    let prepared = prepare_regions(&plan, &ordinary_route(), &handler, &query_ctx, &authorized)
+        .await
+        .expect("an ordered-field approval is not terminal")
+        .expect("every region approved the complete ordered binding");
+    assert_eq!(prepared.len(), 2);
+    assert_eq!(
+        accepting.calls(),
+        vec![
+            Call::Prepare(REGION_ONE_PEER),
+            Call::Prepare(REGION_TWO_PEER)
+        ],
+        "both ordered approvals are collected before any raw read"
+    );
+
+    // A contradiction in the second approved field stays terminal instead of becoming a silent
+    // ordinary execution, and it is reported before any raw read starts.
+    let mut contradicted = multifloat_binding(region(2), &fields);
+    column(&mut contradicted, SECOND_VALUE_COLUMN_ID)
+        .column_schema
+        .data_type = ConcreteDataType::int32_datatype();
+    let fake = Arc::new(FakeHandler::new(vec![
+        FakeRegion::new(
+            REGION_ONE_PEER,
+            Some(multifloat_binding(region(1), &fields)),
+        ),
+        FakeRegion::new(REGION_TWO_PEER, Some(contradicted)),
+    ]));
+    let handler: RegionQueryHandlerRef = fake.clone();
+    assert!(
+        prepare_regions(&plan, &ordinary_route(), &handler, &query_ctx, &authorized)
+            .await
+            .is_err(),
+        "a contradicting second field is terminal"
+    );
+    assert_eq!(
+        fake.calls(),
+        vec![
+            Call::Prepare(REGION_ONE_PEER),
+            Call::Prepare(REGION_TWO_PEER)
+        ],
+        "the contradiction is reported after both preparations and before any raw read"
+    );
 }
 
 #[test]

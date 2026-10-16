@@ -89,10 +89,6 @@ impl NativeInstantMapping {
                 .fields
                 .iter()
                 .all(|field| field.name.as_ref() != *name)
-        }) || series_schema.fields.iter().any(|field| {
-            node.field_column
-                .as_deref()
-                .is_some_and(|selected| selected != field.name.as_ref())
         }) {
             return Ok(None);
         }

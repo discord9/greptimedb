@@ -322,13 +322,13 @@ struct AuthorizedColumn {
 /// The frontend authorization of the captured table, derived from its own table metadata.
 ///
 /// The authorized output is the whole table: the complete time index, every logical tag in
-/// primary-key order, and the single value field, each with the authoritative name and type.
-/// Nothing is selected or narrowed here.
+/// primary-key order, and every value field in its declared field order, each with the
+/// authoritative name and type. Nothing is selected or narrowed here.
 struct AuthorizedScan {
     table_id: u32,
     metric_name: String,
     tags: Vec<AuthorizedColumn>,
-    field: AuthorizedColumn,
+    fields: Vec<AuthorizedColumn>,
     time_index: AuthorizedColumn,
 }
 
@@ -407,28 +407,39 @@ fn authorize(shape: &RemoteShape<'_>, table: &TableName) -> Option<AuthorizedSca
         return None;
     }
 
-    let mut fields = info.meta.field_column_names().cloned().collect::<Vec<_>>();
-    if fields.len() != 1 {
+    // Every value field of the table is authorized in its declared field order: each one must be
+    // an existing Float64 column with a distinct, non-reserved physical identifier.
+    let field_names = info.meta.field_column_names().cloned().collect::<Vec<_>>();
+    if field_names.is_empty() {
         return None;
     }
-    let field_name = fields.pop()?;
-    if store_api::storage::consts::is_internal_column(&field_name)
-        || store_api::metric_engine_consts::is_metric_engine_internal_column(&field_name)
-    {
-        return None;
+    let mut fields = Vec::with_capacity(field_names.len());
+    for field_name in &field_names {
+        if store_api::storage::consts::is_internal_column(field_name)
+            || store_api::metric_engine_consts::is_metric_engine_internal_column(field_name)
+        {
+            return None;
+        }
+        let field_column = schema.column_schema_by_name(field_name)?;
+        if field_column.data_type != ConcreteDataType::float64_datatype() {
+            return None;
+        }
+        let field_id = *ids.get(field_name)?;
+        if ReservedColumnId::is_reserved(field_id) || !seen_ids.insert(field_id) {
+            return None;
+        }
+        fields.push(AuthorizedColumn {
+            id: field_id,
+            name: field_name.clone(),
+            data_type: field_column.data_type.clone(),
+        });
     }
-    let field_column = schema.column_schema_by_name(&field_name)?;
-    if field_column.data_type != ConcreteDataType::float64_datatype() {
-        return None;
-    }
-    let field_id = *ids.get(&field_name)?;
     let time_index_id = *ids.get(&time_index.name)?;
-    // Every authorized identifier must be a distinct, non-reserved physical column.
-    if ReservedColumnId::is_reserved(field_id)
-        || ReservedColumnId::is_reserved(time_index_id)
-        || !seen_ids.insert(field_id)
+    // Every authorized identifier must be a distinct, non-reserved physical column, so the
+    // timestamp is inserted into the same `seen_ids` set as every tag and field identifier.
+    if ReservedColumnId::is_reserved(time_index_id)
+        || !seen_ids.insert(time_index_id)
         || !seen_names.insert(time_index.name.clone())
-        || time_index_id == field_id
     {
         return None;
     }
@@ -437,11 +448,7 @@ fn authorize(shape: &RemoteShape<'_>, table: &TableName) -> Option<AuthorizedSca
         table_id: info.table_id(),
         metric_name: info.name.clone(),
         tags,
-        field: AuthorizedColumn {
-            id: field_id,
-            name: field_name,
-            data_type: field_column.data_type.clone(),
-        },
+        fields,
         time_index: AuthorizedColumn {
             id: time_index_id,
             name: time_index.name.clone(),
@@ -467,7 +474,7 @@ fn route_targets_authorized(
 
 /// Checks the bounded instant declaration from the authorized table alone, before the first RPC.
 ///
-/// The declaration is built from the authorized frontend field name with no evaluation grid, so
+/// The declaration is built from the authorized frontend field names with no evaluation grid, so
 /// this is the same declaration the final plan will carry; the approved peers still validate it
 /// and the native plan is still built from their actual label binding, so this decision is
 /// eligibility and not authorization. `Ok(false)` returns the ordinary plan without contacting a
@@ -478,9 +485,14 @@ fn instant_is_evaluable(
     authorized: &AuthorizedScan,
 ) -> DfResult<bool> {
     let series_schema = Arc::new(SeriesSchema {
-        fields: Arc::from([FieldSpec {
-            name: Arc::from(authorized.field.name.as_str()),
-        }]),
+        fields: authorized
+            .fields
+            .iter()
+            .map(|field| FieldSpec {
+                name: Arc::from(field.name.as_str()),
+            })
+            .collect::<Vec<_>>()
+            .into(),
         eval_grid: None,
     });
     let logical_tags = authorized
@@ -710,14 +722,14 @@ async fn prepare_regions(
 /// Validates one approved binding against the authorized frontend table.
 ///
 /// The approved binding describes the actual authorized region scanner, so it must describe
-/// exactly the authorized output: the same region, metric name, single field, millisecond time
-/// index, and the same physical key columns in the authorized key order. Every approved column is
-/// compared against the authorized name and type of the column with that identifier, because the
-/// existing cross-region merge only compares peers with each other and cannot notice that all of
-/// them approve the same wrong type. Tag names and ids are compared as the merge contract compares
-/// them (by column id, because the label decoder resolves every logical tag by its physical
-/// identifier), while the key order is compared exactly because it decides the order of the merged
-/// stream.
+/// exactly the authorized output: the same region, metric name, every authorized field in
+/// declared field order, millisecond time index, and the same physical key columns in the
+/// authorized key order. Every approved column is compared against the authorized name and type
+/// of the column with that identifier, because the existing cross-region merge only compares
+/// peers with each other and cannot notice that all of them approve the same wrong type. Tag
+/// names and ids are compared as the merge contract compares them (by column id, because the
+/// label decoder resolves every logical tag by its physical identifier), while the key order is
+/// compared exactly because it decides the order of the merged stream.
 fn binding_matches(
     binding: &RawSeriesRequest,
     authorized: &AuthorizedScan,
@@ -753,7 +765,12 @@ fn binding_matches(
             return false;
         }
     }
-    if binding.field_ids != vec![authorized.field.id] {
+    let expected_field_ids = authorized
+        .fields
+        .iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    if binding.field_ids != expected_field_ids {
         return false;
     }
     let expected_key = authorized.tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
@@ -762,14 +779,16 @@ fn binding_matches(
     }
 
     let metadata = &binding.physical_metadata;
-    let Some(field) = metadata.column_by_id(authorized.field.id) else {
-        return false;
-    };
-    if field.semantic_type != SemanticType::Field
-        || field.column_schema.name != authorized.field.name
-        || field.column_schema.data_type != authorized.field.data_type
-    {
-        return false;
+    for expected in &authorized.fields {
+        let Some(field) = metadata.column_by_id(expected.id) else {
+            return false;
+        };
+        if field.semantic_type != SemanticType::Field
+            || field.column_schema.name != expected.name
+            || field.column_schema.data_type != expected.data_type
+        {
+            return false;
+        }
     }
     let time_index = metadata.time_index_column();
     time_index.column_id == authorized.time_index.id

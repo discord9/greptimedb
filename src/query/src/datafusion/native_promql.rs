@@ -125,11 +125,12 @@ fn try_select_local(
             _ => return Ok(None),
         }
     }
-    // First slice preserves the ordinary selector's single-field staleness semantics.
+    // The declared Float64 fields are mapped in declared order; only the configured staleness
+    // columns are checked, exactly like the ordinary selector.
     if !time_found
         || logical_output.fields().len() != logical_tags.len() + fields.len() + 1
         || tags_found.len() != logical_tags.len()
-        || fields.len() != 1
+        || fields.is_empty()
         || (!divide.tags().is_empty() && divide.tags() != logical_tags)
     {
         return Ok(None);
