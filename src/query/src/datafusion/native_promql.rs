@@ -184,7 +184,12 @@ fn logical_shape(
     Some((instant, divide, scan))
 }
 
-fn table_scan_through_safe_nodes(
+/// Returns the single table scan a plan reaches through safe nodes: a sort without a fetch, a
+/// filter whose predicate the raw path supports, or a positional identity projection.
+///
+/// The scan is a discovery result only: callers must preserve every node of the discovered tree
+/// instead of treating the wrappers around the scan as removable.
+pub(crate) fn table_scan_through_safe_nodes(
     plan: &LogicalPlan,
 ) -> Option<&datafusion_expr::logical_plan::TableScan> {
     match plan {
