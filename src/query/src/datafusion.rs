@@ -703,7 +703,22 @@ impl DatafusionQueryEngine {
             .create_physical_plan(&optimized_plan, state)
             .await?;
         let physical_plan = if self.state.experimental_native_promql() {
-            native_promql::try_select(&optimized_plan, physical_plan)?
+            if let DfLogicalPlan::Analyze(analyze) = &optimized_plan
+                && let Some(exec) = physical_plan.downcast_ref::<AnalyzeExec>()
+            {
+                let selected =
+                    native_promql::try_select(&analyze.input, Arc::clone(exec.input())).await?;
+                if Arc::ptr_eq(&selected, exec.input()) {
+                    physical_plan
+                } else {
+                    physical_plan.replace_children(
+                        vec![selected],
+                        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                    )?
+                }
+            } else {
+                native_promql::try_select(&optimized_plan, physical_plan).await?
+            }
         } else {
             physical_plan
         };

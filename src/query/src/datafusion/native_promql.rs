@@ -27,18 +27,38 @@ use table::table::scan::RegionScanExec;
 use crate::datafusion::raw_expr_supported;
 use crate::dummy_catalog::DummyTableProvider;
 
-/// Selects native execution only for the bounded, unmodified instant-over-divide shape.
-pub(crate) fn try_select(
+mod remote;
+
+/// Selects native execution for the bounded, unmodified instant-over-divide shape.
+///
+/// The local single-region shape is selected first and keeps its own behavior; every other plan
+/// is offered to the remote shape, which returns the original plan unless the complete frozen
+/// route admits it.
+pub(crate) async fn try_select(
     logical: &LogicalPlan,
     original: Arc<dyn ExecutionPlan>,
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    if let Some(local) = try_select_local(logical, &original)? {
+        return Ok(local);
+    }
+    match remote::try_select_remote(logical, Arc::clone(&original)).await? {
+        Some(native) => Ok(native),
+        None => Ok(original),
+    }
+}
+
+/// Selects native execution only for the bounded, unmodified local instant-over-divide shape.
+fn try_select_local(
+    logical: &LogicalPlan,
+    original: &Arc<dyn ExecutionPlan>,
+) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some((instant, divide, scan_node)) = logical_shape(logical) else {
-        return Ok(original);
+        return Ok(None);
     };
     let Some((instant_exec_schema, scan_exec, root_cooperative, scan_cooperative)) =
-        physical_shape(&original)
+        physical_shape(original)
     else {
-        return Ok(original);
+        return Ok(None);
     };
     if scan_node.fetch.is_some()
         || !scan_node.statistics_requests.is_empty()
@@ -47,13 +67,13 @@ pub(crate) fn try_select(
             .iter()
             .any(|filter| !raw_expr_supported(filter))
     {
-        return Ok(original);
+        return Ok(None);
     }
     let Some(source) = scan_node.source.downcast_ref::<DefaultTableSource>() else {
-        return Ok(original);
+        return Ok(None);
     };
     let Some(provider) = source.table_provider.downcast_ref::<DummyTableProvider>() else {
-        return Ok(original);
+        return Ok(None);
     };
 
     let metadata = provider.region_metadata();
@@ -78,14 +98,14 @@ pub(crate) fn try_select(
                 logical.name() != physical.name() || logical.data_type() != physical.data_type()
             })
     {
-        return Ok(original);
+        return Ok(None);
     }
     let mut fields = Vec::new();
     let mut tags_found = std::collections::HashSet::new();
     let mut time_found = false;
     for field in logical_output.fields() {
         let Some(column) = metadata.column_by_name(field.name()) else {
-            return Ok(original);
+            return Ok(None);
         };
         match column.semantic_type {
             SemanticType::Tag if logical_tags.iter().any(|tag| tag == field.name()) => {
@@ -102,7 +122,7 @@ pub(crate) fn try_select(
             {
                 fields.push(field.name().clone());
             }
-            _ => return Ok(original),
+            _ => return Ok(None),
         }
     }
     // First slice preserves the ordinary selector's single-field staleness semantics.
@@ -112,7 +132,7 @@ pub(crate) fn try_select(
         || fields.len() != 1
         || (!divide.tags().is_empty() && divide.tags() != logical_tags)
     {
-        return Ok(original);
+        return Ok(None);
     }
 
     let Some(native_scan) =
@@ -120,7 +140,7 @@ pub(crate) fn try_select(
             .clone()
             .try_to_named_series_scan(&table_name, &logical_tags, &fields)?
     else {
-        return Ok(original);
+        return Ok(None);
     };
     let label_source = native_scan.label_source().clone();
     let series_schema = Arc::clone(native_scan.series_schema());
@@ -138,17 +158,19 @@ pub(crate) fn try_select(
         &logical_tags,
     )?;
     let Some(native) = native else {
-        return Ok(original);
+        return Ok(None);
     };
     if root_cooperative {
-        original.replace_children(
-            vec![native],
-            datafusion::physical_plan::ReplaceChildrenOptions::new(
-                datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
-            ),
-        )
+        Arc::clone(original)
+            .replace_children(
+                vec![native],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .map(Some)
     } else {
-        Ok(native)
+        Ok(Some(native))
     }
 }
 
