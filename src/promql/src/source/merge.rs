@@ -201,6 +201,23 @@ impl Input {
         self.ended_series = chunk.is_last;
         Ok(())
     }
+
+    /// Returns whether this input can no longer contribute chunks for `key`.
+    ///
+    /// A held head beyond `key` proves completion. Without a head, only an ended input or `key`'s
+    /// own final chunk proves completion: an earlier completed key never rules out unknown later
+    /// or intervening keys.
+    fn finished_at(&self, key: &[u8]) -> bool {
+        match self.head.as_ref() {
+            Some(head) => head.primary_key.as_slice() > key,
+            None => {
+                self.stream.is_none()
+                    || self.previous_key.as_deref().is_some_and(|previous| {
+                        previous > key || (previous == key && self.ended_series)
+                    })
+            }
+        }
+    }
 }
 
 struct OrderedRawMerge {
@@ -217,8 +234,8 @@ impl OrderedRawMerge {
         Poll::Ready(Some(Err(error)))
     }
 
-    fn poll_inputs(&mut self, cx: &mut Context<'_>) -> Result<bool, BoxedError> {
-        let mut pending = false;
+    /// Polls every input that has no head once, returning upstream errors before progress.
+    fn poll_inputs(&mut self, cx: &mut Context<'_>) -> Result<(), BoxedError> {
         for input in &mut self.streams {
             if input.stream.is_none() || input.head.is_some() {
                 continue;
@@ -228,7 +245,7 @@ impl OrderedRawMerge {
                 .as_mut()
                 .map(|stream| stream.as_mut().poll_next(cx))
             {
-                Some(Poll::Pending) => pending = true,
+                Some(Poll::Pending) => {}
                 Some(Poll::Ready(Some(Err(error)))) => return Err(error),
                 Some(Poll::Ready(Some(Ok(chunk)))) => {
                     input.validate(&chunk, &self.schema)?;
@@ -245,12 +262,12 @@ impl OrderedRawMerge {
                 None => {}
             }
         }
-        Ok(pending)
+        Ok(())
     }
 
-    fn take_next(&mut self) -> Result<Option<RawSeriesChunk>, BoxedError> {
-        let Some(index) = self
-            .streams
+    /// Returns the index of the smallest available head, by read key then first timestamp.
+    fn smallest_head_index(&self) -> Option<usize> {
+        self.streams
             .iter()
             .enumerate()
             .filter_map(|(index, input)| input.head.as_ref().map(|head| (index, head)))
@@ -261,7 +278,20 @@ impl OrderedRawMerge {
                     .then_with(|| a.time.timestamp(0).cmp(&b.time.timestamp(0)))
             })
             .map(|(index, _)| index)
-        else {
+    }
+
+    /// Returns whether every input accounts for `key`: it holds a head, or completion is proven.
+    ///
+    /// A headless input that cannot prove completion may still add chunks to `key`, so the merge
+    /// must wait instead of deciding `key`.
+    fn all_inputs_ready_at(&self, key: &[u8]) -> bool {
+        self.streams
+            .iter()
+            .all(|input| input.head.is_some() || input.finished_at(key))
+    }
+
+    fn take_next(&mut self) -> Result<Option<RawSeriesChunk>, BoxedError> {
+        let Some(index) = self.smallest_head_index() else {
             return Ok(None);
         };
         let chunk = self.streams[index]
@@ -358,31 +388,48 @@ impl Stream for OrderedRawMerge {
             return Poll::Ready(None);
         }
         if this.candidate.is_none() {
-            match this.poll_inputs(cx) {
-                Err(error) => return this.fail(error),
-                Ok(true) => return Poll::Pending,
-                Ok(false) => {}
+            if let Err(error) = this.poll_inputs(cx) {
+                return this.fail(error);
+            }
+            let Some(head) = this
+                .smallest_head_index()
+                .and_then(|index| this.streams[index].head.as_ref())
+            else {
+                // Only a fully drained input set is EOF: a live input may still reveal future keys
+                // or a late error, so its state stays owned instead of being cleared.
+                if this.streams.iter().all(|input| input.stream.is_none()) {
+                    this.streams.clear();
+                    return Poll::Ready(None);
+                }
+                return Poll::Pending;
+            };
+            // A headless input that cannot prove completion at the smallest available key may
+            // still add chunks to it, so the merge waits before consuming that head.
+            if !this.all_inputs_ready_at(head.primary_key.as_slice()) {
+                return Poll::Pending;
             }
             match this.take_next() {
                 Ok(candidate) => this.candidate = candidate,
                 Err(error) => return this.fail(error),
             }
         }
-        match this.poll_inputs(cx) {
-            Err(error) => return this.fail(error),
-            Ok(true) => return Poll::Pending,
-            Ok(false) => {}
+        if let Err(error) = this.poll_inputs(cx) {
+            return this.fail(error);
         }
         let Some(candidate) = this.candidate.take() else {
             this.streams.clear();
             return Poll::Ready(None);
         };
-        let is_last = this.streams.iter().all(|input| {
-            input.stream.is_none() && input.head.is_none()
-                || input.head.as_ref().is_some_and(|head| {
-                    head.primary_key.as_slice() > candidate.primary_key.as_slice()
-                })
-        });
+        if !this.all_inputs_ready_at(candidate.primary_key.as_slice()) {
+            // The candidate's key may still be extended or interleaved by a headless input: an
+            // already-decided prefix is held back instead of being emitted as if it were final.
+            this.candidate = Some(candidate);
+            return Poll::Pending;
+        }
+        let is_last = this
+            .streams
+            .iter()
+            .all(|input| input.finished_at(candidate.primary_key.as_slice()));
         Poll::Ready(Some(Ok(RawSeriesChunk {
             is_last,
             ..candidate

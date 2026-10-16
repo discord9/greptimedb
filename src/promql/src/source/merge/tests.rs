@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use api::v1::SemanticType;
-use common_error::ext::{BoxedError, PlainError};
+use common_error::ext::{BoxedError, ErrorExt, PlainError};
 use common_error::status_code::StatusCode;
 use datatypes::arrow::array::Float64Array;
 use datatypes::arrow::buffer::{Buffer, ScalarBuffer};
@@ -163,6 +163,8 @@ struct TestStream {
     labels: RawLabelSource,
     ordering: SeriesOrdering,
     items: VecDeque<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
+    // Delivered once the gate opens, so a blocked body can resume with later chunks.
+    deferred: VecDeque<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
     polls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     gate: Option<Arc<Mutex<Option<Waker>>>>,
@@ -181,7 +183,10 @@ impl Stream for TestStream {
             *gate.lock().unwrap() = Some(_cx.waker().clone());
             return Poll::Pending;
         }
-        self.items.pop_front().unwrap_or(Poll::Ready(None))
+        self.items
+            .pop_front()
+            .or_else(|| self.deferred.pop_front())
+            .unwrap_or(Poll::Ready(None))
     }
 }
 
@@ -225,6 +230,7 @@ fn stream_with(
             labels,
             ordering,
             items: items.into_iter().collect(),
+            deferred: VecDeque::new(),
             polls: polls.clone(),
             drops: drops.clone(),
             gate: None,
@@ -249,6 +255,34 @@ fn gated_stream(
             labels,
             ordering: SeriesOrdering::KeyThenTime,
             items: [ready(first)].into(),
+            deferred: VecDeque::new(),
+            polls: polls.clone(),
+            drops: drops.clone(),
+            gate: Some(gate),
+            release: Some(release),
+        }),
+        polls,
+        drops,
+    )
+}
+
+// Yields `first` immediately, then blocks while `release` is zero, then yields `resumed` and EOF.
+fn gated_resuming_stream(
+    labels: RawLabelSource,
+    first: RawSeriesChunk,
+    resumed: impl IntoIterator<Item = Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
+    gate: Arc<Mutex<Option<Waker>>>,
+    release: Arc<AtomicUsize>,
+) -> (SendableRawSeriesStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    (
+        Box::pin(TestStream {
+            schema: schema(),
+            labels,
+            ordering: SeriesOrdering::KeyThenTime,
+            items: [ready(first)].into(),
+            deferred: resumed.into_iter().collect(),
             polls: polls.clone(),
             drops: drops.clone(),
             gate: Some(gate),
@@ -294,6 +328,7 @@ fn gated_pending_stream(
             labels,
             ordering: SeriesOrdering::KeyThenTime,
             items: VecDeque::new(),
+            deferred: VecDeque::new(),
             polls: polls.clone(),
             drops: drops.clone(),
             gate: Some(gate),
@@ -306,6 +341,13 @@ fn gated_pending_stream(
 
 fn ready(chunk: RawSeriesChunk) -> Poll<Option<Result<RawSeriesChunk, BoxedError>>> {
     Poll::Ready(Some(Ok(chunk)))
+}
+
+fn float_sample(chunk: &RawSeriesChunk, index: usize) -> f64 {
+    match chunk.fields.get(0).unwrap().sample(index) {
+        SampleRef::Float(value) => value,
+        _ => panic!("expected float sample"),
+    }
 }
 
 #[tokio::test]
@@ -566,6 +608,395 @@ async fn later_error_drops_held_candidate_and_heads_before_returning_error() {
     assert_eq!(first_drops.load(Ordering::SeqCst), 1);
     assert_eq!(second_drops.load(Ordering::SeqCst), 1);
     assert!(merged.next().await.is_none());
+}
+
+// A chunk marked `is_last` proves its input cannot extend that read key, so a body that never
+// becomes ready again must postpone neither the already-decided prefix nor the late error waiting
+// behind another input's greater head. Global finality is still recomputed over all inputs.
+#[test]
+fn completed_key_pending_body_does_not_starve_ready_prefix_or_late_error() {
+    for failing_input_first in [false, true] {
+        let key = read_key("rack-a", "sensor-1");
+        let marker = "late alpha body behind the completed key never unblocked";
+        let key_drops = Arc::new(AtomicUsize::new(0));
+        let (owned_lower_key, weak_lower_key) =
+            owned_key(key.as_slice().to_vec(), key_drops.clone());
+        let gate = Arc::new(Mutex::new(None::<Waker>));
+        let release = Arc::new(AtomicUsize::new(0));
+        // The lower chunk completes the read key; its body stays unreleased, so every later poll of
+        // that input is a genuine, permanent `Pending`.
+        let (completed, _, completed_drops) = gated_stream(
+            label_source(1),
+            chunk(owned_lower_key, &[10], &[1.0], true),
+            gate,
+            release,
+        );
+        let (failing, _, failing_drops) = stream(
+            label_source(2),
+            SeriesOrdering::KeyThenTime,
+            [
+                ready(chunk(key.clone(), &[30], &[3.0], true)),
+                Poll::Ready(Some(Err(BoxedError::new(PlainError::new(
+                    marker.to_string(),
+                    StatusCode::Internal,
+                ))))),
+            ],
+        );
+        let inputs = if failing_input_first {
+            vec![failing, completed]
+        } else {
+            vec![completed, failing]
+        };
+        let mut merged = merge_ordered_raw_series(inputs).unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // The decided lower chunk must not wait for the pending body; the greater same-key head
+        // still holds the key open, so the prefix is not final.
+        let prefix = match Pin::new(&mut merged).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(prefix))) => prefix,
+            other => panic!(
+                "completed lower chunk must be ready before the pending body settles (failing \
+                 input first: {failing_input_first}): {other:?}"
+            ),
+        };
+        assert_eq!(prefix.primary_key, key);
+        assert_eq!(prefix.time.as_buffer().as_ref(), &[10]);
+        assert!(
+            !prefix.is_last,
+            "the greater same-key head keeps the prefix non-final"
+        );
+        match prefix.fields.get(0).unwrap().sample(0) {
+            SampleRef::Float(value) => assert_eq!(value, 1.0),
+            _ => panic!("expected float sample"),
+        }
+        assert_eq!(
+            key_drops.load(Ordering::SeqCst),
+            0,
+            "the emitted prefix retains its key allocation"
+        );
+        drop(prefix);
+        assert!(
+            weak_lower_key.upgrade().is_none(),
+            "dropping the prefix releases its key allocation"
+        );
+        assert_eq!(key_drops.load(Ordering::SeqCst), 1);
+
+        // The late error waits behind the held greater-time head, and that head's own input is
+        // polled again as soon as the head is consumed, so the error must surface on this very
+        // demand: neither the pending body nor the already-decided successor chunk may delay it.
+        let error = match Pin::new(&mut merged).poll_next(&mut cx) {
+            Poll::Ready(Some(Err(error))) => error,
+            other => panic!(
+                "the late error must be returned before the greater-time successor is emitted \
+                 (failing input first: {failing_input_first}): {other:?}"
+            ),
+        };
+        assert_eq!(error.status_code(), StatusCode::Internal);
+        assert!(error.to_string().contains(marker), "{error}");
+        assert_eq!(
+            completed_drops.load(Ordering::SeqCst),
+            1,
+            "both inputs drop before the error is observed"
+        );
+        assert_eq!(failing_drops.load(Ordering::SeqCst), 1);
+        assert!(weak_lower_key.upgrade().is_none());
+        assert_eq!(key_drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            Pin::new(&mut merged).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+}
+
+// A `is_last` chunk completes its read key even while the input stays live, so the final chunk is
+// emitted without waiting for the body; the live input must not be dropped or treated as EOF.
+#[test]
+fn live_input_completed_at_its_last_chunk_emits_final_chunk_without_dropping_input() {
+    let key = read_key("rack-a", "sensor-1");
+    let gate = Arc::new(Mutex::new(None::<Waker>));
+    let release = Arc::new(AtomicUsize::new(0));
+    let (input, _, drops) = gated_stream(
+        label_source(1),
+        chunk(key.clone(), &[10], &[1.0], true),
+        gate,
+        release.clone(),
+    );
+    let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let output = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(output))) => output,
+        other => panic!("a completed series must not wait for its live body: {other:?}"),
+    };
+    assert_eq!(output.primary_key, key);
+    assert_eq!(output.time.as_buffer().as_ref(), &[10]);
+    assert_eq!(float_sample(&output, 0), 1.0);
+    assert!(
+        output.is_last,
+        "the last chunk of a completed series is final"
+    );
+    drop(output);
+
+    // The input is live, so nothing may be dropped or reported as EOF yet.
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "a live input stays owned after its final chunk"
+    );
+    release.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Ready(None)
+    ));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+// A live input that completed one read key says nothing about other keys, so a greater head waits
+// until that input resolves, and is still emitted afterwards.
+#[test]
+fn live_completed_input_withholds_other_key_head_until_it_resolves() {
+    let completed_key = read_key("rack-a", "sensor-1");
+    let later_key = read_key("rack-b", "sensor-1");
+    let gate = Arc::new(Mutex::new(None::<Waker>));
+    let release = Arc::new(AtomicUsize::new(0));
+    let (completed, _, completed_drops) = gated_stream(
+        label_source(1),
+        chunk(completed_key.clone(), &[10], &[1.0], true),
+        gate,
+        release.clone(),
+    );
+    let (later, _, later_drops) = stream(
+        label_source(2),
+        SeriesOrdering::KeyThenTime,
+        [ready(chunk(later_key.clone(), &[50], &[5.0], true))],
+    );
+    let mut merged = merge_ordered_raw_series(vec![completed, later]).unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let first = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(first))) => first,
+        other => panic!("the completed key must be emitted despite the live body: {other:?}"),
+    };
+    assert_eq!(first.primary_key, completed_key);
+    assert_eq!(float_sample(&first, 0), 1.0);
+    assert!(
+        first.is_last,
+        "the greater head proves the completed key is globally final"
+    );
+    drop(first);
+
+    // The live input may still reveal keys before `rack-b`, so that head is not provable yet.
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(completed_drops.load(Ordering::SeqCst), 0);
+    release.store(1, Ordering::SeqCst);
+    let second = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(second))) => second,
+        other => panic!("the held head must be emitted once the live input resolves: {other:?}"),
+    };
+    assert_eq!(second.primary_key, later_key);
+    assert_eq!(second.time.as_buffer().as_ref(), &[50]);
+    assert_eq!(float_sample(&second, 0), 5.0);
+    assert!(second.is_last);
+    drop(second);
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Ready(None)
+    ));
+    assert_eq!(completed_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(later_drops.load(Ordering::SeqCst), 1);
+}
+
+// An input that has not finished a read key may still add chunks to it, so even its already-decided
+// slice waits; its own final chunk then unsticks the exact ordered sequence.
+#[test]
+fn unfinished_same_key_pending_input_blocks_its_slice_until_its_final_chunk() {
+    let key = read_key("rack-a", "sensor-1");
+    let gate = Arc::new(Mutex::new(None::<Waker>));
+    let release = Arc::new(AtomicUsize::new(0));
+    let (unfinished, _, unfinished_drops) = gated_resuming_stream(
+        label_source(1),
+        chunk(key.clone(), &[10], &[1.0], false),
+        [ready(chunk(key.clone(), &[20], &[2.0], true))],
+        gate,
+        release.clone(),
+    );
+    let (later, _, later_drops) = stream(
+        label_source(2),
+        SeriesOrdering::KeyThenTime,
+        [ready(chunk(key.clone(), &[30], &[3.0], true))],
+    );
+    let mut merged = merge_ordered_raw_series(vec![unfinished, later]).unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        matches!(Pin::new(&mut merged).poll_next(&mut cx), Poll::Pending),
+        "an unfinished same-key input holds its whole key back"
+    );
+    assert_eq!(unfinished_drops.load(Ordering::SeqCst), 0);
+    release.store(1, Ordering::SeqCst);
+
+    let mut observed = Vec::new();
+    loop {
+        match Pin::new(&mut merged).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(next))) => observed.push((
+                next.primary_key.clone(),
+                next.time.as_buffer().to_vec(),
+                float_sample(&next, 0).to_bits(),
+                next.is_last,
+            )),
+            Poll::Ready(None) => break,
+            other => panic!("expected the ordered slices or EOF, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![
+            (key.clone(), vec![10], 1.0_f64.to_bits(), false),
+            (key.clone(), vec![20], 2.0_f64.to_bits(), false),
+            (key, vec![30], 3.0_f64.to_bits(), true),
+        ]
+    );
+    assert_eq!(unfinished_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(later_drops.load(Ordering::SeqCst), 1);
+}
+
+// After completing a series, a still-live input keeps being polled: once its blocked body resumes,
+// its later keys are emitted in order with complete values and global finality, and no input is
+// dropped or treated as EOF while the merge is merely blocked.
+#[test]
+fn completed_input_resumes_with_later_keys_after_being_blocked() {
+    let completed_key = read_key("rack-a", "sensor-1");
+    let later_key = read_key("rack-c", "sensor-1");
+    let gate_a = Arc::new(Mutex::new(None::<Waker>));
+    let gate_b = Arc::new(Mutex::new(None::<Waker>));
+    let release_a = Arc::new(AtomicUsize::new(0));
+    let release_b = Arc::new(AtomicUsize::new(0));
+    let (resuming, _, resuming_drops) = gated_resuming_stream(
+        label_source(1),
+        chunk(completed_key.clone(), &[10], &[1.0], true),
+        [ready(chunk(later_key.clone(), &[40], &[4.0], true))],
+        gate_a,
+        release_a.clone(),
+    );
+    let (completed, _, completed_drops) = gated_stream(
+        label_source(2),
+        chunk(completed_key.clone(), &[30], &[3.0], true),
+        gate_b,
+        release_b.clone(),
+    );
+    let mut merged = merge_ordered_raw_series(vec![resuming, completed]).unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let first = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(first))) => first,
+        other => panic!("the completed prefix must be emitted despite live bodies: {other:?}"),
+    };
+    assert_eq!(first.primary_key, completed_key);
+    assert_eq!(first.time.as_buffer().as_ref(), &[10]);
+    assert_eq!(float_sample(&first, 0), 1.0);
+    assert!(!first.is_last);
+    drop(first);
+
+    let second = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(second))) => second,
+        other => panic!("the remaining completed chunk must be emitted before waiting: {other:?}"),
+    };
+    assert_eq!(second.primary_key, completed_key);
+    assert_eq!(second.time.as_buffer().as_ref(), &[30]);
+    assert_eq!(float_sample(&second, 0), 3.0);
+    assert!(second.is_last);
+    drop(second);
+
+    // Both bodies are blocked: the merge waits and keeps both inputs (and their data) owned.
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(resuming_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(completed_drops.load(Ordering::SeqCst), 0);
+    release_a.store(1, Ordering::SeqCst);
+    release_b.store(1, Ordering::SeqCst);
+    let third = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(third))) => third,
+        other => panic!("the resumed key must be emitted after the bodies unblock: {other:?}"),
+    };
+    assert_eq!(third.primary_key, later_key);
+    assert_eq!(third.time.as_buffer().as_ref(), &[40]);
+    assert_eq!(float_sample(&third, 0), 4.0);
+    assert!(third.is_last);
+    drop(third);
+    assert!(matches!(
+        Pin::new(&mut merged).poll_next(&mut cx),
+        Poll::Ready(None)
+    ));
+    assert_eq!(resuming_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(completed_drops.load(Ordering::SeqCst), 1);
+}
+
+// A chunk split against a later same-key head leaves a remainder that is locally final, but its key
+// stays open until that remainder itself is emitted.
+#[test]
+fn split_remainder_head_keeps_its_key_open_despite_local_final_chunk() {
+    let key = read_key("rack-a", "sensor-1");
+    let (left, _, left_drops) = stream(
+        label_source(1),
+        SeriesOrdering::KeyThenTime,
+        [ready(chunk(key.clone(), &[10, 40], &[1.0, 4.0], true))],
+    );
+    let (right, _, right_drops) = stream(
+        label_source(2),
+        SeriesOrdering::KeyThenTime,
+        [ready(chunk(key.clone(), &[30], &[3.0], true))],
+    );
+    let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let first = match Pin::new(&mut merged).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(first))) => first,
+        other => panic!("expected the split prefix, got {other:?}"),
+    };
+    assert_eq!(first.time.as_buffer().as_ref(), &[10]);
+    assert_eq!(float_sample(&first, 0), 1.0);
+    assert!(
+        !first.is_last,
+        "the locally final remainder head still holds the key open"
+    );
+    drop(first);
+
+    let mut observed = Vec::new();
+    loop {
+        match Pin::new(&mut merged).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(next))) => observed.push((
+                next.time.as_buffer().to_vec(),
+                float_sample(&next, 0).to_bits(),
+                next.is_last,
+            )),
+            Poll::Ready(None) => break,
+            other => panic!("expected the remaining slices or EOF, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![
+            (vec![30], 3.0_f64.to_bits(), false),
+            (vec![40], 4.0_f64.to_bits(), true),
+        ]
+    );
+    assert_eq!(left_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(right_drops.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
