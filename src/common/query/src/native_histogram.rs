@@ -14,6 +14,8 @@
 
 //! Shared native histogram field contract.
 //!
+//! The canonical names and types are owned by
+//! `datatypes::series::histogram::public` and re-exported here.
 //! Prom remote-write v2 stores these names as children of one Struct field, while
 //! metric-engine uses the same contract to recognize native histogram tables.
 //! [`NativeHistogram`] is the query-time representation and therefore normalizes
@@ -31,104 +33,26 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType as ArrowDataType, Field, Float64Type, Int32Type, Int64Type,
-    TimestampMillisecondType,
+    ArrowPrimitiveType, Field, Float64Type, Int32Type, Int64Type, TimestampMillisecondType,
 };
 use datafusion_common::{DataFusionError, Result as DfResult};
-use datatypes::data_type::{ConcreteDataType, DataType};
+use datatypes::data_type::ConcreteDataType;
 pub use datatypes::series::histogram::CounterResetHint;
+pub use datatypes::series::histogram::public::{
+    COUNT_F64_FIELD, COUNT_I64_FIELD, CUSTOM_VALUES_FIELD, NATIVE_HISTOGRAM_FIELD,
+    NATIVE_HISTOGRAM_FIELD_NAMES, NEGATIVE_BUCKETS_F64_FIELD, NEGATIVE_BUCKETS_I64_FIELD,
+    NEGATIVE_SPAN_LENGTHS_FIELD, NEGATIVE_SPAN_OFFSETS_FIELD, POSITIVE_BUCKETS_F64_FIELD,
+    POSITIVE_BUCKETS_I64_FIELD, POSITIVE_SPAN_LENGTHS_FIELD, POSITIVE_SPAN_OFFSETS_FIELD,
+    RESET_HINT_FIELD, SCHEMA_FIELD, START_TIMESTAMP_FIELD, SUM_FIELD, ZERO_COUNT_F64_FIELD,
+    ZERO_COUNT_I64_FIELD, ZERO_THRESHOLD_FIELD, native_histogram_arrow_type,
+    native_histogram_field_type, native_histogram_value_type,
+};
 use datatypes::series::histogram::{BucketSideView, HistogramBatchBuilder, HistogramView};
 use datatypes::series::samples::Samples;
-use datatypes::types::{StructField, StructType};
 pub use encoding::{NativeHistogramError, encode_native_histogram, native_histogram_column_schema};
-use once_cell::sync::Lazy;
 
 use crate::prelude::greptime_native_histogram;
 use crate::prometheus::format_prometheus_float;
-
-pub const NATIVE_HISTOGRAM_FIELD: &str = "greptime_native_histogram";
-pub const SCHEMA_FIELD: &str = "schema";
-pub const ZERO_THRESHOLD_FIELD: &str = "zero_threshold";
-pub const SUM_FIELD: &str = "sum";
-pub const RESET_HINT_FIELD: &str = "reset_hint";
-pub const START_TIMESTAMP_FIELD: &str = "start_timestamp";
-pub const CUSTOM_VALUES_FIELD: &str = "custom_values";
-pub const POSITIVE_SPAN_OFFSETS_FIELD: &str = "positive_span_offsets";
-pub const POSITIVE_SPAN_LENGTHS_FIELD: &str = "positive_span_lengths";
-pub const NEGATIVE_SPAN_OFFSETS_FIELD: &str = "negative_span_offsets";
-pub const NEGATIVE_SPAN_LENGTHS_FIELD: &str = "negative_span_lengths";
-pub const COUNT_I64_FIELD: &str = "count_i64";
-pub const ZERO_COUNT_I64_FIELD: &str = "zero_count_i64";
-pub const POSITIVE_BUCKETS_I64_FIELD: &str = "positive_buckets_i64";
-pub const NEGATIVE_BUCKETS_I64_FIELD: &str = "negative_buckets_i64";
-pub const COUNT_F64_FIELD: &str = "count_f64";
-pub const ZERO_COUNT_F64_FIELD: &str = "zero_count_f64";
-pub const POSITIVE_BUCKETS_F64_FIELD: &str = "positive_buckets_f64";
-pub const NEGATIVE_BUCKETS_F64_FIELD: &str = "negative_buckets_f64";
-
-// Keep int and float payloads in separate columns. The populated family is the
-// type signal, so we don't need to persist an extra histogram-type tag.
-pub const NATIVE_HISTOGRAM_FIELD_NAMES: &[&str] = &[
-    SCHEMA_FIELD,
-    ZERO_THRESHOLD_FIELD,
-    SUM_FIELD,
-    RESET_HINT_FIELD,
-    START_TIMESTAMP_FIELD,
-    CUSTOM_VALUES_FIELD,
-    POSITIVE_SPAN_OFFSETS_FIELD,
-    POSITIVE_SPAN_LENGTHS_FIELD,
-    NEGATIVE_SPAN_OFFSETS_FIELD,
-    NEGATIVE_SPAN_LENGTHS_FIELD,
-    COUNT_I64_FIELD,
-    ZERO_COUNT_I64_FIELD,
-    POSITIVE_BUCKETS_I64_FIELD,
-    NEGATIVE_BUCKETS_I64_FIELD,
-    COUNT_F64_FIELD,
-    ZERO_COUNT_F64_FIELD,
-    POSITIVE_BUCKETS_F64_FIELD,
-    NEGATIVE_BUCKETS_F64_FIELD,
-];
-
-static NATIVE_HISTOGRAM_VALUE_TYPE: Lazy<ConcreteDataType> = Lazy::new(|| {
-    let fields = NATIVE_HISTOGRAM_FIELD_NAMES
-        .iter()
-        .filter_map(|name| {
-            let data_type = native_histogram_field_type(name)?;
-            Some(StructField::new((*name).to_string(), data_type, true))
-        })
-        .collect();
-    ConcreteDataType::struct_datatype(StructType::new(Arc::new(fields)))
-});
-
-/// Returns the exact Greptime type for a persisted native histogram field.
-pub fn native_histogram_field_type(name: &str) -> Option<ConcreteDataType> {
-    match name {
-        SCHEMA_FIELD | RESET_HINT_FIELD => Some(ConcreteDataType::int32_datatype()),
-        ZERO_THRESHOLD_FIELD | SUM_FIELD | COUNT_F64_FIELD | ZERO_COUNT_F64_FIELD => {
-            Some(ConcreteDataType::float64_datatype())
-        }
-        START_TIMESTAMP_FIELD => Some(ConcreteDataType::timestamp_millisecond_datatype()),
-        CUSTOM_VALUES_FIELD | POSITIVE_BUCKETS_F64_FIELD | NEGATIVE_BUCKETS_F64_FIELD => Some(
-            ConcreteDataType::list_datatype(Arc::new(ConcreteDataType::float64_datatype())),
-        ),
-        POSITIVE_SPAN_OFFSETS_FIELD | NEGATIVE_SPAN_OFFSETS_FIELD => Some(
-            ConcreteDataType::list_datatype(Arc::new(ConcreteDataType::int32_datatype())),
-        ),
-        POSITIVE_SPAN_LENGTHS_FIELD | NEGATIVE_SPAN_LENGTHS_FIELD => Some(
-            ConcreteDataType::list_datatype(Arc::new(ConcreteDataType::int32_datatype())),
-        ),
-        COUNT_I64_FIELD | ZERO_COUNT_I64_FIELD => Some(ConcreteDataType::int64_datatype()),
-        POSITIVE_BUCKETS_I64_FIELD | NEGATIVE_BUCKETS_I64_FIELD => Some(
-            ConcreteDataType::list_datatype(Arc::new(ConcreteDataType::int64_datatype())),
-        ),
-        _ => None,
-    }
-}
-
-/// Returns the exact Greptime type for a complete native histogram value.
-pub fn native_histogram_value_type() -> &'static ConcreteDataType {
-    &NATIVE_HISTOGRAM_VALUE_TYPE
-}
 
 /// Returns whether `data_type` matches the native histogram value contract.
 pub fn is_native_histogram_value_type(data_type: &ConcreteDataType) -> bool {
@@ -1388,11 +1312,6 @@ fn get_bound(idx: i32, schema: i32, custom_values: &[f64]) -> Option<f64> {
     }
     let exponent = idx as f64 / (1u32 << schema) as f64;
     Some(2.0_f64.powf(exponent))
-}
-
-/// Returns the Arrow type for a complete native histogram value.
-pub fn native_histogram_arrow_type() -> ArrowDataType {
-    native_histogram_value_type().as_arrow_type()
 }
 
 fn struct_child<'a>(array: &'a StructArray, name: &str) -> DfResult<&'a ArrayRef> {
@@ -3120,6 +3039,32 @@ mod tests {
         right.custom_values = vec![1.0];
 
         assert!(left.sub(&right).is_none());
+    }
+
+    #[test]
+    fn reexported_native_histogram_schema_matches_datatypes_owner() {
+        use datatypes::series::histogram::public as owner;
+
+        assert_eq!(NATIVE_HISTOGRAM_FIELD, owner::NATIVE_HISTOGRAM_FIELD);
+        assert_eq!(
+            NATIVE_HISTOGRAM_FIELD_NAMES,
+            owner::NATIVE_HISTOGRAM_FIELD_NAMES
+        );
+        // Both paths must expose the same lazily built value, not a copy of it.
+        assert!(std::ptr::eq(
+            native_histogram_value_type(),
+            owner::native_histogram_value_type()
+        ));
+        assert_eq!(
+            native_histogram_arrow_type(),
+            owner::native_histogram_arrow_type()
+        );
+        for &name in NATIVE_HISTOGRAM_FIELD_NAMES {
+            assert_eq!(
+                native_histogram_field_type(name),
+                owner::native_histogram_field_type(name)
+            );
+        }
     }
 }
 
