@@ -470,10 +470,120 @@ fn named_series_scan_declines_invalid_names_before_raw_preflight() {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            scan.clone()
+                .try_to_named_series_binding("cpu", &tags, &fields)
+                .unwrap()
+                .is_none()
+        );
     }
     let state = state.lock().unwrap();
     assert_eq!(state.preflights, 0);
     assert_eq!(state.raw_calls, 0);
+    assert_eq!(state.legacy_calls, 0);
+}
+
+#[test]
+fn named_series_binding_reports_the_binding_of_the_actual_metadata() {
+    let (scan, state, metadata) = named_fixture();
+    state.lock().unwrap().planned_ordering = Some(SeriesOrdering::Contiguous);
+    let scan = Arc::new(scan.with_new_partitions(vec![vec![]], 1).unwrap());
+    let (binding, native) = scan
+        .try_to_named_series_binding(
+            "cpu",
+            &["host".to_string()],
+            &["aux".to_string(), "value".to_string()],
+        )
+        .unwrap()
+        .expect("complete logical names must resolve against the actual metadata");
+    assert_eq!(binding.version, 1);
+    assert_eq!(binding.metric_name, "cpu");
+    assert_eq!(binding.physical_metadata.region_id, metadata.region_id);
+    assert_eq!(
+        binding.physical_metadata.schema_version,
+        metadata.schema_version
+    );
+    assert_eq!(
+        binding
+            .physical_metadata
+            .column_metadatas
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>(),
+        metadata
+            .column_metadatas
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(binding.logical_tags.len(), 1);
+    assert_eq!(binding.logical_tags[0].name, "host");
+    assert_eq!(binding.logical_tags[0].column_id, 7);
+    assert_eq!(binding.field_ids, [11, 12]);
+    assert_eq!(native.raw_series_ordering(), SeriesOrdering::Contiguous);
+    assert_eq!(
+        native
+            .series_schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_ref())
+            .collect::<Vec<_>>(),
+        ["aux", "value"]
+    );
+    let RawLabelSource::PrimaryKey {
+        physical_metadata, ..
+    } = native.label_source()
+    else {
+        panic!("expected primary-key label source");
+    };
+    assert!(Arc::ptr_eq(&metadata, physical_metadata));
+    let state = state.lock().unwrap();
+    assert_eq!(state.preflights, 1);
+    assert_eq!(state.raw_calls, 0);
+    assert_eq!(state.legacy_calls, 0);
+}
+
+#[test]
+fn named_series_binding_never_reorders_or_omits_requested_fields() {
+    let (scan, state, _) = named_fixture();
+    let scan = Arc::new(scan.with_new_partitions(vec![vec![]], 1).unwrap());
+    let (binding, native) = scan
+        .clone()
+        .try_to_named_series_binding(
+            "cpu",
+            &["host".to_string()],
+            &["aux".to_string(), "value".to_string()],
+        )
+        .unwrap()
+        .expect("the requested fields are the projected fields");
+    assert_eq!(binding.field_ids, [11, 12]);
+    assert_eq!(
+        native
+            .series_schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_ref())
+            .collect::<Vec<_>>(),
+        ["aux", "value"]
+    );
+    for fields in [
+        vec!["value", "aux"],
+        vec!["aux"],
+        vec!["value"],
+        vec!["aux", "value", "value"],
+    ] {
+        let fields = fields.into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert!(
+            scan.clone()
+                .try_to_named_series_binding("cpu", &["host".to_string()], &fields)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let state = state.lock().unwrap();
+    assert_eq!(state.preflights, 1);
+    assert_eq!(state.raw_calls, 0);
+    assert_eq!(state.legacy_calls, 0);
 }
 
 #[tokio::test]
