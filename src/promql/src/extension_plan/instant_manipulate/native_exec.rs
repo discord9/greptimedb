@@ -46,6 +46,24 @@ use crate::source::materialize_raw_labels;
 mod tests;
 
 impl InstantManipulate {
+    /// Returns whether the bounded native mapping accepts this output schema, series schema, and
+    /// complete logical tag set.
+    ///
+    /// This is the local half of [`Self::try_to_native_execution_plan`]: the same decision that
+    /// method makes before it inspects its input, so a caller can decline a plan without building
+    /// one. `Err` is the same error that method propagates for an invalid interval or lookback.
+    pub fn is_native_mapping_supported(
+        &self,
+        output_schema: SchemaRef,
+        series_schema: Arc<SeriesSchema>,
+        logical_tags: &[String],
+    ) -> DfResult<bool> {
+        Ok(
+            NativeInstantMapping::try_new(self, output_schema, series_schema, logical_tags)?
+                .is_some(),
+        )
+    }
+
     /// Builds the bounded native execution path for a prepared raw-series frame.
     pub fn try_to_native_execution_plan(
         &self,
