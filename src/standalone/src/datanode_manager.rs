@@ -24,7 +24,7 @@ use common_meta::node_manager::{
     Datanode, DatanodeManager, DatanodeRef, FlownodeManager, FlownodeRef, bind_raw_series_query,
 };
 use common_meta::peer::Peer;
-use common_query::request::{QueryRequest, RawSeriesRequest};
+use common_query::request::{PreparedNamedRawSeries, QueryRequest, RawSeriesRequest};
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::tracing;
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
@@ -125,6 +125,28 @@ impl Datanode for RegionInvoker {
             ));
         self.region_server
             .prepare_raw_series_query(request)
+            .trace(span)
+            .await
+            .map_err(BoxedError::new)
+            .context(meta_error::ExternalSnafu)
+    }
+
+    async fn prepare_named_raw_series_query(
+        &self,
+        request: QueryRequest,
+    ) -> MetaResult<Option<PreparedNamedRawSeries>> {
+        let region_id = request.region_id.to_string();
+        let span = request
+            .header
+            .as_ref()
+            .map(|h| TracingContext::from_w3c(&h.tracing_context))
+            .unwrap_or_default()
+            .attach(tracing::info_span!(
+                "RegionInvoker::prepare_named_raw_series_query",
+                region_id = region_id
+            ));
+        self.region_server
+            .prepare_named_raw_series_query(request)
             .trace(span)
             .await
             .map_err(BoxedError::new)

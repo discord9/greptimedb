@@ -73,6 +73,42 @@ impl Default for EngineAction {
     }
 }
 
+/// Records one preparation call and takes the pending action.
+fn take_prepare_action(state: &EngineState, query_ctx: QueryContextRef) -> EngineAction {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    state.prepare_entered.notify_one();
+    *state.context.lock().unwrap() = Some(query_ctx);
+    std::mem::take(&mut *state.action.lock().unwrap())
+}
+
+/// Resolves one recorded preparation action, mapping an approved ordering through `approved`.
+async fn resolve_prepare_action<T>(
+    action: EngineAction,
+    approved: impl FnOnce(Option<SeriesOrdering>) -> Option<T>,
+) -> query::error::Result<Option<T>> {
+    match action {
+        EngineAction::Return(ordering) => Ok(approved(ordering)),
+        EngineAction::Error => Err(QueryError::DataFusion {
+            error: DataFusionError::Plan("injected prepare error".to_string()),
+            location: snafu::location!(),
+        }),
+        EngineAction::Wait(receiver, dropped) => {
+            struct Dropped(Arc<Notify>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+            let _dropped = Dropped(dropped);
+            receiver.await.map_err(|_| QueryError::DataFusion {
+                error: DataFusionError::Plan("released".into()),
+                location: snafu::location!(),
+            })?;
+            Ok(None)
+        }
+    }
+}
+
 struct AdmissionQueryEngine {
     state: Arc<EngineState>,
 }
@@ -114,31 +150,23 @@ impl QueryEngine for AdmissionQueryEngine {
         query_ctx: QueryContextRef,
         _binding: RawSeriesRequest,
     ) -> query::error::Result<Option<SeriesOrdering>> {
-        self.state.calls.fetch_add(1, Ordering::SeqCst);
-        self.state.prepare_entered.notify_one();
-        *self.state.context.lock().unwrap() = Some(query_ctx);
-        let action = std::mem::take(&mut *self.state.action.lock().unwrap());
-        match action {
-            EngineAction::Return(ordering) => Ok(ordering),
-            EngineAction::Error => Err(QueryError::DataFusion {
-                error: DataFusionError::Plan("injected prepare error".to_string()),
-                location: snafu::location!(),
-            }),
-            EngineAction::Wait(receiver, dropped) => {
-                struct Dropped(Arc<Notify>);
-                impl Drop for Dropped {
-                    fn drop(&mut self) {
-                        self.0.notify_one();
-                    }
-                }
-                let _dropped = Dropped(dropped);
-                receiver.await.map_err(|_| QueryError::DataFusion {
-                    error: DataFusionError::Plan("released".into()),
-                    location: snafu::location!(),
-                })?;
-                Ok(None)
-            }
-        }
+        let action = take_prepare_action(&self.state, query_ctx);
+        resolve_prepare_action(action, |ordering| ordering).await
+    }
+
+    async fn prepare_named_raw_series(
+        &self,
+        _plan: LogicalPlan,
+        query_ctx: QueryContextRef,
+    ) -> query::error::Result<Option<PreparedNamedRawSeries>> {
+        let action = take_prepare_action(&self.state, query_ctx);
+        resolve_prepare_action(action, |ordering| {
+            ordering.map(|ordering| PreparedNamedRawSeries {
+                binding: raw_fixture(),
+                ordering,
+            })
+        })
+        .await
     }
 
     async fn execute_raw_series(
@@ -654,4 +682,492 @@ async fn raw_series_admission_preserves_unrelated_context_and_consumes_marker() 
     );
     assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
     assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_admission_rejects_marker_and_dynamic_filter_intent() {
+    let raw = raw_fixture();
+    let valid = raw.to_extension_value().unwrap();
+    let mut malformed = raw.clone();
+    malformed.version = 2;
+    let malformed = serde_json::to_string(&malformed).unwrap();
+
+    for marker in [Some("{}".to_string()), Some(valid.clone()), Some(malformed)] {
+        let fixture = fixture(EngineAction::Return(None), None);
+        let request = with_marker(logical_request(&fixture.raw), marker);
+        let error = fixture
+            .server
+            .prepare_named_raw_series_query(request)
+            .await
+            .expect_err("a named preflight must reject an incoming raw-series marker");
+        assert!(matches!(error, Error::InvalidQueryContext { .. }));
+        assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
+        assert_available(&fixture).await;
+    }
+
+    // Initial remote dynamic-filter intent is rejected from the request header alone, before any
+    // provider or plan inspection, whatever the extension value is.
+    for intent in ["", "not-json", "{}"] {
+        let fixture = fixture(EngineAction::Return(None), None);
+        let mut request = logical_request(&fixture.raw);
+        request.header = Some(RegionRequestHeader {
+            query_context: Some(ApiQueryContext {
+                extensions: std::collections::HashMap::from([(
+                    INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY.to_string(),
+                    intent.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let error = fixture
+            .server
+            .prepare_named_raw_series_query(request)
+            .await
+            .expect_err("a named preflight must reject initial dynamic-filter intent");
+        assert!(matches!(error, Error::InvalidQueryContext { .. }));
+        assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
+        assert_available(&fixture).await;
+    }
+
+    let fixture = fixture(EngineAction::Return(None), None);
+    let mut request = logical_request(&fixture.raw);
+    request.header = Some(RegionRequestHeader {
+        query_context: Some(ApiQueryContext {
+            extensions: std::collections::HashMap::from([(
+                READ_PREFERENCE_EXTENSION_KEY.to_string(),
+                "invalid".to_string(),
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let error = fixture
+        .server
+        .prepare_named_raw_series_query(request)
+        .await
+        .expect_err("a named preflight must reject an undecodable query context");
+    assert!(matches!(error, Error::InvalidQueryContext { .. }));
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_admission_prepares_without_execution() {
+    for action in [
+        EngineAction::Return(Some(SeriesOrdering::Contiguous)),
+        EngineAction::Return(Some(SeriesOrdering::KeyThenTime)),
+        EngineAction::Return(None),
+        EngineAction::Error,
+    ] {
+        let expected = match &action {
+            EngineAction::Return(Some(ordering)) => Some(Some(*ordering)),
+            EngineAction::Return(None) => Some(None),
+            EngineAction::Error => None,
+            EngineAction::Wait(..) => unreachable!(),
+        };
+        let fixture = fixture(action, None);
+        let result = fixture
+            .server
+            .prepare_named_raw_series_query(logical_request(&fixture.raw))
+            .await;
+        match expected {
+            Some(Some(ordering)) => {
+                let prepared = result
+                    .unwrap()
+                    .expect("a supported named preflight must be approved");
+                assert_eq!(prepared.ordering, ordering);
+                assert_eq!(
+                    prepared.binding.to_extension_value().unwrap(),
+                    fixture.raw.to_extension_value().unwrap()
+                );
+            }
+            Some(None) => assert!(result.unwrap().is_none()),
+            None => match result.unwrap_err() {
+                Error::ExecuteLogicalPlan {
+                    source:
+                        QueryError::DataFusion {
+                            error: DataFusionError::Plan(reason),
+                            ..
+                        },
+                    ..
+                } => assert_eq!(reason, "injected prepare error"),
+                error => panic!("expected injected DataFusion planning error, got: {error:?}"),
+            },
+        }
+        assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 1);
+        assert_available(&fixture).await;
+    }
+}
+
+#[tokio::test]
+async fn named_raw_series_admission_preserves_unrelated_context() {
+    let fixture = fixture(EngineAction::Return(Some(SeriesOrdering::Contiguous)), None);
+    let mut request = logical_request(&fixture.raw);
+    request.header = Some(RegionRequestHeader {
+        query_context: Some(ApiQueryContext {
+            current_catalog: "observability".to_string(),
+            current_schema: "metrics".to_string(),
+            timezone: "Asia/Tokyo".to_string(),
+            channel: session::context::Channel::Internal as u32,
+            snapshot_seqs: Some(SnapshotSequences {
+                snapshot_seqs: std::collections::HashMap::from([(
+                    fixture.raw.physical_metadata.region_id.as_u64(),
+                    41,
+                )]),
+                sst_min_sequences: std::collections::HashMap::from([(
+                    fixture.raw.physical_metadata.region_id.as_u64(),
+                    35,
+                )]),
+            }),
+            extensions: std::collections::HashMap::from([(
+                "unrelated.extension".to_string(),
+                "kept".to_string(),
+            )]),
+            explain: None,
+        }),
+        ..Default::default()
+    });
+    let prepared = fixture
+        .server
+        .prepare_named_raw_series_query(request)
+        .await
+        .unwrap()
+        .expect("a supported named preflight must be approved");
+    assert_eq!(prepared.ordering, SeriesOrdering::Contiguous);
+    let ctx = fixture.engine.context.lock().unwrap().clone().unwrap();
+    assert!(ctx.extension(RAW_SERIES_REQUEST_EXTENSION_KEY).is_none());
+    assert_eq!(ctx.extension("unrelated.extension"), Some("kept"));
+    assert_eq!(ctx.current_catalog(), "observability");
+    assert_eq!(ctx.current_schema(), "metrics");
+    assert_eq!(
+        ctx.timezone(),
+        common_time::Timezone::from_tz_string("Asia/Tokyo").unwrap()
+    );
+    assert_eq!(ctx.channel(), session::context::Channel::Internal);
+    let region_id = fixture.raw.physical_metadata.region_id.as_u64();
+    assert_eq!(
+        ctx.snapshots(),
+        std::collections::HashMap::from([(region_id, 41)])
+    );
+    assert_eq!(
+        ctx.sst_min_sequences(),
+        std::collections::HashMap::from([(region_id, 35)])
+    );
+    assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_admission_cancellation_aborts_owned_task_and_releases_permit() {
+    let dropped = Arc::new(Notify::new());
+    let (_engine_release, receiver) = oneshot::channel();
+    let engine_fixture = fixture(EngineAction::Wait(receiver, dropped.clone()), None);
+    let caller = {
+        let server = engine_fixture.server.clone();
+        let request = logical_request(&engine_fixture.raw);
+        tokio::spawn(async move { server.prepare_named_raw_series_query(request).await })
+    };
+    timeout(BOUND, engine_fixture.engine.prepare_entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine_fixture
+            .server
+            .inner
+            .parallelism
+            .as_ref()
+            .unwrap()
+            .semaphore
+            .available_permits(),
+        0
+    );
+    caller.abort();
+    assert!(timeout(BOUND, caller).await.unwrap().is_err());
+    timeout(BOUND, dropped.notified()).await.unwrap();
+    assert_available(&engine_fixture).await;
+    assert_eq!(
+        engine_fixture.engine.execute_calls.load(Ordering::SeqCst),
+        0
+    );
+}
+
+fn protobuf_request(request: QueryRequest) -> api::v1::region::QueryRequest {
+    api::v1::region::QueryRequest {
+        header: request.header,
+        region_id: request.region_id.as_u64(),
+        plan: Vec::new(),
+    }
+}
+
+fn action_request(action_type: &str, body: impl Into<bytes::Bytes>) -> tonic::Request<Action> {
+    tonic::Request::new(Action {
+        r#type: action_type.to_string(),
+        body: body.into(),
+    })
+}
+
+#[tokio::test]
+async fn named_raw_series_action_stays_unimplemented_for_unknown_actions() {
+    let fixture = fixture(EngineAction::Return(None), None);
+    // A suspended server still answers an unknown action with the bare status: the action type is
+    // checked before suspension and before the payload is decoded.
+    fixture
+        .server
+        .suspend_state()
+        .store(true, Ordering::Relaxed);
+    let status = match fixture
+        .server
+        .do_action(action_request(
+            "greptime.unknown.v1",
+            protobuf_request(logical_request(&fixture.raw)).encode_to_vec(),
+        ))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("an absent action must stay unimplemented"),
+    };
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(
+        status.metadata().is_empty(),
+        "a bare Unimplemented must not carry error metadata: {:?}",
+        status.metadata()
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+
+    // A malformed payload of the known action is a storage error, never a bare Unimplemented:
+    // the caller must be able to tell a failed preflight apart from an absent action.
+    let fixture = self::fixture(EngineAction::Return(None), None);
+    let status = match fixture
+        .server
+        .do_action(action_request(
+            PREPARE_RAW_SERIES_ACTION,
+            b"\xff".as_slice(),
+        ))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("a malformed action body must be rejected"),
+    };
+    assert!(
+        status
+            .metadata()
+            .contains_key(common_error::GREPTIME_DB_HEADER_ERROR_CODE),
+        "a malformed action body must carry the storage error code: {:?}",
+        status.metadata()
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_action_rejects_reserved_requests_before_any_work() {
+    let raw = raw_fixture();
+    let valid = raw.to_extension_value().unwrap();
+    let mut malformed = raw.clone();
+    malformed.version = 2;
+    let malformed = serde_json::to_string(&malformed).unwrap();
+
+    for marker in [Some("{}".to_string()), Some(valid), Some(malformed)] {
+        let fixture = fixture(EngineAction::Return(None), None);
+        let request = with_marker(logical_request(&fixture.raw), marker);
+        let status = match fixture
+            .server
+            .do_action(action_request(
+                PREPARE_RAW_SERIES_ACTION,
+                protobuf_request(request).encode_to_vec(),
+            ))
+            .await
+        {
+            Err(status) => status,
+            Ok(_) => panic!("a reserved raw-series marker must be rejected"),
+        };
+        assert!(
+            status
+                .metadata()
+                .contains_key(common_error::GREPTIME_DB_HEADER_ERROR_CODE)
+        );
+        assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
+        assert_available(&fixture).await;
+    }
+
+    // Initial remote dynamic-filter intent cannot be answered by a preflight either, and it is
+    // rejected before the plan is decoded.
+    let fixture = fixture(EngineAction::Return(None), None);
+    let mut request = logical_request(&fixture.raw);
+    request.header = Some(RegionRequestHeader {
+        query_context: Some(ApiQueryContext {
+            extensions: std::collections::HashMap::from([(
+                INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY.to_string(),
+                "{}".to_string(),
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let status = match fixture
+        .server
+        .do_action(action_request(
+            PREPARE_RAW_SERIES_ACTION,
+            protobuf_request(request).encode_to_vec(),
+        ))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("initial dynamic-filter intent must be rejected"),
+    };
+    assert!(
+        status
+            .metadata()
+            .contains_key(common_error::GREPTIME_DB_HEADER_ERROR_CODE)
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+
+    // An undecodable query context is rejected before the plan is decoded.
+    let fixture = self::fixture(EngineAction::Return(None), None);
+    let mut request = logical_request(&fixture.raw);
+    request.header = Some(RegionRequestHeader {
+        query_context: Some(ApiQueryContext {
+            extensions: std::collections::HashMap::from([(
+                READ_PREFERENCE_EXTENSION_KEY.to_string(),
+                "invalid".to_string(),
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let status = match fixture
+        .server
+        .do_action(action_request(
+            PREPARE_RAW_SERIES_ACTION,
+            protobuf_request(request).encode_to_vec(),
+        ))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("an undecodable query context must be rejected"),
+    };
+    assert!(
+        status
+            .metadata()
+            .contains_key(common_error::GREPTIME_DB_HEADER_ERROR_CODE)
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+
+    // A suspended server rejects the preflight without touching the plan.
+    let fixture = self::fixture(EngineAction::Return(None), None);
+    fixture
+        .server
+        .suspend_state()
+        .store(true, Ordering::Relaxed);
+    let status = match fixture
+        .server
+        .do_action(action_request(
+            PREPARE_RAW_SERIES_ACTION,
+            protobuf_request(logical_request(&fixture.raw)).encode_to_vec(),
+        ))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("a suspended server must reject the preflight"),
+    };
+    assert!(
+        status
+            .metadata()
+            .contains_key(common_error::GREPTIME_DB_HEADER_ERROR_CODE)
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_action_waits_for_the_query_permit_and_releases_on_cancel() {
+    let fixture = fixture(EngineAction::Return(None), None);
+    let parallelism = fixture.server.inner.parallelism.as_ref().unwrap();
+    let held = parallelism.semaphore.clone().acquire_owned().await.unwrap();
+    let mut action = Box::pin(fixture.server.do_action(action_request(
+        PREPARE_RAW_SERIES_ACTION,
+        protobuf_request(logical_request(&fixture.raw)).encode_to_vec(),
+    )));
+    // The remote preflight owns one query permit before it starts the owned preparation task, so
+    // it stays pending while every permit is held elsewhere.
+    assert!(
+        timeout(Duration::from_millis(100), &mut action)
+            .await
+            .is_err(),
+        "the remote preflight must wait for a query permit"
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+
+    // A cancelled call (the client deadline) must not leak the permit it was waiting for.
+    drop(action);
+    drop(held);
+    assert_available(&fixture).await;
+}
+
+#[tokio::test]
+async fn named_raw_series_preflight_runner_aborts_its_task_when_cancelled() {
+    let fixture = fixture(EngineAction::Return(None), None);
+    let entered = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let (_release, receiver) = oneshot::channel::<()>();
+    let body_entered = entered.clone();
+    let body_dropped = dropped.clone();
+    let server = fixture.server.clone();
+    // Both the local preparation and the remote action run their body through this runner, so a
+    // client deadline that cancels the call owns the whole preparation task and its permit.
+    let caller = tokio::spawn(async move {
+        server
+            .prepare_named_raw_series_guarded("named raw-series preparation", async move {
+                struct Dropped(Arc<Notify>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) {
+                        self.0.notify_one();
+                    }
+                }
+                let _dropped = Dropped(body_dropped);
+                body_entered.notify_one();
+                let _ = receiver.await;
+                Ok(None)
+            })
+            .await
+    });
+    timeout(BOUND, entered.notified()).await.unwrap();
+    assert_eq!(
+        fixture
+            .server
+            .inner
+            .parallelism
+            .as_ref()
+            .unwrap()
+            .semaphore
+            .available_permits(),
+        0,
+        "the runner must own a permit while its body runs"
+    );
+
+    caller.abort();
+    assert!(timeout(BOUND, caller).await.unwrap().is_err());
+    timeout(BOUND, dropped.notified()).await.unwrap();
+    assert_available(&fixture).await;
+    assert_eq!(fixture.engine.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.execute_calls.load(Ordering::SeqCst), 0);
 }
