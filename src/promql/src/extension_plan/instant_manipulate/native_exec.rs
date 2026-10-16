@@ -429,7 +429,7 @@ impl Stream for NativeInstantStream {
             };
             match ready!(source.as_mut().poll_next(cx)) {
                 Some(Err(error)) => {
-                    return self.fail(DataFusionError::Execution(error.to_string()));
+                    return self.fail(DataFusionError::External(Box::new(error)));
                 }
                 None if !self.pending.is_empty() => {
                     return self.fail(DataFusionError::Execution(

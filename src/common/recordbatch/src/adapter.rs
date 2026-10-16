@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use common_base::readable_size::ReadableSize;
+use common_error::ext::BoxedError;
 use common_telemetry::tracing::{Span, info_span};
 use common_time::util::format_nanoseconds_human_readable;
 use datafusion::arrow::compute::cast;
@@ -206,7 +207,9 @@ impl Stream for DfRecordBatchStreamAdapter {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(recordbatch)) => match recordbatch {
                 Ok(recordbatch) => Poll::Ready(Some(Ok(recordbatch.into_df_record_batch()))),
-                Err(e) => Poll::Ready(Some(Err(DataFusionError::External(Box::new(e))))),
+                Err(e) => Poll::Ready(Some(Err(DataFusionError::External(Box::new(
+                    BoxedError::new(e),
+                ))))),
             },
             Poll::Ready(None) => Poll::Ready(None),
         }
@@ -942,9 +945,10 @@ fn convert_map_to_json_binary(
 
 #[cfg(test)]
 mod test {
+    use std::collections::VecDeque;
     use std::time::Duration;
 
-    use common_error::ext::BoxedError;
+    use common_error::ext::{ErrorExt, PlainError};
     use common_error::mock::MockError;
     use common_error::status_code::StatusCode;
     use datafusion::execution::TaskContext;
@@ -964,8 +968,8 @@ mod test {
     use snafu::IntoError;
 
     use super::*;
-    use crate::RecordBatches;
     use crate::error::Error;
+    use crate::{RecordBatchStreamWrapper, RecordBatches};
 
     #[derive(Debug)]
     struct TestMetricsExec {
@@ -1347,6 +1351,160 @@ mod test {
             matches!(err, Error::External { .. }),
             "unexpected err {err}"
         );
+    }
+
+    /// Invariant: both stream adapters must forward the original error as a
+    /// typed `BoxedError` inside `DataFusionError::External`, so downstream
+    /// status code recovery (the `Error::PollStream` arm of `Error::status_code`)
+    /// keeps the original status code.
+    #[test]
+    fn test_df_record_batch_stream_adapter_preserves_typed_errors() {
+        fn chain_has_marker(err: &(dyn std::error::Error + 'static), marker: &str) -> bool {
+            let mut current = Some(err);
+            while let Some(error) = current {
+                if error.to_string().contains(marker) {
+                    return true;
+                }
+                current = error.source();
+            }
+            false
+        }
+
+        fn assert_typed_external(
+            df_error: &DataFusionError,
+            expected: StatusCode,
+            context: &str,
+            marker: &str,
+        ) {
+            let DataFusionError::External(payload) = df_error else {
+                panic!("{context}: expected DataFusionError::External, got {df_error:?}");
+            };
+            let Some(boxed) = payload.downcast_ref::<BoxedError>() else {
+                panic!("{context}: external payload lost its typed BoxedError: {payload:?}");
+            };
+            assert_eq!(
+                boxed.status_code(),
+                expected,
+                "{context}: original status code lost"
+            );
+            assert!(
+                chain_has_marker(boxed, marker),
+                "{context}: original error lost from the source chain: {payload:?}"
+            );
+        }
+
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "a",
+            ConcreteDataType::int32_datatype(),
+            false,
+        )]));
+        let batch = RecordBatch::new(
+            schema.clone(),
+            vec![Arc::new(Int32Vector::from_slice([1])) as _],
+        )
+        .unwrap();
+        let expected_df_batch = batch.clone().into_df_record_batch();
+
+        // A stream is consumed once, so every adapter under test gets its own
+        // fresh equivalent stream. Sequence: Pending -> batch -> typed error -> EOF.
+        let make_stream = |marker: &str, status: StatusCode| -> SendableRecordBatchStream {
+            let typed_error = error::ExternalSnafu
+                .into_error(BoxedError::new(PlainError::new(marker.to_string(), status)));
+            let mut items: VecDeque<Poll<Option<Result<RecordBatch>>>> = VecDeque::from([
+                Poll::Pending,
+                Poll::Ready(Some(Ok(batch.clone()))),
+                Poll::Ready(Some(Err(typed_error))),
+                Poll::Ready(None),
+            ]);
+            Box::pin(RecordBatchStreamWrapper::new(
+                schema.clone(),
+                futures::stream::poll_fn(move |_| items.pop_front().unwrap_or(Poll::Ready(None))),
+            ))
+        };
+
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        for status in [StatusCode::Internal, StatusCode::RequestOutdated] {
+            // Unique per case, so a match proves the *original* error survived.
+            let marker = format!("df-record-batch-stream-adapter-typed-error-marker-{status}");
+
+            // Greptime -> DataFusion forward adapter.
+            let mut df_adapter = DfRecordBatchStreamAdapter::new(make_stream(&marker, status));
+            assert_eq!(df_adapter.schema(), schema.arrow_schema().clone());
+            assert!(
+                matches!(Pin::new(&mut df_adapter).poll_next(&mut cx), Poll::Pending),
+                "Pending must be preserved"
+            );
+            let Poll::Ready(Some(Ok(df_batch))) = Pin::new(&mut df_adapter).poll_next(&mut cx)
+            else {
+                panic!("expected the forwarded batch");
+            };
+            assert_eq!(df_batch.schema(), schema.arrow_schema().clone());
+            assert_eq!(df_batch, expected_df_batch);
+            let Poll::Ready(Some(Err(df_error))) = Pin::new(&mut df_adapter).poll_next(&mut cx)
+            else {
+                panic!("expected the forwarded error");
+            };
+            assert_typed_external(
+                &df_error,
+                status,
+                &format!("forward adapter, status {status}"),
+                &marker,
+            );
+            assert!(
+                matches!(
+                    Pin::new(&mut df_adapter).poll_next(&mut cx),
+                    Poll::Ready(None)
+                ),
+                "EOF must be preserved"
+            );
+
+            // DataFusion -> Greptime adapter over another fresh equivalent
+            // stream: Pending, batch, schema and EOF stay unchanged, and the
+            // error is reported exactly once.
+            let df_stream: DfSendableRecordBatchStream = Box::pin(DfRecordBatchStreamAdapter::new(
+                make_stream(&marker, status),
+            ));
+            let mut roundtrip = RecordBatchStreamAdapter::try_new(df_stream).unwrap();
+            assert_eq!(roundtrip.schema().arrow_schema(), schema.arrow_schema());
+            assert!(
+                matches!(Pin::new(&mut roundtrip).poll_next(&mut cx), Poll::Pending),
+                "Pending must be preserved"
+            );
+            let Poll::Ready(Some(Ok(roundtrip_batch))) =
+                Pin::new(&mut roundtrip).poll_next(&mut cx)
+            else {
+                panic!("expected the roundtripped batch");
+            };
+            assert_eq!(roundtrip_batch.schema, roundtrip.schema());
+            assert_eq!(roundtrip_batch.df_record_batch(), &expected_df_batch);
+            let Poll::Ready(Some(Err(roundtrip_error))) =
+                Pin::new(&mut roundtrip).poll_next(&mut cx)
+            else {
+                panic!("expected the roundtripped error");
+            };
+            let Error::PollStream {
+                error: df_error, ..
+            } = &roundtrip_error
+            else {
+                panic!("expected a poll stream error, got {roundtrip_error:?}");
+            };
+            assert_eq!(roundtrip_error.status_code(), status);
+            assert_typed_external(
+                df_error,
+                status,
+                &format!("roundtrip adapter, status {status}"),
+                &marker,
+            );
+            assert!(
+                matches!(
+                    Pin::new(&mut roundtrip).poll_next(&mut cx),
+                    Poll::Ready(None)
+                ),
+                "the roundtrip stream must end after the error"
+            );
+        }
     }
 
     #[test]

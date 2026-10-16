@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use common_error::ext::{BoxedError, PlainError};
+use common_error::ext::{BoxedError, ErrorExt, PlainError};
 use common_error::status_code::StatusCode;
 use datafusion::arrow::array::{Array, Float64Array, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -221,7 +221,21 @@ fn source_error_after_prefix_is_returned_once_and_clears_reservation_and_input()
     let pool = Arc::new(GreedyMemoryPool::new(1_000_000)) as Arc<dyn MemoryPool>;
     let mut stream = stream(input, &pool);
     assert!(matches!(poll(&mut stream), Poll::Ready(Some(Ok(_)))));
-    assert!(matches!(poll(&mut stream), Poll::Ready(Some(Err(_)))));
+    let Poll::Ready(Some(Err(error))) = poll(&mut stream) else {
+        panic!("source error must be returned once")
+    };
+    assert_eq!(
+        common_query::error::datafusion_status_code::<common_query::error::Error>(&error, None),
+        StatusCode::Internal
+    );
+    let DataFusionError::External(source) = error else {
+        panic!("source error must stay a typed DataFusionError::External payload")
+    };
+    let source = source
+        .downcast_ref::<BoxedError>()
+        .expect("source error must still be the original BoxedError");
+    assert_eq!(source.status_code(), StatusCode::Internal);
+    assert_eq!(source.to_string(), "mock source error");
     assert!(matches!(poll(&mut stream), Poll::Ready(None)));
     assert!(matches!(poll(&mut stream), Poll::Ready(None)));
     assert_eq!(polls.load(Ordering::SeqCst), 2);
