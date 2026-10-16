@@ -61,6 +61,7 @@ struct State {
     raw_error: bool,
     fail_first_poll: bool,
     error_after_poll: Option<usize>,
+    pending_at_poll: Option<usize>,
     polls: usize,
     drops: usize,
     resets: usize,
@@ -85,6 +86,7 @@ struct RawStream {
     state: Arc<Mutex<State>>,
     fail_first_poll: bool,
     error_after_poll: Option<usize>,
+    pending_at_poll: Option<usize>,
     ordering: SeriesOrdering,
 }
 
@@ -96,14 +98,22 @@ impl Drop for RawStream {
 
 impl Stream for RawStream {
     type Item = Result<RawSeriesChunk, BoxedError>;
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let should_fail = {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let (should_fail, should_pend) = {
             let mut state = self.state.lock().unwrap();
             state.polls += 1;
-            (self.fail_first_poll && state.polls == 1) || self.error_after_poll == Some(state.polls)
+            let polls = state.polls;
+            (
+                (self.fail_first_poll && polls == 1) || self.error_after_poll == Some(polls),
+                self.pending_at_poll == Some(polls),
+            )
         };
         if should_fail {
             return Poll::Ready(Some(Err(raw_error("raw failure"))));
+        }
+        if should_pend {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
         Poll::Ready((!self.chunks.is_empty()).then(|| Ok(self.chunks.remove(0))))
     }
@@ -215,6 +225,7 @@ impl RegionScanner for TestScanner {
             state: self.state.clone(),
             fail_first_poll: state.fail_first_poll,
             error_after_poll: state.error_after_poll,
+            pending_at_poll: state.pending_at_poll,
         })))
     }
     fn has_predicate_without_region(&self) -> bool {
@@ -1030,17 +1041,63 @@ async fn error_after_emitted_frame_is_not_replayed() {
         .try_to_series_scan(RawLabelSource::Explicit)
         .unwrap()
         .unwrap();
-    state.lock().unwrap().error_after_poll = Some(2);
+    {
+        let mut state = state.lock().unwrap();
+        state.pending_at_poll = Some(2);
+        state.error_after_poll = Some(3);
+    }
     let mut stream = plan.execute(0, context()).unwrap();
-    assert!(stream.next().await.unwrap().is_ok());
-    assert!(stream.next().await.unwrap().is_err());
-    assert_eq!(state.lock().unwrap().drops, 1);
+    let frame = stream.next().await.unwrap().unwrap();
+    assert_eq!(frame.schema(), plan.schema());
+    let decoded = datatypes::series::frame::unpack_raw_series_frame(
+        plan.series_schema(),
+        RawLabelMode::Explicit,
+        &frame,
+    )
+    .unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].primary_key.as_slice(), b"complete-key");
+    assert_eq!(
+        decoded[0].metric.as_ref().unwrap().name(),
+        Some("cpu_usage")
+    );
+    assert_eq!(decoded[0].time.timestamp(0), Some(10));
+    assert_eq!(decoded[0].time.timestamp(1), Some(20));
+    assert_eq!(decoded[0].fields.get(0).unwrap().len(), 2);
+    assert!(
+        matches!(decoded[0].fields.get(0).unwrap().sample(0), datatypes::series::samples::SampleRef::Float(v) if v.to_bits() == 1.5f64.to_bits())
+    );
+    assert!(matches!(
+        decoded[0].fields.get(0).unwrap().sample(1),
+        datatypes::series::samples::SampleRef::Missing
+    ));
+    assert!(decoded[0].is_last);
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.polls, 2);
+        assert_eq!(state.drops, 0);
+    }
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("raw failure"), "{error}");
+    assert_eq!(
+        common_query::error::datafusion_status_code::<common_recordbatch::error::Error>(
+            &error, None,
+        ),
+        common_error::status_code::StatusCode::InvalidArguments
+    );
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.polls, 3);
+        assert_eq!(state.drops, 1);
+    }
+    assert!(stream.next().await.is_none());
     assert!(stream.next().await.is_none());
     drop(stream);
     let state = state.lock().unwrap();
     assert_eq!(state.raw_calls, 1);
     assert_eq!(state.legacy_calls, 0);
     assert_eq!(state.drops, 1);
+    assert_eq!(state.polls, 3);
 }
 
 #[tokio::test]
