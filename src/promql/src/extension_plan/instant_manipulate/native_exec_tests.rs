@@ -20,15 +20,23 @@ use std::task::{Context, Poll};
 
 use common_error::ext::{BoxedError, ErrorExt, PlainError};
 use common_error::status_code::StatusCode;
-use datafusion::arrow::array::{Array, Float64Array, TimestampMillisecondArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float64Array, StructArray, TimestampMillisecondArray, UInt32Array,
+    new_null_array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
 use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 use datatypes::arrow::buffer::ScalarBuffer;
+use datatypes::series::histogram::public::{
+    NATIVE_HISTOGRAM_FIELD_NAMES, PublicHistogramBatch, SUM_FIELD, native_histogram_arrow_type,
+};
 use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
-use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
+use datatypes::series::samples::{
+    DenseSamplesRef, FieldSpec, PublicHistogramSamples, Samples, SeriesFields, SeriesSchema,
+};
 use datatypes::series::{MetricName, SeriesOrdering};
 use futures::Stream;
 use store_api::region_engine::{RawLabelSource, RawSeriesStream, SendableRawSeriesStream};
@@ -424,4 +432,95 @@ fn larger_pool_completes_one_point_many_evaluation_grid() {
         &[0, 1, 2, 3, 4]
     );
     assert_eq!(pool.reserved(), 0);
+}
+
+/// The materialized metric of the public-histogram chunk fixture.
+const PUBLIC_HISTOGRAM_METRIC: &str = "greptime_public_histogram_total";
+
+/// Direct public-histogram sum fixture: ordered 18-field schema, not a canonical histogram.
+fn public_histogram_struct(sums: &[Option<f64>]) -> StructArray {
+    let DataType::Struct(fields) = native_histogram_arrow_type() else {
+        panic!("the public native histogram type must be a struct");
+    };
+    assert_eq!(fields.len(), NATIVE_HISTOGRAM_FIELD_NAMES.len());
+    let children = fields
+        .iter()
+        .map(|field| {
+            if field.name() == SUM_FIELD {
+                Arc::new(Float64Array::from(sums.to_vec())) as ArrayRef
+            } else {
+                new_null_array(field.data_type(), sums.len())
+            }
+        })
+        .collect::<Vec<_>>();
+    StructArray::new(fields, children, None)
+}
+
+/// A raw series chunk whose single field is a public-histogram carrier, carrying the materialized
+/// metric of the series like the float `chunk` helper above.
+fn public_histogram_chunk(
+    time: &[i64],
+    sums: &[Option<f64>],
+    indices: Vec<Option<u32>>,
+    floats: Option<Vec<Option<f64>>>,
+) -> RawSeriesChunk {
+    let batch =
+        Arc::new(PublicHistogramBatch::try_from_arrow(public_histogram_struct(sums)).unwrap());
+    let samples = PublicHistogramSamples::try_new(
+        UInt32Array::from(indices),
+        batch,
+        floats.map(Float64Array::from),
+    )
+    .unwrap();
+    RawSeriesChunk::try_new(
+        &raw_schema(),
+        datatypes::arrow::buffer::Buffer::from(vec![1, 2, 3]),
+        Some(MetricName::try_new(Some(Arc::from(PUBLIC_HISTOGRAM_METRIC)), vec![]).unwrap()),
+        RawTimestamps::try_new(ScalarBuffer::from(time.to_vec())).unwrap(),
+        SeriesFields::one(Samples::from_public_histogram(samples)),
+        true,
+    )
+    .unwrap()
+}
+
+#[test]
+fn public_histogram_chunks_are_rejected_by_float_only_retained_accounting() {
+    let cases = [
+        (
+            "pure",
+            public_histogram_chunk(
+                &[10, 20, 30],
+                &[Some(1.0), None, Some(3.0)],
+                vec![Some(0), Some(1), Some(2)],
+                None,
+            ),
+        ),
+        (
+            "mixed with optional floats",
+            public_histogram_chunk(
+                &[10, 20],
+                &[Some(1.0), Some(2.0)],
+                vec![Some(0), None],
+                Some(vec![None, Some(0.5)]),
+            ),
+        ),
+    ];
+    for (name, chunk) in cases {
+        // The chunk really carries the public histogram field.
+        let field = chunk.fields.get(0).unwrap();
+        assert!(matches!(
+            field.dense(),
+            Some(DenseSamplesRef::PublicHistogram(_))
+        ));
+        // Float-only retained accounting must refuse the whole chunk instead of charging only its
+        // timestamps and indices, so no part of the histogram payload is under-charged.
+        assert_eq!(retained_chunk_bytes(&chunk), None, "{name}");
+    }
+
+    // The existing float lane keeps its non-zero estimate for the same chunk shape.
+    let float_chunk = chunk(&[10, 20, 30], &[1.0, 2.0, 3.0], true);
+    assert!(
+        retained_chunk_bytes(&float_chunk).is_some_and(|bytes| bytes > 0),
+        "float chunks stay accounted"
+    );
 }

@@ -15,13 +15,19 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use datatypes::arrow::array::{Float64Array, UInt32Array};
-use datatypes::arrow::buffer::ScalarBuffer;
+use datatypes::arrow::array::{ArrayRef, Float64Array, StructArray, UInt32Array, new_null_array};
+use datatypes::arrow::buffer::{NullBuffer, ScalarBuffer};
+use datatypes::arrow::datatypes::DataType;
+use datatypes::series::histogram::public::{
+    NATIVE_HISTOGRAM_FIELD_NAMES, PublicHistogramBatch, SUM_FIELD, native_histogram_arrow_type,
+};
 use datatypes::series::histogram::{
     BucketSideView, CounterResetHint, HistogramBatch, HistogramBatchBuilder, HistogramView,
 };
 use datatypes::series::raw::RawTimestamps;
-use datatypes::series::samples::{DenseSamplesRef, SampleRef, Samples, SeriesFields};
+use datatypes::series::samples::{
+    DenseSamplesRef, PublicHistogramSamples, SampleRef, Samples, SeriesFields,
+};
 
 use super::select_instants;
 
@@ -67,6 +73,47 @@ fn histogram_batch(sums: &[f64]) -> Arc<HistogramBatch> {
             .unwrap();
     }
     builder.finish().unwrap()
+}
+
+/// Direct public-histogram sum fixture: ordered 18-field schema, not a canonical histogram.
+fn public_histogram_struct(sums: &[Option<f64>], parent_valid: Option<Vec<bool>>) -> StructArray {
+    let DataType::Struct(fields) = native_histogram_arrow_type() else {
+        panic!("the public native histogram type must be a struct");
+    };
+    assert_eq!(fields.len(), NATIVE_HISTOGRAM_FIELD_NAMES.len());
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        NATIVE_HISTOGRAM_FIELD_NAMES
+    );
+    let children = fields
+        .iter()
+        .map(|field| {
+            if field.name() == SUM_FIELD {
+                Arc::new(Float64Array::from(sums.to_vec())) as ArrayRef
+            } else {
+                new_null_array(field.data_type(), sums.len())
+            }
+        })
+        .collect::<Vec<_>>();
+    StructArray::new(fields, children, parent_valid.map(NullBuffer::from))
+}
+
+/// A public-histogram carrier whose optional floats are valid exactly where the histogram index
+/// is null, so no position is both a float and a histogram.
+fn public_histogram_samples(
+    batch: &Arc<PublicHistogramBatch>,
+    indices: Vec<Option<u32>>,
+    floats: Option<Vec<Option<f64>>>,
+) -> PublicHistogramSamples {
+    PublicHistogramSamples::try_new(
+        UInt32Array::from(indices),
+        batch.clone(),
+        floats.map(Float64Array::from),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -248,4 +295,132 @@ fn empty_axis_returns_no_selections() {
         select(&[], &fields, -10..=10, 1, 10, 0).unwrap(),
         (vec![], vec![])
     );
+}
+
+#[test]
+fn public_histogram_sums_keep_ordinary_selector_staleness_semantics() {
+    let stale = f64::from_bits(0x7ff0_0000_0000_0002);
+    let ordinary_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+    // Row 1 is stale on a valid parent row: it is suppressed without retrying the older row 0
+    // that is still inside the lookback. Row 2 has a nullable sum and row 3 hides a stale sum
+    // behind an invalid parent row, so neither is stale. Row 4 keeps an ordinary NaN payload and
+    // row 5 a signed zero.
+    let sums = [
+        Some(1.0),
+        Some(stale),
+        None,
+        Some(stale),
+        Some(ordinary_nan),
+        Some(-0.0),
+    ];
+    // Only the structural 18-field public contract is needed here; the fixture is not a canonical
+    // native histogram and carries no bucket or span data.
+    let batch = Arc::new(
+        PublicHistogramBatch::try_from_arrow(public_histogram_struct(
+            &sums,
+            Some(vec![true, true, true, false, true, true]),
+        ))
+        .unwrap(),
+    );
+    let samples = public_histogram_samples(&batch, (0..6u32).map(Some).collect(), None);
+    let fields = SeriesFields::one(Samples::from_public_histogram(samples));
+
+    let (rows, times) = select(
+        &[100, 200, 300, 400, 500, 600],
+        &fields,
+        100..=600,
+        100,
+        200,
+        0,
+    )
+    .unwrap();
+    assert_eq!(rows, [0, 2, 3, 4, 5]);
+    assert_eq!(times, [100, 300, 400, 500, 600]);
+
+    let field = fields.get(0).unwrap();
+    assert!(matches!(
+        field.sample(0),
+        SampleRef::PublicHistogram(view) if view.sum() == Some(1.0)
+    ));
+    // A nullable sum on a valid parent row is not stale.
+    assert!(matches!(
+        field.sample(2),
+        SampleRef::PublicHistogram(view) if view.sum().is_none()
+    ));
+    // An invalid parent row is still a public sample rather than a missing one, and its hidden
+    // stale sum must not suppress the row.
+    assert!(matches!(
+        field.sample(3),
+        SampleRef::PublicHistogram(view) if view.is_null() && view.sum().is_none()
+    ));
+    assert!(matches!(
+        field.sample(4),
+        SampleRef::PublicHistogram(view)
+            if view.sum().unwrap().to_bits() == 0x7ff8_0000_0000_0042
+    ));
+    assert!(matches!(
+        field.sample(5),
+        SampleRef::PublicHistogram(view)
+            if view.sum().unwrap().to_bits() == (-0.0_f64).to_bits()
+    ));
+    assert!(matches!(field.sample(6), SampleRef::Missing));
+}
+
+#[test]
+fn mixed_public_histogram_float_stale_marker_survives_slice_and_chunking() {
+    let stale = f64::from_bits(0x7ff0_0000_0000_0002);
+    let sums = [None, Some(4.0)];
+    let batch = Arc::new(
+        PublicHistogramBatch::try_from_arrow(public_histogram_struct(&sums, None)).unwrap(),
+    );
+    // Pre-slice carrier: a disposable float, the stale float without a histogram index, a
+    // histogram with a nullable sum, and an ordinary histogram value.
+    let samples = public_histogram_samples(
+        &batch,
+        vec![None, None, Some(0), Some(1)],
+        Some(vec![Some(9.0), Some(stale), None, None]),
+    );
+    assert!(samples.floats().is_some());
+    let fields = SeriesFields::one(Samples::from_public_histogram(samples));
+
+    // The unsliced carrier suppresses only the stale float row.
+    let (rows, times) = select(&[10, 20, 30, 40], &fields, 10..=40, 10, 0, 0).unwrap();
+    assert_eq!(rows, [0, 2, 3]);
+    assert_eq!(times, [10, 30, 40]);
+    let field = fields.get(0).unwrap();
+    assert!(matches!(field.sample(0), SampleRef::Float(value) if value == 9.0));
+    assert!(matches!(
+        field.sample(1),
+        SampleRef::Float(value) if value.to_bits() == 0x7ff0_0000_0000_0002
+    ));
+
+    // A caller may hand over a non-zero-offset slice: dropping only the disposable position keeps
+    // the stale float and both histogram rows. The three retained positions arrive in two chunks
+    // whose boundary sits next to the float/histogram edge.
+    let sliced = field.slice(1, 3).unwrap();
+    assert_eq!(sliced.len(), 3);
+    let chunked = Samples::try_from_chunks(vec![
+        sliced.slice(0, 1).unwrap(),
+        sliced.slice(1, 2).unwrap(),
+    ])
+    .unwrap();
+    let chunked_fields = SeriesFields::one(chunked);
+    let (rows, times) = select(&[20, 30, 40], &chunked_fields, 20..=40, 10, 0, 0).unwrap();
+    // The retained stale float at position 0 is suppressed and never retried, so the two retained
+    // histograms are the only selected rows.
+    assert_eq!(rows, [1, 2]);
+    assert_eq!(times, [30, 40]);
+    let field = chunked_fields.get(0).unwrap();
+    assert!(matches!(
+        field.sample(0),
+        SampleRef::Float(value) if value.to_bits() == 0x7ff0_0000_0000_0002
+    ));
+    assert!(matches!(
+        field.sample(1),
+        SampleRef::PublicHistogram(view) if view.sum().is_none()
+    ));
+    assert!(matches!(
+        field.sample(2),
+        SampleRef::PublicHistogram(view) if view.sum() == Some(4.0)
+    ));
 }

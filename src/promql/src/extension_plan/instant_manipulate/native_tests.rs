@@ -16,13 +16,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
-use datafusion::arrow::array::{Array, Float64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float64Array, StringArray, StructArray, TimestampMillisecondArray,
+    UInt32Array, new_null_array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 use datatypes::arrow::buffer::ScalarBuffer;
+use datatypes::series::histogram::public::{
+    NATIVE_HISTOGRAM_FIELD_NAMES, PublicHistogramBatch, SUM_FIELD, native_histogram_arrow_type,
+};
 use datatypes::series::raw::RawTimestamps;
-use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
+use datatypes::series::samples::{
+    FieldSpec, PublicHistogramSamples, SampleRef, Samples, SeriesFields, SeriesSchema,
+};
 use datatypes::series::{Label, MetricName};
 
 use super::*;
@@ -594,4 +603,56 @@ fn multifloat_native_mapping_keeps_ordered_fields_and_checks_only_the_configured
             assert!(tags.iter().all(|value| value == Some("multifloat")));
         }
     }
+}
+
+/// Direct public-histogram sum fixture: ordered 18-field schema, not a canonical histogram.
+fn public_histogram_struct(sums: &[Option<f64>]) -> StructArray {
+    let DataType::Struct(fields) = native_histogram_arrow_type() else {
+        panic!("the public native histogram type must be a struct");
+    };
+    assert_eq!(fields.len(), NATIVE_HISTOGRAM_FIELD_NAMES.len());
+    let children = fields
+        .iter()
+        .map(|field| {
+            if field.name() == SUM_FIELD {
+                Arc::new(Float64Array::from(sums.to_vec())) as ArrayRef
+            } else {
+                new_null_array(field.data_type(), sums.len())
+            }
+        })
+        .collect::<Vec<_>>();
+    StructArray::new(fields, children, None)
+}
+
+#[test]
+fn float_native_mapping_rejects_a_public_histogram_sample_instead_of_admitting_it() {
+    // The existing Float64 output schema still admits the plan: no histogram column is required,
+    // and nothing here mutates the histogram output schema to become admissible.
+    let output_schema = schema(DataType::Utf8);
+    let mapping =
+        NativeInstantMapping::try_new(&node(), output_schema, series_schema(), &["zone".into()])
+            .unwrap()
+            .expect("the bounded Float64 mapping still accepts the plan");
+    let sums = [Some(1.0), Some(2.0)];
+    let batch =
+        Arc::new(PublicHistogramBatch::try_from_arrow(public_histogram_struct(&sums)).unwrap());
+    let samples =
+        PublicHistogramSamples::try_new(UInt32Array::from(vec![Some(0), Some(1)]), batch, None)
+            .unwrap();
+    let fields = SeriesFields::one(Samples::from_public_histogram(samples));
+    // The sample is a real public-histogram view with a non-stale sum, so staleness selection
+    // keeps its row and reaching the error below proves the value mapping rejected it.
+    assert!(matches!(
+        fields.get(0).unwrap().sample(0),
+        SampleRef::PublicHistogram(view) if view.sum() == Some(1.0)
+    ));
+    let time = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
+    let error = mapping.evaluate(&metric(None), &time, &fields).unwrap_err();
+    assert!(matches!(error, DataFusionError::Execution(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("native instant expected Float64 sample"),
+        "{error}"
+    );
 }

@@ -122,6 +122,11 @@ pub fn select_instants(
                 let stale = match sample {
                     SampleRef::Float(value) => is_prometheus_stale_nan(value),
                     SampleRef::Histogram(histogram) => is_prometheus_stale_nan(histogram.sum),
+                    // A null parent hides its stale sum and a nullable sum is not stale, so only a
+                    // present value can be a stale marker.
+                    SampleRef::PublicHistogram(view) => {
+                        view.sum().is_some_and(is_prometheus_stale_nan)
+                    }
                     SampleRef::Missing => false,
                 };
                 current_stale |= stale;

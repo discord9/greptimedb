@@ -16,11 +16,17 @@
 //!
 //! Prom remote-write v2 stores these names as children of one Struct field, while
 //! metric-engine uses the same contract to recognize native histogram tables.
+//!
+//! [`PublicHistogramBatch`] retains such a struct array as it was supplied: it validates the
+//! structural schema and indexes rows, but keeps every child value, buffer, and null exactly as
+//! given, so integer payloads above `2^53` and float payload bits survive unchanged.
 
 use std::sync::{Arc, LazyLock};
 
+use crate::arrow::array::{Array, Float64Array, StructArray};
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::data_type::{ConcreteDataType, DataType};
+use crate::error::{InvalidSeriesSnafu, Result};
 use crate::types::{StructField, StructType};
 
 pub const NATIVE_HISTOGRAM_FIELD: &str = "greptime_native_histogram";
@@ -110,6 +116,107 @@ pub fn native_histogram_value_type() -> &'static ConcreteDataType {
 /// Returns the Arrow type for a complete native histogram value.
 pub fn native_histogram_arrow_type() -> ArrowDataType {
     native_histogram_value_type().as_arrow_type()
+}
+
+/// Position of [`SUM_FIELD`] in [`NATIVE_HISTOGRAM_FIELD_NAMES`].
+///
+/// [`PublicHistogramBatch::try_from_arrow`] rejects any payload whose member order differs, so the
+/// sum column is always at this position in a validated batch.
+const SUM_COLUMN: usize = 2;
+
+/// An immutable public (remote-write v2) native histogram table.
+///
+/// The batch owns exactly the supplied struct array: all 18 members, their buffers, and their
+/// hidden values are retained as they are, without semantic validation of spans, buckets, or
+/// algorithms, and without rebuilding individual members.
+#[derive(Clone, Debug)]
+pub struct PublicHistogramBatch {
+    array: StructArray,
+}
+impl PublicHistogramBatch {
+    /// Validate the exact native histogram structural schema and retain the payload.
+    ///
+    /// The check covers member names, their order, their types, and their item-level metadata and
+    /// nullability. Values themselves are not inspected: a payload is accepted as it stands.
+    pub fn try_from_arrow(array: StructArray) -> Result<Self> {
+        let ArrowDataType::Struct(fields) = native_histogram_arrow_type() else {
+            return invalid("native histogram value type is not a struct");
+        };
+        if array.fields() != &fields {
+            return invalid("public histogram fields, order, types, or nullability mismatch");
+        }
+        Ok(Self { array })
+    }
+    /// The retained struct array, shared with every view and slice.
+    pub fn as_arrow(&self) -> &StructArray {
+        &self.array
+    }
+    /// Number of histogram rows.
+    pub fn len(&self) -> usize {
+        self.array.len()
+    }
+    /// Whether there are no rows.
+    pub fn is_empty(&self) -> bool {
+        self.array.is_empty()
+    }
+    /// Returns a borrowed row, or `None` only when `row` is out of bounds.
+    ///
+    /// A null parent row still yields a view; the view reports it through
+    /// [`PublicHistogramView::is_null`].
+    pub fn view(&self, row: usize) -> Option<PublicHistogramView<'_>> {
+        if row >= self.len() {
+            return None;
+        }
+        Some(PublicHistogramView { batch: self, row })
+    }
+}
+
+/// A row borrowed from a [`PublicHistogramBatch`].
+#[derive(Clone, Copy, Debug)]
+pub struct PublicHistogramView<'a> {
+    batch: &'a PublicHistogramBatch,
+    row: usize,
+}
+impl<'a> PublicHistogramView<'a> {
+    /// The table this row belongs to.
+    pub fn batch(&self) -> &'a PublicHistogramBatch {
+        self.batch
+    }
+    /// Row position within [`Self::batch`].
+    pub fn row(&self) -> usize {
+        self.row
+    }
+    /// Whether the parent row is null.
+    pub fn is_null(&self) -> bool {
+        !self.batch.array.is_valid(self.row)
+    }
+    /// The row's `sum`, or `None` when the parent row is null or the scalar itself is null.
+    ///
+    /// A present value is returned bit for bit; no arithmetic or canonicalization is applied. A
+    /// null parent row therefore hides its children instead of exposing them.
+    pub fn sum(&self) -> Option<f64> {
+        if self.is_null() {
+            return None;
+        }
+        let sum = self
+            .batch
+            .array
+            .column(SUM_COLUMN)
+            .as_any()
+            .downcast_ref::<Float64Array>()?;
+        if sum.is_valid(self.row) {
+            Some(sum.value(self.row))
+        } else {
+            None
+        }
+    }
+}
+
+fn invalid<T>(reason: impl Into<String>) -> Result<T> {
+    Err(InvalidSeriesSnafu {
+        reason: reason.into(),
+    }
+    .build())
 }
 
 #[cfg(test)]

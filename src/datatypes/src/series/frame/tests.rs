@@ -738,6 +738,7 @@ fn segmented_mixed_fields_emit_every_aligned_position_and_marker() {
                     assert_histogram(histogram, -9.5);
                     observed_first.push(("h", histogram.sum.to_bits()));
                 }
+                SampleRef::PublicHistogram(_) => panic!("unexpected public histogram sample"),
             }
             match row.fields.get(1).unwrap().sample(position) {
                 SampleRef::Missing => observed_second.push(("m", 0.0_f64.to_bits())),
@@ -746,6 +747,7 @@ fn segmented_mixed_fields_emit_every_aligned_position_and_marker() {
                     assert_histogram(histogram, 42.25);
                     observed_second.push(("h", histogram.sum.to_bits()));
                 }
+                SampleRef::PublicHistogram(_) => panic!("unexpected public histogram sample"),
             }
         }
     }
@@ -841,11 +843,13 @@ fn segmented_mixed_fields_emit_every_aligned_position_and_marker() {
                 SampleRef::Missing => None,
                 SampleRef::Float(value) => Some(value.to_bits()),
                 SampleRef::Histogram(_) => panic!("expected float field"),
+                SampleRef::PublicHistogram(_) => panic!("expected float field"),
             });
             aligned_b.push(match row.fields.get(1).unwrap().sample(position) {
                 SampleRef::Missing => None,
                 SampleRef::Float(value) => Some(value.to_bits()),
                 SampleRef::Histogram(_) => panic!("expected float field"),
+                SampleRef::PublicHistogram(_) => panic!("expected float field"),
             });
         }
     }

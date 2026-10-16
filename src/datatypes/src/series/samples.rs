@@ -20,6 +20,7 @@ use snafu::OptionExt;
 
 use crate::error::{InvalidSeriesSnafu, Result};
 use crate::series::MetricName;
+use crate::series::histogram::public::{PublicHistogramBatch, PublicHistogramView};
 use crate::series::histogram::{HistogramBatch, HistogramView};
 use crate::series::time::{EvalGrid, TimeAxis};
 
@@ -90,6 +91,85 @@ impl HistogramSamples {
     }
 }
 
+/// Public (remote-write v2) histogram references for each time position, backed by one immutable
+/// table and an optional float lane.
+///
+/// The float lane and the histogram indices are mutually exclusive at every position, including
+/// positions whose referenced histogram row is a null parent row: a valid index always denotes a
+/// histogram, never a float.
+#[derive(Clone, Debug)]
+pub struct PublicHistogramSamples {
+    indices: UInt32Array,
+    batch: Arc<PublicHistogramBatch>,
+    floats: Option<Float64Array>,
+}
+impl PublicHistogramSamples {
+    /// Validate and bind reference indices, their table, and an optional float lane.
+    ///
+    /// Indices must be in bounds for `batch`; when a float lane is present it must match the
+    /// index length and no position may hold both a valid float and a valid index.
+    pub fn try_new(
+        indices: UInt32Array,
+        batch: Arc<PublicHistogramBatch>,
+        floats: Option<Float64Array>,
+    ) -> Result<Self> {
+        if indices.iter().flatten().any(|i| i as usize >= batch.len()) {
+            return invalid("public histogram sample index is out of bounds");
+        }
+        if let Some(floats) = &floats {
+            if floats.len() != indices.len() {
+                return invalid("public histogram float lane has an unequal length");
+            }
+            if (0..indices.len()).any(|i| floats.is_valid(i) && indices.is_valid(i)) {
+                return invalid("public histogram sample position has both float and histogram");
+            }
+        }
+        Ok(Self {
+            indices,
+            batch,
+            floats,
+        })
+    }
+    /// Read-only reference indices.
+    pub fn indices(&self) -> &UInt32Array {
+        &self.indices
+    }
+    /// Shared public histogram table.
+    pub fn batch(&self) -> &Arc<PublicHistogramBatch> {
+        &self.batch
+    }
+    /// Read-only float lane, when this carrier mixes floats and histograms.
+    pub fn floats(&self) -> Option<&Float64Array> {
+        self.floats.as_ref()
+    }
+    /// Number of time positions.
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    /// Whether this contains no positions.
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+    /// Returns a referenced histogram, or `None` for a null index or an out-of-range position.
+    pub fn view_at(&self, index: usize) -> Option<PublicHistogramView<'_>> {
+        if index >= self.indices.len() {
+            return None;
+        }
+        if self.indices.is_valid(index) {
+            self.batch.view(self.indices.value(index) as usize)
+        } else {
+            None
+        }
+    }
+    fn slice(&self, offset: usize, len: usize) -> Self {
+        Self {
+            indices: self.indices.slice(offset, len),
+            batch: self.batch.clone(),
+            floats: self.floats.as_ref().map(|lane| lane.slice(offset, len)),
+        }
+    }
+}
+
 /// Float and histogram values with mutually exclusive validity at each position.
 #[derive(Clone, Debug)]
 pub struct MixedSamples {
@@ -119,6 +199,7 @@ impl MixedSamples {
 enum SampleStorage {
     Float(Float64Array),
     Histogram(HistogramSamples),
+    PublicHistogram(PublicHistogramSamples),
     Mixed(MixedSamples),
     Chunks(Arc<[Samples]>, usize),
 }
@@ -133,6 +214,7 @@ pub struct Samples {
 pub enum DenseSamplesRef<'a> {
     Float(&'a Float64Array),
     Histogram(&'a HistogramSamples),
+    PublicHistogram(&'a PublicHistogramSamples),
     Mixed(&'a MixedSamples),
 }
 
@@ -141,6 +223,7 @@ pub enum SampleRef<'a> {
     Missing,
     Float(f64),
     Histogram(HistogramView<'a>),
+    PublicHistogram(PublicHistogramView<'a>),
 }
 
 impl Samples {
@@ -155,6 +238,12 @@ impl Samples {
         Ok(Self {
             storage: SampleStorage::Histogram(HistogramSamples::try_new(indices, batch)?),
         })
+    }
+    /// Retain an already validated public histogram carrier as it is.
+    pub fn from_public_histogram(samples: PublicHistogramSamples) -> Self {
+        Self {
+            storage: SampleStorage::PublicHistogram(samples),
+        }
     }
     /// Validate lengths and ensure no position is simultaneously float and histogram.
     pub fn try_from_mixed(floats: Float64Array, histograms: HistogramSamples) -> Result<Self> {
@@ -244,6 +333,7 @@ impl Samples {
         match &self.storage {
             SampleStorage::Float(a) => a.len(),
             SampleStorage::Histogram(a) => a.len(),
+            SampleStorage::PublicHistogram(a) => a.len(),
             SampleStorage::Mixed(a) => a.len(),
             SampleStorage::Chunks(_, len) => *len,
         }
@@ -257,6 +347,7 @@ impl Samples {
         match &self.storage {
             SampleStorage::Float(a) => Some(DenseSamplesRef::Float(a)),
             SampleStorage::Histogram(a) => Some(DenseSamplesRef::Histogram(a)),
+            SampleStorage::PublicHistogram(a) => Some(DenseSamplesRef::PublicHistogram(a)),
             SampleStorage::Mixed(a) => Some(DenseSamplesRef::Mixed(a)),
             SampleStorage::Chunks(_, _) => None,
         }
@@ -277,6 +368,12 @@ impl Samples {
             SampleStorage::Histogram(a) => a
                 .view_at(index)
                 .map_or(SampleRef::Missing, SampleRef::Histogram),
+            SampleStorage::PublicHistogram(a) => match a.floats() {
+                Some(lane) if lane.is_valid(index) => SampleRef::Float(lane.value(index)),
+                _ => a
+                    .view_at(index)
+                    .map_or(SampleRef::Missing, SampleRef::PublicHistogram),
+            },
             SampleStorage::Mixed(a) => {
                 if a.floats.is_valid(index) {
                     SampleRef::Float(a.floats.value(index))
@@ -325,6 +422,9 @@ impl Samples {
             SampleStorage::Histogram(a) => Ok(Self {
                 storage: SampleStorage::Histogram(a.slice(offset, len)),
             }),
+            SampleStorage::PublicHistogram(a) => Ok(Self {
+                storage: SampleStorage::PublicHistogram(a.slice(offset, len)),
+            }),
             SampleStorage::Mixed(a) => Ok(Self {
                 storage: SampleStorage::Mixed(MixedSamples {
                     floats: a.floats.slice(offset, len),
@@ -356,6 +456,10 @@ impl Samples {
     }
     /// Materialize chunks into one dense array. When all histogram-bearing chunks reference the
     /// same Arrow table view, reuse it; otherwise concatenate tables per chunk and remap indices.
+    ///
+    /// Canonical (14-member) and public (18-member) histograms can coexist as chunks, segments,
+    /// samples, slices, and iterated values, because their layouts are separate Arrow types, but
+    /// they cannot share one dense table and densification of a mix fails instead.
     pub fn into_dense(self) -> Result<Self> {
         let SampleStorage::Chunks(chunks, total_len) = self.storage else {
             return Ok(self);
@@ -383,11 +487,19 @@ impl Samples {
                 })?;
             return Ok(Self::from_float(values.clone()));
         }
+        if chunks
+            .iter()
+            .any(|chunk| matches!(chunk.storage, SampleStorage::PublicHistogram(_)))
+        {
+            return into_dense_public(&chunks, total_len);
+        }
 
         let mut histogram_batches = chunks.iter().filter_map(|chunk| match &chunk.storage {
             SampleStorage::Histogram(histogram) => Some(&histogram.batch),
             SampleStorage::Mixed(mixed) => Some(&mixed.histograms.batch),
-            SampleStorage::Float(_) | SampleStorage::Chunks(_, _) => None,
+            SampleStorage::Float(_)
+            | SampleStorage::PublicHistogram(_)
+            | SampleStorage::Chunks(_, _) => None,
         });
         let mut first_data = None;
         let shared_batch = histogram_batches.next().filter(|first| {
@@ -416,6 +528,9 @@ impl Samples {
                 SampleStorage::Float(values) => (Some(values), None),
                 SampleStorage::Histogram(histogram) => (None, Some(histogram)),
                 SampleStorage::Mixed(mixed) => (Some(&mixed.floats), Some(&mixed.histograms)),
+                SampleStorage::PublicHistogram(_) => {
+                    return invalid("canonical and public histograms cannot densify together");
+                }
                 SampleStorage::Chunks(_, _) => {
                     return invalid("nested sample chunks were not flattened");
                 }
@@ -486,6 +601,120 @@ impl Samples {
             })
         }
     }
+}
+
+/// Densifies chunks whose histogram payloads are public (18-member) histograms.
+///
+/// Public and canonical histograms have different table layouts, so a mix is rejected rather than
+/// concatenated into one incompatible table. Owners that share one Arrow view (the same
+/// [`PublicHistogramBatch`] or the exact same Arrow payload) reuse their first owner; distinct
+/// owners are concatenated whole, preserving every child value — including values hidden behind a
+/// null parent row — and remapping each later owner's indices by the visible lengths before it.
+fn into_dense_public(chunks: &[Samples], total_len: usize) -> Result<Samples> {
+    let mut needs_float = false;
+    for chunk in chunks {
+        match &chunk.storage {
+            SampleStorage::Float(_) => needs_float = true,
+            SampleStorage::PublicHistogram(samples) => needs_float |= samples.floats.is_some(),
+            SampleStorage::Histogram(_) | SampleStorage::Mixed(_) => {
+                return invalid("canonical and public histograms cannot densify together");
+            }
+            SampleStorage::Chunks(_, _) => {
+                return invalid("nested sample chunks were not flattened");
+            }
+        }
+    }
+    let mut owners = chunks.iter().filter_map(|chunk| match &chunk.storage {
+        SampleStorage::PublicHistogram(samples) => Some(samples),
+        _ => None,
+    });
+    let mut first_view = None;
+    let shared = owners.next().filter(|first| {
+        owners.all(|owner| {
+            Arc::ptr_eq(first.batch(), owner.batch()) || {
+                first_view
+                    .get_or_insert_with(|| first.batch().as_arrow().to_data())
+                    .ptr_eq(&owner.batch().as_arrow().to_data())
+            }
+        })
+    });
+
+    let mut tables: Vec<&dyn Array> = Vec::new();
+    let mut indices = UInt32Builder::with_capacity(total_len);
+    let mut floats = needs_float.then(|| arrow::array::Float64Builder::with_capacity(total_len));
+    let mut base = 0u32;
+    for chunk in chunks {
+        let (lane, carrier) = match &chunk.storage {
+            SampleStorage::Float(values) => (Some(values), None),
+            SampleStorage::PublicHistogram(samples) => (samples.floats.as_ref(), Some(samples)),
+            SampleStorage::Histogram(_) | SampleStorage::Mixed(_) => {
+                return invalid("canonical and public histograms cannot densify together");
+            }
+            SampleStorage::Chunks(_, _) => {
+                return invalid("nested sample chunks were not flattened");
+            }
+        };
+        if shared.is_none()
+            && let Some(carrier) = carrier
+        {
+            tables.push(carrier.batch().as_arrow());
+        }
+        for position in 0..chunk.len() {
+            if let Some(floats) = &mut floats {
+                match lane {
+                    Some(values) if values.is_valid(position) => {
+                        floats.append_value(values.value(position));
+                    }
+                    _ => floats.append_null(),
+                }
+            }
+            match carrier {
+                Some(carrier) if carrier.indices().is_valid(position) => {
+                    indices.append_value(
+                        base.checked_add(carrier.indices().value(position))
+                            .context(InvalidSeriesSnafu {
+                                reason: "public histogram remapped index overflow",
+                            })?,
+                    );
+                }
+                _ => indices.append_null(),
+            }
+        }
+        if shared.is_none()
+            && let Some(carrier) = carrier
+        {
+            base = base
+                .checked_add(u32::try_from(carrier.batch().len()).map_err(|_| {
+                    InvalidSeriesSnafu {
+                        reason: "public histogram table too large",
+                    }
+                    .build()
+                })?)
+                .context(InvalidSeriesSnafu {
+                    reason: "public histogram table index overflow",
+                })?;
+        }
+    }
+    let batch = if let Some(owner) = shared {
+        Arc::clone(owner.batch())
+    } else {
+        let table = arrow_result(concat(&tables))?;
+        let struct_array = table
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .ok_or_else(|| {
+                InvalidSeriesSnafu {
+                    reason: "public histogram concatenation returned a non-struct array",
+                }
+                .build()
+            })?
+            .clone();
+        Arc::new(PublicHistogramBatch::try_from_arrow(struct_array)?)
+    };
+    let floats = floats.map(|mut builder| builder.finish());
+    Ok(Samples::from_public_histogram(
+        PublicHistogramSamples::try_new(indices.finish(), batch, floats)?,
+    ))
 }
 
 /// Sequential exact-size iterator over a dense series or its chunk descriptors.

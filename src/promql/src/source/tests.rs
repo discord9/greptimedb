@@ -576,6 +576,7 @@ async fn preserves_sliced_multifield_payload_and_shared_owners() {
             SampleRef::Missing => None,
             SampleRef::Float(v) => Some(v.to_bits()),
             SampleRef::Histogram(_) => panic!("expected float"),
+            SampleRef::PublicHistogram(_) => panic!("expected float"),
         })
         .collect();
     assert_eq!(
@@ -614,6 +615,7 @@ async fn preserves_sliced_multifield_payload_and_shared_owners() {
                 assert_eq!(value.negative.buckets, &[0.75]);
                 Some(0)
             }
+            SampleRef::PublicHistogram(_) => panic!("the fixture has no public histogram samples"),
         })
         .collect();
     assert_eq!(mixed, [Some(1.25_f64.to_bits()), Some(0), None]);

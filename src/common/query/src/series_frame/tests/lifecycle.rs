@@ -321,6 +321,7 @@ async fn streaming_round_trip_preserves_sliced_multifield_payload_and_owners() {
                 SampleRef::Float(value) => float_seen.push(Some(value.to_bits())),
                 SampleRef::Missing => float_seen.push(None),
                 SampleRef::Histogram(_) => panic!("expected float field"),
+                SampleRef::PublicHistogram(_) => panic!("expected float field"),
             }
             let SampleRef::Histogram(value) = chunk.fields.get(1).unwrap().sample(i) else {
                 panic!("expected histogram")
@@ -513,6 +514,7 @@ async fn single_row_sliced_payload_keeps_zero_copy_buffers_and_releases_owners()
             f64::from_bits(0x7ff8_0000_0000_0042).to_bits()
         ),
         SampleRef::Missing | SampleRef::Histogram(_) => panic!("expected float field"),
+        SampleRef::PublicHistogram(_) => panic!("expected float field"),
     }
     let SampleRef::Histogram(value) = chunk.fields.get(1).unwrap().sample(0) else {
         panic!("expected histogram")
@@ -521,5 +523,6 @@ async fn single_row_sliced_payload_keeps_zero_copy_buffers_and_releases_owners()
     match chunk.fields.get(2).unwrap().sample(0) {
         SampleRef::Float(value) => assert_eq!(value.to_bits(), (-0.0_f64).to_bits()),
         SampleRef::Missing | SampleRef::Histogram(_) => panic!("expected mixed float"),
+        SampleRef::PublicHistogram(_) => panic!("expected mixed float"),
     }
 }

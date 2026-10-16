@@ -298,6 +298,7 @@ async fn merges_typed_multifield_payload_through_frame_and_label_roundtrip() {
                 );
                 Some(("hist", 0))
             }
+            SampleRef::PublicHistogram(_) => panic!("unexpected public histogram sample"),
         })
         .collect();
     assert_eq!(

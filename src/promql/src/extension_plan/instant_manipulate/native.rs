@@ -261,7 +261,7 @@ impl NativeInstantMapping {
                                     })? {
                                         SampleRef::Float(value) => Some(value),
                                         SampleRef::Missing => None,
-                                        SampleRef::Histogram(_) => {
+                                        SampleRef::Histogram(_) | SampleRef::PublicHistogram(_) => {
                                             return Err(DataFusionError::Execution(
                                                 "native instant expected Float64 sample".into(),
                                             ));

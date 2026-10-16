@@ -442,6 +442,11 @@ fn measure_row(row: &RawFrameRow) -> Result<usize> {
             DenseSamplesRef::Histogram(values) => {
                 bytes = add_checked(bytes, histogram_charge(values)?)?
             }
+            DenseSamplesRef::PublicHistogram(_) => {
+                return Err(err(
+                    "public histogram samples require v2 raw frames, not the v1 layout",
+                ));
+            }
             DenseSamplesRef::Mixed(values) => {
                 bytes = add_checked(bytes, float_charge(values.floats().len())?)?;
                 bytes = add_checked(bytes, histogram_charge(values.histograms())?)?;
@@ -602,6 +607,11 @@ fn encode_rows(
                     table_lengths.push(values.batch().len());
                     table_parts.push(Arc::new(values.batch().as_arrow().clone()));
                     histogram_valid.push(true);
+                }
+                DenseSamplesRef::PublicHistogram(_) => {
+                    return Err(err(
+                        "public histogram samples require v2 raw frames, not the v1 layout",
+                    ));
                 }
                 DenseSamplesRef::Mixed(values) => {
                     float_lengths.push(values.floats().len());

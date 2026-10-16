@@ -870,6 +870,7 @@ fn float_values(chunk: &RawSeriesChunk) -> Vec<Option<f64>> {
             SampleRef::Float(value) => Some(value),
             SampleRef::Missing => None,
             SampleRef::Histogram(_) => panic!("the fixture has no histogram samples"),
+            SampleRef::PublicHistogram(_) => panic!("the fixture has no histogram samples"),
         })
         .collect()
 }

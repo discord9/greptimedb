@@ -2109,6 +2109,7 @@ async fn pack_emits_oversized_legal_rows_whole() {
                     assert_eq!(value.to_bits(), (offset as f64 + index as f64).to_bits());
                 }
                 SampleRef::Missing | SampleRef::Histogram(_) => panic!("expected float samples"),
+                SampleRef::PublicHistogram(_) => panic!("expected float samples"),
             }
         }
     }
@@ -2268,6 +2269,7 @@ async fn multirow_ipc_roundtrip_preserves_cross_chunk_variable_segments() {
                 }
                 SampleRef::Missing => assert_eq!(expected.float_bits, None),
                 SampleRef::Histogram(_) => panic!("expected a float field"),
+                SampleRef::PublicHistogram(_) => panic!("expected a float field"),
             }
             match expected.hist_index {
                 Some(index_value) => {
