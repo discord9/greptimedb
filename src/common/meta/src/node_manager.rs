@@ -25,7 +25,7 @@ use common_query::request::{QueryRequest, RAW_SERIES_REQUEST_EXTENSION_KEY, RawS
 use common_query::series_frame::{raw_series_frame_ordering, unpack_raw_series};
 use common_recordbatch::SendableRecordBatchStream;
 use common_recordbatch::adapter::DfRecordBatchStreamAdapter;
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::SeriesSchema;
 use snafu::{ResultExt, location};
 use store_api::region_engine::{RawLabelSource, SendableRawSeriesStream};
@@ -50,7 +50,7 @@ pub trait Datanode: Send + Sync {
         &self,
         _request: QueryRequest,
         _binding: RawSeriesRequest,
-    ) -> Result<Option<RawSeriesOrdering>> {
+    ) -> Result<Option<SeriesOrdering>> {
         Ok(None)
     }
 

@@ -36,7 +36,8 @@ use datatypes::arrow::datatypes::ArrowNativeType;
 use datatypes::arrow::datatypes::DataType;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{Samples, SeriesFields, SeriesSchema};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
@@ -82,7 +83,7 @@ fn chunk(
     if (start..end).any(|row| !timestamp.is_valid(row)) {
         return Err(invalid("null timestamp"));
     }
-    let time = RawTimeAxis::try_new(timestamp.values().slice(start, end - start))
+    let time = RawTimestamps::try_new(timestamp.values().slice(start, end - start))
         .context(DataTypeMismatchSnafu)
         .map_err(BoxedError::new)?;
     let mut samples = Vec::with_capacity(fields.len());
@@ -127,7 +128,7 @@ fn chunk(
 struct RawStream {
     schema: Arc<SeriesSchema>,
     label_source: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     inner: BoxStream<'static, Result<RawSeriesChunk, BoxedError>>,
 }
 
@@ -145,7 +146,7 @@ impl RawSeriesStream for RawStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.label_source
     }
-    fn ordering(&self) -> RawSeriesOrdering {
+    fn ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 }
@@ -157,7 +158,7 @@ pub(crate) fn make_stream(
     fields: Vec<(usize, ConcreteDataType)>,
     metrics: PartitionMetrics,
     predicates: Vec<Arc<dyn PhysicalExpr>>,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
 ) -> SendableRawSeriesStream {
     let output_schema = schema.clone();
     let stream = async_stream::stream! {
@@ -239,21 +240,21 @@ pub(crate) fn make_stream(
                     };
                     metrics.inc_convert_batch_cost(begun.elapsed());
                     if let Some(old) = pending.as_ref()
-                        && ordering == RawSeriesOrdering::ReadKeyThenTime
-                        && old.read_key.as_slice() != current.read_key.as_slice()
-                        && current.read_key.as_slice() <= old.read_key.as_slice()
+                        && ordering == SeriesOrdering::KeyThenTime
+                        && old.primary_key.as_slice() != current.primary_key.as_slice()
+                        && current.primary_key.as_slice() <= old.primary_key.as_slice()
                     {
                         yield Err(invalid("legacy series primary keys are not strictly increasing")); return;
                     }
                     if let Some(old) = pending.as_ref()
-                        && old.read_key.as_slice() == current.read_key.as_slice()
+                        && old.primary_key.as_slice() == current.primary_key.as_slice()
                         && current.time.timestamp(0).zip(old.time.timestamp(old.time.len() - 1))
                             .is_some_and(|(next, previous)| next <= previous)
                     {
                         yield Err(invalid("raw timestamps are not strictly increasing")); return;
                     }
                     if let Some(mut old) = pending.take() {
-                        if old.read_key.as_slice() != current.read_key.as_slice() { old.is_last = true; }
+                        if old.primary_key.as_slice() != current.primary_key.as_slice() { old.is_last = true; }
                         yield Ok(old);
                     }
                     pending = Some(current);

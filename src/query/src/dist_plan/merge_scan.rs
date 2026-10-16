@@ -1360,7 +1360,7 @@ mod tests {
     use datatypes::prelude::{ConcreteDataType, VectorRef};
     use datatypes::schema::{ColumnSchema, Schema};
     use datatypes::series::frame::{self, RawLabelMode};
-    use datatypes::series::raw::{RawSeriesChunk, RawTimeAxis};
+    use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
     use datatypes::series::samples::{
         DenseSamplesRef, FieldSpec, SampleRef, Samples, SeriesFields, SeriesSchema,
     };
@@ -3152,7 +3152,7 @@ mod tests {
                 &raw,
                 Buffer::from(vec![1u8, 2, 3]),
                 None,
-                RawTimeAxis::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
+                RawTimestamps::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
                 SeriesFields::try_from_vec(vec![
                     Samples::from_float(Float64Array::from(values.to_vec())),
                     Samples::from_float(Float64Array::from(vec![4.0, 5.0])),
@@ -3298,7 +3298,7 @@ mod tests {
             &raw,
             Buffer::from(vec![1u8, 2, 3]),
             None,
-            RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap(),
+            RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap(),
             SeriesFields::try_from_vec(vec![
                 Samples::from_float(Float64Array::from(vec![Some(-0.0), None])),
                 Samples::from_float(Float64Array::from(vec![
@@ -3333,7 +3333,7 @@ mod tests {
         let decoded = frame::unpack_raw_series_frame(&raw, RawLabelMode::Key, &result[0]);
         let decoded = decoded.unwrap();
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].read_key.as_slice(), &[1, 2, 3]);
+        assert_eq!(decoded[0].primary_key.as_slice(), &[1, 2, 3]);
         assert!(decoded[0].is_last);
         assert_eq!(decoded[0].time.timestamp(0), Some(10));
         assert_eq!(decoded[0].time.timestamp(1), Some(20));

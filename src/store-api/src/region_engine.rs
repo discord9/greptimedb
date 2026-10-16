@@ -30,7 +30,8 @@ use common_time::Timestamp;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, PhysicalExpr};
 use datatypes::schema::SchemaRef;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::RawSeriesChunk;
 use datatypes::series::samples::SeriesSchema;
 use futures::Stream;
 use futures::future::join_all;
@@ -492,29 +493,84 @@ pub enum RawLabelSource {
         /// Logical tag names mapped to physical column identifiers.
         logical_tags: Arc<[BoundTag]>,
     },
-    /// The stream supplies a complete metric name and label set in each chunk.
+    /// The stream supplies a complete metric name and label set in each chunk, not a partial
+    /// label projection; `Some(metric)` is a complete name/label set (the name itself may be
+    /// absent).
     Explicit,
 }
 
 /// A stream of raw series chunks with stable schema, label binding, and ordering.
 ///
-/// Producers MUST emit chunks for each read key contiguously, with strictly increasing timestamps
-/// within and across chunks. Adapters validate adjacent chunk conditions but do not certify
-/// nonadjacent recurrence for [`RawSeriesOrdering::Contiguous`]; an A/B/A sequence violates the
-/// producer contract. `is_last` marks the last chunk of that key in this stream, not across streams.
+/// Every series has strictly increasing timestamps within and across chunks; timestamps are
+/// unique per series. `Interleaved` permits a series to resume after another series; `Contiguous`
+/// and `KeyThenTime` guarantee each series' chunks are contiguous. `KeyThenTime` uses the complete
+/// stream identity compatible with its label binding, not just a TSID or hash. These are
+/// per-stream guarantees, not query-global order, partition ownership, or finality. `is_last`
+/// marks the last chunk of that series in this stream only; merging requires recomputing
+/// per-input-series finalization across all related inputs, not aggregate-group finality.
+/// `RawLabelSource` keeps label interpretation self-contained through transport. Stream finality
+/// applies to all related input series, not aggregate groups or vector-match state.
 pub trait RawSeriesStream: Stream<Item = Result<RawSeriesChunk, BoxedError>> + Send {
     /// Returns the schema shared by all chunks; raw schemas have no evaluation grid.
     fn schema(&self) -> &Arc<SeriesSchema>;
     /// Returns scan-bound label metadata. `PrimaryKey` chunks leave `metric` as `None`, meaning
     /// labels are undecoded, not that the metric name is missing; `Explicit` chunks supply
-    /// `Some` with a complete metric name and labels.
+    /// `Some` with the complete name/label set, not a partial projection. The metric name itself
+    /// may be absent.
     fn label_source(&self) -> &RawLabelSource;
     /// Returns this stream's ordering guarantee.
-    fn ordering(&self) -> RawSeriesOrdering;
+    fn ordering(&self) -> SeriesOrdering;
 }
 
 /// A pinned raw-series stream that can be sent between threads.
 pub type SendableRawSeriesStream = Pin<Box<dyn RawSeriesStream>>;
+
+/// Stable identity metadata for one ordinal in a prepared series source.
+#[derive(Clone, Debug)]
+pub struct SeriesInfo {
+    /// Complete encoded primary key, not a TSID or hash alone.
+    pub primary_key: datatypes::arrow::buffer::Buffer,
+    /// Complete explicit metric name and labels, not a partial label projection; or `None` for
+    /// primary-key label binding (undecoded, not nameless). The metric name itself may be absent.
+    pub metric: Option<datatypes::series::MetricName>,
+}
+
+/// An immutable, finite selected set of series prepared for independent range reads.
+///
+/// The count may include series with no samples after filtering. Ordinals are stable local
+/// indexes, not protocol identifiers; each has exactly one complete identity returned by
+/// [`PreparedSeriesSource::series_info`], and that identity matches chunks for that ordinal.
+/// Every reader exposes the same fixed schema, label binding, and ordering before polling,
+/// including for an empty range, and describes labels independently of this source's lifetime.
+/// `PrimaryKey` output has `metric: None` (undecoded); `Explicit` output has a complete
+/// `Some(metric)` matching each chunk. Ordering describes the stream, not ordinal enumeration.
+///
+/// Preparation, identity lookup, and reader creation do not load sample payloads or perform
+/// hidden blocking I/O. The selected set is bound to the partition's immutable MVCC view,
+/// predicates, authorization, projection, labels, and existing scan resources. Readers own
+/// resources needed to continue after this source or scanner is dropped. Dropping one reader
+/// does not cancel sibling readers; normal ownership cleanup applies without detached work.
+///
+/// A range must satisfy `start <= end <= num_series()`. Invalid ranges and invalid ordinals
+/// return errors; an empty in-bounds range returns an ordinary empty stream. Repeated and
+/// overlapping reads are independent and do not consume shared iteration state.
+pub trait PreparedSeriesSource: Send + Sync {
+    /// Returns the exact, stable number of selected local series ordinals.
+    fn num_series(&self) -> usize;
+
+    /// Returns label binding shared by series metadata and every reader, without opening or
+    /// polling a reader; the binding is self-contained for remote consumers.
+    fn label_source(&self) -> &RawLabelSource;
+
+    /// Returns identity metadata for an ordinal without polling sample data.
+    fn series_info(&self, ordinal: usize) -> Result<SeriesInfo, BoxedError>;
+
+    /// Creates an independent reader for the half-open ordinal range.
+    fn read_series(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<SendableRawSeriesStream, BoxedError>;
+}
 
 /// A scanner that provides a way to scan the region concurrently.
 ///
@@ -564,8 +620,11 @@ pub trait RegionScanner: Debug + DisplayAs + Send {
     }
 
     /// Returns the guarantee for subsequent raw scans without consuming scanner state.
-    fn raw_series_ordering(&self) -> RawSeriesOrdering {
-        RawSeriesOrdering::Contiguous
+    ///
+    /// Legacy raw sources have no ordering declaration, so `Contiguous` is the conservative
+    /// default; `Interleaved` is not representable on the raw frame wire.
+    fn raw_series_ordering(&self) -> SeriesOrdering {
+        SeriesOrdering::Contiguous
     }
 
     /// Scans a partition as raw series when this source supports that path.
@@ -595,6 +654,22 @@ pub trait RegionScanner: Debug + DisplayAs + Send {
         _label_source: &RawLabelSource,
     ) -> Result<Option<SendableRawSeriesStream>, BoxedError> {
         todo!()
+    }
+
+    /// Prepares a finite, stable set of series for independent ordinal-range reads.
+    ///
+    /// `None` means unsupported before consumption, so callers may use the legacy record-batch
+    /// scan. `Some`, including a source with zero series, selects this path; errors propagate
+    /// without replay. Choose exactly one entrypoint per partition per execution: this prepared
+    /// source, [`Self::scan_series_partition`], or [`Self::scan_partition`]. In particular, do
+    /// not call the legacy raw-scan default merely because this returns `None`.
+    fn prepare_series_partition(
+        &self,
+        _ctx: &QueryScanContext,
+        _metrics_set: &ExecutionPlanMetricsSet,
+        _partition: usize,
+    ) -> Result<Option<Arc<dyn PreparedSeriesSource>>, BoxedError> {
+        Ok(None)
     }
 
     /// Check if there is any predicate exclude region partition exprs that may be executed in this scanner.
@@ -836,6 +911,10 @@ impl RegionStatistic {
 }
 
 #[cfg(test)]
+#[path = "region_engine/prepared_series_tests.rs"]
+mod prepared_series_tests;
+
+#[cfg(test)]
 mod tests {
     use common_recordbatch::{RecordBatch, RecordBatches};
     use datatypes::prelude::ConcreteDataType;
@@ -890,13 +969,21 @@ mod tests {
         let ctx = QueryScanContext::default();
         let metrics = ExecutionPlanMetricsSet::new();
 
-        // The default raw-scan preflight declines without consuming the legacy scan.
+        // The default raw-scan preflight declines without consuming the legacy scan, and the
+        // prepared-series entrypoint reports unsupported before consumption as well.
         assert!(
             scanner
                 .raw_series_schema(&RawLabelSource::Explicit)
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            scanner
+                .prepare_series_partition(&ctx, &metrics, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(scanner.raw_series_ordering(), SeriesOrdering::Contiguous);
 
         // SinglePartitionScanner uses the default raw-scan implementation, which panics.
         let raw_scan = catch_unwind(AssertUnwindSafe(|| {

@@ -22,7 +22,8 @@ use std::task::{Context, Poll};
 
 use common_error::ext::BoxedError;
 use datatypes::error::InvalidSeriesSnafu;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::RawSeriesChunk;
 use datatypes::series::samples::{SeriesFields, SeriesSchema};
 use futures::Stream;
 use mito_codec::labels::{LabelProjection, PrimaryKeyLabelDecoder};
@@ -78,7 +79,7 @@ fn validate_input(
     binding: &RawLabelSource,
 ) -> Result<(), BoxedError> {
     let other = stream.schema();
-    if stream.ordering() != RawSeriesOrdering::ReadKeyThenTime
+    if stream.ordering() != SeriesOrdering::KeyThenTime
         || other.eval_grid.is_some()
         || other.fields.is_empty()
         || other.fields.len() != schema.fields.len()
@@ -168,19 +169,16 @@ impl Input {
         }
         RawSeriesChunk::try_new(
             schema,
-            chunk.read_key.clone(),
+            chunk.primary_key.clone(),
             None,
             chunk.time.clone(),
             chunk.fields.clone(),
             chunk.is_last,
         )
         .map_err(BoxedError::new)?;
-        let times = chunk
-            .time
-            .as_explicit()
-            .ok_or_else(|| invalid("raw merge requires explicit timestamps"))?;
+        let times = chunk.time.as_buffer();
         if let Some(previous_key) = &self.previous_key {
-            match previous_key.as_slice().cmp(chunk.read_key.as_slice()) {
+            match previous_key.as_slice().cmp(chunk.primary_key.as_slice()) {
                 Ordering::Greater => {
                     return Err(invalid("raw merge input read keys are not ordered"));
                 }
@@ -198,7 +196,7 @@ impl Input {
                 _ => {}
             }
         }
-        self.previous_key = Some(chunk.read_key.as_slice().to_vec());
+        self.previous_key = Some(chunk.primary_key.as_slice().to_vec());
         self.previous_time = times.last().copied();
         self.ended_series = chunk.is_last;
         Ok(())
@@ -257,9 +255,9 @@ impl OrderedRawMerge {
             .enumerate()
             .filter_map(|(index, input)| input.head.as_ref().map(|head| (index, head)))
             .min_by(|(_, a), (_, b)| {
-                a.read_key
+                a.primary_key
                     .as_slice()
-                    .cmp(b.read_key.as_slice())
+                    .cmp(b.primary_key.as_slice())
                     .then_with(|| a.time.timestamp(0).cmp(&b.time.timestamp(0)))
             })
             .map(|(index, _)| index)
@@ -270,7 +268,7 @@ impl OrderedRawMerge {
             .head
             .take()
             .ok_or_else(|| invalid("raw merge lost selected head"))?;
-        let key = chunk.read_key.as_slice();
+        let key = chunk.primary_key.as_slice();
         let start = chunk
             .time
             .timestamp(0)
@@ -278,7 +276,7 @@ impl OrderedRawMerge {
         let mut end = chunk.time.len();
         for input in &self.streams {
             if let Some(head) = &input.head {
-                if head.read_key.as_slice() == key {
+                if head.primary_key.as_slice() == key {
                     let next = head
                         .time
                         .timestamp(0)
@@ -292,8 +290,7 @@ impl OrderedRawMerge {
                         end = end.min(
                             chunk
                                 .time
-                                .as_explicit()
-                                .ok_or_else(|| invalid("raw merge requires explicit timestamps"))?
+                                .as_buffer()
                                 .partition_point(|timestamp| *timestamp < next),
                         );
                     }
@@ -302,7 +299,7 @@ impl OrderedRawMerge {
         }
         if end == chunk.time.len() {
             return Ok(Some(RawSeriesChunk {
-                read_key: chunk.read_key,
+                primary_key: chunk.primary_key,
                 metric: None,
                 time: chunk.time,
                 fields: chunk.fields,
@@ -332,7 +329,7 @@ impl OrderedRawMerge {
             )
             .map_err(BoxedError::new)?;
             self.streams[index].head = Some(RawSeriesChunk {
-                read_key: chunk.read_key.clone(),
+                primary_key: chunk.primary_key.clone(),
                 metric: None,
                 time: chunk
                     .time
@@ -343,7 +340,7 @@ impl OrderedRawMerge {
             });
         }
         Ok(Some(RawSeriesChunk {
-            read_key: chunk.read_key,
+            primary_key: chunk.primary_key,
             metric: None,
             time,
             fields,
@@ -382,10 +379,9 @@ impl Stream for OrderedRawMerge {
         };
         let is_last = this.streams.iter().all(|input| {
             input.stream.is_none() && input.head.is_none()
-                || input
-                    .head
-                    .as_ref()
-                    .is_some_and(|head| head.read_key.as_slice() > candidate.read_key.as_slice())
+                || input.head.as_ref().is_some_and(|head| {
+                    head.primary_key.as_slice() > candidate.primary_key.as_slice()
+                })
         });
         Poll::Ready(Some(Ok(RawSeriesChunk {
             is_last,
@@ -401,7 +397,7 @@ impl RawSeriesStream for OrderedRawMerge {
     fn label_source(&self) -> &RawLabelSource {
         &self.binding
     }
-    fn ordering(&self) -> RawSeriesOrdering {
-        RawSeriesOrdering::ReadKeyThenTime
+    fn ordering(&self) -> SeriesOrdering {
+        SeriesOrdering::KeyThenTime
     }
 }

@@ -861,7 +861,7 @@ async fn test_native_single_region_raw_flight_preserves_typed_filter_and_snapsho
     use datafusion::arrow::array::{Array, Float64Array};
     use datafusion::common::TableReference;
     use datafusion_expr::{col, lit};
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::samples::SampleRef;
     use futures_util::TryStreamExt;
     use mito2::test_util::sst_util::new_primary_key;
@@ -982,7 +982,7 @@ async fn test_native_single_region_raw_flight_preserves_typed_filter_and_snapsho
         }
         RawLabelSource::Explicit => panic!("expected key-backed source"),
     }
-    assert_eq!(RawSeriesOrdering::ReadKeyThenTime, raw.ordering());
+    assert_eq!(SeriesOrdering::KeyThenTime, raw.ordering());
     assert_eq!(PrimaryKeyEncoding::Dense, metadata.primary_key_encoding);
     assert_eq!(&[host_id], metadata.primary_key.as_slice());
     let expected_key = new_primary_key(&["alpha"]);
@@ -993,10 +993,10 @@ async fn test_native_single_region_raw_flight_preserves_typed_filter_and_snapsho
         assert!(chunk.metric.is_none());
         assert_eq!(
             expected_key,
-            chunk.read_key.as_slice(),
+            chunk.primary_key.as_slice(),
             "every chunk must retain the complete encoded primary key"
         );
-        timestamps.extend_from_slice(chunk.time.as_explicit().unwrap());
+        timestamps.extend_from_slice(chunk.time.as_buffer());
         assert_eq!(2, chunk.fields.len());
         assert_eq!(chunk.time.len(), chunk.fields.get(0).unwrap().len());
         assert_eq!(chunk.time.len(), chunk.fields.get(1).unwrap().len());
@@ -1051,7 +1051,7 @@ async fn test_native_single_region_raw_flight_preserves_typed_filter_and_snapsho
     assert_eq!(old_baseline + 1, rpc_requests(&cluster, *datanode));
     let old_again_times = old_again_chunks
         .iter()
-        .flat_map(|chunk| chunk.time.as_explicit().unwrap().iter().copied())
+        .flat_map(|chunk| chunk.time.as_buffer().iter().copied())
         .collect::<Vec<_>>();
     assert_eq!(vec![2000, 3000], old_again_times);
 
@@ -1113,7 +1113,7 @@ async fn test_native_single_region_raw_flight_preserves_typed_filter_and_snapsho
     let fresh_chunks = fresh.try_collect::<Vec<_>>().await.unwrap();
     let fresh_times = fresh_chunks
         .iter()
-        .flat_map(|chunk| chunk.time.as_explicit().unwrap().iter().copied())
+        .flat_map(|chunk| chunk.time.as_buffer().iter().copied())
         .collect::<Vec<_>>();
     assert_eq!(fresh_baseline + 1, rpc_requests(&cluster, *datanode));
     assert_eq!(vec![2000, 3000, 4000], fresh_times);
@@ -1219,7 +1219,7 @@ async fn assert_raw_entrypoint_wrapper_contract(
     use datafusion::physical_plan::coop::CooperativeExec;
     use datafusion::physical_plan::execution_plan::SchedulingType;
     use datafusion_expr::{col, lit};
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use query::dummy_catalog::DummyTableProviderFactory;
     use query::options::QueryOptions;
     use query::physical_wrapper::{PhysicalPlanWrapper, PhysicalPlanWrapperRef};
@@ -1232,7 +1232,7 @@ async fn assert_raw_entrypoint_wrapper_contract(
     struct TestWrapper {
         identity: bool,
         calls: Arc<AtomicUsize>,
-        prepared_ordering: Arc<Mutex<Option<RawSeriesOrdering>>>,
+        prepared_ordering: Arc<Mutex<Option<SeriesOrdering>>>,
         prepared_plan: Arc<Mutex<Option<Weak<dyn ExecutionPlan>>>>,
     }
 
@@ -1312,7 +1312,7 @@ async fn assert_raw_entrypoint_wrapper_contract(
 
     let identity_engine = make_engine(true);
     assert_eq!(
-        Some(RawSeriesOrdering::ReadKeyThenTime),
+        Some(SeriesOrdering::KeyThenTime),
         identity_engine
             .prepare_raw_series(scan.clone(), query_ctx.clone(), binding.clone())
             .await
@@ -1320,7 +1320,7 @@ async fn assert_raw_entrypoint_wrapper_contract(
     );
     assert_eq!(1, calls.load(Ordering::SeqCst));
     assert_eq!(
-        Some(RawSeriesOrdering::ReadKeyThenTime),
+        Some(SeriesOrdering::KeyThenTime),
         *prepared_ordering.lock().unwrap()
     );
     assert!(
@@ -1396,7 +1396,7 @@ async fn assert_raw_entrypoint_wrapper_contract(
     let native_schema = native_schema.arrow_schema();
     assert_eq!(native_root_schema.as_ref(), native_schema.as_ref());
     assert_eq!(
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         raw_series_frame_ordering(native_schema).unwrap()
     );
     assert_eq!(
@@ -1489,8 +1489,8 @@ async fn test_native_histogram_raw_flight_preserves_payload_across_flush() {
     use common_query::request::{QueryRequest as LogicalQueryRequest, RawSeriesTag};
     use datafusion::common::TableReference;
     use datatypes::prelude::ConcreteDataType;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::histogram::{BucketSideView, HistogramView};
-    use datatypes::series::raw::RawSeriesOrdering;
     use datatypes::series::samples::SampleRef;
     use futures_util::TryStreamExt;
     use mito2::test_util::sst_util::new_primary_key;
@@ -1787,12 +1787,12 @@ async fn test_native_histogram_raw_flight_preserves_payload_across_flush() {
             }
             RawLabelSource::Explicit => panic!("expected key-backed source"),
         }
-        assert_eq!(RawSeriesOrdering::ReadKeyThenTime, stream.ordering());
+        assert_eq!(SeriesOrdering::KeyThenTime, stream.ordering());
         let chunks = stream.try_collect::<Vec<_>>().await.unwrap();
         let mut timestamps = Vec::new();
         for (chunk_index, chunk) in chunks.iter().enumerate() {
             assert!(chunk.metric.is_none());
-            assert_eq!(expected_key, chunk.read_key.as_slice());
+            assert_eq!(expected_key, chunk.primary_key.as_slice());
             assert_eq!(2, chunk.fields.len());
             assert!(!chunk.time.is_empty());
             assert_eq!(chunk.time.len(), chunk.fields.get(0).unwrap().len());
@@ -1882,7 +1882,7 @@ async fn test_native_raw_series_through_production_datanode_trait() {
     use common_query::request::{QueryRequest as LogicalQueryRequest, RawSeriesTag};
     use datafusion::common::TableReference;
     use datafusion_expr::{col, lit};
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::samples::SampleRef;
     use futures_util::TryStreamExt;
     use mito2::test_util::sst_util::new_primary_key;
@@ -2003,7 +2003,7 @@ async fn test_native_raw_series_through_production_datanode_trait() {
             .map(|f| f.name.as_ref())
             .collect::<Vec<_>>()
     );
-    assert_eq!(RawSeriesOrdering::ReadKeyThenTime, raw.ordering());
+    assert_eq!(SeriesOrdering::KeyThenTime, raw.ordering());
     assert!(matches!(
         raw.label_source(),
         RawLabelSource::PrimaryKey { .. }
@@ -2016,8 +2016,8 @@ async fn test_native_raw_series_through_production_datanode_trait() {
     assert_eq!(2, chunk.fields.len());
     assert_eq!(chunk.time.len(), chunk.fields.get(0).unwrap().len());
     assert_eq!(chunk.time.len(), chunk.fields.get(1).unwrap().len());
-    assert_eq!(new_primary_key(&["alpha"]), chunk.read_key.as_slice());
-    assert_eq!(&[2000], chunk.time.as_explicit().unwrap().as_ref());
+    assert_eq!(new_primary_key(&["alpha"]), chunk.primary_key.as_slice());
+    assert_eq!(&[2000], chunk.time.as_buffer().as_ref());
     assert!(
         matches!(chunk.fields.get(0).unwrap().sample(0), SampleRef::Float(v) if v.to_bits() == (-0.0_f64).to_bits())
     );

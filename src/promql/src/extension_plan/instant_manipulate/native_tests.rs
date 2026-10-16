@@ -21,7 +21,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 use datatypes::arrow::buffer::ScalarBuffer;
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
 use datatypes::series::{Label, MetricName};
 
@@ -112,7 +112,7 @@ fn evaluates_sliced_chunked_samples_and_preserves_original_schema() {
     ])
     .unwrap();
     let fields = SeriesFields::one(samples);
-    let time = RawTimeAxis::try_new(ScalarBuffer::from(vec![0, 10, 20, 30])).unwrap();
+    let time = RawTimestamps::try_new(ScalarBuffer::from(vec![0, 10, 20, 30])).unwrap();
     let batch = mapping.evaluate(&metric(Some("")), &time, &fields).unwrap();
     assert_eq!(batch.num_rows(), 2);
     assert_eq!(batch.schema(), output_schema);
@@ -171,7 +171,7 @@ fn selected_repeated_indices_across_sliced_chunks_preserve_missing_and_nan() {
     ])
     .unwrap();
     let fields = SeriesFields::one(samples);
-    let time = RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 30])).unwrap();
+    let time = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 30])).unwrap();
 
     let batch = mapping.evaluate(&metric(None), &time, &fields).unwrap();
     let values = batch
@@ -198,7 +198,7 @@ fn maps_all_supported_string_types_and_distinguishes_missing_from_empty() {
         Some(1.0),
         Some(2.0),
     ])));
-    let time = RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
+    let time = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
 
     for tag_type in tag_types {
         let output_schema = schema(tag_type);
@@ -232,7 +232,7 @@ fn maps_all_supported_string_types_and_distinguishes_missing_from_empty() {
 #[test]
 fn selected_field_staleness_and_no_field_semantics_match_existing_selector_contract() {
     let stale = f64::from_bits(PROMETHEUS_STALE_NAN_BITS);
-    let times = RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
+    let times = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
     let values = SeriesFields::one(Samples::from_float(Float64Array::from(vec![
         Some(1.0),
         Some(stale),
@@ -350,7 +350,7 @@ fn absent_tag_is_null_and_nonzero_offset_is_rejected() {
         Some(1.0),
         Some(2.0),
     ])));
-    let time = RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
+    let time = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
     let batch = mapping.evaluate(&metric(None), &time, &fields).unwrap();
     assert_eq!(batch.column(2).null_count(), 2);
 

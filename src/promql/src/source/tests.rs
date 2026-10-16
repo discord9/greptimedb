@@ -29,12 +29,12 @@ use datatypes::schema::ColumnSchema;
 use datatypes::series::histogram::{
     BucketSideView, CounterResetHint, HistogramBatch, HistogramBatchBuilder, HistogramView,
 };
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{
     DenseSamplesRef, FieldSpec, HistogramSamples, SampleRef, Samples, SeriesFields, SeriesSchema,
 };
 use datatypes::series::time::{EvalGrid, GridSpec};
-use datatypes::series::{Label, MetricName};
+use datatypes::series::{Label, MetricName, SeriesOrdering};
 use futures::{Stream, StreamExt};
 use mito_codec::row_converter::{
     DensePrimaryKeyCodec, PrimaryKeyCodec, SortField, SparsePrimaryKeyCodec,
@@ -165,7 +165,7 @@ fn chunk(read_key: Buffer, metric: Option<MetricName>, final_chunk: bool) -> Raw
         &schema(),
         read_key,
         metric,
-        RawTimeAxis::try_new(times).unwrap(),
+        RawTimestamps::try_new(times).unwrap(),
         SeriesFields::one(Samples::from_float(Float64Array::from(vec![1.0, 2.0]))),
         final_chunk,
     )
@@ -175,7 +175,7 @@ fn chunk(read_key: Buffer, metric: Option<MetricName>, final_chunk: bool) -> Raw
 struct MockStream {
     schema: Arc<SeriesSchema>,
     source: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     items: VecDeque<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
     polls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
@@ -197,7 +197,7 @@ impl RawSeriesStream for MockStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.source
     }
-    fn ordering(&self) -> RawSeriesOrdering {
+    fn ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 }
@@ -211,7 +211,7 @@ impl Drop for MockStream {
 fn mock_with(
     schema: Arc<SeriesSchema>,
     source: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     items: Vec<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
 ) -> (SendableRawSeriesStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
@@ -234,7 +234,7 @@ fn mock(
     source: RawLabelSource,
     items: Vec<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
 ) -> (SendableRawSeriesStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-    mock_with(schema(), source, RawSeriesOrdering::Contiguous, items)
+    mock_with(schema(), source, SeriesOrdering::Contiguous, items)
 }
 
 fn histogram_batch() -> Arc<HistogramBatch> {
@@ -296,10 +296,10 @@ async fn materializes_complete_labels_without_changing_raw_chunks() {
         ))))],
     );
     let mut output = materialize_raw_labels(raw).unwrap();
-    assert_eq!(output.ordering(), RawSeriesOrdering::Contiguous);
+    assert_eq!(output.ordering(), SeriesOrdering::Contiguous);
     assert_eq!(output.schema().fields.len(), 1);
     let decoded = output.next().await.unwrap().unwrap();
-    assert_eq!(decoded.read_key, original_key);
+    assert_eq!(decoded.primary_key, original_key);
     assert!(decoded.is_last);
     let metric = decoded.metric.unwrap();
     assert_eq!(metric.name(), Some("requests_total"));
@@ -397,7 +397,7 @@ async fn preserves_sliced_multifield_payload_and_shared_owners() {
     let schema = schema_with_fields(&["float", "histogram", "mixed", "chunks"]);
     let time_owner = ScalarBuffer::from(vec![0, 11, 22, 33, 44]);
     let time_slice = time_owner.slice(1, 3);
-    let times = RawTimeAxis::try_new(time_slice.clone()).unwrap();
+    let times = RawTimestamps::try_new(time_slice.clone()).unwrap();
     let float_owner = Float64Array::from(vec![
         Some(90.0),
         None,
@@ -460,18 +460,18 @@ async fn preserves_sliced_multifield_payload_and_shared_owners() {
     let (raw, _, drops) = mock_with(
         schema.clone(),
         source(PrimaryKeyEncoding::Dense),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         vec![Poll::Ready(Some(Ok(input_chunk))), Poll::Ready(None)],
     );
     let mut output = materialize_raw_labels(raw).unwrap();
     assert!(Arc::ptr_eq(output.schema(), &schema));
-    assert_eq!(output.ordering(), RawSeriesOrdering::ReadKeyThenTime);
+    assert_eq!(output.ordering(), SeriesOrdering::KeyThenTime);
     assert!(matches!(output.label_source(), RawLabelSource::Explicit));
     let decoded = output.next().await.unwrap().unwrap();
-    assert_eq!(decoded.time.as_explicit().unwrap().as_ptr(), time_ptr);
-    assert_eq!(decoded.time.as_explicit().unwrap().as_ref(), &[11, 22, 33]);
+    assert_eq!(decoded.time.as_buffer().as_ptr(), time_ptr);
+    assert_eq!(decoded.time.as_buffer().as_ref(), &[11, 22, 33]);
     assert_eq!(
-        decoded.time.as_explicit().unwrap().as_ptr(),
+        decoded.time.as_buffer().as_ptr(),
         time_owner.as_ptr().wrapping_add(1)
     );
     let DenseSamplesRef::Float(decoded_float) = decoded.fields.get(0).unwrap().segments()[0]
@@ -532,8 +532,8 @@ async fn preserves_sliced_multifield_payload_and_shared_owners() {
             .to_data()
             .ptr_eq(&sliced_table.as_arrow().to_data())
     );
-    assert_eq!(decoded.read_key, payload_key);
-    assert_eq!(decoded.read_key.as_ptr(), payload_key.as_ptr());
+    assert_eq!(decoded.primary_key, payload_key);
+    assert_eq!(decoded.primary_key.as_ptr(), payload_key.as_ptr());
     assert!(decoded.is_last);
     assert!(output.next().await.is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -807,7 +807,7 @@ async fn constructor_and_mode_errors_drop_input_without_polling_ahead() {
         let raw: SendableRawSeriesStream = Box::pin(MockStream {
             schema: invalid_schema,
             source: RawLabelSource::Explicit,
-            ordering: RawSeriesOrdering::Contiguous,
+            ordering: SeriesOrdering::Contiguous,
             items: VecDeque::new(),
             polls: polls.clone(),
             drops: drops.clone(),
@@ -845,27 +845,23 @@ async fn constructor_and_mode_errors_drop_input_without_polling_ahead() {
     }
 
     let malformed_shape = RawSeriesChunk {
-        read_key: Buffer::from(vec![1]),
+        primary_key: Buffer::from(vec![1]),
         metric: Some(MetricName::try_new(None, vec![]).unwrap()),
-        time: RawTimeAxis::try_new(ScalarBuffer::from(vec![100, 200])).unwrap(),
+        time: RawTimestamps::try_new(ScalarBuffer::from(vec![100, 200])).unwrap(),
         fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![1.0]))),
         is_last: false,
     };
     let malformed_empty_time = RawSeriesChunk {
-        read_key: Buffer::from(vec![2]),
+        primary_key: Buffer::from(vec![2]),
         metric: Some(MetricName::try_new(None, vec![]).unwrap()),
-        time: RawTimeAxis::try_new(ScalarBuffer::from(Vec::<i64>::new())).unwrap(),
+        time: RawTimestamps::try_new(ScalarBuffer::from(Vec::<i64>::new())).unwrap(),
         fields: SeriesFields::one(Samples::from_float(Float64Array::from(Vec::<f64>::new()))),
         is_last: false,
     };
-    let malformed_order = RawSeriesChunk {
-        read_key: Buffer::from(vec![3]),
-        metric: Some(MetricName::try_new(None, vec![]).unwrap()),
-        time: RawTimeAxis::Explicit(ScalarBuffer::from(vec![100, 100, 90])),
-        fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![1.0, 2.0, 3.0]))),
-        is_last: false,
-    };
-    for malformed in [malformed_shape, malformed_empty_time, malformed_order] {
+    // `RawTimestamps` rejects duplicate or descending axes at construction, so a chunk
+    // carrying an out-of-order time axis can no longer be constructed.
+    assert!(RawTimestamps::try_new(ScalarBuffer::from(vec![100, 100, 90])).is_err());
+    for malformed in [malformed_shape, malformed_empty_time] {
         let (raw, polls, drops) = mock(
             RawLabelSource::Explicit,
             vec![Poll::Ready(Some(Ok(malformed))), Poll::Ready(None)],
@@ -916,7 +912,7 @@ async fn preserves_split_keys_finality_and_independent_streams() {
             (41, Value::String("b".into())),
         ],
     );
-    let later_times = RawTimeAxis::try_new(ScalarBuffer::from(vec![300, 400])).unwrap();
+    let later_times = RawTimestamps::try_new(ScalarBuffer::from(vec![300, 400])).unwrap();
     let later_chunk = RawSeriesChunk::try_new(
         &schema(),
         first_key.clone(),
@@ -938,11 +934,11 @@ async fn preserves_split_keys_finality_and_independent_streams() {
     let first = output.next().await.unwrap().unwrap();
     let second = output.next().await.unwrap().unwrap();
     let third = output.next().await.unwrap().unwrap();
-    assert_eq!(first.read_key, first_key);
-    assert_eq!(second.read_key, first_key);
-    assert_eq!(third.read_key, second_key);
-    assert_eq!(first.time.as_explicit().unwrap().as_ref(), &[100, 200]);
-    assert_eq!(second.time.as_explicit().unwrap().as_ref(), &[300, 400]);
+    assert_eq!(first.primary_key, first_key);
+    assert_eq!(second.primary_key, first_key);
+    assert_eq!(third.primary_key, second_key);
+    assert_eq!(first.time.as_buffer().as_ref(), &[100, 200]);
+    assert_eq!(second.time.as_buffer().as_ref(), &[300, 400]);
     assert_eq!(second.metric.as_ref().unwrap().get("zeta"), Some("z"));
     assert!(!first.is_last);
     assert!(second.is_last);
@@ -1030,7 +1026,7 @@ async fn dense_and_sparse_sources_materialize_complete_labels() {
         );
         let mut output = materialize_raw_labels(raw).unwrap();
         let decoded = output.next().await.unwrap().unwrap();
-        assert_eq!(decoded.read_key, read_key);
+        assert_eq!(decoded.primary_key, read_key);
         assert_eq!(
             decoded.metric.as_ref().unwrap().name(),
             Some("requests_total")

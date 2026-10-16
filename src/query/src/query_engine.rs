@@ -33,7 +33,7 @@ use common_query::request::RawSeriesRequest;
 use datafusion::catalog::TableFunction;
 use datafusion::dataframe::DataFrame;
 use datafusion_expr::{AggregateUDF, LogicalPlan, WindowUDF};
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 pub use default_serializer::{DefaultPlanDecoder, DefaultSerializer};
 use partition::manager::PartitionRuleManagerRef;
 use session::context::QueryContextRef;
@@ -87,7 +87,7 @@ pub trait QueryEngine: Send + Sync {
         _plan: LogicalPlan,
         _query_ctx: QueryContextRef,
         _binding: RawSeriesRequest,
-    ) -> Result<Option<RawSeriesOrdering>> {
+    ) -> Result<Option<SeriesOrdering>> {
         Ok(None)
     }
 

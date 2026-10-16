@@ -38,8 +38,8 @@ use datatypes::arrow::array::{
 use datatypes::arrow::compute::cast;
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::series::SeriesOrdering;
 use datatypes::series::raw::RawSeriesChunk;
-use datatypes::series::raw::RawSeriesOrdering;
 use datatypes::series::samples::{DenseSamplesRef, FieldSpec, SampleRef};
 use futures_util::{Stream, StreamExt};
 
@@ -174,7 +174,7 @@ async fn collect(
 }
 
 fn key(chunk: &RawSeriesChunk) -> &[u8] {
-    chunk.read_key.as_slice()
+    chunk.primary_key.as_slice()
 }
 
 #[tokio::test]
@@ -199,7 +199,7 @@ async fn maps_identity_and_payload_columns_across_batches() {
         output.label_source(),
         store_api::region_engine::RawLabelSource::Explicit
     ));
-    assert_eq!(output.ordering(), RawSeriesOrdering::Contiguous);
+    assert_eq!(output.ordering(), SeriesOrdering::Contiguous);
     assert_eq!(
         output
             .schema()
@@ -211,7 +211,7 @@ async fn maps_identity_and_payload_columns_across_batches() {
     );
     let chunks = collect(output).await;
     assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].time.as_explicit().unwrap().as_ref(), &[1, 2]);
+    assert_eq!(chunks[0].time.as_buffer().as_ref(), &[1, 2]);
     assert_eq!(chunks[1].time.timestamp(0), Some(3));
     assert_eq!(chunks[2].time.timestamp(0), Some(1));
     assert_eq!(key(&chunks[0]), key(&chunks[1]));
@@ -396,7 +396,7 @@ async fn preserves_sliced_timestamp_and_float_buffers_and_exact_values() {
     let (input, _, _) = source_custom(schema, vec![batch]);
     let chunks = collect(record_batches_to_raw_series(input, mapping()).unwrap()).await;
     assert_eq!(chunks.len(), 1);
-    let time = chunks[0].time.as_explicit().unwrap();
+    let time = chunks[0].time.as_buffer();
     assert_eq!(time.as_ptr(), input_time_ptr);
     let DenseSamplesRef::Float(values) = chunks[0].fields.as_slice()[0].segments()[0]
         .dense()
@@ -474,7 +474,7 @@ async fn native_histogram_payload_and_null_positions_are_preserved() {
     let (input, _, _) = source_custom(schema, vec![batch]);
     let chunks = collect(record_batches_to_raw_series(input, mapping).unwrap()).await;
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].time.as_explicit().unwrap().as_ref(), &[1, 2]);
+    assert_eq!(chunks[0].time.as_buffer().as_ref(), &[1, 2]);
     let samples = &chunks[0].fields.as_slice()[0].segments()[0];
     let SampleRef::Histogram(view) = samples.sample(0) else {
         panic!("histogram expected")
@@ -1134,12 +1134,12 @@ async fn exact_int64_filter_sort_adapter_frame_pipeline() {
         frames,
         expected,
         store_api::region_engine::RawLabelSource::Explicit,
-        RawSeriesOrdering::Contiguous,
+        SeriesOrdering::Contiguous,
     )
     .unwrap();
     let chunk = decoded.next().await.unwrap().unwrap();
     assert!(chunk.is_last);
-    assert_eq!(chunk.time.as_explicit().unwrap().as_ref(), &[1, 2]);
+    assert_eq!(chunk.time.as_buffer().as_ref(), &[1, 2]);
     assert_eq!(chunk.metric.as_ref().unwrap().name(), Some("cpu"));
     assert_eq!(chunk.metric.as_ref().unwrap().get("host"), Some("h"));
     let DenseSamplesRef::Float(values) = chunk.fields.as_slice()[0].segments()[0].dense().unwrap()
@@ -1159,7 +1159,7 @@ async fn empty_input_finishes_with_explicit_contiguous_metadata() {
         stream.label_source(),
         store_api::region_engine::RawLabelSource::Explicit
     ));
-    assert_eq!(stream.ordering(), RawSeriesOrdering::Contiguous);
+    assert_eq!(stream.ordering(), SeriesOrdering::Contiguous);
     assert!(stream.next().await.is_none());
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(drops.load(Ordering::SeqCst), 1);

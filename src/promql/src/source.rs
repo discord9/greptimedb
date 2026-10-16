@@ -22,7 +22,8 @@ use std::task::{Context, Poll};
 
 use common_error::ext::BoxedError;
 use datatypes::error::InvalidSeriesSnafu;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::RawSeriesChunk;
 use datatypes::series::samples::SeriesSchema;
 use futures::Stream;
 use mito_codec::labels::{DecodedLabels, LabelProjection, PrimaryKeyLabelDecoder};
@@ -78,7 +79,7 @@ pub fn materialize_raw_labels(
 struct MaterializedRawSeriesStream {
     source: Option<SendableRawSeriesStream>,
     schema: Arc<SeriesSchema>,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     decoder: Option<PrimaryKeyLabelDecoder>,
     label_source: RawLabelSource,
 }
@@ -124,7 +125,7 @@ impl RawSeriesStream for MaterializedRawSeriesStream {
         &self.label_source
     }
 
-    fn ordering(&self) -> RawSeriesOrdering {
+    fn ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 }
@@ -133,7 +134,10 @@ impl MaterializedRawSeriesStream {
     fn materialize(&mut self, chunk: RawSeriesChunk) -> Result<RawSeriesChunk, BoxedError> {
         let metric = match (&mut self.decoder, chunk.metric) {
             (Some(decoder), None) => {
-                match decoder.decode(&chunk.read_key).map_err(BoxedError::new)? {
+                match decoder
+                    .decode(&chunk.primary_key)
+                    .map_err(BoxedError::new)?
+                {
                     DecodedLabels::Complete(metric) => Some(metric),
                     DecodedLabels::Projected(_) => {
                         return Err(BoxedError::new(
@@ -157,7 +161,7 @@ impl MaterializedRawSeriesStream {
         };
         RawSeriesChunk::try_new(
             &self.schema,
-            chunk.read_key,
+            chunk.primary_key,
             metric,
             chunk.time,
             chunk.fields,

@@ -56,8 +56,8 @@ use datafusion_physical_expr::{
 };
 use datatypes::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datatypes::compute::SortOptions;
+use datatypes::series::SeriesOrdering;
 use datatypes::series::frame::RawLabelMode;
-use datatypes::series::raw::RawSeriesOrdering;
 use datatypes::series::samples::SeriesSchema;
 use futures::{Stream, StreamExt};
 use store_api::metric_engine_consts::DATA_SCHEMA_TSID_COLUMN_NAME;
@@ -594,7 +594,7 @@ pub struct SeriesScanExec {
     label_source: RawLabelSource,
     series_schema: Arc<SeriesSchema>,
     arrow_schema: ArrowSchemaRef,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     properties: Arc<PlanProperties>,
 }
 
@@ -624,7 +624,7 @@ impl SeriesScanExec {
     }
 
     /// Returns the producer ordering captured when this scan was prepared.
-    pub fn raw_series_ordering(&self) -> RawSeriesOrdering {
+    pub fn raw_series_ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 

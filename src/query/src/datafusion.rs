@@ -58,7 +58,7 @@ use datafusion_expr::{
 };
 use datatypes::prelude::VectorRef;
 use datatypes::schema::Schema;
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use futures_util::StreamExt;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt, ensure};
@@ -212,7 +212,7 @@ pub struct DatafusionQueryEngine {
 struct PreparedRawSeries {
     context: QueryEngineContext,
     plan: Arc<dyn ExecutionPlan>,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
 }
 
 impl DatafusionQueryEngine {
@@ -703,7 +703,7 @@ impl QueryEngine for DatafusionQueryEngine {
         plan: LogicalPlan,
         query_ctx: QueryContextRef,
         binding: RawSeriesRequest,
-    ) -> Result<Option<RawSeriesOrdering>> {
+    ) -> Result<Option<SeriesOrdering>> {
         Ok(self
             .prepare_raw_series_plan(plan, query_ctx, &binding)
             .await?

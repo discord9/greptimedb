@@ -42,7 +42,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::ident;
 use datatypes::arrow::compute;
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{Samples, SeriesFields};
 use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::{Stream, StreamExt, ready};
@@ -705,7 +705,8 @@ impl InstantManipulateStream {
                 && !float_fields.is_empty()
                 && values.windows(2).all(|pair| pair[0] < pair[1])
             {
-                let time = RawTimeAxis::Explicit(values.clone());
+                let time = RawTimestamps::try_new(values.clone())
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
                 let fields = SeriesFields::try_from_vec(
                     float_fields.into_iter().map(Samples::from_float).collect(),
                 )

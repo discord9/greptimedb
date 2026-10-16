@@ -16,7 +16,7 @@ use std::ops::RangeInclusive;
 
 use common_query::prometheus::is_prometheus_stale_nan;
 use datafusion::error::{DataFusionError, Result};
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{SampleRef, SeriesFields};
 
 #[cfg(test)]
@@ -30,7 +30,7 @@ pub(crate) const MAX_INSTANT_MANIPULATE_OUTPUT_POINTS: usize = 1_000_000;
 /// of strictly increasing milliseconds. Any provided field's stale marker suppresses selection;
 /// missing samples are not stale and remain selectable.
 pub fn select_instants(
-    time: &RawTimeAxis,
+    time: &RawTimestamps,
     fields: &SeriesFields,
     range: RangeInclusive<i64>,
     step_ms: i64,
@@ -54,9 +54,7 @@ pub fn select_instants(
             "InstantManipulate lookback must be non-negative".into(),
         ));
     }
-    let timestamps = time.as_explicit().ok_or_else(|| {
-        DataFusionError::Execution("Instant evaluation requires explicit timestamps".into())
-    })?;
+    let timestamps = time.as_buffer();
     if timestamps.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(DataFusionError::Execution(
             "raw timestamps must be strictly increasing".into(),

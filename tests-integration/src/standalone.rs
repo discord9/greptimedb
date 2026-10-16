@@ -457,7 +457,7 @@ mod tests {
     use datafusion::common::{ScalarValue, TableReference};
     use datafusion::logical_expr::TableSource;
     use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, col, lit};
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::samples::SampleRef;
     use frontend::instance::Instance;
     use futures_util::TryStreamExt;
@@ -751,13 +751,13 @@ mod tests {
             .prepare_raw_series_query(request(), binding.clone())
             .await
             .unwrap();
-        assert_eq!(Some(RawSeriesOrdering::ReadKeyThenTime), prepared);
+        assert_eq!(Some(SeriesOrdering::KeyThenTime), prepared);
 
         let raw = datanode
             .handle_raw_series_query(request(), binding.clone())
             .await
             .unwrap();
-        assert_eq!(RawSeriesOrdering::ReadKeyThenTime, raw.ordering());
+        assert_eq!(SeriesOrdering::KeyThenTime, raw.ordering());
         match raw.label_source() {
             RawLabelSource::PrimaryKey {
                 metric_name,
@@ -776,11 +776,11 @@ mod tests {
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
         for chunk in &chunks {
-            assert_eq!(new_primary_key(&["alpha"]), chunk.read_key.as_slice());
+            assert_eq!(new_primary_key(&["alpha"]), chunk.primary_key.as_slice());
             assert!(chunk.metric.is_none());
             assert_eq!(1, chunk.fields.len());
             assert_eq!(chunk.time.len(), chunk.fields.get(0).unwrap().len());
-            timestamps.extend_from_slice(chunk.time.as_explicit().unwrap());
+            timestamps.extend_from_slice(chunk.time.as_buffer());
             for i in 0..chunk.time.len() {
                 values.push(chunk.fields.get(0).unwrap().sample(i));
             }
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(
             vec![1000, 2000],
             old.iter()
-                .flat_map(|chunk| chunk.time.as_explicit().unwrap().iter().copied())
+                .flat_map(|chunk| chunk.time.as_buffer().iter().copied())
                 .collect::<Vec<_>>()
         );
 

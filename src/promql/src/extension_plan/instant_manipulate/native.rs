@@ -19,16 +19,15 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datatypes::series::MetricName;
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{SampleRef, Samples, SeriesFields, SeriesSchema};
 
 #[cfg(test)]
 #[path = "native_tests.rs"]
 mod tests;
 
+use crate::extension_plan::instant_manipulate::InstantManipulate;
 use crate::instant_eval::{MAX_INSTANT_MANIPULATE_OUTPUT_POINTS, select_instants};
-
-use super::InstantManipulate;
 
 #[derive(Clone)]
 enum Column {
@@ -204,7 +203,7 @@ impl NativeInstantMapping {
     pub(crate) fn evaluate(
         &self,
         metric: &MetricName,
-        time: &RawTimeAxis,
+        time: &RawTimestamps,
         fields: &SeriesFields,
     ) -> DataFusionResult<RecordBatch> {
         if fields.len() != self.series_schema.fields.len() {

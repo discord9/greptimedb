@@ -30,9 +30,9 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::{DataFusionError, Result as DfResult};
 use datatypes::arrow_array::string_array_value_at_index;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
-use datatypes::series::{Label, MetricName};
+use datatypes::series::{Label, MetricName, SeriesOrdering};
 use futures_util::Stream;
 use snafu::Location;
 use store_api::region_engine::{RawLabelSource, RawSeriesStream, SendableRawSeriesStream};
@@ -200,8 +200,8 @@ impl RawSeriesStream for InputStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.label_source
     }
-    fn ordering(&self) -> RawSeriesOrdering {
-        RawSeriesOrdering::Contiguous
+    fn ordering(&self) -> SeriesOrdering {
+        SeriesOrdering::Contiguous
     }
 }
 impl InputStream {
@@ -245,7 +245,7 @@ impl InputStream {
         if time.slice(start, len).null_count() != 0 {
             return Err(invalid("time values must not be null"));
         }
-        let axis = RawTimeAxis::try_new(time.values().slice(start, len)).map_err(codec_error)?;
+        let axis = RawTimestamps::try_new(time.values().slice(start, len)).map_err(codec_error)?;
         let mut fields = Vec::with_capacity(self.mapping.fields.len());
         for (_, index) in &self.mapping.fields {
             let array = batch.column(*index);
@@ -345,7 +345,7 @@ impl Stream for InputStream {
             if this
                 .pending
                 .as_ref()
-                .is_some_and(|previous| previous.read_key.as_slice() != key.as_slice())
+                .is_some_and(|previous| previous.primary_key.as_slice() != key.as_slice())
             {
                 if let Some(mut complete) = this.pending.take() {
                     complete.is_last = true;

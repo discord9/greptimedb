@@ -27,9 +27,9 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
 use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 use datatypes::arrow::buffer::ScalarBuffer;
-use datatypes::series::MetricName;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
+use datatypes::series::{MetricName, SeriesOrdering};
 use futures::Stream;
 use store_api::region_engine::{RawLabelSource, RawSeriesStream, SendableRawSeriesStream};
 
@@ -88,7 +88,7 @@ fn chunk(time: &[i64], values: &[f64], last: bool) -> RawSeriesChunk {
         &raw_schema(),
         datatypes::arrow::buffer::Buffer::from(vec![1, 2, 3]),
         Some(MetricName::try_new(None, vec![]).unwrap()),
-        RawTimeAxis::try_new(ScalarBuffer::from(time.to_vec())).unwrap(),
+        RawTimestamps::try_new(ScalarBuffer::from(time.to_vec())).unwrap(),
         SeriesFields::one(Samples::from_float(Float64Array::from(values.to_vec()))),
         last,
     )
@@ -121,8 +121,8 @@ impl RawSeriesStream for RawMock {
     fn label_source(&self) -> &RawLabelSource {
         &self.labels
     }
-    fn ordering(&self) -> RawSeriesOrdering {
-        RawSeriesOrdering::Contiguous
+    fn ordering(&self) -> SeriesOrdering {
+        SeriesOrdering::Contiguous
     }
 }
 
@@ -250,7 +250,7 @@ fn dropping_pending_stream_releases_source_chunks_and_memory() {
         &raw_schema(),
         datatypes::arrow::buffer::Buffer::from(vec![1]),
         Some(MetricName::try_new(None, vec![]).unwrap()),
-        RawTimeAxis::try_new(ScalarBuffer::from(vec![10])).unwrap(),
+        RawTimestamps::try_new(ScalarBuffer::from(vec![10])).unwrap(),
         SeriesFields::one(samples),
         false,
     )
@@ -331,7 +331,7 @@ fn dense_large_chunk_uses_segment_count_not_row_count_for_descriptors() {
         &raw_schema(),
         datatypes::arrow::buffer::Buffer::from(vec![1]),
         Some(MetricName::try_new(None, vec![]).unwrap()),
-        RawTimeAxis::try_new(ScalarBuffer::from(timestamps)).unwrap(),
+        RawTimestamps::try_new(ScalarBuffer::from(timestamps)).unwrap(),
         SeriesFields::one(Samples::from_float(values)),
         true,
     )

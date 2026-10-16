@@ -57,7 +57,7 @@ use dashmap::DashMap;
 use datafusion::datasource::TableProvider;
 use datafusion_common::tree_node::TreeNode;
 use datatypes::schema::SchemaRef;
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use either::Either;
 use futures_util::future::try_join_all;
 use futures_util::{Stream, StreamExt};
@@ -411,7 +411,7 @@ impl RegionServer {
     pub async fn prepare_raw_series_query(
         &self,
         request: QueryRequest,
-    ) -> Result<Option<RawSeriesOrdering>> {
+    ) -> Result<Option<SeriesOrdering>> {
         let permit = if let Some(p) = &self.inner.parallelism {
             Some(p.acquire().await?)
         } else {

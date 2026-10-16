@@ -31,7 +31,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{DenseSamplesRef, Samples, SeriesFields, SeriesSchema};
 use futures::{Stream, ready};
 use store_api::region_engine::{RawLabelSource, SendableRawSeriesStream};
@@ -95,7 +96,7 @@ struct NativeInstantManipulateExec {
     raw_schema: SchemaRef,
     series_schema: Arc<SeriesSchema>,
     label_source: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     properties: Arc<PlanProperties>,
 }
 impl NativeInstantManipulateExec {
@@ -105,7 +106,7 @@ impl NativeInstantManipulateExec {
         raw_schema: SchemaRef,
         series_schema: Arc<SeriesSchema>,
         label_source: RawLabelSource,
-        ordering: RawSeriesOrdering,
+        ordering: SeriesOrdering,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(mapping.schema()),
@@ -337,7 +338,7 @@ impl NativeInstantStream {
                 target.push(field.clone());
             }
         }
-        let time = RawTimeAxis::try_new(times.into())
+        let time = RawTimestamps::try_new(times.into())
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         let fields = field_chunks
             .into_iter()
@@ -350,7 +351,7 @@ impl NativeInstantStream {
     }
 }
 fn retained_chunk_bytes(chunk: &RawSeriesChunk) -> Option<usize> {
-    let timestamp_bytes = chunk.time.as_explicit()?.inner().capacity();
+    let timestamp_bytes = chunk.time.as_buffer().inner().capacity();
     let labels = chunk
         .metric
         .as_ref()
@@ -392,7 +393,7 @@ fn retained_chunk_bytes(chunk: &RawSeriesChunk) -> Option<usize> {
             ))
         })?;
     timestamp_bytes
-        .checked_add(chunk.read_key.capacity())?
+        .checked_add(chunk.primary_key.capacity())?
         .checked_add(labels)?
         .checked_add(field_descriptors)?
         .checked_add(segment_descriptors)?

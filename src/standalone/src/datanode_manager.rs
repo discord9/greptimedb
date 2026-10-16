@@ -29,7 +29,7 @@ use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::tracing;
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
 use datanode::region_server::RegionServer;
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use servers::grpc::region_server::RegionServerHandler;
 use snafu::{OptionExt, ResultExt};
 
@@ -111,7 +111,7 @@ impl Datanode for RegionInvoker {
         &self,
         request: QueryRequest,
         binding: RawSeriesRequest,
-    ) -> MetaResult<Option<RawSeriesOrdering>> {
+    ) -> MetaResult<Option<SeriesOrdering>> {
         let (request, _, _) = bind_raw_series_query(request, &binding)?;
         let region_id = request.region_id.to_string();
         let span = request

@@ -35,7 +35,8 @@ use datatypes::arrow::buffer::Buffer;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::error::InvalidSeriesSnafu;
 use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::SeriesOrdering;
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, Samples, SeriesFields, SeriesSchema};
 use datatypes::vectors::{Int32Vector, TimestampMillisecondVector, VectorRef};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -63,8 +64,8 @@ struct State {
     polls: usize,
     drops: usize,
     resets: usize,
-    planned_ordering: Option<RawSeriesOrdering>,
-    stream_ordering: Option<RawSeriesOrdering>,
+    planned_ordering: Option<SeriesOrdering>,
+    stream_ordering: Option<SeriesOrdering>,
 }
 
 fn raw_error(reason: &str) -> BoxedError {
@@ -84,7 +85,7 @@ struct RawStream {
     state: Arc<Mutex<State>>,
     fail_first_poll: bool,
     error_after_poll: Option<usize>,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
 }
 
 impl Drop for RawStream {
@@ -115,7 +116,7 @@ impl RawSeriesStream for RawStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.source
     }
-    fn ordering(&self) -> RawSeriesOrdering {
+    fn ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 }
@@ -153,12 +154,12 @@ impl RegionScanner for TestScanner {
     fn metadata(&self) -> store_api::metadata::RegionMetadataRef {
         self.metadata.clone()
     }
-    fn raw_series_ordering(&self) -> RawSeriesOrdering {
+    fn raw_series_ordering(&self) -> SeriesOrdering {
         self.state
             .lock()
             .unwrap()
             .planned_ordering
-            .unwrap_or(RawSeriesOrdering::ReadKeyThenTime)
+            .unwrap_or(SeriesOrdering::KeyThenTime)
     }
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
         self.properties.prepare(request);
@@ -199,9 +200,7 @@ impl RegionScanner for TestScanner {
         if state.raw_none {
             return Ok(None);
         }
-        let ordering = state
-            .stream_ordering
-            .unwrap_or(RawSeriesOrdering::ReadKeyThenTime);
+        let ordering = state.stream_ordering.unwrap_or(SeriesOrdering::KeyThenTime);
         Ok(Some(Box::pin(RawStream {
             ordering,
             schema: state
@@ -384,7 +383,7 @@ fn chunk(schema: &SeriesSchema) -> RawSeriesChunk {
         schema,
         Buffer::from(b"complete-key".as_slice()),
         Some(datatypes::series::MetricName::try_new(Some(Arc::from("cpu_usage")), vec![]).unwrap()),
-        RawTimeAxis::try_new(vec![10, 20].into()).unwrap(),
+        RawTimestamps::try_new(vec![10, 20].into()).unwrap(),
         SeriesFields::one(Samples::from_float(Float64Array::from(vec![
             Some(1.5),
             None,
@@ -548,7 +547,7 @@ async fn native_raw_frame_executes_and_decodes_bound_data() {
     )
     .unwrap();
     assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded[0].read_key.as_slice(), b"complete-key");
+    assert_eq!(decoded[0].primary_key.as_slice(), b"complete-key");
     assert_eq!(
         decoded[0].metric.as_ref().unwrap().name(),
         Some("cpu_usage")
@@ -604,7 +603,7 @@ async fn supported_empty_stream_remains_native_with_declared_frame_schema() {
         raw_series_frame_schema_with_ordering(
             plan.series_schema(),
             RawLabelMode::Explicit,
-            RawSeriesOrdering::ReadKeyThenTime
+            SeriesOrdering::KeyThenTime
         )
         .unwrap()
     );
@@ -615,10 +614,7 @@ async fn supported_empty_stream_remains_native_with_declared_frame_schema() {
 
 #[tokio::test]
 async fn planned_ordering_is_preserved_for_empty_and_nonempty_frames() {
-    for ordering in [
-        RawSeriesOrdering::ReadKeyThenTime,
-        RawSeriesOrdering::Contiguous,
-    ] {
+    for ordering in [SeriesOrdering::KeyThenTime, SeriesOrdering::Contiguous] {
         for nonempty in [false, true] {
             let schema = series_schema();
             let chunks = if nonempty {
@@ -674,17 +670,33 @@ async fn planned_ordering_is_preserved_for_empty_and_nonempty_frames() {
     }
 }
 
+#[test]
+fn interleaved_planned_ordering_cannot_start_a_native_or_legacy_read() {
+    let schema = series_schema();
+    let (scan, state) = fixture(Some(schema.clone()), vec![chunk(&schema)]);
+    state.lock().unwrap().planned_ordering = Some(SeriesOrdering::Interleaved);
+    let error = scan
+        .clone()
+        .try_to_series_scan(RawLabelSource::Explicit)
+        .expect_err("interleaved planning must not produce a native raw-series plan");
+    assert!(error.to_string().contains("ordering"), "{error}");
+    // The preflight ran, but no entrypoint was consumed and no chunk was polled.
+    let state = state.lock().unwrap();
+    assert_eq!(1, state.preflights);
+    assert_eq!(0, state.raw_calls);
+    assert_eq!(0, state.legacy_calls);
+    assert_eq!(0, state.polls);
+    assert_eq!(0, state.drops);
+}
+
 #[tokio::test]
 async fn planned_and_stream_ordering_mismatches_fail_without_legacy_fallback() {
     for (planned, actual) in [
-        (
-            RawSeriesOrdering::ReadKeyThenTime,
-            RawSeriesOrdering::Contiguous,
-        ),
-        (
-            RawSeriesOrdering::Contiguous,
-            RawSeriesOrdering::ReadKeyThenTime,
-        ),
+        (SeriesOrdering::KeyThenTime, SeriesOrdering::Contiguous),
+        (SeriesOrdering::Contiguous, SeriesOrdering::KeyThenTime),
+        // An interleaved stream must not be packed under a stricter planned guarantee.
+        (SeriesOrdering::KeyThenTime, SeriesOrdering::Interleaved),
+        (SeriesOrdering::Contiguous, SeriesOrdering::Interleaved),
     ] {
         let schema = series_schema();
         let (scan, state) = fixture(Some(schema.clone()), vec![chunk(&schema)]);
@@ -721,7 +733,7 @@ async fn ordering_changed_after_planning_fails_before_raw_execution() {
         .try_to_series_scan(RawLabelSource::Explicit)
         .unwrap()
         .unwrap();
-    state.lock().unwrap().planned_ordering = Some(RawSeriesOrdering::Contiguous);
+    state.lock().unwrap().planned_ordering = Some(SeriesOrdering::Contiguous);
     assert!(plan.execute(0, context()).is_err());
     let state = state.lock().unwrap();
     assert_eq!(0, state.raw_calls);
@@ -1185,7 +1197,7 @@ async fn tracked_native_frame_holds_and_releases_quota_on_cancel() {
 async fn memory_quota_failure_does_not_replay_raw_scan() {
     let schema = series_schema();
     let mut oversized = chunk(&schema);
-    oversized.read_key = Buffer::from(vec![0; 2048]);
+    oversized.primary_key = Buffer::from(vec![0; 2048]);
     let (scan, state) = fixture(Some(schema.clone()), vec![oversized]);
     let policy = serde_json::from_str("\"fail\"").unwrap();
     let tracker = QueryMemoryTracker::builder(1, policy).build();
@@ -1279,10 +1291,7 @@ fn bound_series_scan_uses_open_scanner_metadata_without_execution() {
 
 #[tokio::test]
 async fn raw_series_admission_captures_scanner_ordering_before_execution() {
-    for ordering in [
-        RawSeriesOrdering::ReadKeyThenTime,
-        RawSeriesOrdering::Contiguous,
-    ] {
+    for ordering in [SeriesOrdering::KeyThenTime, SeriesOrdering::Contiguous] {
         let schema = series_schema();
         let chunk = chunk(&schema);
         let (scan, state) = fixture(Some(schema), vec![chunk]);
@@ -1311,8 +1320,12 @@ async fn raw_series_admission_captures_scanner_ordering_before_execution() {
         }
 
         state.lock().unwrap().planned_ordering = Some(match ordering {
-            RawSeriesOrdering::ReadKeyThenTime => RawSeriesOrdering::Contiguous,
-            RawSeriesOrdering::Contiguous => RawSeriesOrdering::ReadKeyThenTime,
+            SeriesOrdering::KeyThenTime => SeriesOrdering::Contiguous,
+            SeriesOrdering::Contiguous => SeriesOrdering::KeyThenTime,
+            // `Interleaved` is rejected before consumption, so this two-mode loop never supplies it.
+            SeriesOrdering::Interleaved => {
+                unreachable!("interleaved ordering is not an admitted raw series plan")
+            }
         });
         assert_eq!(plan.raw_series_ordering(), ordering);
         assert!(plan.execute(0, context()).is_err());

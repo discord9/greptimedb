@@ -34,7 +34,7 @@ use datafusion::datasource::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion_expr::{AggregateUDF, LogicalPlan, WindowUDF, table_scan};
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use query::error::Error as QueryError;
 use query::planner::LogicalPlanner;
 use query::query_engine::{DescribeResult, QueryEngineState};
@@ -62,7 +62,7 @@ struct EngineState {
 }
 
 enum EngineAction {
-    Return(Option<RawSeriesOrdering>),
+    Return(Option<SeriesOrdering>),
     Error,
     Wait(oneshot::Receiver<()>, Arc<Notify>),
 }
@@ -113,7 +113,7 @@ impl QueryEngine for AdmissionQueryEngine {
         _plan: LogicalPlan,
         query_ctx: QueryContextRef,
         _binding: RawSeriesRequest,
-    ) -> query::error::Result<Option<RawSeriesOrdering>> {
+    ) -> query::error::Result<Option<SeriesOrdering>> {
         self.state.calls.fetch_add(1, Ordering::SeqCst);
         self.state.prepare_entered.notify_one();
         *self.state.context.lock().unwrap() = Some(query_ctx);
@@ -326,8 +326,8 @@ async fn assert_available(fixture: &Fixture) {
 #[tokio::test]
 async fn raw_series_admission_prepares_without_execution_and_releases_permit() {
     for action in [
-        EngineAction::Return(Some(RawSeriesOrdering::Contiguous)),
-        EngineAction::Return(Some(RawSeriesOrdering::ReadKeyThenTime)),
+        EngineAction::Return(Some(SeriesOrdering::Contiguous)),
+        EngineAction::Return(Some(SeriesOrdering::KeyThenTime)),
         EngineAction::Return(None),
         EngineAction::Error,
     ] {

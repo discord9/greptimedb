@@ -4768,7 +4768,7 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
     use api::v1::{Row, Value};
     use common_recordbatch::filter;
     use datatypes::arrow::array::Array;
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::samples::SampleRef;
     use datatypes::value::Value as DatumValue;
     use mito_codec::row_converter::build_primary_key_codec;
@@ -4908,7 +4908,7 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
             .scan_series_partition(&QueryScanContext::default(), &metrics, partition, &source)
             .unwrap()
             .expect("supported millisecond PerSeries scan");
-        assert_eq!(RawSeriesOrdering::ReadKeyThenTime, stream.ordering());
+        assert_eq!(SeriesOrdering::KeyThenTime, stream.ordering());
         assert!(stream.schema().eval_grid.is_none());
         assert_eq!(
             vec!["field_1", "field_0"],
@@ -4923,10 +4923,10 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
         while let Some(chunk) = stream.try_next().await.unwrap() {
             assert!(chunk.metric.is_none());
             assert!(
-                !closed_keys.contains(chunk.read_key.as_slice()),
+                !closed_keys.contains(chunk.primary_key.as_slice()),
                 "no chunk may follow a key's is_last chunk"
             );
-            let times = chunk.time.as_explicit().unwrap();
+            let times = chunk.time.as_buffer();
             assert_eq!(2, chunk.fields.len());
             assert_eq!(times.len(), chunk.fields.get(0).unwrap().len());
             assert_eq!(times.len(), chunk.fields.get(1).unwrap().len());
@@ -4939,7 +4939,7 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
                     SampleRef::Missing => None,
                     _ => panic!("f0 type"),
                 };
-                let key = chunk.read_key.to_vec();
+                let key = chunk.primary_key.to_vec();
                 if let Some(previous) = previous_times.insert(key.clone(), *time) {
                     assert!(
                         previous < *time,
@@ -4947,10 +4947,10 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
                     );
                 }
                 if chunk.is_last {
-                    closed_keys.insert(chunk.read_key.to_vec());
+                    closed_keys.insert(chunk.primary_key.to_vec());
                 }
                 raw.push((
-                    chunk.read_key.clone(),
+                    chunk.primary_key.clone(),
                     *time,
                     f1,
                     f0,
@@ -5129,7 +5129,7 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
         native_frames,
         native_schema,
         native_source,
-        RawSeriesOrdering::Contiguous,
+        SeriesOrdering::Contiguous,
     )
     .unwrap();
     let native_schema = unpacked.schema().clone();
@@ -5160,8 +5160,8 @@ async fn test_mito_handle_query_raw_series_candidate_projection_and_mvcc() {
             assert_eq!(1, labels.len());
             let tag = labels["tag_0"].to_string();
             assert!(tag == "A" || tag == "B");
-            let times = chunk.time.as_explicit().unwrap();
-            let key = chunk.read_key.to_vec();
+            let times = chunk.time.as_buffer();
+            let key = chunk.primary_key.to_vec();
             let is_last = chunk.is_last;
             let mut rows = Vec::with_capacity(times.len());
             for (i, time) in times.iter().enumerate() {
@@ -5234,7 +5234,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
     use api::v1::{Row, Value};
     use common_query::series_frame::{pack_raw_series, unpack_raw_series};
     use datatypes::arrow::array::Array;
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::samples::{SampleRef, SeriesSchema};
     use datatypes::value::Value as DatumValue;
     use mito_codec::row_converter::build_primary_key_codec;
@@ -5350,10 +5350,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
             }
             _ => panic!("PerSeries request must select a series scanner"),
         };
-        assert_eq!(
-            RawSeriesOrdering::ReadKeyThenTime,
-            scanner.raw_series_ordering()
-        );
+        assert_eq!(SeriesOrdering::KeyThenTime, scanner.raw_series_ordering());
         let metadata = scanner.metadata();
         metadata_for_codec.get_or_insert_with(|| metadata.clone());
         let source = RawLabelSource::PrimaryKey {
@@ -5409,7 +5406,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
                 .unwrap()
                 .expect("native raw input");
             assert_eq!(scanner.raw_series_ordering(), stream.ordering());
-            assert_eq!(RawSeriesOrdering::ReadKeyThenTime, stream.ordering());
+            assert_eq!(SeriesOrdering::KeyThenTime, stream.ordering());
             assert_eq!(
                 vec!["field_1", "field_0"],
                 stream
@@ -5444,7 +5441,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
     let merged_schema = Arc::clone(merged.schema());
     let binding = merged.label_source().clone();
     let ordering = merged.ordering();
-    assert_eq!(RawSeriesOrdering::ReadKeyThenTime, ordering);
+    assert_eq!(SeriesOrdering::KeyThenTime, ordering);
     let packed = pack_raw_series(merged).unwrap();
     let unpacked = unpack_raw_series(packed, merged_schema, binding, ordering).unwrap();
     let mut materialized = materialize_raw_labels(unpacked).unwrap();
@@ -5463,7 +5460,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
                 _ => panic!("unexpected field_0 sample type"),
             };
             actual.push((
-                chunk.read_key.to_vec(),
+                chunk.primary_key.to_vec(),
                 tag.clone(),
                 chunk.time.timestamp(index).unwrap(),
                 f1.to_bits(),
@@ -5667,7 +5664,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
     let duplicate_error = loop {
         match duplicate_merge.try_next().await {
             Ok(Some(chunk)) => {
-                if chunk.read_key.as_slice() == duplicate_key.as_slice() {
+                if chunk.primary_key.as_slice() == duplicate_key.as_slice() {
                     affected_key_last.push(chunk.is_last);
                 }
             }
@@ -5699,7 +5696,7 @@ async fn test_mito_regional_raw_merge_preserves_global_key_order_and_labels() {
 
 #[tokio::test]
 async fn test_two_phase_native_raw_stream_is_rejected_by_ordered_merge() {
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use store_api::region_engine::{BoundTag, QueryScanContext, RawLabelSource};
     use store_api::region_request::RegionPutRequest;
 
@@ -5777,7 +5774,7 @@ async fn test_two_phase_native_raw_stream_is_rejected_by_ordered_merge() {
     };
     assert_eq!("two_phase", series.mode());
     let mut scanner = engine.handle_query(region_id, request).await.unwrap();
-    assert_eq!(RawSeriesOrdering::Contiguous, scanner.raw_series_ordering());
+    assert_eq!(SeriesOrdering::Contiguous, scanner.raw_series_ordering());
     let metadata = scanner.metadata();
     let source = RawLabelSource::PrimaryKey {
         metric_name: Arc::from("fixture_metric"),
@@ -5815,7 +5812,7 @@ async fn test_two_phase_native_raw_stream_is_rejected_by_ordered_merge() {
             .unwrap()
             .unwrap();
         assert_eq!(scanner.raw_series_ordering(), stream.ordering());
-        assert_eq!(RawSeriesOrdering::Contiguous, stream.ordering());
+        assert_eq!(SeriesOrdering::Contiguous, stream.ordering());
         streams.push(stream);
     }
     let error = match promql::source::merge_ordered_raw_series(streams) {
@@ -5925,7 +5922,7 @@ async fn test_mito_raw_series_int64_predicate_uses_original_precision() {
         );
         let chunks = stream.try_collect::<Vec<_>>().await.unwrap();
         for chunk in chunks {
-            let axis = chunk.time.as_explicit().unwrap();
+            let axis = chunk.time.as_buffer();
             times.extend(axis.iter().copied());
             for index in 0..axis.len() {
                 output_values.push((
@@ -5945,7 +5942,7 @@ async fn test_mito_raw_series_int64_predicate_uses_original_precision() {
     use common_query::series_frame::unpack_raw_series;
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::ExecutionPlan;
-    use datatypes::series::raw::RawSeriesOrdering;
+    use datatypes::series::SeriesOrdering;
     use table::table::scan::RegionScanExec;
     let native_request = ScanRequest {
         projection: Some(vec![2, 3]),
@@ -5982,7 +5979,7 @@ async fn test_mito_raw_series_int64_predicate_uses_original_precision() {
         frames,
         native_schema,
         native_source,
-        RawSeriesOrdering::Contiguous,
+        SeriesOrdering::Contiguous,
     )
     .unwrap()
     .try_collect::<Vec<_>>()
@@ -5991,7 +5988,7 @@ async fn test_mito_raw_series_int64_predicate_uses_original_precision() {
     let native_rows = chunks
         .iter()
         .flat_map(|chunk| {
-            let times = chunk.time.as_explicit().unwrap();
+            let times = chunk.time.as_buffer();
             (0..times.len())
                 .map(|i| {
                     let SampleRef::Float(value) = chunk.fields.get(0).unwrap().sample(i) else {
@@ -6039,7 +6036,7 @@ async fn test_mito_raw_series_int64_predicate_uses_original_precision() {
         empty_frames,
         empty_schema,
         empty_source,
-        RawSeriesOrdering::Contiguous,
+        SeriesOrdering::Contiguous,
     )
     .unwrap()
     .try_collect::<Vec<_>>()
@@ -6150,7 +6147,7 @@ async fn test_mito_raw_series_invalid_binding_before_legacy_read() {
             let tuples = chunks
                 .iter()
                 .map(|chunk| {
-                    let times = chunk.time.as_explicit().unwrap();
+                    let times = chunk.time.as_buffer();
                     let SampleRef::Float(value) = chunk.fields.get(0).unwrap().sample(0) else {
                         panic!("expected raw float sample");
                     };

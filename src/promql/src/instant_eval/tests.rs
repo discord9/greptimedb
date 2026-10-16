@@ -19,13 +19,13 @@ use datatypes::arrow::buffer::ScalarBuffer;
 use datatypes::series::histogram::{
     BucketSideView, CounterResetHint, HistogramBatch, HistogramBatchBuilder, HistogramView,
 };
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{DenseSamplesRef, SampleRef, Samples, SeriesFields};
 
 use super::select_instants;
 
-fn axis(times: &[i64]) -> RawTimeAxis {
-    RawTimeAxis::try_new(ScalarBuffer::from(times.to_vec())).unwrap()
+fn axis(times: &[i64]) -> RawTimestamps {
+    RawTimestamps::try_new(ScalarBuffer::from(times.to_vec())).unwrap()
 }
 
 fn select(
@@ -228,10 +228,10 @@ fn invalid_manual_inputs_are_rejected() {
         Some(1.0),
         Some(2.0),
     ])));
-    let invalid_axis = RawTimeAxis::Explicit(ScalarBuffer::from(vec![10, 10]));
-    assert!(select_instants(&invalid_axis, &fields, 0..=10, 1, 0, 0).is_err());
-    let descending_axis = RawTimeAxis::Explicit(ScalarBuffer::from(vec![20, 10]));
-    assert!(select_instants(&descending_axis, &fields, 0..=20, 1, 0, 0).is_err());
+    // `RawTimestamps` validates at construction, so duplicate or descending axes are
+    // rejected before `select_instants` can receive them.
+    assert!(RawTimestamps::try_new(ScalarBuffer::from(vec![10, 10])).is_err());
+    assert!(RawTimestamps::try_new(ScalarBuffer::from(vec![20, 10])).is_err());
 
     let mismatched = SeriesFields::one(Samples::from_float(Float64Array::from(vec![Some(1.0)])));
     assert!(select(&[10, 20], &mismatched, 0..=10, 1, 0, 0).is_err());

@@ -56,8 +56,8 @@ mod test {
     };
     use datatypes::prelude::{ConcreteDataType, ScalarVector, VectorRef};
     use datatypes::schema::{ColumnSchema, Schema};
+    use datatypes::series::SeriesOrdering;
     use datatypes::series::frame::{RawLabelMode, raw_series_frame_schema};
-    use datatypes::series::raw::RawSeriesOrdering;
     use datatypes::vectors::{Int32Vector, StringVector, TimestampMillisecondVector};
     use futures_util::{Stream, StreamExt};
     use hyper_util::rt::TokioIo;
@@ -446,7 +446,7 @@ mod test {
             );
         } else {
             let raw = result.expect("missing ordering defaults to contiguous");
-            assert_eq!(RawSeriesOrdering::Contiguous, raw.ordering());
+            assert_eq!(SeriesOrdering::Contiguous, raw.ordering());
             drop(raw);
         }
 

@@ -24,7 +24,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::memory::MemoryStream;
 use datatypes::arrow::buffer::ScalarBuffer;
-use datatypes::series::raw::RawTimeAxis;
+use datatypes::series::raw::RawTimestamps;
 use datatypes::series::samples::{Samples, SeriesFields};
 
 use super::*;
@@ -189,7 +189,7 @@ fn typed_selection_matches_existing_wide_native_scan_oracle() {
     let timestamps = [0, 10, 20, 30, 40];
     let values = [Some(1.0), Some(f64::NAN), Some(3.0), Some(stale), Some(5.0)];
     let fields = SeriesFields::one(Samples::from_float(Float64Array::from(values.to_vec())));
-    let axis = RawTimeAxis::try_new(ScalarBuffer::from(timestamps.to_vec())).unwrap();
+    let axis = RawTimestamps::try_new(ScalarBuffer::from(timestamps.to_vec())).unwrap();
     let typed = select_instants(&axis, &fields, 5..=45, 10, 20, 0).unwrap();
     let batch = input_batch(timestamps.to_vec(), values.to_vec(), vec![Some(0.0); 5]);
     let scanner = stream(&batch, 5, 45, 10, 20, 0);
@@ -216,7 +216,7 @@ fn typed_selection_matches_existing_wide_native_scan_oracle() {
     let offset = select_instants(&axis, &fields, 15..=35, 10, 20, 10).unwrap();
     assert_eq!(offset, (vec![0, 1, 2], vec![15, 25, 35]));
 
-    let lower_axis = RawTimeAxis::try_new(ScalarBuffer::from(vec![0, 10])).unwrap();
+    let lower_axis = RawTimestamps::try_new(ScalarBuffer::from(vec![0, 10])).unwrap();
     let lower_fields = SeriesFields::one(Samples::from_float(Float64Array::from(vec![
         Some(1.0),
         Some(2.0),
@@ -234,7 +234,7 @@ fn typed_selection_matches_existing_wide_native_scan_oracle() {
         (vec![1], vec![10])
     );
 
-    let edge_axis = RawTimeAxis::try_new(ScalarBuffer::from(vec![i64::MIN, i64::MAX])).unwrap();
+    let edge_axis = RawTimestamps::try_new(ScalarBuffer::from(vec![i64::MIN, i64::MAX])).unwrap();
     let edge_fields = SeriesFields::one(Samples::from_float(Float64Array::from(vec![
         Some(1.0),
         Some(2.0),
@@ -255,12 +255,8 @@ fn typed_selection_matches_existing_wide_native_scan_oracle() {
 
 #[test]
 fn duplicate_arrow_timestamps_fall_back_and_invalid_typed_arguments_propagate() {
-    let fields = SeriesFields::one(Samples::from_float(Float64Array::from(vec![
-        Some(1.0),
-        Some(2.0),
-    ])));
-    let duplicate = RawTimeAxis::Explicit(ScalarBuffer::from(vec![10, 10]));
-    assert!(select_instants(&duplicate, &fields, 10..=11, 1, 2, 0).is_err());
+    // `RawTimestamps` rejects duplicate axes at construction.
+    assert!(RawTimestamps::try_new(ScalarBuffer::from(vec![10, 10])).is_err());
     let batch = input_batch(vec![10, 10], vec![Some(1.0), Some(2.0)], vec![Some(0.0); 2]);
     let result = stream(&batch, 10, 11, 1, 2, 0).manipulate(batch).unwrap();
     let times = result
@@ -277,7 +273,7 @@ fn duplicate_arrow_timestamps_fall_back_and_invalid_typed_arguments_propagate() 
     assert_eq!(values.values(), &[1.0, 2.0]);
 
     let batch = input_batch(vec![10, 20], vec![Some(1.0), Some(2.0)], vec![Some(0.0); 2]);
-    let axis = RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
+    let axis = RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap();
     let invalid_fields =
         SeriesFields::one(Samples::from_float(Float64Array::from(vec![Some(1.0); 2])));
     let typed_error = select_instants(&axis, &invalid_fields, 10..=20, 10, -1, 0)

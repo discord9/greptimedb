@@ -21,10 +21,11 @@ use common_error::ext::BoxedError;
 use common_query::series_frame::{pack_raw_series, unpack_raw_series};
 use datatypes::arrow::array::{Array, Float64Array, ListArray, UInt32Array};
 use datatypes::arrow::buffer::{Buffer, ScalarBuffer};
+use datatypes::series::SeriesOrdering;
 use datatypes::series::histogram::{
     BucketSideView, CounterResetHint, HistogramBatch, HistogramBatchBuilder, HistogramView,
 };
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{
     DenseSamplesRef, FieldSpec, HistogramSamples, SampleRef, Samples, SeriesFields, SeriesSchema,
 };
@@ -156,7 +157,7 @@ fn payload_chunk(
         &payload_schema(),
         key,
         None,
-        RawTimeAxis::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
+        RawTimestamps::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
         fields,
         last,
     )
@@ -183,8 +184,8 @@ impl RawSeriesStream for PayloadStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.labels
     }
-    fn ordering(&self) -> RawSeriesOrdering {
-        RawSeriesOrdering::ReadKeyThenTime
+    fn ordering(&self) -> SeriesOrdering {
+        SeriesOrdering::KeyThenTime
     }
 }
 
@@ -257,7 +258,7 @@ async fn merges_typed_multifield_payload_through_frame_and_label_roundtrip() {
             .collect::<Vec<_>>(),
         [10, 20, 30, 40]
     );
-    assert!(rows.iter().all(|r| r.read_key == key));
+    assert!(rows.iter().all(|r| r.primary_key == key));
     for row in &rows {
         let metric = row.metric.as_ref().unwrap();
         assert_eq!(metric.name(), Some("room_temperature"));
@@ -373,7 +374,7 @@ async fn merge_retains_sliced_float_time_and_histogram_owners_until_output_drop(
         &payload_schema(),
         key.clone(),
         None,
-        RawTimeAxis::try_new(times.clone()).unwrap(),
+        RawTimestamps::try_new(times.clone()).unwrap(),
         fields,
         true,
     )
@@ -443,18 +444,18 @@ async fn merge_retains_sliced_float_time_and_histogram_owners_until_output_drop(
     assert!(
         matches!(merged.label_source(), RawLabelSource::PrimaryKey { metric_name, .. } if metric_name.as_ref() == "room_temperature")
     );
-    assert_eq!(merged.ordering(), RawSeriesOrdering::ReadKeyThenTime);
+    assert_eq!(merged.ordering(), SeriesOrdering::KeyThenTime);
     let prefix = merged.next().await.unwrap().unwrap();
-    assert_eq!(prefix.time.as_explicit().unwrap().as_ref(), &[11]);
-    assert_eq!(prefix.time.as_explicit().unwrap().as_ptr(), time_ptr);
-    assert_eq!(prefix.read_key.as_ptr(), key_ptr);
+    assert_eq!(prefix.time.as_buffer().as_ref(), &[11]);
+    assert_eq!(prefix.time.as_buffer().as_ptr(), time_ptr);
+    assert_eq!(prefix.primary_key.as_ptr(), key_ptr);
     let interleaved = merged.next().await.unwrap().unwrap();
-    assert_eq!(interleaved.time.as_explicit().unwrap().as_ref(), &[15]);
+    assert_eq!(interleaved.time.as_buffer().as_ref(), &[15]);
     let remainder = merged.next().await.unwrap().unwrap();
-    assert_eq!(remainder.read_key.as_ptr(), key_ptr);
-    assert_eq!(remainder.time.as_explicit().unwrap().as_ref(), &[22]);
+    assert_eq!(remainder.primary_key.as_ptr(), key_ptr);
+    assert_eq!(remainder.time.as_buffer().as_ref(), &[22]);
     assert_eq!(
-        remainder.time.as_explicit().unwrap().as_ptr(),
+        remainder.time.as_buffer().as_ptr(),
         time_ptr.wrapping_add(1)
     );
     assert!(
@@ -589,8 +590,8 @@ async fn merge_retains_sliced_float_time_and_histogram_owners_until_output_drop(
     drop(hist_indices);
     assert!(hist_weak.upgrade().is_none());
     assert!(batch_weak.upgrade().is_some());
-    assert_eq!(prefix.time.as_explicit().unwrap().as_ref(), &[11]);
-    assert_eq!(remainder.time.as_explicit().unwrap().as_ref(), &[22]);
+    assert_eq!(prefix.time.as_buffer().as_ref(), &[11]);
+    assert_eq!(remainder.time.as_buffer().as_ref(), &[22]);
     let SampleRef::Histogram(prefix_histogram) = prefix.fields.get(2).unwrap().sample(0) else {
         panic!("expected histogram");
     };

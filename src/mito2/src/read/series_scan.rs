@@ -39,7 +39,7 @@ use datatypes::arrow::datatypes::DataType as ArrowDataType;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::SchemaRef;
-use datatypes::series::raw::RawSeriesOrdering;
+use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use datatypes::types::TimestampType;
 use futures::{StreamExt, TryStreamExt};
@@ -769,10 +769,10 @@ impl RegionScanner for SeriesScan {
             .map_err(BoxedError::new)
     }
 
-    fn raw_series_ordering(&self) -> RawSeriesOrdering {
+    fn raw_series_ordering(&self) -> SeriesOrdering {
         match self.mode {
-            SeriesScanMode::Legacy => RawSeriesOrdering::ReadKeyThenTime,
-            SeriesScanMode::TwoPhase => RawSeriesOrdering::Contiguous,
+            SeriesScanMode::Legacy => SeriesOrdering::KeyThenTime,
+            SeriesScanMode::TwoPhase => SeriesOrdering::Contiguous,
         }
     }
 

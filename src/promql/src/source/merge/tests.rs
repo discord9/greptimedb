@@ -28,10 +28,10 @@ use datatypes::arrow::buffer::{Buffer, ScalarBuffer};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::Value;
 use datatypes::schema::ColumnSchema;
-use datatypes::series::MetricName;
-use datatypes::series::raw::{RawSeriesChunk, RawSeriesOrdering, RawTimeAxis};
+use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, SampleRef, Samples, SeriesFields, SeriesSchema};
 use datatypes::series::time::{EvalGrid, GridSpec};
+use datatypes::series::{MetricName, SeriesOrdering};
 use futures::{Stream, StreamExt, TryStreamExt};
 use mito_codec::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodec, SortField};
 use store_api::codec::PrimaryKeyEncoding;
@@ -151,7 +151,7 @@ fn chunk(key: Buffer, times: &[i64], values: &[f64], is_last: bool) -> RawSeries
         &schema(),
         key,
         None,
-        RawTimeAxis::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
+        RawTimestamps::try_new(ScalarBuffer::from(times.to_vec())).unwrap(),
         SeriesFields::one(Samples::from_float(Float64Array::from(values.to_vec()))),
         is_last,
     )
@@ -161,7 +161,7 @@ fn chunk(key: Buffer, times: &[i64], values: &[f64], is_last: bool) -> RawSeries
 struct TestStream {
     schema: Arc<SeriesSchema>,
     labels: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     items: VecDeque<Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
     polls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
@@ -197,14 +197,14 @@ impl RawSeriesStream for TestStream {
     fn label_source(&self) -> &RawLabelSource {
         &self.labels
     }
-    fn ordering(&self) -> RawSeriesOrdering {
+    fn ordering(&self) -> SeriesOrdering {
         self.ordering
     }
 }
 
 fn stream(
     labels: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     items: impl IntoIterator<Item = Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
 ) -> (SendableRawSeriesStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     stream_with(schema(), labels, ordering, items)
@@ -213,7 +213,7 @@ fn stream(
 fn stream_with(
     schema: Arc<SeriesSchema>,
     labels: RawLabelSource,
-    ordering: RawSeriesOrdering,
+    ordering: SeriesOrdering,
     items: impl IntoIterator<Item = Poll<Option<Result<RawSeriesChunk, BoxedError>>>>,
 ) -> (SendableRawSeriesStream, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
@@ -246,7 +246,7 @@ fn gated_stream(
         Box::pin(TestStream {
             schema: schema(),
             labels,
-            ordering: RawSeriesOrdering::ReadKeyThenTime,
+            ordering: SeriesOrdering::KeyThenTime,
             items: [ready(first)].into(),
             polls: polls.clone(),
             drops: drops.clone(),
@@ -291,7 +291,7 @@ fn gated_pending_stream(
         Box::pin(TestStream {
             schema: schema(),
             labels,
-            ordering: RawSeriesOrdering::ReadKeyThenTime,
+            ordering: SeriesOrdering::KeyThenTime,
             items: VecDeque::new(),
             polls: polls.clone(),
             drops: drops.clone(),
@@ -314,7 +314,7 @@ async fn merges_full_encoded_keys_and_interleaved_chunks_with_global_finality() 
     let rack_b_sensor_1 = read_key("rack-b", "sensor-1");
     let (left, _, _) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [
             ready(chunk(rack_a_sensor_1.clone(), &[10, 30], &[1.0, 3.0], true)),
             ready(chunk(rack_b_sensor_1.clone(), &[5, 25], &[5.0, 25.0], true)),
@@ -322,7 +322,7 @@ async fn merges_full_encoded_keys_and_interleaved_chunks_with_global_finality() 
     );
     let (right, _, _) = stream(
         label_source(2),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [
             ready(chunk(rack_a_sensor_1.clone(), &[20, 40], &[2.0, 4.0], true)),
             ready(chunk(rack_a_sensor_2.clone(), &[7, 17], &[7.0, 17.0], true)),
@@ -330,7 +330,7 @@ async fn merges_full_encoded_keys_and_interleaved_chunks_with_global_finality() 
     );
 
     let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
-    assert_eq!(merged.ordering(), RawSeriesOrdering::ReadKeyThenTime);
+    assert_eq!(merged.ordering(), SeriesOrdering::KeyThenTime);
     assert!(merged.schema().eval_grid.is_none());
     assert!(matches!(
         merged.label_source(),
@@ -346,8 +346,8 @@ async fn merges_full_encoded_keys_and_interleaved_chunks_with_global_finality() 
             })
             .collect::<Vec<_>>();
         observed.push((
-            item.read_key,
-            item.time.as_explicit().unwrap().to_vec(),
+            item.primary_key,
+            item.time.as_buffer().to_vec(),
             values,
             item.is_last,
         ));
@@ -393,12 +393,12 @@ async fn rejects_equal_timestamp_from_separate_heads() {
     let key = read_key("rack-a", "sensor-1");
     let (left, _, _) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(key.clone(), &[10], &[1.0], true))],
     );
     let (right, _, _) = stream(
         label_source(2),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(key, &[10], &[1.0], true))],
     );
     let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
@@ -412,17 +412,19 @@ async fn rejects_equal_timestamp_from_separate_heads() {
 
 #[tokio::test]
 async fn rejects_unsupported_ordering_and_empty_input_without_polling() {
-    let (input, polls, drops) = stream(label_source(1), RawSeriesOrdering::Contiguous, []);
-    let error = match merge_ordered_raw_series(vec![input]) {
-        Ok(_) => panic!("Contiguous ordering must be rejected"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        error.contains("ordering") || error.contains("ordered"),
-        "unexpected error: {error}"
-    );
-    assert_eq!(polls.load(Ordering::SeqCst), 0);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    for ordering in [SeriesOrdering::Contiguous, SeriesOrdering::Interleaved] {
+        let (input, polls, drops) = stream(label_source(1), ordering, []);
+        let error = match merge_ordered_raw_series(vec![input]) {
+            Ok(_) => panic!("{ordering:?} ordering must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("ordering") || error.contains("ordered"),
+            "{ordering:?}: {error}"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "{ordering:?}");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "{ordering:?}");
+    }
 
     let error = match merge_ordered_raw_series(vec![]) {
         Ok(_) => panic!("empty inputs must be rejected"),
@@ -436,11 +438,8 @@ async fn rejects_unsupported_ordering_and_empty_input_without_polling() {
 
 #[tokio::test]
 async fn preflight_rejects_binding_and_schema_mismatches_without_polling() {
-    let (explicit, explicit_polls, explicit_drops) = stream(
-        RawLabelSource::Explicit,
-        RawSeriesOrdering::ReadKeyThenTime,
-        [],
-    );
+    let (explicit, explicit_polls, explicit_drops) =
+        stream(RawLabelSource::Explicit, SeriesOrdering::KeyThenTime, []);
     let error = match merge_ordered_raw_series(vec![explicit]) {
         Ok(_) => panic!("Explicit label binding must be rejected"),
         Err(error) => error.to_string(),
@@ -453,7 +452,7 @@ async fn preflight_rejects_binding_and_schema_mismatches_without_polling() {
     assert_eq!(explicit_drops.load(Ordering::SeqCst), 1);
 
     let (single, single_polls, single_drops) =
-        stream(label_source(1), RawSeriesOrdering::ReadKeyThenTime, []);
+        stream(label_source(1), SeriesOrdering::KeyThenTime, []);
     let _merged = merge_ordered_raw_series(vec![single]).unwrap();
     assert_eq!(
         single_polls.load(Ordering::SeqCst),
@@ -483,7 +482,7 @@ async fn preflight_rejects_binding_and_schema_mismatches_without_polling() {
         ),
     ];
     let (invalid_mode, _, invalid_mode_drops) =
-        stream(label_source(1), RawSeriesOrdering::Contiguous, []);
+        stream(label_source(1), SeriesOrdering::Contiguous, []);
     let ordering_error = match merge_ordered_raw_series(vec![invalid_mode]) {
         Ok(_) => panic!("Contiguous ordering must be rejected"),
         Err(error) => error.to_string(),
@@ -496,7 +495,7 @@ async fn preflight_rejects_binding_and_schema_mismatches_without_polling() {
 
     for (description, fields, eval_grid) in cases {
         let (first, first_polls, first_drops) =
-            stream(label_source(1), RawSeriesOrdering::ReadKeyThenTime, []);
+            stream(label_source(1), SeriesOrdering::KeyThenTime, []);
         let incompatible = Arc::new(SeriesSchema {
             fields: fields.into(),
             eval_grid,
@@ -504,7 +503,7 @@ async fn preflight_rejects_binding_and_schema_mismatches_without_polling() {
         let (second, second_polls, second_drops) = stream_with(
             incompatible,
             label_source(2),
-            RawSeriesOrdering::ReadKeyThenTime,
+            SeriesOrdering::KeyThenTime,
             [],
         );
         let error = match merge_ordered_raw_series(vec![first, second]) {
@@ -532,7 +531,7 @@ async fn later_error_drops_held_candidate_and_heads_before_returning_error() {
     let (owned_b, weak_b) = owned_key(key_b.as_slice().to_vec(), key_b_drops.clone());
     let (first, _, first_drops) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [
             ready(chunk(owned_a, &[10], &[1.0], false)),
             Poll::Pending,
@@ -544,7 +543,7 @@ async fn later_error_drops_held_candidate_and_heads_before_returning_error() {
     );
     let (second, _, second_drops) = stream(
         label_source(2),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(owned_b, &[20], &[2.0], true))],
     );
     let mut merged = merge_ordered_raw_series(vec![first, second]).unwrap();
@@ -571,15 +570,15 @@ async fn later_error_drops_held_candidate_and_heads_before_returning_error() {
 #[tokio::test]
 async fn rejects_malformed_public_chunk_and_unfinished_series_at_eof() {
     let malformed = RawSeriesChunk {
-        read_key: read_key("rack-a", "sensor-1"),
+        primary_key: read_key("rack-a", "sensor-1"),
         metric: None,
-        time: RawTimeAxis::try_new(ScalarBuffer::from(vec![10, 20])).unwrap(),
+        time: RawTimestamps::try_new(ScalarBuffer::from(vec![10, 20])).unwrap(),
         fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![1.0]))),
         is_last: true,
     };
     let (input, _, drops) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(malformed)],
     );
     let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
@@ -594,9 +593,9 @@ async fn rejects_malformed_public_chunk_and_unfinished_series_at_eof() {
     for (malformed, reason) in [
         (
             RawSeriesChunk {
-                read_key: read_key("rack-a", "sensor-2"),
+                primary_key: read_key("rack-a", "sensor-2"),
                 metric: None,
-                time: RawTimeAxis::try_new(ScalarBuffer::from(Vec::<i64>::new())).unwrap(),
+                time: RawTimestamps::try_new(ScalarBuffer::from(Vec::<i64>::new())).unwrap(),
                 fields: SeriesFields::one(Samples::from_float(Float64Array::from(
                     Vec::<f64>::new(),
                 ))),
@@ -606,9 +605,9 @@ async fn rejects_malformed_public_chunk_and_unfinished_series_at_eof() {
         ),
         (
             RawSeriesChunk {
-                read_key: read_key("rack-a", "sensor-3"),
+                primary_key: read_key("rack-a", "sensor-3"),
                 metric: None,
-                time: RawTimeAxis::try_new(ScalarBuffer::from(vec![30])).unwrap(),
+                time: RawTimestamps::try_new(ScalarBuffer::from(vec![30])).unwrap(),
                 fields: SeriesFields::try_from_vec(vec![
                     Samples::from_float(Float64Array::from(vec![3.0])),
                     Samples::from_float(Float64Array::from(vec![4.0])),
@@ -621,7 +620,7 @@ async fn rejects_malformed_public_chunk_and_unfinished_series_at_eof() {
     ] {
         let (input, _, drops) = stream(
             label_source(1),
-            RawSeriesOrdering::ReadKeyThenTime,
+            SeriesOrdering::KeyThenTime,
             [ready(malformed)],
         );
         let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
@@ -635,15 +634,15 @@ async fn rejects_malformed_public_chunk_and_unfinished_series_at_eof() {
     }
 
     let unfinished = RawSeriesChunk {
-        read_key: read_key("rack-a", "sensor-1"),
+        primary_key: read_key("rack-a", "sensor-1"),
         metric: None,
-        time: RawTimeAxis::try_new(ScalarBuffer::from(vec![30])).unwrap(),
+        time: RawTimestamps::try_new(ScalarBuffer::from(vec![30])).unwrap(),
         fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![3.0]))),
         is_last: false,
     };
     let (input, _, drops) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(unfinished), Poll::Ready(None)],
     );
     let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
@@ -661,19 +660,19 @@ async fn equal_timestamp_at_successor_boundary_is_an_error() {
     let key = read_key("rack-a", "sensor-1");
     let (left, _, drops_a) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(key.clone(), &[10, 30], &[1.0, 3.0], true))],
     );
     let (right, _, drops_b) = stream(
         label_source(2),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(key, &[20, 30], &[2.0, 30.0], true))],
     );
     let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
     let first = merged.next().await.unwrap().unwrap();
     let second = merged.next().await.unwrap().unwrap();
-    assert_eq!(first.time.as_explicit().unwrap().as_ref(), &[10]);
-    assert_eq!(second.time.as_explicit().unwrap().as_ref(), &[20]);
+    assert_eq!(first.time.as_buffer().as_ref(), &[10]);
+    assert_eq!(second.time.as_buffer().as_ref(), &[20]);
     assert!(!first.is_last && !second.is_last);
     let error = merged.next().await.unwrap().unwrap_err().to_string();
     assert!(
@@ -699,7 +698,7 @@ async fn greater_key_head_allows_finished_series_before_future_eof() {
     );
     let (left, _, left_drops) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(key_a.clone(), &[10], &[1.0], true))],
     );
     let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
@@ -709,7 +708,7 @@ async fn greater_key_head_allows_finished_series_before_future_eof() {
         Poll::Ready(Some(Ok(item))) => item,
         _ => panic!("expected finished smaller key"),
     };
-    assert_eq!(item.read_key, key_a);
+    assert_eq!(item.primary_key, key_a);
     assert!(item.is_last);
     assert!(
         gate.lock().unwrap().is_none(),
@@ -895,9 +894,8 @@ async fn preflight_rejects_incompatible_primary_key_bindings_without_polling() {
             &full_baseline
         };
         let (first, polls_a, drops_a) =
-            stream((*baseline).clone(), RawSeriesOrdering::ReadKeyThenTime, []);
-        let (second, polls_b, drops_b) =
-            stream(incompatible, RawSeriesOrdering::ReadKeyThenTime, []);
+            stream((*baseline).clone(), SeriesOrdering::KeyThenTime, []);
+        let (second, polls_b, drops_b) = stream(incompatible, SeriesOrdering::KeyThenTime, []);
         let error = match merge_ordered_raw_series(vec![first, second]) {
             Ok(_) => panic!("{description} mismatch must be rejected"),
             Err(error) => error.to_string(),
@@ -976,7 +974,7 @@ async fn metadata_snapshots_with_same_layout_are_accepted() {
     };
     let (left, _, _) = stream(
         first_binding,
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(
             read_key("rack-a", "sensor-1"),
             &[1],
@@ -986,7 +984,7 @@ async fn metadata_snapshots_with_same_layout_are_accepted() {
     );
     let (right, _, _) = stream(
         second_binding,
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(
             read_key("rack-b", "sensor-1"),
             &[2],
@@ -996,7 +994,7 @@ async fn metadata_snapshots_with_same_layout_are_accepted() {
     );
     let mut merged = merge_ordered_raw_series(vec![left, right]).unwrap();
     let first = merged.next().await.unwrap().unwrap();
-    assert_eq!(first.time.as_explicit().unwrap().as_ref(), &[1]);
+    assert_eq!(first.time.as_buffer().as_ref(), &[1]);
     drop(first);
     assert_eq!(
         merged
@@ -1005,8 +1003,7 @@ async fn metadata_snapshots_with_same_layout_are_accepted() {
             .unwrap()
             .unwrap()
             .time
-            .as_explicit()
-            .unwrap()
+            .as_buffer()
             .as_ref(),
         &[2]
     );
@@ -1091,7 +1088,7 @@ async fn cancel_and_eof_drop_owned_inputs_and_candidate_key_buffers() {
     let (owned, weak_owner) = owned_key(bytes, key_drops.clone());
     let (input, _, drops) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(owned, &[1], &[1.0], true))],
     );
     let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
@@ -1163,7 +1160,7 @@ fn previous_key_validation_retains_only_key_bytes_not_input_allocation() {
     let owner_key = parent_key.slice_with_length(offset, key_len);
     drop(parent_key);
     let input_chunk = chunk(owner_key, &[10], &[1.0], true);
-    let (upstream, _, _) = stream(label_source(1), RawSeriesOrdering::ReadKeyThenTime, []);
+    let (upstream, _, _) = stream(label_source(1), SeriesOrdering::KeyThenTime, []);
     let mut input = Input::new(upstream);
     input.validate(&input_chunk, &schema()).unwrap();
     drop(input_chunk);
@@ -1178,18 +1175,10 @@ fn previous_key_validation_retains_only_key_bytes_not_input_allocation() {
 async fn ordered_input_contract_rejects_bad_key_time_and_finality_transitions() {
     let a = read_key("rack-a", "sensor-1");
     let b = read_key("rack-b", "sensor-1");
+    // `RawTimestamps` rejects descending axes at construction; a merge only observes
+    // chunks that already satisfy the strictly increasing time contract.
+    assert!(RawTimestamps::try_new(ScalarBuffer::from(vec![20, 10])).is_err());
     let cases = [
-        (
-            "descending timestamps",
-            vec![RawSeriesChunk {
-                read_key: a.clone(),
-                metric: None,
-                time: RawTimeAxis::Explicit(ScalarBuffer::from(vec![20, 10])),
-                fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![2.0, 1.0]))),
-                is_last: true,
-            }],
-            "time",
-        ),
         (
             "series recurs after another key",
             vec![
@@ -1226,9 +1215,9 @@ async fn ordered_input_contract_rejects_bad_key_time_and_finality_transitions() 
         (
             "explicit metric in primary-key mode",
             vec![RawSeriesChunk {
-                read_key: a.clone(),
+                primary_key: a.clone(),
                 metric: Some(MetricName::try_new(None, vec![]).unwrap()),
-                time: RawTimeAxis::try_new(ScalarBuffer::from(vec![1])).unwrap(),
+                time: RawTimestamps::try_new(ScalarBuffer::from(vec![1])).unwrap(),
                 fields: SeriesFields::one(Samples::from_float(Float64Array::from(vec![1.0]))),
                 is_last: true,
             }],
@@ -1238,7 +1227,7 @@ async fn ordered_input_contract_rejects_bad_key_time_and_finality_transitions() 
     for (description, chunks, reason) in cases {
         let (input, _, drops) = stream(
             label_source(1),
-            RawSeriesOrdering::ReadKeyThenTime,
+            SeriesOrdering::KeyThenTime,
             chunks.into_iter().map(ready),
         );
         let mut merged = merge_ordered_raw_series(vec![input]).unwrap();
@@ -1307,14 +1296,10 @@ async fn sparse_complete_keys_keep_tag_and_internal_identity_distinct() {
         .map(|key| ready(chunk(key, &[2], &[20.0], true)));
     let (left, _, _) = stream(
         sparse_source.clone(),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         left_chunks,
     );
-    let (right, _, _) = stream(
-        sparse_source,
-        RawSeriesOrdering::ReadKeyThenTime,
-        right_chunks,
-    );
+    let (right, _, _) = stream(sparse_source, SeriesOrdering::KeyThenTime, right_chunks);
     let merged = merge_ordered_raw_series(vec![left, right]).unwrap();
     let rows = super::super::materialize_raw_labels(merged)
         .unwrap()
@@ -1324,7 +1309,7 @@ async fn sparse_complete_keys_keep_tag_and_internal_identity_distinct() {
     assert_eq!(rows.len(), 3);
     let observed = rows
         .iter()
-        .map(|chunk| chunk.read_key.clone())
+        .map(|chunk| chunk.primary_key.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         observed,
@@ -1361,7 +1346,7 @@ async fn sparse_complete_keys_keep_tag_and_internal_identity_distinct() {
         metrics[0], metrics[2],
         "different complete internal keys with same labels remain separate"
     );
-    assert_ne!(rows[0].read_key, rows[2].read_key);
+    assert_ne!(rows[0].primary_key, rows[2].primary_key);
 }
 
 #[tokio::test]
@@ -1369,7 +1354,7 @@ async fn primary_key_codec_identity_survives_merge_then_label_materialization() 
     let key = read_key("rack-z", "sensor-4");
     let (input, _, _) = stream(
         label_source(1),
-        RawSeriesOrdering::ReadKeyThenTime,
+        SeriesOrdering::KeyThenTime,
         [ready(chunk(
             key.clone(),
             &[1, 2],
@@ -1380,7 +1365,7 @@ async fn primary_key_codec_identity_survives_merge_then_label_materialization() 
     let merged = merge_ordered_raw_series(vec![input]).unwrap();
     let mut materialized = super::super::materialize_raw_labels(merged).unwrap();
     let output = materialized.next().await.unwrap().unwrap();
-    assert_eq!(output.read_key, key);
+    assert_eq!(output.primary_key, key);
     assert_eq!(
         output.metric.as_ref().unwrap().name(),
         Some("room_temperature")
@@ -1390,7 +1375,7 @@ async fn primary_key_codec_identity_survives_merge_then_label_materialization() 
         output.metric.as_ref().unwrap().get("sensor"),
         Some("sensor-4")
     );
-    assert_eq!(output.time.as_explicit().unwrap().as_ref(), &[1, 2]);
+    assert_eq!(output.time.as_buffer().as_ref(), &[1, 2]);
     match output.fields.get(0).unwrap().sample(0) {
         SampleRef::Float(value) => assert_eq!(value, 18.5),
         _ => panic!("expected float sample"),
