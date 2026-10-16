@@ -29,7 +29,7 @@ use common_function::handlers::{
     FlowServiceHandlerRef, ProcedureServiceHandlerRef, TableMutationHandlerRef,
 };
 use common_query::Output;
-use common_query::request::RawSeriesRequest;
+use common_query::request::{PreparedNamedRawSeries, RawSeriesRequest};
 use datafusion::catalog::TableFunction;
 use datafusion::dataframe::DataFrame;
 use datafusion_expr::{AggregateUDF, LogicalPlan, WindowUDF};
@@ -88,6 +88,19 @@ pub trait QueryEngine: Send + Sync {
         _query_ctx: QueryContextRef,
         _binding: RawSeriesRequest,
     ) -> Result<Option<SeriesOrdering>> {
+        Ok(None)
+    }
+
+    /// Non-consumingly checks whether a named raw-series preflight is supported.
+    ///
+    /// Returns the approved binding and ordering on support, or `None` when the plan is
+    /// explicitly unsupported. Errors propagate unchanged. This point-in-time check does not
+    /// reserve a plan; execution revalidates support.
+    async fn prepare_named_raw_series(
+        &self,
+        _plan: LogicalPlan,
+        _query_ctx: QueryContextRef,
+    ) -> Result<Option<PreparedNamedRawSeries>> {
         Ok(None)
     }
 

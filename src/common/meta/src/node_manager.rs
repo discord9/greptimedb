@@ -21,7 +21,9 @@ pub use common_base::AffectedRows;
 use common_error::ext::{BoxedError, PlainError};
 use common_error::status_code::StatusCode;
 use common_query::error::Error as CommonQueryError;
-use common_query::request::{QueryRequest, RAW_SERIES_REQUEST_EXTENSION_KEY, RawSeriesRequest};
+use common_query::request::{
+    PreparedNamedRawSeries, QueryRequest, RAW_SERIES_REQUEST_EXTENSION_KEY, RawSeriesRequest,
+};
 use common_query::series_frame::{raw_series_frame_ordering, unpack_raw_series};
 use common_recordbatch::SendableRecordBatchStream;
 use common_recordbatch::adapter::DfRecordBatchStreamAdapter;
@@ -51,6 +53,19 @@ pub trait Datanode: Send + Sync {
         _request: QueryRequest,
         _binding: RawSeriesRequest,
     ) -> Result<Option<SeriesOrdering>> {
+        Ok(None)
+    }
+
+    /// Non-consumingly checks whether a named raw-series preflight is supported.
+    ///
+    /// Returns the approved binding and ordering on support, or `None` when the request is
+    /// explicitly unsupported; failures that are not unsupported preparation are returned as
+    /// errors. This point-in-time check does not reserve a plan, and execution revalidates
+    /// support.
+    async fn prepare_named_raw_series_query(
+        &self,
+        _request: QueryRequest,
+    ) -> Result<Option<PreparedNamedRawSeries>> {
         Ok(None)
     }
 
