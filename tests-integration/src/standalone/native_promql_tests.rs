@@ -276,8 +276,12 @@ async fn test_native_promql_standalone_executes_with_real_tql_query() {
     )
     .await;
     assert!(
-        !time_plan.contains("NativeInstantManipulateExec"),
-        "time-partitioned plan unexpectedly used native instant manipulation:\n{time_plan}"
+        time_plan.contains("NativeInstantManipulateExec"),
+        "time-partitioned plan did not use native instant manipulation:\n{time_plan}"
+    );
+    assert!(
+        time_plan.contains("NativeRawMergeExec"),
+        "time-partitioned plan did not merge the native raw series of its regions:\n{time_plan}"
     );
     let time_enabled = query_batches(instance, time_query).await;
     let time_ordinary =
@@ -317,5 +321,76 @@ async fn test_native_promql_standalone_executes_with_real_tql_query() {
             (3_000, None, Some(12.5)),
         ],
         rows(&filtered_enabled)
+    );
+}
+
+/// The time-partitioned case at parallelism 4: the frontend plans more than one target partition,
+/// and the native instant manipulation must still consume the merged raw series of the two
+/// regions that hold the one series of the table.
+///
+/// An ordinary instance built with the same options and seeded with the same fixture is the schema
+/// oracle of this case, so the complete public schema of the result is compared instead of only
+/// the plan of the enabled instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_native_promql_standalone_time_partitioned_parallelism_4() {
+    const CREATE_TIME_PARTS: &str = "CREATE TABLE native_time_parts (ts TIMESTAMP(3), host STRING, val DOUBLE, TIME INDEX (ts), PRIMARY KEY (host)) PARTITION ON COLUMNS (ts) (ts < '1970-01-01 00:00:02', ts >= '1970-01-01 00:00:02') ENGINE=mito";
+    const INSERT_TIME_PARTS: &str =
+        "INSERT INTO native_time_parts VALUES (1000, 'alpha', 1), (3000, 'alpha', 3)";
+    const TIME_PARTS_QUERY: &str = "TQL EVAL (1, 3, '1s') native_time_parts";
+    const TIME_PARTS_PLAN: &str = "TQL ANALYZE VERBOSE (1, 3, '1s') native_time_parts";
+
+    let enabled = create_seeded_instance(
+        "native_promql_time_parts_p4",
+        QueryOptions {
+            parallelism: 4,
+            experimental_native_promql: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let ordinary = create_seeded_instance(
+        "native_promql_time_parts_p4_ordinary",
+        QueryOptions {
+            parallelism: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let instance = &enabled.frontend.instance;
+    let ordinary_instance = &ordinary.frontend.instance;
+    for target in [instance, ordinary_instance] {
+        execute_sql(target, CREATE_TIME_PARTS).await;
+        execute_sql(target, INSERT_TIME_PARTS).await;
+    }
+
+    let plan = run_query(instance, TIME_PARTS_PLAN).await;
+    assert!(
+        plan.contains("NativeInstantManipulateExec"),
+        "time-partitioned plan at parallelism 4 did not use native instant manipulation:\n{plan}"
+    );
+    assert!(
+        plan.contains("NativeRawMergeExec"),
+        "time-partitioned plan at parallelism 4 did not merge the native raw series of its \
+         regions:\n{plan}"
+    );
+
+    let time_batches = query_batches(instance, TIME_PARTS_QUERY).await;
+    let ordinary_batches = query_batches(ordinary_instance, TIME_PARTS_QUERY).await;
+    // The complete public schema, including nullability and field and schema metadata: the
+    // frontend has already expanded scan-time dictionaries, so a dictionary-shaped native schema
+    // must fail here instead of being normalized away.
+    assert_eq!(time_batches.schema(), ordinary_batches.schema());
+    assert_eq!(
+        time_batches.schema().arrow_schema(),
+        ordinary_batches.schema().arrow_schema()
+    );
+    assert_eq!(rows(&time_batches), rows(&ordinary_batches));
+    assert_eq!(
+        vec![
+            (1_000, Some("alpha".to_string()), Some(1.0)),
+            (2_000, Some("alpha".to_string()), Some(1.0)),
+            (3_000, Some("alpha".to_string()), Some(3.0)),
+        ],
+        rows(&time_batches)
     );
 }
