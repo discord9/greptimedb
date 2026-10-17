@@ -119,6 +119,41 @@ impl RangeManipulate {
         format!("{time_index}_range")
     }
 
+    /// The start of the evaluation range, in milliseconds.
+    pub fn start(&self) -> Millisecond {
+        self.start
+    }
+
+    /// The end of the evaluation range, in milliseconds.
+    pub fn end(&self) -> Millisecond {
+        self.end
+    }
+
+    /// The evaluation step, in milliseconds.
+    pub fn interval(&self) -> Millisecond {
+        self.interval
+    }
+
+    /// The width of the folded range window, in milliseconds.
+    pub fn range(&self) -> Millisecond {
+        self.range
+    }
+
+    /// The offset applied to the folded window, in milliseconds.
+    pub fn offset(&self) -> Millisecond {
+        self.offset
+    }
+
+    /// The name of the time index column.
+    pub fn time_index(&self) -> &str {
+        &self.time_index
+    }
+
+    /// The names of the folded value columns.
+    pub fn field_columns(&self) -> &[String] {
+        &self.field_columns
+    }
+
     pub fn internal_range_end_col_name() -> String {
         "__internal_range_end".to_string()
     }

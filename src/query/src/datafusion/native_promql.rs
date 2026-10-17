@@ -27,15 +27,20 @@ use table::table::scan::RegionScanExec;
 use crate::datafusion::raw_expr_supported;
 use crate::dummy_catalog::DummyTableProvider;
 
+mod fused;
 mod remote;
 
-/// Selects native execution for the bounded, unmodified instant-over-divide shape.
+/// Selects native execution for one fused range-function subtree, the bounded unmodified
+/// instant-over-divide shape, or one frozen remote instant route, in that order.
 ///
-/// Returns the original plan unchanged for any shape that does not match the local pattern.
+/// Returns the original plan unchanged for any shape that does not match.
 pub(crate) async fn try_select(
     logical: &LogicalPlan,
     original: Arc<dyn ExecutionPlan>,
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    if let Some(fused) = fused::try_select_fused(logical, &original)? {
+        return Ok(fused);
+    }
     if let Some(local) = try_select_local(logical, &original)? {
         return Ok(local);
     }

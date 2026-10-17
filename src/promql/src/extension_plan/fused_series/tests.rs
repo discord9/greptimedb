@@ -25,9 +25,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
-use datafusion::arrow::array::{Array, Float64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
+};
 use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt32Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
@@ -44,7 +46,7 @@ use datatypes::series::frame::{
 };
 use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, Samples, Series, SeriesFields, SeriesSchema};
-use datatypes::series::time::{EvalGrid, GridSpec, TimeAxis};
+use datatypes::series::time::{EvalGrid, GridRange, GridSpec, TimeAxis};
 use datatypes::series::{Label, MetricName, SeriesOrdering};
 use futures::{Stream, StreamExt};
 use store_api::region_engine::RawLabelSource;
@@ -102,6 +104,28 @@ fn output_schema_of(fields: &[&str], tags: &[&str]) -> SchemaRef {
         tags.iter()
             .map(|tag| Field::new(*tag, DataType::Utf8, true)),
     );
+    columns.push(Field::new(
+        TIME,
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    ));
+    Arc::new(Schema::new(columns))
+}
+
+/// [`output_schema_of`] with every tag column `Dictionary(UInt32, Utf8)`, the encoding the real
+/// PromQL plan reports for labels.
+fn dictionary_output_schema_of(fields: &[&str], tags: &[&str]) -> SchemaRef {
+    let mut columns = fields
+        .iter()
+        .map(|name| Field::new(*name, DataType::Float64, true))
+        .collect::<Vec<_>>();
+    columns.extend(tags.iter().map(|tag| {
+        Field::new(
+            *tag,
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+    }));
     columns.push(Field::new(
         TIME,
         DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -350,7 +374,10 @@ impl Case {
             let batch =
                 series_to_record_batch(&classification, &self.tags, &self.output_schema, &series)
                     .unwrap();
-            out.push((series, batch));
+            // A series without a value emits no batch, so it has no reference row either.
+            if let Some(batch) = batch {
+                out.push((series, batch));
+            }
         }
         out
     }
@@ -369,6 +396,36 @@ fn collect(items: Vec<Result<RecordBatch>>) -> Vec<RecordBatch> {
     items
         .into_iter()
         .map(|item| item.expect("the fused stream must not fail"))
+        .collect()
+}
+
+/// The rendered values of a plain string column.
+fn string_values(array: &ArrayRef) -> Vec<Option<String>> {
+    let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+    (0..array.len())
+        .map(|row| array.is_valid(row).then(|| array.value(row).to_string()))
+        .collect()
+}
+
+/// The rendered values of a `Dictionary(UInt32, Utf8)` column, decoded through its dictionary.
+fn dictionary_values(array: &ArrayRef) -> Vec<Option<String>> {
+    let array = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let dictionary = array
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..array.len())
+        .map(|row| {
+            array.is_valid(row).then(|| {
+                dictionary
+                    .value(array.keys().value(row) as usize)
+                    .to_string()
+            })
+        })
         .collect()
 }
 
@@ -446,14 +503,20 @@ fn assert_matches_reference(
                     assert_eq!(bits(actual), bits(expected), "{context}: value column");
                 }
                 DataType::Utf8 => {
-                    let actual = actual.as_any().downcast_ref::<StringArray>().unwrap();
-                    let expected = expected.as_any().downcast_ref::<StringArray>().unwrap();
-                    let values = |array: &StringArray| {
-                        (0..array.len())
-                            .map(|row| array.is_valid(row).then(|| array.value(row).to_string()))
-                            .collect::<Vec<_>>()
-                    };
-                    assert_eq!(values(actual), values(expected), "{context}: string column");
+                    assert_eq!(
+                        string_values(actual),
+                        string_values(expected),
+                        "{context}: string column"
+                    );
+                }
+                DataType::Dictionary(key, value)
+                    if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+                {
+                    assert_eq!(
+                        dictionary_values(actual),
+                        dictionary_values(expected),
+                        "{context}: dictionary column"
+                    );
                 }
                 DataType::Timestamp(TimeUnit::Millisecond, None) => {
                     let actual = actual
@@ -914,7 +977,7 @@ async fn two_fields_convert_both_columns_and_keep_a_half_missing_row() {
 }
 
 #[tokio::test]
-async fn missing_point_inside_the_trimmed_range_becomes_a_null_row() {
+async fn missing_point_inside_the_trimmed_range_drops_its_row() {
     let chunks = vec![chunk(
         1,
         "a",
@@ -935,15 +998,14 @@ async fn missing_point_inside_the_trimmed_range_becomes_a_null_row() {
     let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
     assert_matches_reference(&batches, &reference, "missing point");
 
+    // The empty middle window is not a point of the series, so it is omitted instead of being
+    // emitted as a null row, and the remaining rows keep their own timestamps.
     let batch = &batches[0];
-    assert_eq!(
-        timestamp_column(batch, TIME),
-        vec![420_000, 480_000, 540_000]
-    );
+    assert_eq!(timestamp_column(batch, TIME), vec![420_000, 540_000]);
     assert_eq!(
         float_column(batch, VALUE),
-        vec![Some(1.0), None, Some(3.0)],
-        "the empty middle window is a null row, not a dropped or shifted one"
+        vec![Some(1.0), Some(3.0)],
+        "the empty middle window is dropped, not shifted onto a neighbour"
     );
     assert_eq!(grid_range(&reference[0].0), (2, 3));
 }
@@ -956,8 +1018,8 @@ async fn nan_stays_a_value_and_a_stale_marker_only_clears_its_window() {
             "ordinary NaN",
             RangeFunction::AvgOverTime,
             vec![(420_000, Some(f64::NAN)), (540_000, Some(f64::NAN))],
-            vec![420_000, 480_000, 540_000],
-            vec![Some(f64::NAN), None, Some(f64::NAN)],
+            vec![420_000, 540_000],
+            vec![Some(f64::NAN), Some(f64::NAN)],
         ),
         (
             "stale marker",
@@ -1004,8 +1066,8 @@ async fn nan_stays_a_value_and_a_stale_marker_only_clears_its_window() {
         );
     }
 
-    // An ordinary NaN is a value, never a null, and the missing middle window is a row, so the
-    // row count stays that of the trimmed interval.
+    // An ordinary NaN is a value, never a null, so it is neither dropped nor turned into a
+    // missing sample: only the empty middle window disappears.
     let nan_chunks = vec![chunk(
         1,
         "a",
@@ -1024,10 +1086,9 @@ async fn nan_stays_a_value_and_a_stale_marker_only_clears_its_window() {
     );
     let batch = &collect(run(case.fused(memory_child(&nan_chunks)).unwrap()).await)[0];
     let values = float_column(batch, VALUE);
-    assert_eq!(batch.num_rows(), 3, "the null row is kept, not dropped");
+    assert_eq!(batch.num_rows(), 2, "the empty middle window is dropped");
     assert!(values[0].is_some_and(f64::is_nan), "{values:?}");
-    assert_eq!(values[1], None);
-    assert!(values[2].is_some_and(f64::is_nan), "{values:?}");
+    assert!(values[1].is_some_and(f64::is_nan), "{values:?}");
 }
 
 #[tokio::test]
@@ -1178,17 +1239,9 @@ async fn construction_rejects_a_non_nullable_field_column() {
 }
 
 #[tokio::test]
-async fn construction_rejects_a_non_nullable_tag_column() {
-    let case = Case::new(
-        &["host"],
-        RangeWindow {
-            range_ms: 300_000,
-            offset_ms: 0,
-            anchor_ms: None,
-        },
-        RangeFunction::Rate,
-        vec![],
-    );
+async fn a_non_nullable_tag_column_uses_the_empty_label_value() {
+    // The PromQL plan reports tag columns as non-nullable, so the node must accept them and report
+    // an absent label the way Prometheus reads it: as the empty label value.
     let not_nullable = Arc::new(Schema::new(vec![
         Field::new(VALUE, DataType::Float64, true),
         Field::new("host", DataType::Utf8, false),
@@ -1198,15 +1251,52 @@ async fn construction_rejects_a_non_nullable_tag_column() {
             false,
         ),
     ]));
-    let error = case
-        .with_output_schema(not_nullable)
-        .fused(memory_child(&[]))
-        .err()
-        .unwrap();
-    assert!(matches!(error, DataFusionError::Plan(_)), "{error}");
-    let message = error.to_string();
-    assert!(message.contains("host"), "{message}");
-    assert!(message.contains("must be nullable"), "{message}");
+    let present = counter_chunks(1, "a", &counter_rows(1.0), &[9]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_output_schema(not_nullable.clone());
+    let batches = collect(run(case.fused(memory_child(&present)).unwrap()).await);
+    assert_eq!(
+        string_column(&batches[0], "host"),
+        vec![Some("a".to_string()); batches[0].num_rows()],
+        "a present label is emitted as itself"
+    );
+
+    // A tag the raw series does not carry becomes the empty label value, never a null.
+    let case = Case::new(
+        &["az"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_output_schema(Arc::new(Schema::new(vec![
+        Field::new(VALUE, DataType::Float64, true),
+        Field::new("az", DataType::Utf8, false),
+        Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ])));
+    let batches = collect(run(case.fused(memory_child(&present)).unwrap()).await);
+    let az = batches[0].column_by_name("az").unwrap();
+    assert_eq!(az.null_count(), 0, "a non-nullable tag column has no nulls");
+    assert_eq!(
+        string_column(&batches[0], "az"),
+        vec![Some(String::new()); batches[0].num_rows()]
+    );
 }
 
 #[tokio::test]
@@ -1479,4 +1569,210 @@ impl Drop for ProbeStream {
     fn drop(&mut self) {
         self.dropped.store(true, Ordering::SeqCst);
     }
+}
+
+#[tokio::test]
+async fn dictionary_tag_column_works_end_to_end() {
+    let chunks = counter_chunks(1, "a", &counter_rows(1.0), &[3, 6, 9]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_output_schema(dictionary_output_schema_of(&[VALUE], &["host"]));
+    let reference = case.reference(&chunks);
+    let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+    assert_matches_reference(&batches, &reference, "dictionary tag");
+
+    let batch = &batches[0];
+    let host = batch.column_by_name("host").unwrap();
+    assert_eq!(host.data_type(), &dictionary_tag_type());
+    assert_eq!(
+        dictionary_values(host),
+        vec![Some("a".to_string()); batch.num_rows()],
+        "every row of one series carries the same label value"
+    );
+    // One series holds one label value, so the dictionary has one entry and the keys are a
+    // constant buffer over it instead of one stored string per row.
+    let host = host
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    assert_eq!(host.values().len(), 1);
+    assert!(host.keys().values().iter().all(|key| *key == 0));
+    assert_eq!(host.keys().null_count(), 0);
+}
+
+#[tokio::test]
+async fn dictionary_tag_column_of_a_missing_tag_is_null() {
+    // `rate` drops `__name__`, and the declared tag below is not part of this raw series, so the
+    // tag column is entirely null while the row still exists.
+    let chunks = counter_chunks(1, "a", &counter_rows(1.0), &[9]);
+    let case = Case::new(
+        &["host", "az"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_output_schema(dictionary_output_schema_of(&[VALUE], &["host", "az"]));
+    let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+    let az = batches[0].column_by_name("az").unwrap();
+    assert_eq!(az.null_count(), batches[0].num_rows());
+    assert_eq!(dictionary_values(az), vec![None; batches[0].num_rows()]);
+}
+
+#[tokio::test]
+async fn construction_rejects_an_unsupported_tag_type() {
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    );
+    for tag_type in [
+        DataType::Int32,
+        DataType::LargeUtf8,
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::LargeUtf8)),
+    ] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new("host", tag_type.clone(), true),
+            Field::new(
+                TIME,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        let error = case
+            .with_output_schema(schema)
+            .fused(memory_child(&[]))
+            .err()
+            .unwrap();
+        assert!(matches!(error, DataFusionError::Plan(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("host"), "{tag_type:?}: {message}");
+        assert!(
+            message.contains("must be Utf8 or Dictionary(UInt32, Utf8)"),
+            "{tag_type:?}: {message}"
+        );
+    }
+}
+
+/// The Arrow type of a dictionary-encoded tag column.
+fn dictionary_tag_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+}
+
+#[tokio::test]
+async fn a_gap_only_drops_the_null_rows() {
+    // One sample lands between two grid points of a one-second window: no grid point of the
+    // trimmed interval holds a value for it, while the two series below hold values everywhere.
+    let chunks = vec![
+        counter_chunks(1, "a", &counter_rows(1.0), &[9])[0].clone(),
+        chunk(2, "b", &[(420_000, Some(1.0))], true),
+        counter_chunks(3, "c", &counter_rows(2.0), &[9])[0].clone(),
+    ];
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 60_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::SumOverTime,
+        vec![],
+    );
+    let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+    assert_eq!(batches.len(), 3, "one batch per series with a value");
+    let hosts = batches
+        .iter()
+        .map(|batch| string_column(batch, "host")[0].clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(hosts, vec!["a", "b", "c"]);
+    for batch in &batches {
+        let values = float_column(batch, VALUE);
+        assert!(
+            values.iter().all(|value| value.is_some()),
+            "a null row survived: {values:?}"
+        );
+        assert_eq!(
+            batch.num_rows(),
+            values.len(),
+            "the timestamp column must be cut like every other column"
+        );
+        assert_eq!(
+            timestamp_column(batch, TIME).len(),
+            values.len(),
+            "row counts of all columns must agree"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_all_null_series_emits_no_batch() {
+    // The evaluator itself never produces an all-null series (its trimmed interval starts and
+    // ends with a value), so the conversion rule is exercised on the series value directly: a
+    // non-empty grid whose every row is empty is not a batch of nulls but no batch at all.
+    let grid = grid();
+    // A grid series is validated against the schema's own grid, so the fixture declares it.
+    let schema = Arc::new(SeriesSchema {
+        fields: vec![FieldSpec {
+            name: Arc::from(VALUE),
+        }]
+        .into(),
+        eval_grid: Some(grid.clone()),
+    });
+    let range = GridRange::try_new(grid.clone(), 2, 3).unwrap();
+    let fields = SeriesFields::try_from_vec(vec![Samples::from_float(Float64Array::from(vec![
+        None::<f64>,
+        None::<f64>,
+        None::<f64>,
+    ]))])
+    .unwrap();
+    let series = Series::try_new(&schema, metric("a"), TimeAxis::Grid(range), fields).unwrap();
+    assert_eq!(grid_range(&series).1, 3, "the fixture has a non-empty grid");
+
+    let output_schema = output_schema(&["host"]);
+    let tags = ["host".to_string()];
+    let classification = classify_output(&output_schema, &schema, &tags, TIME).unwrap();
+    let batch = series_to_record_batch(&classification, &tags, &output_schema, &series).unwrap();
+    assert!(
+        batch.is_none(),
+        "a series without a value must not emit a batch, got {batch:?}"
+    );
+
+    // A series with one value in the same grid keeps its own rows, so the drop above is caused
+    // by the missing values and not by the fixture.
+    let grid_range_value = GridRange::try_new(grid, 2, 3).unwrap();
+    let fields = SeriesFields::try_from_vec(vec![Samples::from_float(Float64Array::from(vec![
+        Some(1.0),
+        None,
+        Some(3.0),
+    ]))])
+    .unwrap();
+    let series = Series::try_new(
+        &schema,
+        metric("a"),
+        TimeAxis::Grid(grid_range_value),
+        fields,
+    )
+    .unwrap();
+    let batch = series_to_record_batch(&classification, &tags, &output_schema, &series)
+        .unwrap()
+        .expect("a series with values must emit a batch");
+    assert_eq!(batch.num_rows(), 2, "only the non-null rows are emitted");
 }

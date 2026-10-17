@@ -20,10 +20,20 @@
 //!
 //! Phase 1 scope: the child produces raw frames of one partition with explicit labels and is not
 //! interleaved, and the output schema must classify into exactly one timestamp column, one
-//! `Float64` column per series field, and one `Utf8` column per declared tag. Anything outside
-//! this scope is rejected at construction instead of silently falling back. The field and tag
-//! columns must be declared nullable: a grid point inside the trimmed interval can be missing, and
-//! the range functions and the map kernels drop `__name__`.
+//! `Float64` column per series field, and one string column per declared tag. A tag column is
+//! either `Utf8` or `Dictionary(UInt32, Utf8)`, because the PromQL plan reports dictionary-encoded
+//! labels; every row of one series carries the same single label value, so the dictionary holds
+//! one entry and the keys are a constant buffer over it. Anything outside this scope is rejected
+//! at construction instead of silently falling back. A field column must be declared nullable: a
+//! grid point inside the trimmed interval can be missing. A tag column may be either, because the
+//! range functions and the map kernels drop `__name__` and a tag can therefore be absent: a
+//! nullable column reports an absent label as a NULL, and a non-nullable one as the empty label
+//! value Prometheus reads for a label the series does not carry.
+//!
+//! Rows follow the ordinary PromQL plan's semantics: that plan keeps `<value> IS NOT NULL` above
+//! its projection, so a grid point at which the series has no value never reaches the result. This
+//! node therefore omits every row whose value columns are all null, and a series without any value
+//! emits no batch at all instead of a batch of null rows.
 //!
 //! This node computes floats only, and admitting raw samples is the caller's responsibility:
 //! validating the declared frame schema cannot prove that the samples are float, so a histogram
@@ -58,9 +68,11 @@ use std::task::{Context, Poll};
 
 use common_query::series_frame::unpack_raw_series;
 use datafusion::arrow::array::{
-    Array, ArrayRef, Float64Array, StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
+    UInt32Array,
 };
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::compute::take;
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
@@ -93,8 +105,17 @@ enum OutputColumn {
     Time,
     /// Series field by index in the input series schema.
     Field(usize),
-    /// Declared logical tag by index in the caller-supplied tag list.
-    Tag(usize),
+    /// Declared logical tag by index in the caller-supplied tag list, and its encoding.
+    Tag(usize, TagEncoding),
+}
+
+/// How one output tag column encodes the single label value of a series.
+#[derive(Clone, Copy, Debug)]
+struct TagEncoding {
+    dictionary: bool,
+    /// A non-nullable column cannot carry an absent label as a NULL; it carries Prometheus'
+    /// empty label value instead.
+    nullable: bool,
 }
 
 /// Evaluates one range function followed by 0..N float map kernels per raw series.
@@ -416,20 +437,49 @@ fn classify_output(
                     "duplicate tag column {name:?} in FusedSeriesExec output schema"
                 )));
             }
-            if field.data_type() != &DataType::Utf8 {
-                return Err(DataFusionError::Plan(format!(
-                    "tag column {name:?} of FusedSeriesExec must be Utf8, got {:?}",
-                    field.data_type()
-                )));
-            }
-            // `rate` and the map kernels drop `__name__`, so any tag can be absent.
+            let dictionary = match field.data_type() {
+                DataType::Utf8 => false,
+                DataType::Dictionary(key, value)
+                    if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+                {
+                    true
+                }
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "tag column {name:?} of FusedSeriesExec must be Utf8 or \
+                         Dictionary(UInt32, Utf8), got {other:?}"
+                    )));
+                }
+            };
+            // `rate` and the map kernels drop `__name__`, so a tag can be absent: a nullable
+            // column says so with a NULL, and a non-nullable one with the empty label value
+            // Prometheus reads for a label the series does not carry.
+            classification.push(OutputColumn::Tag(
+                index,
+                TagEncoding {
+                    dictionary,
+                    nullable: field.is_nullable(),
+                },
+            ));
+            continue;
+        }
+        // A PromQL plan names a range-function value column after the call that produced it
+        // (`prom_rate(timestamp_range,field_0,timestamp,Int64(300000))`), not after the raw field
+        // it reads, so a `Float64` column that names no field still carries exactly one field: the
+        // next unclaimed one, in the order both were declared. Columns that name a field are
+        // matched by that name above, so only genuinely unnamed value columns reach this branch.
+        if field.data_type() == &DataType::Float64
+            && let Some(index) = field_seen.iter().position(|seen| !seen)
+        {
+            // A grid point inside the trimmed interval can have no value in this field.
             if !field.is_nullable() {
                 return Err(DataFusionError::Plan(format!(
-                    "tag column {name:?} of FusedSeriesExec must be nullable, because range \
-                     functions and map kernels drop the metric name"
+                    "field column {name:?} of FusedSeriesExec must be nullable, because a grid \
+                     point can be missing"
                 )));
             }
-            classification.push(OutputColumn::Tag(index));
+            field_seen[index] = true;
+            classification.push(OutputColumn::Field(index));
             continue;
         }
         return Err(DataFusionError::Plan(format!(
@@ -461,29 +511,43 @@ fn classify_output(
     Ok(classification)
 }
 
-/// Converts one evaluated series into exactly one output batch.
+/// Converts one evaluated series into one output batch, or into nothing at all.
 ///
 /// The time column is the trimmed absolute interval of the series, missing samples are nulls and
-/// ordinary NaN stays a value.
+/// ordinary NaN stays a value. A row whose every value column is null is not a point of the
+/// series, so it is omitted, exactly like the `<value> IS NOT NULL` filter the ordinary PromQL
+/// plan keeps above its projection; a series without any value therefore emits no batch.
 fn series_to_record_batch(
     classification: &[OutputColumn],
     tags: &[String],
     output_schema: &SchemaRef,
     series: &Series,
-) -> Result<RecordBatch> {
+) -> Result<Option<RecordBatch>> {
     let TimeAxis::Grid(range) = &series.time else {
         return Err(DataFusionError::Execution(
             "FusedSeriesExec requires evaluated series on a time grid".into(),
         ));
     };
     let rows = range.len();
+    let occupied = occupied_offsets(series)?;
+    if occupied.is_empty() {
+        return Ok(None);
+    }
+    // Every grid point holds a value in the common case, so the copy below is skipped entirely.
+    let indices: Option<ArrayRef> = (occupied.len() != rows).then(|| {
+        Arc::new(UInt32Array::from(
+            occupied
+                .iter()
+                .map(|offset| *offset as u32)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef
+    });
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(classification.len());
     for (position, column) in classification.iter().enumerate() {
-        match column {
-            OutputColumn::Time => columns.push(Arc::new(TimestampMillisecondArray::new(
-                range.timestamps(),
-                None,
-            ))),
+        let values: ArrayRef = match column {
+            OutputColumn::Time => {
+                Arc::new(TimestampMillisecondArray::new(range.timestamps(), None))
+            }
             OutputColumn::Field(index) => {
                 let samples = series.fields.get(*index).ok_or_else(|| {
                     DataFusionError::Execution(format!(
@@ -496,21 +560,58 @@ fn series_to_record_batch(
                         samples.len()
                     )));
                 }
-                columns.push(field_column(samples)?);
+                field_column(samples)?
             }
-            OutputColumn::Tag(index) => {
-                // `__name__` resolves to the metric name, every other tag through the label set.
-                let name = tags.get(*index).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "output column {position} declares unavailable tag {index}"
-                    ))
-                })?;
-                let value = series.metric.get(name);
-                columns.push(Arc::new(StringArray::from(vec![value; rows])));
+            OutputColumn::Tag(index, encoding) => {
+                tag_column(series, tags, *index, *encoding, rows, position)?
             }
-        }
+        };
+        columns.push(match &indices {
+            Some(indices) => take(values.as_ref(), indices.as_ref(), None)?,
+            None => values,
+        });
     }
-    Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+    Ok(Some(RecordBatch::try_new(output_schema.clone(), columns)?))
+}
+
+/// Converts one series' single label value into the constant tag column of every kept row.
+///
+/// `__name__` resolves to the metric name, every other tag through the label set, so a tag can be
+/// absent; an absent tag is a null column, or the empty label value when the declared column is
+/// not nullable. A dictionary column holds the one value in its dictionary and a constant key
+/// buffer over it instead of one value per row.
+fn tag_column(
+    series: &Series,
+    tags: &[String],
+    index: usize,
+    encoding: TagEncoding,
+    rows: usize,
+    position: usize,
+) -> Result<ArrayRef> {
+    let name = tags.get(index).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "output column {position} declares unavailable tag {index}"
+        ))
+    })?;
+    // An absent label is a NULL where the column allows one, and the empty label value where it
+    // does not, which is how Prometheus reads a label the series does not carry.
+    let value = match (series.metric.get(name), encoding.nullable) {
+        (value, true) => value,
+        (value, false) => Some(value.unwrap_or_default()),
+    };
+    if !encoding.dictionary {
+        return Ok(Arc::new(StringArray::from(
+            std::iter::repeat_n(value, rows).collect::<Vec<_>>(),
+        )));
+    }
+    let dictionary: ArrayRef = Arc::new(StringArray::from(vec![value.unwrap_or_default()]));
+    let keys = match value {
+        Some(_) => UInt32Array::from(vec![0_u32; rows]),
+        None => UInt32Array::from(vec![None::<u32>; rows]),
+    };
+    Ok(Arc::new(DictionaryArray::<UInt32Type>::try_new(
+        keys, dictionary,
+    )?))
 }
 
 /// Converts one evaluated series field into one `Float64` column.
@@ -665,11 +766,32 @@ fn render_labels(metric: &MetricName) -> String {
     format!("{{{}}}", parts.join(", "))
 }
 
+/// The offsets of the trimmed interval at which at least one field holds a value.
+///
+/// A row whose every field is missing is not a point of the series: Prometheus has no sample
+/// there, so it is neither emitted nor able to collide with another series.
+fn occupied_offsets(series: &Series) -> Result<Vec<usize>> {
+    let TimeAxis::Grid(range) = &series.time else {
+        return Err(DataFusionError::Execution(
+            "FusedSeriesExec requires evaluated series on a time grid".into(),
+        ));
+    };
+    let mut offsets = Vec::new();
+    for offset in 0..range.len() {
+        if series
+            .fields
+            .iter()
+            .any(|samples| has_value(samples, offset))
+        {
+            offsets.push(offset);
+        }
+    }
+    Ok(offsets)
+}
+
 /// The grid indices of the trimmed interval that hold a value, as merged runs.
 ///
-/// Each run is `(start, end_exclusive)` over absolute grid indices. A row whose every field is
-/// missing is not occupied: Prometheus has no point there, so it cannot collide with another
-/// series.
+/// Each run is `(start, end_exclusive)` over absolute grid indices.
 fn occupied_runs(series: &Series) -> Result<Vec<(usize, usize)>> {
     let TimeAxis::Grid(range) = &series.time else {
         return Err(DataFusionError::Execution(
@@ -677,14 +799,7 @@ fn occupied_runs(series: &Series) -> Result<Vec<(usize, usize)>> {
         ));
     };
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    for offset in 0..range.len() {
-        if !series
-            .fields
-            .iter()
-            .any(|samples| has_value(samples, offset))
-        {
-            continue;
-        }
+    for offset in occupied_offsets(series)? {
         let index = range.start() + offset;
         match runs.last_mut() {
             Some((_, end)) if *end == index => *end += 1,
@@ -814,7 +929,9 @@ impl FusedSeriesStream {
     }
 
     /// Registers the label set of one finished series and converts it into one output batch.
-    fn emit(&mut self, series: &Series) -> Result<RecordBatch> {
+    ///
+    /// `None` means the series holds no value at all, so it has no output row.
+    fn emit(&mut self, series: &Series) -> Result<Option<RecordBatch>> {
         self.claim_label_set(series)?;
         series_to_record_batch(
             &self.classification,
@@ -896,7 +1013,9 @@ impl Stream for FusedSeriesStream {
                 continue;
             };
             return match this.emit(&series) {
-                Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+                // A series without a single value has no row to contribute.
+                Ok(None) => continue,
                 Err(error) => {
                     this.abort();
                     Poll::Ready(Some(Err(error)))
