@@ -11372,6 +11372,7 @@ dependencies = [
  "prost 0.14.1",
  "rand 0.9.4",
  "snafu 0.8.6",
+ "store-api",
  "tokio",
 ]
 
