@@ -329,7 +329,7 @@ overwrite_entry_start_id = false
 
 ## Whether to enable experimental native PromQL execution.
 ## Default: false
-#+ experimental_native_promql = false
+# experimental_native_promql = false
 ## Parallelism of the query engine.
 ## Default to 0, which means the number of CPU cores.
 parallelism = 0
