@@ -94,6 +94,12 @@ pub(crate) fn try_select_fused(
     let Some(replaced) = rebuild(&root, logical, &shape.path, &fused) else {
         return Ok(None);
     };
+    // Operators need to know which path ran; a fallback is silent by design.
+    common_telemetry::debug!(
+        "Fused series selection succeeded: {:?} over {}",
+        shape.function,
+        shape.scan.table_name
+    );
     let result = if root_cooperative {
         Arc::clone(original)
             .replace_children(
