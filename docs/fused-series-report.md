@@ -1192,6 +1192,12 @@ tree, which is the mistake section 4.4 also documents. The CPU profile that sect
 and the summary that attributes its stacks, are
 `scripts/fused_series_profile.py --seconds 60` and `scripts/fused_profile_summarize.py`.
 
+Sections 4.8 and 4.9's numbers are in `docs/bench-records/20261018T122000Z/`, with the
+per-iteration samples behind every median; section 2's three data shapes and the
+`vfrag`/`vmreset` comparison are in `docs/bench-records/20261018T124000Z/`. Both have a
+`RESULTS.md` naming which figure comes from which file and, where a measurement was rejected,
+why.
+
 The correctness *results* of that run are ~300 KB each and are not committed;
 `docs/bench-records/20261018T073117Z/RESULTS.md` lists each one's row count and sha256 so a
 copy can be checked against what was actually compared.
