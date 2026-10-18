@@ -28,9 +28,10 @@ the results appended a column at a time. On a real server the fused query's CPU 
 0.778 / 0.700 / 0.688 of the previous commit on `S` / `G` / `W` and stays at 1.000 on the
 coarse-step `C`, which is the shape that has few grid points and so has nothing to
 amortize; all 15 paired rounds returned identical results and both arms logged the
-expected fused selections. Wall clock moves far less than CPU (4-8% against 22-31%),
-because the query is not purely CPU-bound. Every other range function still runs one
-boxed call per grid point and gained nothing. See sections 1.4 and 4.6.
+expected fused selections. Wall clock moves 4-8% where CPU moves 22-31%; those measure
+different things, and section 4.6 says what each one does and does not support. Every other
+range function still runs one boxed call per grid point and gained nothing. See sections 1.4
+and 4.6.
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -218,6 +219,16 @@ needs for construction; previously each scanned separately. A series whose only
 field is a null-free dense float array is known dense from the array's null count
 and takes a path with no per-row work at all. Tag columns are built at the kept
 length, so a `take` no longer rebuilds a constant column.
+
+**One regression this introduced, and its fix.** The first version decided "dense" only from
+the single-null-free-field case, so a series with several fields where one of them covers
+every row still built an identity index and copied the time column and every value column
+through it. The previous code had skipped that copy whenever nothing was dropped
+(`occupied.len() != rows`), regardless of field count, so this was a regression in exactly the
+multi-field shape. It produced correct results, which is why no value comparison could see it;
+the test that now guards it compares the time column's buffer address against the grid's at
+the same element offset, because a copy cannot occupy the grid's buffer. The scan's result is
+reused: when every row is occupied it has already produced a single run covering the range.
 
 ## 2. Correctness
 
@@ -672,13 +683,23 @@ the larger half at scale. It would mean keeping the incoming Arrow arrays and ex
 retained samples as fragments plus offsets, dropping whole fragments once no later window
 reaches them — a redesign of `RangeEvaluator`'s storage, not of the kernel.
 
-**Its ceiling has now been measured**, which is why it was not attempted in the same round.
-`evaluator_push` already costs what `bulk_copy` costs (table above), so the entire saving
-available is `bulk_copy - read_only`, about 3.6 ns/sample. Applied to the four measured
-cases that is roughly 0.8% of `S`, 1.0% of `G`, 1.5% of `W` and 2.2% of `C` — every one of
-them below the 5-9% run-to-run drift this host shows. Those percentages are arithmetic from
-the measured per-sample rate and the per-case sample counts, not measurements. Against that
-ceiling, the change would rewrite the `&[i64]` / `&[f64]` contract that the batch kernel and
+**A cost estimate, which is why it was not attempted in the same round -- not a ceiling.**
+`evaluator_push` already costs what `bulk_copy` costs (table above), so within that
+microbenchmark the saving available from removing the copy is `bulk_copy - read_only`, about
+3.6 ns/sample. Applied to the four measured cases that is roughly 0.8% of `S`, 1.0% of `G`,
+1.5% of `W` and 2.2% of `C`.
+
+**What that estimate is not.** The benchmark is one 200 000-sample chunk, one grid point, one
+`PresentOverTime` field, so it omits what a real series would add: many chunks, the retained
+window tail moving between them, `Vec` capacity growth, and resets. `read_only` adds up the
+value column only -- it does not read the timestamps and does no stale or reset work -- so the
+difference is not the whole cost of the storage change either. And these percentages are
+per-sample work, not query latency: turning them into a wall-clock prediction needs the
+per-partition split and the parallel assumptions, which are not measured here. So the honest
+statement is that the saving looked small enough, under this benchmark, to prefer the batch
+work first. It is not proof that the real saving is under 2%.
+
+Taking it on would still rewrite the `&[i64]` / `&[f64]` contract that the batch kernel and
 the scalar fallback both depend on, and make a window span able to cross a fragment
 boundary.
 
@@ -705,9 +726,12 @@ Medians over all 27 timed samples per arm. `control` is `max_over_time`, which n
 and which this change does not touch; its 0.971 CPU / 1.040 wall is the drift band, and the
 `S`/`G`/`W` CPU ratios sit well below it.
 
-**Correctness.** All 15 paired rounds compared identical: schema column names and types,
-every row's full label tuple, every timestamp, the row count, then every value. No round
-differed.
+**Correctness.** Each round runs one dedicated correctness query per arm and compares those
+through `compare`: schema column names and types, every row's full label tuple, every
+timestamp, the row count, then every value against a tolerance of `1e-9 * max(1, |value|)`,
+not bit equality. All 15 paired rounds passed. The timed queries are checked for row count
+but are not the ones compared, so this says "identical within the driver's tolerance", which
+is what a float pipeline can be held to and is stricter than the aggregation above it needs.
 
 **Fusion.** Both arms log exactly one fused selection per query on `S`/`G`/`W`/`C` and zero
 on `control`, as required, so the comparison never silently measured the ordinary plan.
@@ -719,17 +743,19 @@ is 1.000. The gain therefore tracks grid points, which is what removing per-poin
 should look like — and it is direct evidence that the win is not an artefact of the
 comparison.
 
-**Two caveats, both material.**
+**The two statistics answer different questions, and both are real.** CPU falls 22-31% on
+the grid-heavy shapes: that is resource consumption, the work the query costs the machine.
+Wall falls 4-8%: that is the latency a caller waits for. They are not rival measurements of
+one quantity and neither is the "real" one -- a query spread over many partitions accumulates
+CPU in parallel, so its total CPU time and its wall time could not move in step by
+construction. Nor do these two ratios, on their own, say where the savings go: they do not
+separate I/O, scheduling or parallelism, and they do not establish any throughput claim.
+Wall also has real outliers here -- `control`'s maximum is 232.5 ms against a 48.2 ms
+minimum in the same arm -- which is why the median is quoted.
 
-1. **Wall clock is not the size of the effect.** CPU falls 22-31% on the grid-heavy shapes
-   while wall falls only 4-8%: the query is not purely CPU-bound, so 90-100 ms of CPU
-   surfaces as 2-4 ms of wall. Quoting the wall figure as "the speedup" would understate
-   the change by roughly a factor of four. Wall also has real outliers here — `control`'s
-   maximum is 232.5 ms against a 48.2 ms minimum in the same arm — which is why CPU is the
-   primary statistic.
-2. **The CPU resolution is 10 ms** (`SC_CLK_TCK` = 100). `S` is 7 ticks against 9, so its
-   ratio is coarse. `G` (21 vs 30) and `W` (22 vs 32) carry the same ratio on three times
-   the ticks and are the trustworthy rows.
+**One caveat on resolution.** The CPU counter ticks at 10 ms (`SC_CLK_TCK` = 100). `S` is 7
+ticks against 9, so its ratio is coarse. `G` (21 vs 30) and `W` (22 vs 32) carry the same
+ratio on three times the ticks and are the trustworthy rows.
 
 **What this does not say.** It does not say the fused path now beats the ordinary plan:
 the arms here are both fused. Sections 4.3 and 5 still hold — no comparison in this report
@@ -749,11 +775,12 @@ shows fusion ahead of the ordinary plan at fine steps with narrow windows.
 - **The evaluator still pays per input sample.** Every sample is copied into growable
   `Vec`s so that the window can slide by `drain`ing the front, at a measured 3.77 ns/sample.
   That is now a memcpy and nothing more, but a memcpy is still O(samples in range) where the
-  ordinary plan copies nothing and does index arithmetic over one shared array. The ceiling
-  on removing it is measured (section 4.5): about 3.6 ns/sample, i.e. 0.8-2.2% on the four
-  measured cases, all inside the drift band. So unlike batching, this one is *not* expected
-  to show up end to end at these shapes, and at a range holding 50 M samples either it or
-  the copy stays in place.
+  ordinary plan copies nothing and does index arithmetic over one shared array. The saving
+  from removing the copy is *estimated* (section 4.5) at about 3.6 ns/sample within a
+  single-chunk microbenchmark, i.e. 0.8-2.2% on the four measured cases -- inside the drift
+  band, so removing it is not expected to show up end to end at these shapes. That estimate
+  omits many-chunk retention, capacity growth and reset work, so it is a reason for the
+  ordering this round chose, not a bound on the real change.
 - **The output path is still not measured.** The node targets 4 096 rows per batch
   (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
   series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
@@ -784,11 +811,15 @@ shows fusion ahead of the ordinary plan at fine steps with narrow windows.
   measures whole queries before and after; there is no evaluator-only criterion number for
   the batch form, so the per-point bookkeeping figure (36.9 ns) still describes the form
   that `rate` and `increase` no longer use.
-- **Nothing here shows fusion beating the ordinary plan.** Every comparison in section 4.6
-  is between two fused builds. Sections 4.3 and 5's conclusion — 0.88x-0.93x against the
-  ordinary plan at fine steps with narrow windows — is unchanged, because the change that
-  would be needed to revisit it (not copying the input samples) is measured at 0.8-2.2% and
-  was therefore not done.
+- **Whether the current build beats the ordinary plan is not known.** Every comparison in
+  section 4.6 is between two *fused* builds. The 0.88x-0.93x in section 4.3 was measured
+  before the batch path existed, so it describes the previous build and says nothing about
+  this one: the query's cost has changed by 22-31% of CPU since, which is larger than the
+  gap that figure described. A same-session comparison of this build with
+  `experimental_native_promql` off has not been run. Neither a claim that fusion still
+  loses nor one that it now wins follows from what is measured here, and multiplying the
+  two rounds' ratios to bridge the gap would be exactly the cross-invocation error this
+  report withdrew twice.
 
 ## 6. Reproduction
 
@@ -805,12 +836,37 @@ python3 scripts/fused_series_bench.py run \
     --arm on --commit <sha> --cases W \
     --out records/cW-r1-N.json --log records/cW-r1-N.log
 
-# The interleaved L/N/F order, three rounds, all cases:
+# Section 4.3: the interleaved L/N/F order, three rounds, all cases.
 bash scripts/fused_series_bench_crossed.sh
 
-# The tables above, from the raw records:
+# The tables of section 4.3, from the raw records:
 python3 scripts/fused_series_bench_summarize.py records
 ```
+
+Section 4.6 uses the two-arm companion, because both of its arms are flag-on:
+
+```bash
+# P and F are two commits; both run with --arm on. The arm order rotates per round.
+BIN_P=<parent binary> COMMIT_P=<parent sha> \
+BIN_F=<this binary>  COMMIT_F=<this sha> \
+  bash scripts/fused_series_bench_pair.sh
+
+# Its tables, from the raw records. The ratio is computed as F/P with both arms named,
+# not from their position in a sorted list.
+python3 scripts/fused_series_bench_pair_summarize.py <run directory>
+```
+
+The timing records of the run quoted in section 4.6 are committed under
+`docs/bench-records/20261018T073117Z/`, so those medians and per-round ratios can be
+recomputed rather than taken on trust:
+
+```bash
+python3 scripts/fused_series_bench_pair_summarize.py docs/bench-records/20261018T073117Z
+```
+
+The correctness *results* of that run are ~300 KB each and are not committed;
+`docs/bench-records/20261018T073117Z/RESULTS.md` lists each one's row count and sha256 so a
+copy can be checked against what was actually compared.
 
 The compute benchmark is a normal criterion group in the promql package:
 `cargo bench -p promql --profile nightly -- bench_main native_range_eval`.
