@@ -1943,9 +1943,11 @@ impl FusedSeriesStream {
                     this.finished = true;
                     return match emitted {
                         Ok(batch) => {
-                            // The state batch was the last thing this stream retained: the slot
-                            // columns and the accumulator are dead weight from here on, so their
-                            // bytes go back to the pool instead of waiting for the stream's drop.
+                            // Drop the slot columns and the accumulator *first*: releasing their
+                            // reservation while they are still allocated would let the pool hand
+                            // the same bytes to another consumer. They are dead weight from here
+                            // on, so they go now instead of waiting for the stream's drop.
+                            this.partial = None;
                             this.reservation.free();
                             match batch {
                                 Some(batch) => Poll::Ready(Some(Ok(batch))),
