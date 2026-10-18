@@ -44,6 +44,7 @@ run the partial step and this script's `on`-vs-`sum` distinction stops existing.
 """
 
 import argparse
+import json
 import re
 import sys
 
@@ -56,45 +57,87 @@ FUSED = "FusedSeriesExec"
 PARTIAL = "partial=sum"
 
 
-def physical_plan(server, case):
-    """The `physical_plan` row `TQL EXPLAIN` answers with, as one string."""
-    statement = bench.tql(case).replace("TQL EVAL ", "TQL EXPLAIN ", 1)
+def executed_operators(server, case):
+    """`[(name, detail)]` of every operator the query actually ran, from `TQL ANALYZE`.
+
+    `TQL EXPLAIN` is not usable here: in standalone mode it prints
+    `CooperativeExec -> MergeScanExec` and leaves the remote plan unexpanded, so no aggregate and
+    no fused node appear in it at all. `TQL ANALYZE` runs the query and reports one entry per
+    operator that executed, which is also the only form that can prove a node ran rather than
+    merely appearing in a plan.
+    """
+    statement = bench.tql(case).replace("TQL EVAL ", "TQL ANALYZE VERBOSE FORMAT JSON ", 1)
     payload, _ = server.sql(statement)
+    # One row per stage: `[stage, node, plan]`, the plan a JSON string. Standalone reports stage 0
+    # as the datanode's `MergeScanExec` and every stage after it as the frontend's own plan, so the
+    # aggregate and the fused node appear in stage 1 onwards.
+    stages = []
     for block in payload.get("output", []):
         records = block.get("records") or {}
-        rows = records.get("rows") or []
-        columns = [column["name"] for column in records.get("schema", {}).get("column_schemas", [])]
-        if "plan_type" in columns and "plan" in columns:
-            for row in rows:
-                if row[columns.index("plan_type")] == "physical_plan":
-                    return row[columns.index("plan")]
-    raise SystemExit(f"no physical_plan row in the TQL EXPLAIN answer for {case['name']}")
+        columns = [c["name"] for c in records.get("schema", {}).get("column_schemas", [])]
+        if "plan" not in columns:
+            continue
+        index = columns.index("plan")
+        for row in records.get("rows", []):
+            try:
+                stages.append(json.loads(row[index]))
+            except (TypeError, json.JSONDecodeError):
+                # A stage whose plan is not JSON (or is null) contributes no operators; the
+                # emptiness check below is what turns a fully unparseable answer into an error.
+                continue
+    found = []
+
+    # `ANALYZE ... FORMAT JSON` nests the plan inside a `plan` column as a JSON *string*, one row
+    # per stage, so it has to be parsed before it can be walked. The operator's own configuration
+    # -- `mode=FinalPartitioned`, `partial=sum` -- lives in `param`, not in `name`, so both are
+    # kept: matching on `name` alone would see every `AggregateExec` and no partial marker.
+    def walk(node):
+        if isinstance(node, dict):
+            name = node.get("name") or node.get("operator")
+            if isinstance(name, str) and node.get("metrics") is not None:
+                found.append(f"{name}: {node.get('param', '')}")
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for stage in stages:
+        walk(stage)
+    if not found:
+        raise SystemExit(
+            f"case {case['name']}: the TQL ANALYZE answer holds no operator with metrics; "
+            "the plan was not executed, so nothing can be proven about which path ran"
+        )
+    return found
 
 
-def check_plan(case, arm, plan):
-    """Fails unless `plan` is the plan `arm` is defined to run."""
-    modes = AGGREGATE.findall(plan)
-    fused = plan.count(FUSED)
-    partial = plan.count(PARTIAL)
+def check_plan(case, arm, operators):
+    """Fails unless the executed operators are the ones `arm` is defined to run."""
+    names = list(operators)
+    joined = "\n".join(names)
+    modes = AGGREGATE.findall(joined)
+    fused = sum(1 for line in names if line.startswith(FUSED))
+    partial = sum(1 for line in names if PARTIAL in line)
     expected_fused = 0 if arm == "off" else 1
-    # `off` and `on` keep the partial and the final aggregate; `sum` replaced the partial
-    # one, so only the final one may remain, and it must still be a final one.
+    # `off` and `on` keep the partial and the final aggregate; `sum` replaced the partial one,
+    # so only the final one may remain, and it must still be a final one.
     expected_modes = ["Partial", "FinalPartitioned"] if arm != "sum" else ["FinalPartitioned"]
     expected_partial = 1 if arm == "sum" else 0
     if fused != expected_fused:
         raise SystemExit(
-            f"case {case['name']} arm {arm}: expected {expected_fused} {FUSED} in the plan, "
-            f"found {fused}:\n{plan}"
+            f"case {case['name']} arm {arm}: expected {expected_fused} {FUSED} among the "
+            f"executed operators, found {fused}: {names}"
         )
-    if modes != expected_modes:
+    if sorted(modes) != sorted(expected_modes):
         raise SystemExit(
             f"case {case['name']} arm {arm}: expected aggregate modes {expected_modes}, "
-            f"found {modes}:\n{plan}"
+            f"found {modes}: {names}"
         )
     if partial != expected_partial:
         raise SystemExit(
-            f"case {case['name']} arm {arm}: expected {expected_partial} `{PARTIAL}` "
-            f"marker(s), found {partial}:\n{plan}"
+            f"case {case['name']} arm {arm}: expected {expected_partial} operator(s) displaying "
+            f"`{PARTIAL}`, found {partial}: {names}"
         )
     return {"fused": fused, "modes": modes, "partial": partial}
 
@@ -137,7 +180,7 @@ def main():
             partial=overlay,
         )
         with server:
-            plans[arm] = physical_plan(server, case)
+            plans[arm] = executed_operators(server, case)
             records[arm] = check_plan(case, arm, plans[arm])
             # One ordinary execution, held to the same expectation the benchmark holds every
             # execution to: the arm must have taken the path its plan says it does.
@@ -165,6 +208,9 @@ def main():
             f"partial={records[arm]['partial']} selections={hits}/{partials}",
             flush=True,
         )
+        for line in plans[arm]:
+            if line.startswith(("FusedSeriesExec", "AggregateExec", "RepartitionExec")):
+                print(f"          {line[:150]}", flush=True)
 
     # Every arm must return the ordinary plan's answer, value by value.
     for arm in arms[1:]:
