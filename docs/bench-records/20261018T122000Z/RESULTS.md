@@ -25,12 +25,33 @@ PY
 `pass.quiet` is `false`: `n100`'s ratio spread 11% against a 10% gate (`control` 10%). Section
 4.9 states which cases the conclusion rests on.
 
-## `plan-delta.json` — section 4.8
+## `plan-delta.json` — section 4.8, the first and rejected attempt
 
-`TQL ANALYZE VERBOSE FORMAT JSON` of `sum by (instance) (rate(vmbench[5m]))` at a 1 s step and at
-a 60 s step, same window, same scanned samples. Each operator's own counters, from
-`scripts/fused_series_plan_budget.py`. The difference between the two columns is that operator's
-cost per added intermediate row; it is not derived by summing operators.
+**One** `TQL ANALYZE` per step. Section 4.8 quotes this only to say that it was not reportable:
+it gave 22.1 / 17.4 ns per added row for the kernel and the aggregate, and replication moved
+those to 20.1 / 13.5. Kept so the correction can be checked rather than taken on trust.
+
+## `marginal-repeat.json` and `marginal-cpu.json` — section 4.8's numbers
+
+The same statement at a 1 s and a 60 s step, repeated. `marginal-repeat.json` is 6
+replications of the pair, alternating order, timers only: kernel larger than the aggregate in
+6 of 6, at a median 17.9 against 12.3 ns per added row.
+
+`marginal-cpu.json` is 4 further replications that take `/proc` CPU per query (40 queries per
+step) **and** the timers in the same server and the same pass, so the operators' share is a
+ratio of two quantities measured together. Medians over those 4, which are what section 4.8
+quotes:
+
+| quantity | median | range |
+| --- | ---: | ---: |
+| kernel ns/added row | 20.06 | 18.20-22.62 |
+| aggregate partial ns/added row | 13.48 | 12.52-15.54 |
+| five operators, ms | 99.3 | — |
+| CPU delta, ms | 132.3 | 113.5-141.5 |
+| five as a share of the delta | 75% | 68-83% per replication |
+
+Every replication logged exactly one fused selection per query at both steps, so neither step
+measured the ordinary plan.
 
 ## `step-sweep.json` — the CPU the grid costs
 
