@@ -532,7 +532,12 @@ def main():
                 # `sum` arm must additionally log that one as a partial sum, or it is the `on`
                 # arm timed twice. A case that does not fuse must log none on any arm.
                 server.expected_hits = bench.expected_hits(fuses, arm)
-                server.expected_partial_hits = bench.expected_partial_hits(fuses, arm)
+                # A case with no aggregation fuses but pushes no partial SUM: `raw` measures the
+                # fused node's whole output. Deriving this from `fuses` alone would demand a
+                # partial-sum line that no aggregate exists to produce.
+                server.expected_partial_hits = bench.expected_partial_hits(
+                    fuses and aggregation is not None, arm
+                )
                 with server:
                     measured[arm] = run_arm(
                         server, label, arm, statement, args.warmup, args.iterations
@@ -557,6 +562,7 @@ def main():
                 "label": label,
                 "statement": statement,
                 "fuses": fuses,
+                "pushes_partial": fuses and aggregation is not None,
                 "rows": rows[baseline],
                 "correctness_hits": {a: measured[a]["correctness_hits"] for a in arms},
                 "correctness_partial_hits": {
@@ -621,6 +627,7 @@ def main():
             "label": label,
             "statement": entries[0]["statement"],
             "fuses": fuses,
+            "pushes_partial": fuses and aggregation is not None,
             "span_minutes": SPAN_MINUTES,
             "step": STEP,
             "rows": entries[0]["rows"],

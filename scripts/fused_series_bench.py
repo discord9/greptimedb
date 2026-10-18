@@ -223,6 +223,7 @@ CASES = [
         "step": "1s",
         "window_seconds": 300,
         "fuses": True,
+        "pushes_partial": True,
     },
     {
         "name": "G",
@@ -231,6 +232,7 @@ CASES = [
         "step": "1s",
         "window_seconds": 300,
         "fuses": True,
+        "pushes_partial": True,
     },
     {
         "name": "W",
@@ -239,6 +241,7 @@ CASES = [
         "step": "1s",
         "window_seconds": 3_600,
         "fuses": True,
+        "pushes_partial": True,
     },
     {
         "name": "C",
@@ -247,6 +250,7 @@ CASES = [
         "step": "1m",
         "window_seconds": 300,
         "fuses": True,
+        "pushes_partial": True,
     },
     {
         "name": "control",
@@ -255,6 +259,7 @@ CASES = [
         "step": "1s",
         "window_seconds": 300,
         "fuses": False,
+        "pushes_partial": False,
     },
 ]
 
@@ -363,9 +368,14 @@ def expected_hits(fuses, arm):
     return 0 if arm == "off" else 1
 
 
-def expected_partial_hits(fuses, arm):
-    """How many of `expected_hits` must be the `partial sum` variant: only the `sum` arm."""
-    if not fuses:
+def expected_partial_hits(pushes_partial, arm):
+    """How many of `expected_hits` must be the `partial sum` variant: only the `sum` arm.
+
+    `pushes_partial` is not `fuses`: a query with no aggregation above the fused node still
+    fuses, and still cannot push a partial SUM, because there is no aggregate to fold into the
+    scan.  Asking this of the fusion flag alone would demand a line the planner can never log.
+    """
+    if not pushes_partial:
         return 0
     return 1 if arm == "sum" else 0
 
@@ -378,7 +388,7 @@ def check_hits(case, arm, phase, actual, partial):
     runs the partial SUM -- which is true only of the drivers that have no `sum` arm.
     """
     expected = expected_hits(case["fuses"], arm)
-    expected_partial = expected_partial_hits(case["fuses"], arm)
+    expected_partial = expected_partial_hits(case["pushes_partial"], arm)
     if partial > actual:
         raise SystemExit(
             f"case {case['name']} phase {phase}: {partial} partial-sum line(s) but only "
@@ -940,7 +950,7 @@ def run(args):
                 f"{case['name']}: {len(correctness_rows)} rows, {correctness_hits} hits, "
                 f"correctness, expected {expected} "
                 f"({correctness_partial_hits} partial sums, expected "
-                f"{expected_partial_hits(case['fuses'], arm)})"
+                f"{expected_partial_hits(case['pushes_partial'], arm)})"
             )
             if args.results:
                 saved = save_result(
@@ -1017,7 +1027,7 @@ def run(args):
                         "hits": hits,
                         "partial_hits": partials,
                         "expected_hits": expected,
-                        "expected_partial_hits": expected_partial_hits(case['fuses'], arm),
+                        "expected_partial_hits": expected_partial_hits(case["pushes_partial"], arm),
                     }
                 )
 
@@ -1027,7 +1037,7 @@ def run(args):
                     "name": case["name"],
                     "fuses": case["fuses"],
                     "expected": expected,
-                    "expected_partial": expected_partial_hits(case['fuses'], arm),
+                    "expected_partial": expected_partial_hits(case["pushes_partial"], arm),
                     "correctness": correctness_hits,
                     "correctness_partial": correctness_partial_hits,
                     "warmup": warmup_hits,
@@ -1041,7 +1051,7 @@ def run(args):
                 f"hits correctness={correctness_hits}/{correctness_partial_hits} partial "
                 f"warmup={sorted(set(warmup_hits))}/{sorted(set(warmup_partial_hits))} partial "
                 f"timed={sorted(set(timed_hits))}/{sorted(set(timed_partial_hits))} partial "
-                f"(expected {expected}/{expected_partial_hits(case['fuses'], arm)}), "
+                f"(expected {expected}/{expected_partial_hits(case['pushes_partial'], arm)}), "
                 f"min {min(c['ms'] for c in timed):.1f} ms"
             )
 
