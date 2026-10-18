@@ -180,8 +180,8 @@ impl GridSeriesBuilder {
         let rows = last - first + 1;
         for (field, column) in self.fields.iter_mut().zip(fields) {
             let column = &column[first..=last];
-            // Dense first: an all-valid column is one `extend_from_slice` plus one bulk append,
-            // with no per-value branch and no substitution for the missing ones.
+            // Dense first: an all-valid column is one bulk value append plus one bulk validity
+            // append, with no per-value branch and no substitution for the missing ones.
             if column.iter().all(Option::is_some) {
                 field.values.extend(
                     column

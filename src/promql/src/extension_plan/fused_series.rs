@@ -907,6 +907,17 @@ fn occupancy(series: &Series) -> Result<Occupancy> {
             }
         }
     }
+    // A field can cover every row while another has holes, and then nothing is dropped. Say so
+    // instead of handing the caller an identity index: `series_to_record_batch` would copy the
+    // time column and every value column through it for no change in the result. When every row
+    // is occupied the scan has already produced exactly one run covering the whole range.
+    if offsets.len() == rows {
+        return Ok(Occupancy {
+            offsets: Vec::new(),
+            runs: vec![(start, start + rows)],
+            dense: true,
+        });
+    }
     Ok(Occupancy {
         offsets,
         runs,

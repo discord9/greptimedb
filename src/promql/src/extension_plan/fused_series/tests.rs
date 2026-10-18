@@ -2193,3 +2193,67 @@ async fn the_last_batch_is_flushed_below_the_row_target() {
     assert_eq!(batches[0].num_rows(), expected_rows);
     assert_matches_reference(&batches, &reference, "final flush");
 }
+
+/// A series whose rows are all kept must not be copied through an identity index.
+///
+/// `two_fields_convert_both_columns_and_keep_a_half_missing_row` is exactly this shape -- one
+/// field has a hole, the other covers every row -- and its result is correct whether or not the
+/// copy happens, so comparing values cannot see it. What separates the two is where the time
+/// column's values live: built from the grid's shared buffer when nothing is dropped, freshly
+/// allocated by `take` when something is. Comparing the pointer catches a regression that no
+/// value comparison can.
+#[tokio::test]
+async fn a_series_that_keeps_every_row_shares_the_grid_instead_of_copying_it() {
+    let schema = two_field_schema();
+    let chunks = vec![two_field_chunk(
+        1,
+        &[
+            (420_000, Some(1.0), Some(10.0)),
+            (480_000, None, Some(20.0)),
+            (540_000, Some(3.0), Some(30.0)),
+        ],
+        true,
+    )];
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 60_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::SumOverTime,
+        vec![],
+    )
+    .with_series_schema(schema.clone())
+    .with_output_schema(output_schema_of(&[VALUE, VALUE2], &["host"]));
+    let batches = collect(run(case.fused(memory_child_of(&schema, &chunks)).unwrap()).await);
+    // The grid spans 5 points and the first two hold no sample, so the trimmed range -- and the
+    // output row count -- is 3. Both fields' rows are kept: the second covers all three.
+    assert_eq!(
+        batches[0].num_rows(),
+        3,
+        "the trim keeps 3 rows, and none is dropped"
+    );
+
+    let time = batches[0]
+        .column_by_name(TIME)
+        .expect("the output has a time column")
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .expect("the time column is a timestamp array");
+    let grid = case.grid.timestamps();
+    // The output starts at the first grid point holding a sample, so "shares the buffer" means
+    // equal addresses at the same element offset, not at offset zero.
+    let first = grid
+        .iter()
+        .position(|timestamp| *timestamp == timestamp_column(&batches[0], TIME)[0])
+        .expect("the output starts on a grid point");
+    // A `take` allocates, so no element offset could bring the two addresses together. A slice
+    // of the grid's buffer lands exactly `first` elements in.
+    assert_eq!(
+        time.values().slice(0, 0).as_ptr(),
+        grid.slice(first, 0).as_ptr(),
+        "every row was kept, so the time column must be a slice of the grid's buffer; a \
+         different address means it was copied through an identity index"
+    );
+}
