@@ -233,10 +233,17 @@ impl FusedShape {
             }
             values.push(field.name().clone());
         }
-        // Every visible tag must be projected, or the fused node would emit a different label set
-        // than the ordinary plan, and exactly the one value column must be projected.
-        if !has_time || tags.len() != logical_tags.len() || values.len() != 1 {
-            return Err("output schema is not one time, one value, and every tag column");
+        // Exactly one time column and one value column are required. The tag columns are
+        // whatever the plan still projects: an aggregation over the range function prunes the
+        // labels it does not group by, and the fused node must emit the same columns its parent
+        // reads. Emitting fewer labels does not lose the label-set identity, because duplicate
+        // detection compares the complete label set of each series, not the projected columns.
+        //
+        // Requiring every table tag here would reject `sum by (one_label) (rate(..))` whenever the
+        // table has more than one tag, which is the most common PromQL query shape. The projection
+        // above the fold is the authority on which columns the parent reads.
+        if !has_time || values.len() != 1 {
+            return Err("output schema is not one time column and one value column");
         }
         let field_names = vec![self.field.clone()];
 
