@@ -267,6 +267,12 @@ fn collect_partial_aggregates(
 ///
 /// The gates are numbered the way the design note numbers them. Every one of them is a rejection
 /// and never an error, because the ordinary plan is always a correct answer.
+///
+/// What the columns *mean* -- that the summed column is the one field the node evaluates and that
+/// every group column is the time or a label -- is not decided here. [`PartialSum::try_new`] and
+/// the node's own `validate_partial` decide it from the classification they already own, and
+/// `select_partial_sum` turns their rejection into the same fallback, so a second opinion formed
+/// from the Arrow schema alone could only agree or cause a fallback it does not need.
 fn partial_aggregate(
     node: &Arc<dyn ExecutionPlan>,
     target: &Arc<dyn ExecutionPlan>,
@@ -337,65 +343,12 @@ fn partial_aggregate(
     if aggregate.input_schema() != target.schema() {
         return None;
     }
-    // Gate 8: the sum reads the value column and every group reads the time or a label. A group
-    // column that is the value would produce groups the ordinary partial aggregate never makes.
-    // The node re-checks both against its authoritative classification when it is constructed, so
-    // a disagreement between this schema-only rule and that classification is a fallback.
-    if classify_output_column(&target.schema(), value_column) != Some(OutputKind::Value) {
-        return None;
-    }
-    if group_columns.iter().any(|index| {
-        !matches!(
-            classify_output_column(&target.schema(), *index),
-            Some(OutputKind::Time | OutputKind::Tag)
-        )
-    }) {
-        return None;
-    }
     Some(PartialAggregate {
         node: Arc::clone(node),
         sum: Arc::clone(sum),
         value_column,
         group_columns,
     })
-}
-
-/// Which part of the fused node's evaluated output one column is, as far as the gates need to
-/// tell them apart.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputKind {
-    /// The evaluation grid timestamp.
-    Time,
-    /// The one field the range function evaluates.
-    Value,
-    /// A declared label of the table.
-    Tag,
-}
-
-/// Classifies one output column of the fused subtree from its Arrow schema alone.
-///
-/// This is the planner-side counterpart of the node's own classification, which is private to the
-/// promql crate. It is deliberately derived from the schema: the node re-checks the authoritative
-/// classification when it is constructed and rejects a position that disagrees, so this can only
-/// ever cause a fallback. The encoding rules are the ones the node admits: a non-nullable
-/// millisecond timestamp is the time column, `Float64` is the value, and
-/// `Utf8`/`Dictionary(UInt32, Utf8)` is a label. Anything else is not a column the node emits, and
-/// returns `None`.
-fn classify_output_column(schema: &SchemaRef, index: usize) -> Option<OutputKind> {
-    let field = schema.fields().get(index)?;
-    match field.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, None) if !field.is_nullable() => {
-            Some(OutputKind::Time)
-        }
-        DataType::Float64 => Some(OutputKind::Value),
-        DataType::Utf8 => Some(OutputKind::Tag),
-        DataType::Dictionary(key, value)
-            if **key == DataType::UInt32 && **value == DataType::Utf8 =>
-        {
-            Some(OutputKind::Tag)
-        }
-        _ => None,
-    }
 }
 
 /// The column index of a plain physical column expression, or `None` for a computed one.
@@ -738,12 +691,6 @@ fn is_not_null_only(expr: &Expr) -> bool {
     }
 }
 
-/// The physical counterpart of [`is_not_null_only`].
-///
-/// The node between a partial aggregate and the fused subtree is a `FilterExec`, whose predicate
-/// is physical, so the same predicate has to be recognised on that side too. The fused node
-/// reproduces it by never emitting a row whose value is null, which is why only this predicate is
-/// admitted and no other filter is.
 /// Whether `node` is a `FilterExec` directly over `target` that only drops null `column` values.
 ///
 /// Such a filter is redundant for the partial `SUM`: the node creates a slot only for a grid point
