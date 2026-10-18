@@ -1305,9 +1305,14 @@ fn bench_native_range_eval(c: &mut Criterion) {
         )
         .unwrap();
 
+        // `present_over_time` ignores the window contents and returns a constant, so it isolates
+        // the per-point bookkeeping -- the two binary searches, the `FloatWindow` construction,
+        // and `GridSeriesBuilder::push` -- from any kernel arithmetic. Subtracting it from `rate`
+        // gives the kernel's own share.
         for (function, name) in [
             (RangeFunction::Rate, "rate"),
             (RangeFunction::MaxOverTime, "max_over_time"),
+            (RangeFunction::PresentOverTime, "present_over_time"),
         ] {
             for (range_ms, window) in [(300_000i64, "5m"), (3_600_000, "1h")] {
                 let range = RangeWindow {

@@ -52,6 +52,8 @@ use datatypes::series::{Label, MetricName, SeriesOrdering};
 use futures::{Stream, StreamExt};
 use store_api::region_engine::RawLabelSource;
 
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
+
 use super::{
     FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_EMIT, METRIC_EVALUATE,
     METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_SERIES_COMPLETED,
@@ -705,9 +707,25 @@ async fn the_node_reports_its_own_timers_and_counters() {
     }
 
     // `BaselineMetrics` supplies the standard counters, so the node is visible to any consumer
-    // that reads `output_rows` from a plan.
-    assert_eq!(value("output_rows"), GRID_LEN);
-    assert_eq!(value("output_batches"), 1);
+    // that reads them from a plan. They are read through their own accessors: `sum_by_name`
+    // hard-codes `false` for `OutputRows` and `OutputBatches`, because their names are implied by
+    // the variant rather than carried in it.
+    assert_eq!(metrics.output_rows(), Some(GRID_LEN as usize));
+    assert_eq!(baseline_output_batches(&metrics), 1);
+}
+
+/// `output_batches` summed over every partition.
+///
+/// `MetricsSet` exposes no accessor for it, and `sum_by_name` excludes the variant, so the
+/// metric is read the only remaining way: by matching the variant directly.
+fn baseline_output_batches(metrics: &MetricsSet) -> usize {
+    metrics
+        .iter()
+        .filter_map(|metric| match metric.value() {
+            MetricValue::OutputBatches(count) => Some(count.value()),
+            _ => None,
+        })
+        .sum()
 }
 
 /// A timer must not charge time in which the child was pending: the input-poll timer is skipped
