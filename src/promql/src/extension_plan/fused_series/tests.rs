@@ -30,12 +30,19 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt32Type};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit, UInt32Type,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::functions_aggregate::sum::sum_udaf;
+use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::collect as collect_plan;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::test::TestMemoryExec;
 use datafusion::physical_plan::{
@@ -57,7 +64,8 @@ use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use super::{
     FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_COLUMNS, METRIC_EMIT,
     METRIC_EVALUATE, METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_KERNEL,
-    METRIC_SERIES_COMPLETED, METRIC_SERIES_EMITTED, METRIC_WINDOW_PREP, apply_maps,
+    METRIC_PARTIAL_POINTS, METRIC_PARTIAL_SLOTS, METRIC_PARTIAL_STATE_ROWS, METRIC_PARTIAL_UPDATES,
+    METRIC_SERIES_COMPLETED, METRIC_SERIES_EMITTED, METRIC_WINDOW_PREP, PartialSum, apply_maps,
     classify_output, occupancy, series_to_record_batch,
 };
 use crate::map::MathOp;
@@ -151,6 +159,24 @@ fn named_metric(host: &str, name: &str) -> MetricName {
             name: Arc::from("host"),
             value: Arc::from(host),
         }],
+    )
+    .unwrap()
+}
+
+/// A metric with a second ordinary label, for a group key that is a label subset.
+fn two_label_metric(host: &str, zone: &str) -> MetricName {
+    MetricName::try_new(
+        Some(Arc::from("http_requests_total")),
+        vec![
+            Label {
+                name: Arc::from("host"),
+                value: Arc::from(host),
+            },
+            Label {
+                name: Arc::from("zone"),
+                value: Arc::from(zone),
+            },
+        ],
     )
     .unwrap()
 }
@@ -364,7 +390,23 @@ impl Case {
         }
     }
 
+    fn with_tags(&self, tags: &[&str]) -> Self {
+        Self {
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..self.clone()
+        }
+    }
+
     fn fused(&self, child: Arc<dyn ExecutionPlan>) -> Result<FusedSeriesExec> {
+        self.fused_with_partial(child, None)
+    }
+
+    /// [`Self::fused`], optionally binding a partial aggregate into the node.
+    fn fused_with_partial(
+        &self,
+        child: Arc<dyn ExecutionPlan>,
+        partial: Option<PartialSum>,
+    ) -> Result<FusedSeriesExec> {
         FusedSeriesExec::try_new(
             child,
             self.schema.clone(),
@@ -377,6 +419,7 @@ impl Case {
             self.output_schema.clone(),
             self.tags.clone(),
             TIME.to_string(),
+            partial,
         )
     }
 
@@ -2320,4 +2363,888 @@ async fn the_batch_regions_of_the_evaluator_reach_the_metrics() {
         regions <= value(METRIC_EVALUATE),
         "the batched regions ({regions} ns) must fit inside the evaluation: {metrics:?}"
     );
+}
+
+/// One `sum` bound to the evaluated rows of a [`Case`], plus the DataFusion plans that compute the
+/// same aggregate without the node.
+///
+/// The node's contract is that its state *is* DataFusion's partial state, so the reference is not
+/// hand-rolled: it is the `Partial` aggregate over the fused rows, followed by the `Final`
+/// aggregate production puts above this node. Running the `Final` node over the node's own state
+/// is therefore the strongest available check — a wrong slot, label group or state type fails to
+/// merge, not merely to compare.
+struct PartialCase {
+    /// The binding handed to `FusedSeriesExec::try_new`.
+    partial: PartialSum,
+    /// The same aggregate expression, used to build the reference plans.
+    aggregate: Arc<AggregateFunctionExpr>,
+    /// The node's evaluated output schema, which is the aggregate's input.
+    evaluated_schema: SchemaRef,
+    /// The aggregate's own output schema: group columns then state columns.
+    partial_schema: SchemaRef,
+    /// Group column positions in the evaluated output, in the aggregate's own order.
+    group_columns: Vec<usize>,
+}
+
+impl PartialCase {
+    /// Binds `sum(value_column)` grouped by `group_columns`, both as evaluated-output positions.
+    fn new(case: &Case, value_column: usize, group_columns: Vec<usize>) -> Self {
+        let evaluated_schema = case.output_schema.clone();
+        let value_name = evaluated_schema.field(value_column).name().clone();
+        let aggregate = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![Arc::new(Column::new(&value_name, value_column)) as Arc<dyn PhysicalExpr>],
+            )
+            .schema(evaluated_schema.clone())
+            .alias(format!("sum({value_name})"))
+            .build()
+            .unwrap(),
+        );
+        // `group_by.output_fields(input_schema)` followed by `aggregate.state_fields()`, which is
+        // exactly how `AggregateExec::schema()` lays its own output out.
+        let mut fields: Vec<FieldRef> = group_columns
+            .iter()
+            .map(|position| Arc::new(evaluated_schema.field(*position).clone()) as FieldRef)
+            .collect();
+        fields.extend(aggregate.state_fields().unwrap());
+        let partial_schema = Arc::new(Schema::new(fields));
+        let partial = PartialSum::try_new(
+            value_column,
+            group_columns.clone(),
+            aggregate.clone(),
+            partial_schema.clone(),
+        )
+        .unwrap();
+        Self {
+            partial,
+            aggregate,
+            evaluated_schema,
+            partial_schema,
+            group_columns,
+        }
+    }
+
+    /// The node of this binding over `child`.
+    fn fused(&self, case: &Case, child: Arc<dyn ExecutionPlan>) -> Result<FusedSeriesExec> {
+        case.fused_with_partial(child, Some(self.partial.clone()))
+    }
+
+    /// `[(group columns...), column]` over `schema`, named as the schema names them.
+    fn group_by(&self, schema: &SchemaRef, positions: &[usize]) -> PhysicalGroupBy {
+        PhysicalGroupBy::new_single(
+            positions
+                .iter()
+                .map(|position| {
+                    let field = schema.field(*position);
+                    (
+                        Arc::new(Column::new(field.name(), *position)) as Arc<dyn PhysicalExpr>,
+                        field.name().clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The group columns of the evaluated rows, in the aggregate's own order.
+    fn evaluated_groups(&self) -> Vec<usize> {
+        self.group_columns.clone()
+    }
+
+    /// The group columns of the state rows: every group column comes first, in the same order.
+    fn state_groups(&self) -> Vec<usize> {
+        (0..self.group_columns.len()).collect()
+    }
+
+    /// DataFusion's own `Partial` sum over `rows`, all in one partition.
+    async fn reference_state(&self, rows: Vec<RecordBatch>) -> Vec<RecordBatch> {
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            TestMemoryExec::try_new(&[rows], self.evaluated_schema.clone(), None).unwrap(),
+        );
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                self.group_by(&self.evaluated_schema, &self.evaluated_groups()),
+                vec![self.aggregate.clone()],
+                vec![None],
+                input,
+                self.evaluated_schema.clone(),
+            )
+            .unwrap(),
+        );
+        collect_plan(plan, Arc::new(TaskContext::default()))
+            .await
+            .unwrap()
+    }
+
+    /// The `Final` sum production puts above the fused node, run over `state`.
+    async fn final_over_state(&self, state: Vec<RecordBatch>) -> Vec<RecordBatch> {
+        let state_field = self.aggregate.state_fields().unwrap()[0].clone();
+        let state_index = self.group_columns.len();
+        let aggregate = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![
+                    Arc::new(Column::new(state_field.name(), state_index)) as Arc<dyn PhysicalExpr>
+                ],
+            )
+            .schema(self.partial_schema.clone())
+            .alias("sum_result")
+            .build()
+            .unwrap(),
+        );
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestMemoryExec::try_new(&[state], self.partial_schema.clone(), None).unwrap());
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Final,
+                self.group_by(&self.partial_schema, &self.state_groups()),
+                vec![aggregate],
+                vec![None],
+                input,
+                self.partial_schema.clone(),
+            )
+            .unwrap(),
+        );
+        collect_plan(plan, Arc::new(TaskContext::default()))
+            .await
+            .unwrap()
+    }
+
+    /// The one state column's name, for reading values out of an emitted batch.
+    fn state_name(&self) -> String {
+        self.aggregate.state_fields().unwrap()[0].name().clone()
+    }
+}
+
+/// One output row of a group-by: the tag columns, the timestamp and the value.
+///
+/// NaN is canonicalized because two NaN payloads both mean "this slot is NaN"; every other value,
+/// including both infinities, must match bit for bit.
+type SumRow = (Vec<Option<String>>, i64, Option<u64>);
+
+/// The rows of one state or final batch, sorted by group key.
+///
+/// The group columns are read from the batch itself: whatever is a string or a dictionary is a
+/// group tag, and the timestamp is the group time. Row order is DataFusion's hash order, which the
+/// node does not control and no test may depend on, so both sides are put in one key order first.
+fn sum_rows(batch: &RecordBatch, value_column: &str) -> Vec<SumRow> {
+    let times = timestamp_column(batch, TIME);
+    let values = float_column(batch, value_column);
+    let tag_columns = batch
+        .columns()
+        .iter()
+        .filter_map(|array| match array.data_type() {
+            DataType::Utf8 => Some(string_values(array)),
+            DataType::Dictionary(key, value)
+                if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+            {
+                Some(dictionary_values(array))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut rows = (0..batch.num_rows())
+        .map(|row| {
+            let keys = tag_columns
+                .iter()
+                .map(|column| column[row].clone())
+                .collect::<Vec<_>>();
+            let value = values[row].map(|value| {
+                if value.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                }
+            });
+            (keys, times[row], value)
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
+
+/// The metric `name` summed over every partition, and `0` when it is not registered.
+fn metric_sum(metrics: &MetricsSet, name: &str) -> u64 {
+    metrics
+        .sum_by_name(name)
+        .map_or(0, |value| value.as_usize() as u64)
+}
+
+/// Runs the node in partial mode over `partitions` and checks it against DataFusion.
+///
+/// Three properties per run: each partition's state rows equal DataFusion's own partial state over
+/// that partition's fused rows; the final aggregate over the node's state equals DataFusion's sum
+/// over all fused rows; and the state's group columns name the absolute grid timestamps.
+async fn assert_partial_matches_datafusion(
+    case: &Case,
+    partial: &PartialCase,
+    partitions: &[&[RawSeriesChunk]],
+    context: &str,
+) -> Vec<Vec<RecordBatch>> {
+    let exec = partial
+        .fused(case, partitioned_child(partitions))
+        .unwrap_or_else(|error| panic!("{context}: construction failed: {error}"));
+    // The node reports the aggregate's schema and finishes at the end of each partition.
+    assert_eq!(exec.schema(), partial.partial_schema, "{context}: schema");
+    assert_eq!(
+        exec.properties().output_partitioning().partition_count(),
+        partitions.len(),
+        "{context}: one state stream per input partition"
+    );
+
+    let mut states = Vec::with_capacity(partitions.len());
+    let mut fused_rows = Vec::new();
+    for (index, chunks) in partitions.iter().enumerate() {
+        let state = collect(run_partition(&exec, index).await);
+        assert!(
+            state.len() <= 1,
+            "{context}: partition {index} must emit at most one state batch, got {}",
+            state.len()
+        );
+        // The same fused rows both feed the reference aggregate and, in scored order, are
+        // collected for the whole-query comparison below.
+        let rows = case
+            .reference(chunks)
+            .into_iter()
+            .map(|(_, batch)| batch)
+            .collect::<Vec<_>>();
+        let expected = partial.reference_state(rows.clone()).await;
+        let state_name = partial.state_name();
+        let expected_rows = expected
+            .iter()
+            .flat_map(|batch| sum_rows(batch, &state_name))
+            .collect::<Vec<_>>();
+        let actual_rows = state
+            .iter()
+            .flat_map(|batch| sum_rows(batch, &state_name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_rows, expected_rows,
+            "{context}: partition {index} state must equal DataFusion's partial state"
+        );
+        fused_rows.extend(rows);
+        states.push(state);
+    }
+
+    // Feeding the node's own state to the final aggregate is what production does; comparing that
+    // against DataFusion's sum over the fused rows proves the state is both complete and legal.
+    let state = states.iter().flatten().cloned().collect::<Vec<_>>();
+    let merged = partial.final_over_state(state).await;
+    let expected = partial.reference_state(fused_rows).await;
+    let expected = partial.final_over_state(expected).await;
+    let merged = merged
+        .iter()
+        .flat_map(|batch| sum_rows(batch, "sum_result"))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .flat_map(|batch| sum_rows(batch, "sum_result"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        merged, expected,
+        "{context}: the final sum over the node's state must equal DataFusion's sum over its rows"
+    );
+    states
+}
+
+/// A 5m window over the grid, the window every fixture below uses.
+fn five_minutes() -> RangeWindow {
+    RangeWindow {
+        range_ms: 300_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    }
+}
+
+/// `sum by (host)` and `sum by ()` over two partitions of several series each.
+///
+/// The two arms are the two slot shapes the planner can hand this node: `by (host)` reproduces
+/// DataFusion one group per point (so the slot count equals the point count), and `by ()` puts
+/// every series of a partition into one label group, so the same group appears in both partitions
+/// and several series fold into each of its points.
+#[tokio::test]
+async fn partial_sum_matches_datafusion_across_partitions() {
+    // Two partitions of two series each; both partitions own whole series, never a split one.
+    let left = vec![
+        counter_chunks(1, "a", &counter_rows(60.0), &[9]),
+        counter_chunks(2, "b", &counter_rows(120.0), &[9]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let right = vec![
+        counter_chunks(3, "c", &counter_rows(180.0), &[9]),
+        counter_chunks(4, "d", &counter_rows(240.0), &[9]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partitions: [&[RawSeriesChunk]; 2] = [&left, &right];
+
+    // `sum by (host)`: one group per series, one point per group and grid index.
+    let by_host = PartialCase::new(&case, 0, vec![1, 2]);
+    let states = assert_partial_matches_datafusion(&case, &by_host, &partitions, "by host").await;
+    let points_per_partition = GRID_LEN as usize * 2;
+    for (index, state) in states.iter().enumerate() {
+        assert_eq!(state.len(), 1, "partition {index} reports one state batch");
+        assert_eq!(
+            state[0].num_rows(),
+            points_per_partition,
+            "partition {index}: one slot per (series, grid point)"
+        );
+    }
+    // The 1:1 shape: nothing is merged, so slots and points are the same number.
+    let exec = by_host
+        .fused(&case, partitioned_child(&partitions))
+        .unwrap();
+    for partition in 0..partitions.len() {
+        collect(run_partition(&exec, partition).await);
+    }
+    let metrics = exec.metrics().expect("the node must report metrics");
+    assert_eq!(metric_sum(&metrics, METRIC_PARTIAL_SLOTS), 4 * GRID_LEN);
+    assert_eq!(metric_sum(&metrics, METRIC_PARTIAL_POINTS), 4 * GRID_LEN);
+    assert_eq!(
+        metric_sum(&metrics, METRIC_PARTIAL_STATE_ROWS),
+        4 * GRID_LEN
+    );
+    // One `update_batch` per completed series, so four for the four series of two partitions.
+    assert_eq!(metric_sum(&metrics, METRIC_PARTIAL_UPDATES), 4);
+
+    // `sum by ()`: every series of a partition lands in the same label group, so this partition's
+    // five 4-series points and the other partition's five are the same five `(group, index)` keys
+    // the final aggregate merges.
+    let by_time = PartialCase::new(&case, 0, vec![2]);
+    let states =
+        assert_partial_matches_datafusion(&case, &by_time, &partitions, "by nothing").await;
+    for (index, state) in states.iter().enumerate() {
+        assert_eq!(state.len(), 1, "partition {index} reports one state batch");
+        assert_eq!(
+            state[0].num_rows(),
+            GRID_LEN as usize,
+            "partition {index}: one slot per grid point in the single label group"
+        );
+        // 1/s + 2/s for the left partition, 3/s + 4/s for the right one: the group sums both
+        // series of the partition at every point.
+        let expected = if index == 0 { 3.0 } else { 7.0 };
+        assert_eq!(
+            float_column(&state[0], &by_time.state_name()),
+            vec![Some(expected); GRID_LEN as usize],
+            "partition {index} must sum both of its series"
+        );
+    }
+    // Merging the two partitions' states gives 1/s + 2/s + 3/s + 4/s at every point.
+    let merged = by_time
+        .final_over_state(states.into_iter().flatten().collect())
+        .await;
+    let merged = concat_batches(&merged[0].schema(), &merged).unwrap();
+    assert_eq!(
+        float_column(&merged, "sum_result"),
+        vec![Some(10.0); GRID_LEN as usize],
+        "the final aggregate must add both partitions' state"
+    );
+}
+
+/// `sum by (zone)` with `host` also present, grouped in an order the evaluated rows do not use.
+///
+/// The evaluated rows carry `value, host, zone, time`; this aggregate groups by `time` before
+/// `zone`, so the state batch must be `time, zone, sum(value)[sum]` and every column must carry
+/// its own name's values.
+#[tokio::test]
+async fn partial_sum_orders_group_and_state_columns_by_the_aggregate() {
+    let chunks = vec![
+        chunk_with(1, two_label_metric("a", "z1"), &counter_rows(60.0), true),
+        chunk_with(2, two_label_metric("b", "z1"), &counter_rows(120.0), true),
+        chunk_with(3, two_label_metric("c", "z2"), &counter_rows(180.0), true),
+    ];
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![])
+        .with_output_schema(output_schema_of(&[VALUE], &["host", "zone"]))
+        .with_tags(&["host", "zone"]);
+    // Evaluated order is `value, host, zone, time`; the aggregate groups by `time`, then `zone`.
+    let partial_case = PartialCase::new(&case, 0, vec![3, 2]);
+    assert_partial_matches_datafusion(&case, &partial_case, &[&chunks], "zone").await;
+
+    let exec = partial_case.fused(&case, memory_child(&chunks)).unwrap();
+    // The node reports exactly the aggregate's own layout: group columns, then the state column.
+    let schema = exec.schema();
+    let names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![TIME, "zone", &partial_case.state_name()[..]],
+        "{schema:?}"
+    );
+    // The group tag column inherits the encoding of the evaluated tag column it came from, which
+    // is the plain `Utf8` the fixture declared.
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8, "{schema:?}");
+
+    let state = collect(run_partition(&exec, 0).await);
+    assert_eq!(state.len(), 1, "{state:?}");
+    let batch = &state[0];
+    // z1 holds two series and therefore sums both rates (1/s + 2/s); z2 holds one (3/s).
+    let expected = [("z1", 3.0_f64), ("z2", 3.0_f64)]
+        .into_iter()
+        .flat_map(|(zone, sum)| {
+            (0..GRID_LEN).map(move |point| {
+                (
+                    vec![Some(zone.to_string())],
+                    GRID_START + point as i64 * GRID_STEP,
+                    Some(sum.to_bits()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sum_rows(batch, &partial_case.state_name()),
+        expected,
+        "every (zone, time) slot must appear once, with its own group's sum"
+    );
+    // `host` is not a group column here, so it must not appear in the state at all.
+    assert!(
+        batch.column_by_name("host").is_none(),
+        "a non-group tag must not be emitted: {:?}",
+        batch.schema()
+    );
+}
+
+/// A short-lived series with a hole, a series with no point, and a partition with nothing at all.
+#[tokio::test]
+async fn partial_sum_emits_absolute_grid_indices_and_nothing_for_a_missing_partition() {
+    // `a` only covers the tail of the grid and its middle window is empty; `b` has one sample
+    // before the first window, so no grid point of the evaluated series holds a value for it.
+    let first = vec![
+        chunk(1, "a", &[(420_000, Some(1.0)), (540_000, Some(3.0))], true),
+        chunk(2, "b", &[(30_000, Some(1.0))], true),
+    ];
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 60_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::SumOverTime,
+        vec![],
+    );
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let states =
+        assert_partial_matches_datafusion(&case, &partial_case, &[&first, &[]], "sparse").await;
+
+    // The occupied points keep their absolute grid timestamps, not their local row numbers.
+    let rows = sum_rows(&states[0][0], &partial_case.state_name());
+    let timestamps = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+    assert_eq!(
+        timestamps,
+        vec![420_000, 540_000],
+        "a slot is keyed by `start + offset`, so the timestamps are absolute and the hole is absent"
+    );
+    // `b` has no point at all: it must not be reported as a zero.
+    let hosts = rows.iter().map(|row| row.0[0].clone()).collect::<Vec<_>>();
+    assert_eq!(
+        hosts,
+        vec![Some("a".to_string()), Some("a".to_string())],
+        "a series without a point contributes no group"
+    );
+    assert_eq!(
+        float_column(&states[0][0], &partial_case.state_name()),
+        vec![Some(1.0), Some(3.0)],
+        "the values are the evaluated ones, with no fabricated zero"
+    );
+
+    // The empty partition emits an empty stream: no batch, and no zero row. Only this partition
+    // runs here, so its own metrics are the whole report and must show nothing accumulated.
+    let exec = partial_case
+        .fused(&case, partitioned_child(&[&first, &[]]))
+        .unwrap();
+    let empty = run_partition(&exec, 1).await;
+    assert!(
+        empty.is_empty(),
+        "an empty partition emits nothing: {empty:?}"
+    );
+    let metrics = exec.metrics().expect("the node must report metrics");
+    for name in [
+        METRIC_PARTIAL_STATE_ROWS,
+        METRIC_PARTIAL_SLOTS,
+        METRIC_PARTIAL_POINTS,
+        METRIC_PARTIAL_UPDATES,
+    ] {
+        assert_eq!(
+            metric_sum(&metrics, name),
+            0,
+            "an empty partition must not report {name}: {metrics:?}"
+        );
+    }
+}
+
+/// A duplicate final label set is still an error in partial mode, and disjoint points still merge.
+#[tokio::test]
+async fn partial_sum_keeps_the_duplicate_label_set_rules() {
+    let rows = counter_rows(60.0);
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+
+    // `rate` drops `__name__`, so both raw series reach `{host="x"}` at every grid point.
+    let overlapping = vec![
+        named_chunk("a_total", 1, "x", &rows, true),
+        named_chunk("b_total", 2, "x", &rows, true),
+    ];
+    let exec = partial_case
+        .fused(&case, memory_child(&overlapping))
+        .unwrap();
+    let items = run_partition(&exec, 0).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "expected exactly the error item, got {items:?}"
+    );
+    let message = error_chain(&items.into_iter().next().unwrap().err().unwrap());
+    assert!(
+        message.contains("vector cannot contain metrics with the same labelset"),
+        "a following SUM must not swallow the collision: {message}"
+    );
+
+    // Disjoint points are legal even though the label sets collide, and both contribute.
+    let disjoint = vec![
+        named_chunk(
+            "a_total",
+            1,
+            "x",
+            &[(60_000, Some(60.0)), (120_000, Some(120.0))],
+            true,
+        ),
+        named_chunk(
+            "b_total",
+            2,
+            "x",
+            &[(420_000, Some(420.0)), (480_000, Some(480.0))],
+            false,
+        ),
+        named_chunk("b_total", 2, "x", &[(540_000, Some(540.0))], true),
+    ];
+    let states = assert_partial_matches_datafusion(
+        &case,
+        &partial_case,
+        &[&disjoint],
+        "disjoint label sets",
+    )
+    .await;
+    let rows = sum_rows(&states[0][0], &partial_case.state_name());
+    assert_eq!(
+        rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+        vec![300_000, 480_000, 540_000],
+        "each label set keeps the points its own windows produced"
+    );
+    assert!(
+        rows.iter().all(|row| row.2.is_some()),
+        "no point may be lost: {rows:?}"
+    );
+}
+
+/// NaN and both infinities reach the accumulator unchanged.
+///
+/// Each series carries one of the three values only, so no window ever mixes them: the state must
+/// then be bit-identical to the evaluated rows, and DataFusion's own sum over those rows has
+/// already been compared by the shared assertion.
+#[tokio::test]
+async fn partial_sum_keeps_nan_and_infinities() {
+    let chunks = vec![
+        chunk(
+            1,
+            "a",
+            &[(420_000, Some(f64::NAN)), (540_000, Some(f64::NAN))],
+            true,
+        ),
+        chunk(
+            2,
+            "b",
+            &[
+                (420_000, Some(f64::INFINITY)),
+                (540_000, Some(f64::INFINITY)),
+            ],
+            true,
+        ),
+        chunk(
+            3,
+            "c",
+            &[
+                (420_000, Some(f64::NEG_INFINITY)),
+                (540_000, Some(f64::NEG_INFINITY)),
+            ],
+            true,
+        ),
+    ];
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 60_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::SumOverTime,
+        vec![],
+    );
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let states = assert_partial_matches_datafusion(&case, &partial_case, &[&chunks], "nan").await;
+
+    // The evaluated rows for the same chunks: the state must read exactly like them.
+    let evaluated = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+    let evaluated = concat_batches(&evaluated[0].schema(), &evaluated).unwrap();
+    let hosts = string_column(&evaluated, "host");
+    let times = timestamp_column(&evaluated, TIME);
+    let mut expected = hosts
+        .into_iter()
+        .zip(times)
+        .zip(float_column(&evaluated, VALUE))
+        .map(|((host, time), value)| (host, time, value))
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    let actual = sum_rows(&states[0][0], &partial_case.state_name());
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "the state must hold every point"
+    );
+    for ((host, time, value), row) in expected.into_iter().zip(actual) {
+        assert_eq!(
+            row.0,
+            vec![host.clone()],
+            "the state keeps the evaluated group"
+        );
+        assert_eq!(row.1, time, "the state keeps the evaluated timestamp");
+        let state_value = f64::from_bits(row.2.expect("a state value must be present"));
+        let value = value.expect("an evaluated value must be present");
+        match host.as_deref() {
+            // Adding to a zero accumulator may canonicalize a NaN payload, so a NaN is compared
+            // as a NaN; both infinities must survive bit for bit.
+            Some("a") => assert!(state_value.is_nan(), "{state_value} must stay NaN"),
+            Some("b") => assert_eq!(
+                state_value.to_bits(),
+                f64::INFINITY.to_bits(),
+                "{state_value} must stay +Inf"
+            ),
+            Some("c") => assert_eq!(
+                state_value.to_bits(),
+                f64::NEG_INFINITY.to_bits(),
+                "{state_value} must stay -Inf"
+            ),
+            other => panic!("unexpected group {other:?}"),
+        }
+        if !value.is_nan() {
+            assert_eq!(
+                state_value.to_bits(),
+                value.to_bits(),
+                "the value must match"
+            );
+        }
+    }
+}
+
+/// A fixture that crosses raw chunk boundaries with windows that overlap each other.
+///
+/// `counter_chunks` splits one series into several chunks, and the 5m window over a 1m step means
+/// every sample is counted by five overlapping windows, so a lost or double-counted sample would
+/// move the state away from DataFusion's own sum.
+#[tokio::test]
+async fn partial_sum_across_chunk_boundaries_and_overlapping_windows() {
+    let chunks = vec![
+        counter_chunks(1, "a", &counter_rows(60.0), &[2, 4, 6, 9]),
+        counter_chunks(2, "b", &counter_rows(120.0), &[1, 3, 5, 9]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let states =
+        assert_partial_matches_datafusion(&case, &partial_case, &[&chunks], "chunked").await;
+    assert_eq!(
+        states[0][0].num_rows(),
+        2 * GRID_LEN as usize,
+        "one slot per (series, grid point)"
+    );
+    // Five overlapping windows over a counter rising 60 per minute read exactly 1/s everywhere.
+    let rows = sum_rows(&states[0][0], &partial_case.state_name());
+    for row in rows {
+        let expected: f64 = if row.0[0].as_deref() == Some("a") {
+            1.0
+        } else {
+            2.0
+        };
+        assert_eq!(row.2, Some(expected.to_bits()), "row {row:?}");
+    }
+}
+
+/// A counter that resets in the middle of the series.
+///
+/// The accumulator never sees the raw samples, so this pins that the values it receives are still
+/// the reset-corrected ones the evaluator produced: the node must not have replaced them with
+/// anything its own.
+#[tokio::test]
+async fn partial_sum_sees_the_reset_corrected_values() {
+    // 1, 2, 3, then a reset to 5 (after 185) and back to a 60-per-minute rise.
+    let rows = vec![
+        (60_000, Some(60.0)),
+        (120_000, Some(120.0)),
+        (180_000, Some(180.0)),
+        (240_000, Some(5.0)),
+        (300_000, Some(65.0)),
+        (360_000, Some(125.0)),
+        (420_000, Some(185.0)),
+        (480_000, Some(245.0)),
+        (540_000, Some(305.0)),
+    ];
+    let chunks = counter_chunks(1, "a", &rows, &[3, 9]);
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let states = assert_partial_matches_datafusion(&case, &partial_case, &[&chunks], "reset").await;
+    let evaluated = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+    let evaluated = concat_batches(&evaluated[0].schema(), &evaluated).unwrap();
+    assert_eq!(
+        float_column(&states[0][0], &partial_case.state_name()),
+        float_column(&evaluated, VALUE),
+        "the state must start from the same reset-corrected rate the rows carry"
+    );
+}
+
+/// One raw chunk per sample: the fragmented input shape.
+///
+/// A slot allocated per chunk instead of per grid point would produce far more groups than points
+/// here, and its values would be wrong; both are checked.
+#[tokio::test]
+async fn partial_sum_survives_one_chunk_per_sample() {
+    let rows = counter_rows(60.0);
+    let bounds = (1..=rows.len()).collect::<Vec<_>>();
+    let chunks = counter_chunks(1, "a", &rows, &bounds);
+    assert_eq!(chunks.len(), rows.len(), "one chunk per sample");
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let states =
+        assert_partial_matches_datafusion(&case, &partial_case, &[&chunks], "fragmented").await;
+    assert_eq!(
+        states[0][0].num_rows(),
+        GRID_LEN as usize,
+        "slots follow grid points, not chunks"
+    );
+
+    let exec = partial_case.fused(&case, memory_child(&chunks)).unwrap();
+    collect(run_partition(&exec, 0).await);
+    let metrics = exec.metrics().expect("the node must report metrics");
+    assert_eq!(
+        metric_sum(&metrics, METRIC_PARTIAL_SLOTS),
+        GRID_LEN,
+        "one slot per grid point, however the input was chunked: {metrics:?}"
+    );
+    assert_eq!(metric_sum(&metrics, METRIC_PARTIAL_UPDATES), 1);
+}
+
+/// `EXPLAIN` proves the mode without logs, and leaves the evaluated rendering byte-identical.
+#[tokio::test]
+async fn explain_names_the_partial_sum_mode() {
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let evaluated = case.fused(memory_child(&[])).unwrap();
+    let partial = partial_case.fused(&case, memory_child(&[])).unwrap();
+    // Both formats, character for character: the evaluated one gained neither a comma nor a
+    // marker. `displayable` renders the whole subtree, so the node's own line is what is compared.
+    for text in [
+        displayable(&evaluated).indent(false).to_string(),
+        displayable(&evaluated).indent(true).to_string(),
+    ] {
+        let line = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            line, "FusedSeriesExec: eval=rate, range=300000ms, offset=0ms, maps=[]",
+            "{text}"
+        );
+    }
+    for text in [
+        displayable(&partial).indent(false).to_string(),
+        displayable(&partial).indent(true).to_string(),
+    ] {
+        let line = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            line, "FusedSeriesExec: eval=rate, range=300000ms, offset=0ms, maps=[], partial=sum",
+            "{text}"
+        );
+    }
+}
+
+/// Everything the node cannot fold into an accumulator is rejected at construction.
+#[tokio::test]
+async fn construction_rejects_out_of_scope_partial_bindings() {
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let good = PartialCase::new(&case, 0, vec![1, 2]);
+    let child = || memory_child(&[]);
+
+    // The summed column must be a series field, not the timestamp or a tag.
+    for value_column in [1, 2] {
+        let mutated = PartialSum {
+            value_column,
+            ..good.partial.clone()
+        };
+        let error = case
+            .fused_with_partial(child(), Some(mutated))
+            .expect_err("a non-field value column must be rejected");
+        assert!(
+            error.to_string().contains("aggregate a series field"),
+            "{error}"
+        );
+    }
+
+    // A group key must be the time column or a tag, never the summed field.
+    let mutated = PartialSum {
+        group_columns: vec![0, 2],
+        ..good.partial.clone()
+    };
+    let error = case
+        .fused_with_partial(child(), Some(mutated))
+        .expect_err("a field group column must be rejected");
+    assert!(error.to_string().contains("group key must be"), "{error}");
+
+    // A group column outside the evaluated schema is rejected too.
+    let mutated = PartialSum {
+        group_columns: vec![7],
+        ..good.partial.clone()
+    };
+    let error = case
+        .fused_with_partial(child(), Some(mutated))
+        .expect_err("an out-of-range group column must be rejected");
+    assert!(error.to_string().contains("has 3 columns"), "{error}");
+
+    // The state layout must be the aggregate's own: too few columns is a construction error.
+    let error = PartialSum::try_new(
+        0,
+        vec![1, 2],
+        good.aggregate.clone(),
+        Arc::new(Schema::new(vec![Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )])),
+    )
+    .expect_err("a short state schema must be rejected");
+    assert!(error.to_string().contains("expected"), "{error}");
+
+    // A state that is not a float cannot be a `SUM` over one evaluated field.
+    let counted = Arc::new(
+        AggregateExprBuilder::new(
+            datafusion::functions_aggregate::count::count_udaf(),
+            vec![Arc::new(Column::new(VALUE, 0)) as Arc<dyn PhysicalExpr>],
+        )
+        .schema(case.output_schema.clone())
+        .alias("count(value)")
+        .build()
+        .unwrap(),
+    );
+    let mut fields: Vec<FieldRef> = vec![
+        Arc::new(case.output_schema.field(1).clone()),
+        Arc::new(case.output_schema.field(2).clone()),
+    ];
+    fields.extend(counted.state_fields().unwrap());
+    let error = PartialSum::try_new(0, vec![1, 2], counted, Arc::new(Schema::new(fields)))
+        .expect_err("a non-float state must be rejected");
+    assert!(error.to_string().contains("Float64 state"), "{error}");
 }

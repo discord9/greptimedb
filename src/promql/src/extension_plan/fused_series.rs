@@ -67,6 +67,19 @@
 //! are handed downstream. The range-window samples [`RangeEvaluator`] retains across chunks and the
 //! batches already handed downstream are deliberately not reserved here.
 //!
+//! Partial mode: with a [`PartialSum`] the node stops converting a completed series into rows. It
+//! folds the series' points straight into the replaced partial aggregate's own `GroupsAccumulator`
+//! and emits that accumulator's state once per partition, so the final aggregate above it consumes
+//! exactly what DataFusion's partial `AggregateExec` would have written. The label-set collision
+//! check still runs first and unchanged, on the full result label set: a `SUM` above the node must
+//! not swallow the error a bare evaluated query reports. Slots are keyed by `(label group,
+//! absolute grid index)` — `GridRange::start()` plus the row offset — never by a local row number,
+//! because each series trims its own interval. What that state costs is reserved on the same pool
+//! as it is taken: the slot column of each label group grows only to the highest absolute index the
+//! group has occupied, the slot table and the label-group table are charged in fixed steps, and the
+//! accumulator's own `size()` is charged as it grows. All of it is released together with the rest
+//! of the stream's reservation.
+//!
 //! The child's `is_last` is the only completion signal. This node neither recomputes finality
 //! across inputs nor emits a series it has not seen finalized, so a child that merges regions must
 //! recompute `is_last` globally before handing its frames over; a region-local flag would finalize
@@ -83,8 +96,8 @@ use std::time::Instant;
 
 use common_query::series_frame::unpack_raw_series;
 use datafusion::arrow::array::{
-    Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
-    UInt32Array,
+    Array, ArrayRef, DictionaryArray, Float64Array, StringArray, StringDictionaryBuilder,
+    TimestampMillisecondArray, UInt32Array,
 };
 use datafusion::arrow::compute::{concat_batches, take};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
@@ -93,6 +106,8 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::logical_expr::{EmitTo, GroupsAccumulator};
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
@@ -136,6 +151,89 @@ struct TagEncoding {
     nullable: bool,
 }
 
+/// One partial `SUM` computed over the series this node evaluated itself.
+///
+/// Created by the planner from the partial `AggregateExec` this node replaces, so the state this
+/// node emits is DataFusion's own and the final aggregate above it consumes it unchanged. With a
+/// `PartialSum` the node stops converting each completed series into output rows and instead folds
+/// its points straight into the aggregate's own [`GroupsAccumulator`], then emits that
+/// accumulator's state once per partition.
+#[derive(Clone, Debug)]
+pub struct PartialSum {
+    /// Position of the value column in the node's evaluated classification; must be a `Field`.
+    value_column: usize,
+    /// Positions of the group-key columns in the evaluated classification, in the aggregate's own
+    /// order. Each must be `Time` or `Tag`.
+    group_columns: Vec<usize>,
+    /// The `SUM` expression of the replaced partial aggregate.
+    aggregate: Arc<AggregateFunctionExpr>,
+    /// That aggregate's own output schema: group columns then state columns.
+    output_schema: SchemaRef,
+}
+
+impl PartialSum {
+    /// Creates the partial-aggregate binding, rejecting a state layout this node cannot emit.
+    ///
+    /// Everything that depends on the *evaluation* contract (which classification position is the
+    /// summed field, which are time or tag columns) is checked by `FusedSeriesExec::try_new`,
+    /// because only that type owns the classification.
+    pub fn try_new(
+        value_column: usize,
+        group_columns: Vec<usize>,
+        aggregate: Arc<AggregateFunctionExpr>,
+        output_schema: SchemaRef,
+    ) -> Result<Self> {
+        // The node hands the accumulator one array: the summed field's column.
+        if aggregate.expressions().len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "FusedSeriesExec partial aggregate {} must aggregate exactly one column, got {}",
+                aggregate.name(),
+                aggregate.expressions().len()
+            )));
+        }
+        let state_fields = aggregate.state_fields()?;
+        let expected = group_columns.len() + state_fields.len();
+        if output_schema.fields().len() != expected {
+            return Err(DataFusionError::Plan(format!(
+                "FusedSeriesExec partial output schema has {} columns, expected {} group columns \
+                 plus {} state columns",
+                output_schema.fields().len(),
+                group_columns.len(),
+                state_fields.len()
+            )));
+        }
+        for (position, state) in state_fields.iter().enumerate() {
+            let column = group_columns.len() + position;
+            let field = output_schema.field(column);
+            if field.name() != state.name()
+                || field.data_type() != state.data_type()
+                || field.is_nullable() != state.is_nullable()
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "FusedSeriesExec partial output column {column} is {field:?}, but state field \
+                     {position} of {} is {state:?}",
+                    aggregate.name()
+                )));
+            }
+            // The node computes floats only, so a partial aggregate whose state is not a float is
+            // not a `SUM` over one evaluated field and cannot be collapsed into this node.
+            if state.data_type() != &DataType::Float64 {
+                return Err(DataFusionError::Plan(format!(
+                    "FusedSeriesExec partial aggregate {} must have Float64 state, got {:?}",
+                    aggregate.name(),
+                    state.data_type()
+                )));
+            }
+        }
+        Ok(Self {
+            value_column,
+            group_columns,
+            aggregate,
+            output_schema,
+        })
+    }
+}
+
 /// Time this node spends synchronously polling its input for one chunk.
 ///
 /// The block ends before the poll returns `Pending`, so the value never includes time the
@@ -157,8 +255,25 @@ const METRIC_COLUMNS: &str = "fused_columns_time";
 const METRIC_INPUT_CHUNKS: &str = "fused_input_chunks";
 /// Series the evaluator completed.
 const METRIC_SERIES_COMPLETED: &str = "fused_series_completed";
-/// Series that produced at least one kept row.
+/// Series that produced at least one output: at least one kept row in evaluated mode, and at
+/// least one point fed to the partial accumulator in partial mode.
 const METRIC_SERIES_EMITTED: &str = "fused_series_emitted";
+/// Time spent folding one completed series into the partial accumulator: resolving its label
+/// group, allocating slots and building the group indices handed to `update_batch`.
+const METRIC_PARTIAL_UPDATE: &str = "fused_partial_update_time";
+/// Time spent reading the accumulator's state at end of partition and building the state batch.
+const METRIC_PARTIAL_STATE: &str = "fused_partial_state_time";
+/// `update_batch` calls, one per series that holds a point.
+const METRIC_PARTIAL_UPDATES: &str = "fused_partial_updates";
+/// Grid points fed to the accumulator.
+const METRIC_PARTIAL_POINTS: &str = "fused_partial_points";
+/// Accumulator slots at end of partition, i.e. distinct `(label group, grid index)` pairs.
+const METRIC_PARTIAL_SLOTS: &str = "fused_partial_slots";
+/// State rows emitted at end of partition.
+const METRIC_PARTIAL_STATE_ROWS: &str = "fused_partial_state_rows";
+
+/// Slot id of a `(label group, grid index)` pair that was never seen.
+const NO_SLOT: u32 = u32::MAX;
 
 /// Evaluates one range function followed by 0..N float map kernels per raw series.
 pub struct FusedSeriesExec {
@@ -176,6 +291,9 @@ pub struct FusedSeriesExec {
     time_column: String,
     /// One entry per output column, in output column order.
     classification: Arc<[OutputColumn]>,
+    /// When set, the node folds its evaluated series into this partial aggregate instead of
+    /// converting them into rows, and reports that aggregate's schema.
+    partial: Option<PartialSum>,
     properties: Arc<PlanProperties>,
     metric: ExecutionPlanMetricsSet,
 }
@@ -195,6 +313,7 @@ impl FusedSeriesExec {
         output_schema: SchemaRef,
         tags: Vec<String>,
         time_column: String,
+        partial: Option<PartialSum>,
     ) -> Result<Self> {
         let partition_count = input.properties().partitioning.partition_count();
         if partition_count == 0 {
@@ -225,12 +344,25 @@ impl FusedSeriesExec {
         )?);
         validate_raw_frame_schema(&input, &series_schema, &label_source, ordering)?;
         let classification = classify_output(&output_schema, &series_schema, &tags, &time_column)?;
+        if let Some(partial) = &partial {
+            validate_partial(partial, &classification, &series_schema)?;
+        }
+        // In partial mode the node reports the replaced aggregate's own schema and finishes: one
+        // state batch per partition, at its end. The evaluated properties are never reused,
+        // because no evaluated row ever reaches the consumer.
+        let reporting_schema = match &partial {
+            Some(partial) => partial.output_schema.clone(),
+            None => output_schema.clone(),
+        };
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
+            EquivalenceProperties::new(reporting_schema),
             // One partition per input partition: `execute` runs the child stream of the partition
             // it is given, and each stream owns its own evaluator and label-set state.
             Partitioning::UnknownPartitioning(partition_count),
-            EmissionType::Incremental,
+            match &partial {
+                Some(_) => EmissionType::Final,
+                None => EmissionType::Incremental,
+            },
             Boundedness::Bounded,
         ));
         Ok(Self {
@@ -246,9 +378,19 @@ impl FusedSeriesExec {
             tags,
             time_column,
             classification: classification.into(),
+            partial,
             properties,
             metric: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// The schema this node reports downstream: the partial aggregate's own schema in partial
+    /// mode, the evaluated row schema otherwise.
+    fn reporting_schema(&self) -> SchemaRef {
+        match &self.partial {
+            Some(partial) => partial.output_schema.clone(),
+            None => self.output_schema.clone(),
+        }
     }
 
     fn name() -> &'static str {
@@ -265,13 +407,20 @@ impl std::fmt::Debug for FusedSeriesExec {
 impl DisplayAs for FusedSeriesExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
         let maps: Vec<_> = self.maps.iter().map(|op| describe_map(*op)).collect();
+        // The marker names the aggregate function, so `EXPLAIN` alone proves the mode without a
+        // reader having to look for logs.
+        let partial = match &self.partial {
+            Some(partial) => format!(", partial={}", partial.aggregate.fun().name()),
+            None => String::new(),
+        };
         write!(
             f,
-            "FusedSeriesExec: eval={}, range={}ms, offset={}ms, maps=[{}]",
+            "FusedSeriesExec: eval={}, range={}ms, offset={}ms, maps=[{}]{}",
             describe_function(self.function),
             self.window.range_ms,
             self.window.offset_ms,
-            maps.join(", ")
+            maps.join(", "),
+            partial
         )
     }
 }
@@ -327,6 +476,7 @@ impl ExecutionPlan for FusedSeriesExec {
             self.output_schema.clone(),
             self.tags.clone(),
             self.time_column.clone(),
+            self.partial.clone(),
         )?;
         Ok(Arc::new(exec))
     }
@@ -362,15 +512,28 @@ impl ExecutionPlan for FusedSeriesExec {
             self.window,
             self.function,
         )?;
+        // Same reason: the accumulator carries the running sums, so it too is per stream. State
+        // never crosses a partition, because partitions own disjoint series.
+        let partial = match &self.partial {
+            Some(partial) => Some(PartialSumStream::try_new(
+                partial.clone(),
+                partial.aggregate.create_groups_accumulator()?,
+                &self.classification,
+                self.tags.clone().into(),
+                self.grid.clone(),
+            )?),
+            None => None,
+        };
         Ok(Box::pin(FusedSeriesStream {
             baseline: BaselineMetrics::new(&self.metric, partition),
-            timers: FusedTimers::register(&self.metric, partition),
+            timers: FusedTimers::register(&self.metric, partition, self.partial.is_some()),
             input,
             evaluator: Some(evaluator),
             maps: self.maps.clone(),
             tags: self.tags.clone().into(),
-            output_schema: self.output_schema.clone(),
+            output_schema: self.reporting_schema(),
             classification: self.classification.clone(),
+            partial,
             // Fresh per stream: two streams must never share duplicate-label-set state.
             seen: HashMap::new(),
             pending: Vec::new(),
@@ -380,6 +543,65 @@ impl ExecutionPlan for FusedSeriesExec {
             finished: false,
         }))
     }
+}
+
+/// Checks the parts of the partial binding that depend on the evaluation contract.
+///
+/// The classification is the only place that knows which output column is the summed field and
+/// which are the time and tag columns, so these rejections live here rather than in
+/// [`PartialSum::try_new`].
+fn validate_partial(
+    partial: &PartialSum,
+    classification: &[OutputColumn],
+    series_schema: &SeriesSchema,
+) -> Result<()> {
+    let value_field = match classification.get(partial.value_column) {
+        Some(OutputColumn::Field(index)) => *index,
+        Some(other) => {
+            return Err(DataFusionError::Plan(format!(
+                "FusedSeriesExec partial sum must aggregate a series field, but output column {} \
+                 is {other:?}",
+                partial.value_column
+            )));
+        }
+        None => {
+            return Err(DataFusionError::Plan(format!(
+                "FusedSeriesExec partial sum aggregates output column {}, but the evaluated \
+                 schema has {} columns",
+                partial.value_column,
+                classification.len()
+            )));
+        }
+    };
+    // Every series field is a float field (`FieldSpec` carries a name only and the range
+    // functions produce floats), so locating the summed field is the whole check; the state type
+    // check in `PartialSum::try_new` proves the aggregate over it is a float `SUM`.
+    if series_schema.fields.get(value_field).is_none() {
+        return Err(DataFusionError::Plan(format!(
+            "FusedSeriesExec partial sum aggregates field {value_field}, but the series schema has \
+             {} fields",
+            series_schema.fields.len()
+        )));
+    }
+    for column in &partial.group_columns {
+        match classification.get(*column) {
+            Some(OutputColumn::Time) | Some(OutputColumn::Tag(_, _)) => {}
+            Some(OutputColumn::Field(index)) => {
+                return Err(DataFusionError::Plan(format!(
+                    "FusedSeriesExec partial sum group column {column} is the field \
+                     {index:?}, but a group key must be the time column or a tag column"
+                )));
+            }
+            None => {
+                return Err(DataFusionError::Plan(format!(
+                    "FusedSeriesExec partial sum groups by output column {column}, but the \
+                     evaluated schema has {} columns",
+                    classification.len()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Checks that the child's declared schema is a legal raw frame for this binding.
@@ -649,23 +871,13 @@ fn tag_column(
     rows: usize,
     position: usize,
 ) -> Result<ArrayRef> {
-    let name = tags.get(index).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "output column {position} declares unavailable tag {index}"
-        ))
-    })?;
-    // An absent label is a NULL where the column allows one, and the empty label value where it
-    // does not, which is how Prometheus reads a label the series does not carry.
-    let value = match (series.metric.get(name), encoding.nullable) {
-        (value, true) => value,
-        (value, false) => Some(value.unwrap_or_default()),
-    };
+    let value = tag_value(series, tags, index, encoding, position)?;
     if !encoding.dictionary {
         return Ok(Arc::new(StringArray::from(
             std::iter::repeat_n(value, rows).collect::<Vec<_>>(),
         )));
     }
-    let dictionary: ArrayRef = Arc::new(StringArray::from(vec![value.unwrap_or_default()]));
+    let dictionary: ArrayRef = Arc::new(StringArray::from(vec![value.clone().unwrap_or_default()]));
     let keys = match value {
         Some(_) => UInt32Array::from(vec![0_u32; rows]),
         None => UInt32Array::from(vec![None::<u32>; rows]),
@@ -673,6 +885,29 @@ fn tag_column(
     Ok(Arc::new(DictionaryArray::<UInt32Type>::try_new(
         keys, dictionary,
     )?))
+}
+
+/// The single value one series' tag column carries, before it is repeated over the rows.
+///
+/// Both the evaluated rows and the partial state's group columns print the same value, so this is
+/// the one place the absent-label rule lives: a NULL where the column allows one, and the empty
+/// label value where it does not, which is how Prometheus reads a label the series does not carry.
+fn tag_value(
+    series: &Series,
+    tags: &[String],
+    index: usize,
+    encoding: TagEncoding,
+    position: usize,
+) -> Result<Option<String>> {
+    let name = tags.get(index).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "output column {position} declares unavailable tag {index}"
+        ))
+    })?;
+    Ok(match (series.metric.get(name), encoding.nullable) {
+        (value, true) => value.map(str::to_string),
+        (value, false) => Some(value.unwrap_or_default().to_string()),
+    })
 }
 
 /// Converts one evaluated series field into one `Float64` column.
@@ -993,7 +1228,374 @@ fn merge_runs(stored: &mut Vec<(usize, usize)>, new: &[(usize, usize)]) {
     *stored = merged;
 }
 
-/// Turns raw series chunks into output batches of coalesced completed series.
+/// One partition's running partial aggregate.
+///
+/// Slots are keyed by `(label group, absolute grid index)`, never by a local row number: each
+/// series trims its own interval, so only the absolute index names the DataFusion group the
+/// ordinary partial aggregate would have produced for that point.
+struct PartialSumStream {
+    /// The node's binding: value column, group columns, output schema and accumulator factory.
+    config: PartialSum,
+    /// DataFusion's own accumulator, one per stream: its state *is* the emitted state.
+    accumulator: Box<dyn GroupsAccumulator>,
+    /// The series field the aggregate sums: the classification position of the aggregate's value
+    /// column, resolved to the field it names.
+    value_field: usize,
+    /// The group columns resolved against the evaluated classification, in the aggregate's own
+    /// order. Stored once so a batch never re-derives what a column is.
+    group_columns: Vec<GroupColumn>,
+    /// The node's evaluation grid: an absolute grid index names its timestamp here.
+    grid: Arc<EvalGrid>,
+    tags: Arc<[String]>,
+    /// One entry per label group: absolute grid index -> slot id.
+    slots: Vec<SlotColumn>,
+    /// Label group key -> id in `slots`, `label_values` and `keys`.
+    labels: HashMap<Vec<u8>, usize>,
+    /// Per label group: the resolved value of each group *tag* column, in `group_columns` order.
+    /// Filled from the same rule the evaluated tag columns use, so the emitted group columns print
+    /// exactly the labels the evaluated rows would have carried.
+    label_values: Vec<Vec<Option<String>>>,
+    /// Slot -> `(label group, absolute grid index)`, in slot order: the order `state()` returns.
+    keys: Vec<(u32, u32)>,
+    /// Entries of `keys` already reserved on the pool, so each step is charged exactly once.
+    keys_reserved: usize,
+    /// The accumulator's own `size()` at the last reservation, so only its growth is reserved.
+    accumulator_bytes: usize,
+}
+
+/// One group column of the emitted state batch, resolved from the evaluated classification.
+enum GroupColumn {
+    /// The evaluation timestamp of the slot's absolute grid index.
+    Time,
+    /// A tag column: index in the node's tag list, its encoding, the classification position it
+    /// came from (for error messages), and its ordinal among the group *tag* columns, which is
+    /// where `label_values` keeps the value.
+    Tag {
+        tag: usize,
+        encoding: TagEncoding,
+        position: usize,
+        ordinal: usize,
+    },
+}
+
+/// The slot ids of one label group, indexed by absolute grid index.
+///
+/// The column grows with the highest absolute index the group has occupied so far instead of with
+/// the grid, so a group that only covers the tail of the grid does not allocate the whole of it.
+/// A shape in which every group spans the whole grid still costs one `u32` per grid point per
+/// group; those bytes are reserved on the stream's memory pool as they are taken.
+#[derive(Default)]
+struct SlotColumn {
+    ids: Vec<u32>,
+}
+
+impl SlotColumn {
+    /// The slot of `abs`, or `None` when this group has no point there yet.
+    fn get(&self, abs: usize) -> Option<u32> {
+        match self.ids.get(abs) {
+            Some(&slot) if slot != NO_SLOT => Some(slot),
+            _ => None,
+        }
+    }
+
+    /// Extends the column to hold `abs`, reserving the new indices on the pool first.
+    ///
+    /// Grows in steps, so a dense group pays one reservation per step instead of one per point,
+    /// and never initializes past the step that covers `abs`.
+    fn reserve(&mut self, abs: usize, reservation: &mut MemoryReservation) -> Result<()> {
+        // Indices a single step adds: 256 bytes per group and step, at most one step of slack.
+        const STEP: usize = 64;
+        if self.ids.len() > abs {
+            return Ok(());
+        }
+        let target = abs + STEP;
+        reservation.try_grow((target - self.ids.len()) * size_of::<u32>())?;
+        self.ids.resize(target, NO_SLOT);
+        Ok(())
+    }
+
+    fn set(&mut self, abs: usize, slot: u32) {
+        self.ids[abs] = slot;
+    }
+}
+
+impl PartialSumStream {
+    /// Creates the accumulator state of one stream and resolves its group columns.
+    fn try_new(
+        config: PartialSum,
+        accumulator: Box<dyn GroupsAccumulator>,
+        classification: &[OutputColumn],
+        tags: Arc<[String]>,
+        grid: Arc<EvalGrid>,
+    ) -> Result<Self> {
+        let mut group_columns = Vec::with_capacity(config.group_columns.len());
+        let mut ordinals = 0;
+        for position in &config.group_columns {
+            let column = match classification.get(*position) {
+                Some(OutputColumn::Time) => GroupColumn::Time,
+                Some(OutputColumn::Tag(tag, encoding)) => {
+                    let column = GroupColumn::Tag {
+                        tag: *tag,
+                        encoding: *encoding,
+                        position: *position,
+                        ordinal: ordinals,
+                    };
+                    ordinals += 1;
+                    column
+                }
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "partial sum group column {position} is {other:?}, but only the time \
+                         column and tag columns can be group keys"
+                    )));
+                }
+            };
+            group_columns.push(column);
+        }
+        let value_field = match classification.get(config.value_column) {
+            Some(OutputColumn::Field(index)) => *index,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "partial sum value column {} is {other:?}, but it must be a series field",
+                    config.value_column
+                )));
+            }
+        };
+        Ok(Self {
+            config,
+            accumulator,
+            value_field,
+            group_columns,
+            grid,
+            tags,
+            slots: Vec::new(),
+            labels: HashMap::new(),
+            label_values: Vec::new(),
+            keys: Vec::new(),
+            keys_reserved: 0,
+            accumulator_bytes: 0,
+        })
+    }
+
+    /// Folds one completed evaluated series into the accumulator and reports the points it fed.
+    ///
+    /// Zero means the series held no point at all and contributed no group, so it has no output
+    /// row and nothing to accumulate. The series is dropped by the caller right after this call:
+    /// only accumulator state survives.
+    fn ingest(
+        &mut self,
+        series: &Series,
+        occupancy: &Occupancy,
+        reservation: &mut MemoryReservation,
+    ) -> Result<usize> {
+        let TimeAxis::Grid(range) = &series.time else {
+            return Err(DataFusionError::Execution(
+                "FusedSeriesExec requires evaluated series on a time grid".into(),
+            ));
+        };
+        let rows = range.len();
+        // A dense occupancy is every row, so the common case allocates no offset list here.
+        let points = if occupancy.dense {
+            rows
+        } else {
+            occupancy.offsets.len()
+        };
+        if points == 0 {
+            return Ok(0);
+        }
+        let start = range.start();
+
+        // The label group is the aggregate's tag columns only: the timestamp is the other half of
+        // the slot key, so it must not take part in the group's identity.
+        let mut values = Vec::with_capacity(self.group_columns.len());
+        for column in &self.group_columns {
+            if let GroupColumn::Tag {
+                tag,
+                encoding,
+                position,
+                ..
+            } = column
+            {
+                values.push(tag_value(series, &self.tags, *tag, *encoding, *position)?);
+            }
+        }
+        let group = self.label_group(&values, reservation)?;
+
+        // One `group_indices` entry per row of the value array below. A row with no value carries
+        // an in-range index: SUM skips nulls, so it never contributes to that slot.
+        let mut indices = vec![0usize; rows];
+        if occupancy.dense {
+            for (offset, index) in indices.iter_mut().enumerate() {
+                *index = self.slot(group, start + offset, reservation)? as usize;
+            }
+        } else {
+            for offset in &occupancy.offsets {
+                indices[*offset] = self.slot(group, start + offset, reservation)? as usize;
+            }
+        }
+
+        // The occupancy of a point is the union over the series' fields, so with more than one
+        // field a point can be occupied while *this* value column is null: SUM skips it, and a
+        // slot that receives no value at all emits a null state. The planner hook therefore only
+        // binds a single-field shape, where "occupied" and "the summed value is non-null" are the
+        // same set and the state rows match DataFusion's own partial groups exactly.
+        let samples = series.fields.get(self.value_field).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "evaluated series has no field at index {}",
+                self.value_field
+            ))
+        })?;
+        let values = field_column(samples)?;
+        if values.len() != rows {
+            return Err(DataFusionError::Execution(format!(
+                "evaluated series field {} has {} rows, time axis has {rows}",
+                self.value_field,
+                values.len()
+            )));
+        }
+        // `total_num_groups` is the slot count *after* this series' slots exist, and slots are
+        // handed out contiguously, so the accumulator can size itself once per batch.
+        self.accumulator
+            .update_batch(&[values], &indices, None, self.keys.len())?;
+        let size = self.accumulator.size();
+        if size > self.accumulator_bytes {
+            reservation.try_grow(size - self.accumulator_bytes)?;
+            self.accumulator_bytes = size;
+        }
+        Ok(points)
+    }
+
+    /// The label group of the given tag values, registering a new one on first use.
+    fn label_group(
+        &mut self,
+        values: &[Option<String>],
+        reservation: &mut MemoryReservation,
+    ) -> Result<usize> {
+        let mut key = Vec::new();
+        for value in values {
+            match value {
+                Some(value) => {
+                    // Length-prefixed, marked for presence: an absent label must not encode like
+                    // the empty label value, and a value must not swallow its neighbour.
+                    key.push(1);
+                    push_component(&mut key, value);
+                }
+                None => key.push(0),
+            }
+        }
+        if let Some(group) = self.labels.get(&key) {
+            return Ok(*group);
+        }
+        let group = self.slots.len();
+        let bytes = key.len()
+            + size_of::<usize>()
+            + size_of::<Vec<Option<String>>>()
+            + values
+                .iter()
+                .map(|value| value.as_ref().map_or(0, String::len))
+                .sum::<usize>();
+        reservation.try_grow(bytes)?;
+        self.labels.insert(key, group);
+        self.slots.push(SlotColumn::default());
+        self.label_values.push(values.to_vec());
+        Ok(group)
+    }
+
+    /// The slot of `(group, abs)`, allocated on first use.
+    fn slot(
+        &mut self,
+        group: usize,
+        abs: usize,
+        reservation: &mut MemoryReservation,
+    ) -> Result<u32> {
+        if let Some(slot) = self.slots[group].get(abs) {
+            return Ok(slot);
+        }
+        let slot = u32::try_from(self.keys.len()).map_err(|_| {
+            DataFusionError::Execution(
+                "FusedSeriesExec partial sum exceeds the supported number of groups".into(),
+            )
+        })?;
+        // Charge the slot table in steps, so a long run of new slots costs one reservation per
+        // step rather than one per point.
+        if self.keys.len() == self.keys_reserved {
+            const STEP: usize = 64;
+            reservation.try_grow(STEP * size_of::<(u32, u32)>())?;
+            self.keys_reserved += STEP;
+        }
+        self.slots[group].reserve(abs, reservation)?;
+        self.slots[group].set(abs, slot);
+        self.keys.push((
+            u32::try_from(group).map_err(|_| {
+                DataFusionError::Execution(
+                    "FusedSeriesExec partial sum exceeds the supported number of label groups"
+                        .into(),
+                )
+            })?,
+            u32::try_from(abs).map_err(|_| {
+                DataFusionError::Execution(
+                    "FusedSeriesExec partial sum exceeds the supported grid length".into(),
+                )
+            })?,
+        ));
+        Ok(slot)
+    }
+
+    /// Reads the accumulator's state once and builds the batch this partition reports.
+    ///
+    /// `None` means the partition saw no point at all: an empty partition emits an empty stream
+    /// instead of a fabricated zero row. `evaluate()` is never called; the state API is the
+    /// contract, so the final aggregate above consumes exactly what DataFusion would have written.
+    fn emit_state(&mut self) -> Result<Option<RecordBatch>> {
+        if self.keys.is_empty() {
+            return Ok(None);
+        }
+        let state = self.accumulator.state(EmitTo::All)?;
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.group_columns.len() + state.len());
+        for column in &self.group_columns {
+            columns.push(match column {
+                GroupColumn::Time => Arc::new(TimestampMillisecondArray::from(
+                    self.keys
+                        .iter()
+                        .map(|(_, abs)| self.grid.timestamps()[*abs as usize])
+                        .collect::<Vec<_>>(),
+                )),
+                GroupColumn::Tag {
+                    ordinal, encoding, ..
+                } => self.tag_group_column(*ordinal, *encoding)?,
+            });
+        }
+        columns.extend(state);
+        Ok(Some(RecordBatch::try_new(
+            self.config.output_schema.clone(),
+            columns,
+        )?))
+    }
+
+    /// One group tag column of the state batch: the label value of each slot's group.
+    fn tag_group_column(&self, ordinal: usize, encoding: TagEncoding) -> Result<ArrayRef> {
+        let values = self
+            .keys
+            .iter()
+            .map(|(group, _)| self.label_values[*group as usize][ordinal].as_deref());
+        if !encoding.dictionary {
+            return Ok(Arc::new(StringArray::from_iter(values)));
+        }
+        // Real keys through the builder, so the state batch's dictionary column is a legal
+        // dictionary and not one entry with every row pointing at it.
+        let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+        for value in values {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+/// Turns raw series chunks into output batches of coalesced completed series, or, in partial mode,
+/// into one batch of partial-aggregate state per partition.
 struct FusedSeriesStream {
     input: SendableRawSeriesStream,
     /// `None` once the child ended; `finish(self)` consumes the evaluator.
@@ -1002,6 +1604,8 @@ struct FusedSeriesStream {
     tags: Arc<[String]>,
     output_schema: SchemaRef,
     classification: Arc<[OutputColumn]>,
+    /// The running partial aggregate of this partition; `None` in evaluated mode.
+    partial: Option<PartialSumStream>,
     /// The grid positions each final label set already occupies, as merged, sorted runs.
     ///
     /// Per stream, hence per partition: each partition owns whole series of its own, so a label
@@ -1012,9 +1616,9 @@ struct FusedSeriesStream {
     pending_rows: usize,
     /// Bytes of `pending`, reserved on `reservation` like the label-set state.
     pending_bytes: usize,
-    /// Accounts for `seen` and `pending`; batches already handed downstream are not reserved.
-    /// Released at [`Self::abort`] on every error path, and by [`MemoryReservation`]'s own `Drop`
-    /// otherwise.
+    /// Accounts for `seen`, `pending` and the partial aggregate's slot and accumulator state;
+    /// batches already handed downstream are not reserved. Released at [`Self::abort`] on every
+    /// error path, and by [`MemoryReservation`]'s own `Drop` otherwise.
     reservation: MemoryReservation,
     finished: bool,
     /// Standard `output_rows` / `output_batches` / `elapsed_compute`.
@@ -1024,8 +1628,8 @@ struct FusedSeriesStream {
     timers: FusedTimers,
 }
 
-/// The four block-scoped timers, the three batch-region timers and the three counters of one
-/// partition.
+/// The four block-scoped timers, the three batch-region timers, the three counters of one
+/// partition and, in partial mode, its two partial timers and four partial counters.
 #[derive(Clone)]
 struct FusedTimers {
     input_poll: Time,
@@ -1038,11 +1642,19 @@ struct FusedTimers {
     input_chunks: Count,
     series_completed: Count,
     series_emitted: Count,
+    /// Recorded but only *registered* in partial mode, so a node that never folds into an
+    /// accumulator reports no empty partial metrics.
+    partial_update: Time,
+    partial_state: Time,
+    partial_updates: Count,
+    partial_points: Count,
+    partial_slots: Count,
+    partial_state_rows: Count,
 }
 
 impl FusedTimers {
     /// Registers the handles on `set` for `partition` and returns the clones the stream records on.
-    fn register(set: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    fn register(set: &ExecutionPlanMetricsSet, partition: usize, partial: bool) -> Self {
         let build_time = |name: &'static str| {
             let time = Time::new();
             MetricBuilder::new(set)
@@ -1077,6 +1689,42 @@ impl FusedTimers {
         let series_completed = build_count(METRIC_SERIES_COMPLETED);
         let series_emitted = build_count(METRIC_SERIES_EMITTED);
 
+        // Partial metrics exist only on a node that actually folds into an accumulator; the
+        // handles are still created so the recording sites need no branches, but an evaluated
+        // node registers nothing and reports nothing.
+        let partial_update = Time::new();
+        let partial_state = Time::new();
+        let partial_updates = Count::new();
+        let partial_points = Count::new();
+        let partial_slots = Count::new();
+        let partial_state_rows = Count::new();
+        if partial {
+            for (name, time) in [
+                (METRIC_PARTIAL_UPDATE, &partial_update),
+                (METRIC_PARTIAL_STATE, &partial_state),
+            ] {
+                MetricBuilder::new(set)
+                    .with_partition(partition)
+                    .build(MetricValue::Time {
+                        name: name.into(),
+                        time: time.clone(),
+                    });
+            }
+            for (name, count) in [
+                (METRIC_PARTIAL_UPDATES, &partial_updates),
+                (METRIC_PARTIAL_POINTS, &partial_points),
+                (METRIC_PARTIAL_SLOTS, &partial_slots),
+                (METRIC_PARTIAL_STATE_ROWS, &partial_state_rows),
+            ] {
+                MetricBuilder::new(set)
+                    .with_partition(partition)
+                    .build(MetricValue::Count {
+                        name: name.into(),
+                        count: count.clone(),
+                    });
+            }
+        }
+
         Self {
             input_poll,
             evaluate,
@@ -1088,6 +1736,12 @@ impl FusedTimers {
             input_chunks,
             series_completed,
             series_emitted,
+            partial_update,
+            partial_state,
+            partial_updates,
+            partial_points,
+            partial_slots,
+            partial_state_rows,
         }
     }
 
@@ -1120,6 +1774,9 @@ impl FusedSeriesStream {
         self.pending = Vec::new();
         self.pending_rows = 0;
         self.pending_bytes = 0;
+        // The accumulator, the slot columns and the label group table go with it; the whole
+        // reservation built up by `seen`, `pending` and the partial state is freed in one call.
+        self.partial = None;
         self.reservation.free();
     }
 
@@ -1169,6 +1826,48 @@ impl FusedSeriesStream {
             &occupancy,
         )?;
         self.timers.emit.add_elapsed(started);
+        Ok(batch)
+    }
+
+    /// Folds one finished series into the partial aggregate and reports the points it fed.
+    ///
+    /// Zero means the series held no value at all, so it created no group and added no row. The
+    /// duplicate-label-set check runs first and unchanged: a `SUM` above the node must not swallow
+    /// the error a bare evaluated query reports.
+    fn ingest_partial(&mut self, series: &Series) -> Result<usize> {
+        let started = Instant::now();
+        let occupancy = occupancy(series)?;
+        self.claim_label_set(series, &occupancy.runs)?;
+        let update_started = Instant::now();
+        let points = match self.partial.as_mut() {
+            Some(partial) => partial.ingest(series, &occupancy, &mut self.reservation)?,
+            None => 0,
+        };
+        if points > 0 {
+            self.timers.partial_update.add_elapsed(update_started);
+            self.timers.partial_updates.add(1);
+            self.timers.partial_points.add(points);
+        }
+        self.timers.emit.add_elapsed(started);
+        Ok(points)
+    }
+
+    /// Emits the partial aggregate's state for this partition, once, at its end.
+    ///
+    /// `None` means the partition saw no point at all: it emits an empty stream rather than a
+    /// fabricated zero row, so a `sum` over nothing stays empty.
+    fn emit_partial_state(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(partial) = self.partial.as_mut() else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let slots = partial.keys.len();
+        let batch = partial.emit_state()?;
+        if let Some(batch) = &batch {
+            self.timers.partial_state.add_elapsed(started);
+            self.timers.partial_slots.add(slots);
+            self.timers.partial_state_rows.add(batch.num_rows());
+        }
         Ok(batch)
     }
 
@@ -1232,10 +1931,33 @@ impl FusedSeriesStream {
         // Every call starts a fresh budget, so returning a batch below resets it.
         let mut consumed = 0usize;
         loop {
-            // A finished evaluator means the child already ended and its last series is emitted:
-            // the buffered rows are all that is left, so they are flushed before the end is
-            // reported. The stream therefore never reports the end with rows still buffered.
+            // A finished evaluator means the child already ended and its last series is emitted.
+            // Evaluated mode then flushes the buffered rows before reporting the end, so the
+            // stream never ends with rows still buffered. Partial mode has no buffered rows: it
+            // emits the accumulator's state exactly once, and nothing after it.
             if this.evaluator.is_none() {
+                if this.partial.is_some() {
+                    let emitted = this.emit_partial_state();
+                    // Set before reporting, so the next poll sees a terminal stream. A partition
+                    // without a single point stays an empty stream, never a zero row.
+                    this.finished = true;
+                    return match emitted {
+                        Ok(batch) => {
+                            // The state batch was the last thing this stream retained: the slot
+                            // columns and the accumulator are dead weight from here on, so their
+                            // bytes go back to the pool instead of waiting for the stream's drop.
+                            this.reservation.free();
+                            match batch {
+                                Some(batch) => Poll::Ready(Some(Ok(batch))),
+                                None => Poll::Ready(None),
+                            }
+                        }
+                        Err(error) => {
+                            this.abort();
+                            Poll::Ready(Some(Err(error)))
+                        }
+                    };
+                }
                 return match this.flush() {
                     Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
                     Ok(None) => {
@@ -1322,6 +2044,22 @@ impl FusedSeriesStream {
                 continue;
             };
             this.timers.series_completed.add(1);
+            // Partial mode never builds evaluated rows: the series goes straight into the
+            // accumulator, and the one state batch is built at the end of the partition.
+            if this.partial.is_some() {
+                match this.ingest_partial(&series) {
+                    // A series without a single point contributes no group and no row.
+                    Ok(0) => continue,
+                    Ok(_) => {
+                        this.timers.series_emitted.add(1);
+                        continue;
+                    }
+                    Err(error) => {
+                        this.abort();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                }
+            }
             match this.emit(&series) {
                 // A series without a single value has no row to contribute.
                 Ok(None) => continue,
