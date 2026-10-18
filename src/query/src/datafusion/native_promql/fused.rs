@@ -715,6 +715,7 @@ mod e2e {
     use std::time::{Duration, UNIX_EPOCH};
 
     use api::region::RegionResponse;
+    use api::v1::SemanticType;
     use async_trait::async_trait;
     use catalog::RegisterTableRequest;
     use catalog::memory::MemoryCatalogManager;
@@ -741,7 +742,7 @@ mod e2e {
     use promql_parser::parser;
     use promql_parser::parser::EvalStmt;
     use session::context::QueryContext;
-    use store_api::metadata::RegionMetadataRef;
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
     use store_api::region_engine::{
         PrepareRequest, QueryScanContext, RawLabelSource, RawSeriesStream, RegionEngine,
         RegionEngineRef, RegionRole, RegionScanner, RegionScannerRef, RegionStatistic,
@@ -761,18 +762,74 @@ mod e2e {
     use crate::query_engine::QueryEngineState;
 
     const TABLE: &str = "some_metric";
-    const TAG: &str = "k0";
     const TIME: &str = "ts";
     const VALUE: &str = "v0";
 
-    /// One sample per minute from 0s to 540s, rising 60 per sample. Starting at 0s means every
-    /// five-minute window of `rate` in the evaluated range is fully covered, so both the ordinary
-    /// and the fused path must report exactly one per second with no extrapolation slack.
-    fn samples() -> Vec<(i64, f64)> {
-        (0..=9).map(|i| (i * 60_000, (i * 60) as f64)).collect()
+    /// The tags of the fixture table, in primary-key order. `sum by (instance)` keeps only
+    /// `instance`, so the other three are exactly the tags a tag-subset projection drops.
+    const TAGS: [&str; 4] = ["host", "instance", "job", "l1"];
+    /// The one tag `sum by (instance)` keeps.
+    const INSTANCE: &str = "instance";
+
+    /// One sample per minute from 0 s to 540 s, rising 60 per sample.
+    fn linear_counter(rate_per_minute: f64) -> Vec<(i64, f64)> {
+        (0..=9)
+            .map(|i| (i * 60_000, (i as f64) * rate_per_minute))
+            .collect()
     }
 
-    fn engine_state() -> QueryEngineState {
+    /// Two instances, each with one series in each of the two storage partitions. The four
+    /// slopes are chosen so that a correct `sum by (instance)` gives a value no partial sum can
+    /// imitate: `instance=x` is 1 + 2 and `instance=y` is 3 + 4 per second.
+    fn aggregate_fixture() -> Fixture {
+        Fixture {
+            tags: TAGS.to_vec(),
+            partitions: 2,
+            series: vec![
+                FixtureSeries {
+                    tags: vec!["a", "x", "j", "l"],
+                    partition: 0,
+                    samples: linear_counter(60.0),
+                },
+                FixtureSeries {
+                    tags: vec!["b", "x", "j", "l"],
+                    partition: 1,
+                    samples: linear_counter(120.0),
+                },
+                FixtureSeries {
+                    tags: vec!["c", "y", "j", "l"],
+                    partition: 0,
+                    samples: linear_counter(180.0),
+                },
+                FixtureSeries {
+                    tags: vec!["d", "y", "j", "l"],
+                    partition: 1,
+                    samples: linear_counter(240.0),
+                },
+            ],
+        }
+    }
+
+    /// One series in the first partition, for the tests that do not need two.
+    fn one_series_fixture() -> Fixture {
+        Fixture {
+            tags: TAGS.to_vec(),
+            partitions: 1,
+            series: vec![FixtureSeries {
+                tags: vec!["alpha", "x", "j", "l"],
+                partition: 0,
+                samples: linear_counter(60.0),
+            }],
+        }
+    }
+
+    /// An engine whose native-PromQL flag is `native` and whose parallelism is `parallelism`.
+    ///
+    /// `parallelism` is the session's `target_partitions`, which is what the scan-parallelizing
+    /// optimizer splits a region's ranges into. Pinning it to the fixture's own split is what
+    /// makes the fused node's partition count the number this file asserts, rather than whatever
+    /// the machine has cores for.
+    fn engine_state(native: bool, parallelism: usize) -> QueryEngineState {
         QueryEngineState::new(
             MemoryCatalogManager::with_default_setup(),
             None,
@@ -783,34 +840,69 @@ mod e2e {
             false,
             Plugins::default(),
             QueryOptions {
-                experimental_native_promql: true,
+                experimental_native_promql: native,
+                parallelism,
                 ..Default::default()
             },
         )
     }
 
-    /// A catalog holding the empty logical table the PromQL planner resolves.
-    fn table_provider() -> DfTableSourceProvider {
-        let catalog_list = MemoryCatalogManager::with_default_setup();
-        let columns = vec![
-            ColumnSchema::new(TAG.to_string(), ConcreteDataType::string_datatype(), false),
+    /// The columns of the fixture table: the tag columns, then the field, then the time index.
+    fn table_columns() -> (Vec<ColumnSchema>, usize) {
+        let mut columns: Vec<ColumnSchema> = TAGS
+            .iter()
+            .map(|tag| {
+                ColumnSchema::new(tag.to_string(), ConcreteDataType::string_datatype(), false)
+            })
+            .collect();
+        columns.push(ColumnSchema::new(
+            VALUE.to_string(),
+            ConcreteDataType::float64_datatype(),
+            true,
+        ));
+        columns.push(
             ColumnSchema::new(
                 TIME,
                 ConcreteDataType::timestamp_millisecond_datatype(),
                 false,
             )
             .with_time_index(true),
-            ColumnSchema::new(
-                VALUE.to_string(),
-                ConcreteDataType::float64_datatype(),
-                true,
-            ),
-        ];
+        );
+        (columns, TAGS.len())
+    }
+
+    /// A region metadata over [`table_columns`] whose primary key is every tag column, in order.
+    fn fixture_region_metadata(region_id: RegionId) -> RegionMetadataRef {
+        let (columns, tags) = table_columns();
+        let mut builder = RegionMetadataBuilder::new(region_id);
+        for (index, column) in columns.iter().enumerate() {
+            let semantic_type = match index {
+                i if i < tags => SemanticType::Tag,
+                i if i == tags => SemanticType::Field,
+                _ => SemanticType::Timestamp,
+            };
+            builder.push_column_metadata(ColumnMetadata {
+                column_schema: column.clone(),
+                semantic_type,
+                column_id: index as u32,
+            });
+        }
+        builder.primary_key((0..tags as u32).collect());
+        Arc::new(builder.build().unwrap())
+    }
+
+    /// A catalog holding the empty logical table the PromQL planner resolves.
+    fn table_provider() -> DfTableSourceProvider {
+        let catalog_list = MemoryCatalogManager::with_default_setup();
+        let (columns, tags) = table_columns();
+        let tag_count = columns.len() - 2;
+        assert_eq!(tags, tag_count);
         let schema = Arc::new(Schema::new(columns));
         let table_meta = TableMetaBuilder::empty()
             .schema(schema)
-            .primary_key_indices(vec![0])
-            .value_indices(vec![2])
+            // The field is the column between the tags and the time index.
+            .primary_key_indices((0..tags).collect())
+            .value_indices(vec![tags])
             .next_column_id(1024)
             .build()
             .unwrap();
@@ -837,10 +929,10 @@ mod e2e {
         )
     }
 
-    /// `rate(some_metric[5m])` from 360s to 540s. Every five-minute window of the fixture below is
-    /// fully covered from 360s on, so both the ordinary and the fused path must report exactly
-    /// 1/s at every step. The first window of a range query is left open by the ordinary plan,
-    /// which would need extrapolation slack, so it is deliberately outside the compared range.
+    /// `rate(some_metric[5m])` from 360 s to 540 s, at 60 s steps.
+    ///
+    /// The fixture has one sample per minute, so every window from 360 s on holds five intervals
+    /// and is fully covered: no extrapolation slack enters the expected value.
     fn eval_stmt() -> EvalStmt {
         EvalStmt {
             expr: parser::parse(&format!("rate({TABLE}[5m])")).unwrap(),
@@ -854,14 +946,70 @@ mod e2e {
     /// `sum by (k0) (rate(some_metric[5m]))`, the most common query shape, over the same range.
     fn aggregate_eval_stmt() -> EvalStmt {
         EvalStmt {
-            expr: parser::parse(&format!("sum by ({TAG}) (rate({TABLE}[5m]))")).unwrap(),
+            expr: parser::parse(&format!("sum by ({INSTANCE}) (rate({TABLE}[5m]))")).unwrap(),
             ..eval_stmt()
         }
     }
 
-    /// A region engine serving one series with both an ordinary and a raw-series scan.
+    /// One series of the mock region: its tag values in primary-key order, the storage partition
+    /// that owns it, and its samples.
+    struct FixtureSeries {
+        tags: Vec<&'static str>,
+        partition: usize,
+        samples: Vec<(i64, f64)>,
+    }
+
+    /// The rows a mock region serves, and how they are split across storage partitions.
+    ///
+    /// Both scanners read from this one description: the ordinary scan serves the rows of each
+    /// partition and the raw scan serves the series of each partition, so the two arms of every
+    /// comparison see the same data under the same ownership.
+    struct Fixture {
+        tags: Vec<&'static str>,
+        series: Vec<FixtureSeries>,
+        partitions: usize,
+    }
+
+    impl fmt::Debug for Fixture {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Fixture")
+                .field("tags", &self.tags)
+                .field("series", &self.series.len())
+                .field("partitions", &self.partitions)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for FixtureSeries {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("FixtureSeries")
+                .field("tags", &self.tags)
+                .field("partition", &self.partition)
+                .field("samples", &self.samples.len())
+                .finish()
+        }
+    }
+
+    impl Fixture {
+        /// The rows of one storage partition, series by series, each in timestamp order.
+        fn rows_of(&self, partition: usize) -> Vec<(&[&'static str], i64, f64)> {
+            self.series
+                .iter()
+                .filter(|series| series.partition == partition)
+                .flat_map(|series| {
+                    series
+                        .samples
+                        .iter()
+                        .map(move |(ts, value)| (series.tags.as_slice(), *ts, *value))
+                })
+                .collect()
+        }
+    }
+
+    /// A region engine serving the fixture with both an ordinary and a raw-series scan.
     struct MockEngine {
         metadata: RegionMetadataRef,
+        fixture: Arc<Fixture>,
         requests: Mutex<Vec<ScanRequest>>,
     }
 
@@ -884,10 +1032,15 @@ mod e2e {
         ) -> Result<RegionScannerRef, BoxedError> {
             self.requests.lock().unwrap().push(request);
             Ok(Box::new(MockScanner {
-                properties: ScannerProperties::default(),
+                // One empty range per storage partition: the fixture's split, not the request's.
+                properties: ScannerProperties::new(
+                    vec![Vec::new(); self.fixture.partitions],
+                    false,
+                    0,
+                ),
                 metadata: self.metadata.clone(),
                 schema: self.metadata.schema.clone(),
-                rows: samples(),
+                fixture: self.fixture.clone(),
             }))
         }
         async fn get_metadata(
@@ -944,7 +1097,7 @@ mod e2e {
         properties: ScannerProperties,
         metadata: RegionMetadataRef,
         schema: datatypes::schema::SchemaRef,
-        rows: Vec<(i64, f64)>,
+        fixture: Arc<Fixture>,
     }
 
     impl MockScanner {
@@ -980,6 +1133,10 @@ mod e2e {
             self.metadata.clone()
         }
         fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
+            // A real scanner applies the ranges the planner hands it, and the fused path relies on
+            // that: it collapses the scan to one partition to resolve the raw-series binding and
+            // then restores the split it will actually run. Ignoring the ranges here would make
+            // every fused build fail at the binding gate instead of exercising that path.
             self.properties.prepare(request);
             Ok(())
         }
@@ -987,27 +1144,31 @@ mod e2e {
             &self,
             _ctx: &QueryScanContext,
             _metrics: &ExecutionPlanMetricsSet,
-            _partition: usize,
+            partition: usize,
         ) -> Result<common_recordbatch::SendableRecordBatchStream, BoxedError> {
-            // The ordinary scan projects the entire schema; `RegionScanExec` does not project.
-            let batch = DfRecordBatch::try_new(
-                self.schema.arrow_schema().clone(),
-                vec![
-                    Arc::new(StringArray::from(vec!["alpha"; self.rows.len()])) as ArrayRef,
-                    Arc::new(TimestampMillisecondArray::from(
-                        self.rows.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
-                    )),
-                    Arc::new(Float64Array::from(
-                        self.rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-                    )),
-                ],
-            )
-            .map_err(|e| {
-                BoxedError::new(common_error::ext::PlainError::new(
-                    e.to_string(),
-                    common_error::status_code::StatusCode::Internal,
-                ))
-            })?;
+            // The ordinary scan projects the entire schema, and a storage partition only holds
+            // its own series, so each output partition reports its own rows.
+            let rows = self.fixture.rows_of(partition);
+            let mut columns: Vec<ArrayRef> = (0..self.fixture.tags.len())
+                .map(|tag| {
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(tags, _, _)| tags[tag]),
+                    )) as ArrayRef
+                })
+                .collect();
+            columns.push(Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|(_, _, value)| *value),
+            )));
+            columns.push(Arc::new(TimestampMillisecondArray::from_iter_values(
+                rows.iter().map(|(_, ts, _)| *ts),
+            )));
+            let batch = DfRecordBatch::try_new(self.schema.arrow_schema().clone(), columns)
+                .map_err(|e| {
+                    BoxedError::new(common_error::ext::PlainError::new(
+                        e.to_string(),
+                        common_error::status_code::StatusCode::Internal,
+                    ))
+                })?;
             let df_stream = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
                 batch.schema(),
                 futures::stream::iter(vec![Ok::<_, datafusion_common::DataFusionError>(batch)]),
@@ -1036,32 +1197,44 @@ mod e2e {
             label_source: &RawLabelSource,
         ) -> Result<Option<SendableRawSeriesStream>, BoxedError> {
             let schema = self.raw_schema();
-            // A `PerSeries` scan owns each series in exactly one partition, so the fixture's one
-            // series is served by the first partition and the others are empty. Serving it from
-            // every partition would report the same series once per partition.
-            let chunk = (partition == 0).then(|| {
-                let samples = samples();
-                let fields = SeriesFields::try_from_vec(vec![Samples::from_float(
-                    Float64Array::from(samples.iter().map(|(_, v)| Some(*v)).collect::<Vec<_>>()),
-                )])
-                .unwrap();
-                RawSeriesChunk::try_new(
-                    &schema,
-                    Buffer::from(dense_primary_key("alpha").as_slice()),
-                    None,
-                    RawTimestamps::try_new(
-                        samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>().into(),
+            // A `PerSeries` scan owns each series in exactly one partition, so a partition only
+            // serves the series assigned to it. Serving them all from every partition would report
+            // each series once per partition.
+            let chunks: Vec<RawSeriesChunk> = self
+                .fixture
+                .series
+                .iter()
+                .filter(|series| series.partition == partition)
+                .map(|series| {
+                    let fields = SeriesFields::try_from_vec(vec![Samples::from_float(
+                        Float64Array::from_iter_values(series.samples.iter().map(|(_, v)| *v)),
+                    )])
+                    .unwrap();
+                    RawSeriesChunk::try_new(
+                        &schema,
+                        Buffer::from(
+                            dense_primary_key(&series.tags, self.fixture.tags.len()).as_slice(),
+                        ),
+                        None,
+                        RawTimestamps::try_new(
+                            series
+                                .samples
+                                .iter()
+                                .map(|(ts, _)| *ts)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        )
+                        .unwrap(),
+                        fields,
+                        true,
                     )
-                    .unwrap(),
-                    fields,
-                    true,
-                )
-                .unwrap()
-            });
+                    .unwrap()
+                })
+                .collect();
             Ok(Some(Box::pin(SampleStream {
                 schema,
                 label_source: label_source.clone(),
-                chunk,
+                chunks: chunks.into_iter(),
             })))
         }
         fn raw_series_ordering(&self) -> SeriesOrdering {
@@ -1086,11 +1259,12 @@ mod e2e {
 
     /// Encodes one `String` primary key the way the region's dense codec does: a presence byte,
     /// the byte-string marker, then the value padded to a block with its significant length.
-    fn dense_primary_key(value: &str) -> Vec<u8> {
+    /// Encodes one `String` primary key column the way the region's dense codec does: a presence
+    /// byte, the byte-string marker, then the value padded to a block with its significant
+    /// length.
+    fn dense_string_column(value: &str, key: &mut Vec<u8>) {
         let bytes = value.as_bytes();
-        // A presence byte, then the byte-string marker: zero for an empty string, which stores
-        // no block at all.
-        let mut key = vec![1, u8::from(!bytes.is_empty())];
+        key.extend_from_slice(&[1, u8::from(!bytes.is_empty())]);
         let mut written = 0;
         for chunk in bytes.chunks(8) {
             key.extend_from_slice(chunk);
@@ -1103,19 +1277,32 @@ mod e2e {
                 9
             });
         }
+    }
+
+    /// The dense primary key of one fixture series: its tags in table order, concatenated.
+    fn dense_primary_key(tags: &[&str], expected: usize) -> Vec<u8> {
+        assert_eq!(
+            tags.len(),
+            expected,
+            "a fixture series must tag every key column"
+        );
+        let mut key = Vec::new();
+        for tag in tags {
+            dense_string_column(tag, &mut key);
+        }
         key
     }
 
     struct SampleStream {
         schema: Arc<SeriesSchema>,
         label_source: RawLabelSource,
-        chunk: Option<RawSeriesChunk>,
+        chunks: std::vec::IntoIter<RawSeriesChunk>,
     }
 
     impl Stream for SampleStream {
         type Item = Result<RawSeriesChunk, BoxedError>;
         fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.chunk.take().map(Ok))
+            Poll::Ready(self.chunks.next().map(Ok))
         }
     }
 
@@ -1190,10 +1377,23 @@ mod e2e {
         )
     }
 
-    #[tokio::test]
-    async fn a_real_rate_query_runs_through_the_fused_node() {
-        let state = engine_state();
-        let logical = PromPlanner::stmt_to_plan(table_provider(), &eval_stmt(), &state)
+    /// Plans, binds and physically plans one PromQL statement against `fixture`, returning both
+    /// arms of the comparison the production path would choose: the ordinary plan and, when the
+    /// flag is on, the plan the fused selection entry point returns.
+    ///
+    /// Neither arm is collected here, so a caller can inspect the plan before running it.
+    async fn plan_arms(
+        stmt: &EvalStmt,
+        fixture: &Arc<Fixture>,
+        native: bool,
+    ) -> (
+        QueryEngineState,
+        datafusion_expr::LogicalPlan,
+        Arc<dyn ExecutionPlan>,
+        Option<Arc<dyn ExecutionPlan>>,
+    ) {
+        let state = engine_state(native, fixture.partitions);
+        let logical = PromPlanner::stmt_to_plan(table_provider(), stmt, &state)
             .await
             .unwrap();
         let context = QueryEngineContext::new(state.session_state(), QueryContext::arc());
@@ -1203,10 +1403,10 @@ mod e2e {
 
         // Bind the plan to the mock region, then plan physically with the engine's planner.
         let region_id = RegionId::new(1, 1);
-        let metadata =
-            crate::optimizer::test_util::mock_table_provider(region_id).region_metadata();
+        let metadata = fixture_region_metadata(region_id);
         let engine: RegionEngineRef = Arc::new(MockEngine {
             metadata: metadata.clone(),
+            fixture: fixture.clone(),
             requests: Mutex::new(Vec::new()),
         });
         let dummy = DummyTableProvider::new(region_id, engine, metadata);
@@ -1217,6 +1417,24 @@ mod e2e {
             .create_physical_plan(&logical, &session)
             .await
             .unwrap();
+        // The flag is what routes a plan through the fused selection in production, so the same
+        // entry point is called here; a change in that routing fails the test rather than
+        // silently comparing the ordinary plan with itself.
+        let selected = if native {
+            super::try_select_fused(&logical, &physical).unwrap()
+        } else {
+            None
+        };
+        (state, logical, physical, selected)
+    }
+
+    #[tokio::test]
+    async fn a_real_rate_query_runs_through_the_fused_node() {
+        let fixture = Arc::new(one_series_fixture());
+        let (state, logical, ordinary, selected) = plan_arms(&eval_stmt(), &fixture, true).await;
+        let session = state.session_state();
+        let fused = selected
+            .unwrap_or_else(|| panic!("the rate query was not fused:\n{}", describe(&ordinary)));
 
         // Narrow down the gates so a failure says which one rejected the plan.
         let shape = super::FusedShape::discover(&logical).unwrap_or_else(|| {
@@ -1225,7 +1443,7 @@ mod e2e {
                 logical.display_indent()
             )
         });
-        let target = super::pick(&physical, &shape)
+        let target = super::pick(&ordinary, &shape)
             .unwrap_or_else(|| panic!("the physical plan does not hold the fused subtree"));
         let (scan, _) = super::fused_scan(&target).unwrap_or_else(|| {
             panic!(
@@ -1244,11 +1462,6 @@ mod e2e {
             "the built node is not a FusedSeriesExec:\n{}",
             describe(&built)
         );
-        // The production entry point must fuse the same plan.
-        let fused = super::try_select_fused(&logical, &physical).unwrap();
-        let Some(fused) = fused else {
-            panic!("the rate query was not fused:\n{}", describe(&physical));
-        };
         assert!(
             contains_fused(&fused),
             "the selected plan has no FusedSeriesExec:\n{}",
@@ -1263,8 +1476,9 @@ mod e2e {
             "the fused node must keep the scan's {scan_partitions} partitions:\n{}",
             describe(&fused)
         );
+
         // The fused result must equal the ordinary plan's result over the same samples.
-        let ordinary = datafusion::physical_plan::collect(physical, session.task_ctx())
+        let ordinary = datafusion::physical_plan::collect(ordinary, session.task_ctx())
             .await
             .unwrap();
         let fused_batches = datafusion::physical_plan::collect(fused, session.task_ctx())
@@ -1272,65 +1486,8 @@ mod e2e {
             .unwrap();
         assert!(!fused_batches.is_empty(), "the fused plan produced no rows");
 
-        let mut fused_rows = Vec::new();
-        for batch in &fused_batches {
-            let timestamps = batch
-                .column_by_name(TIME)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            let value = batch
-                .column_by_name(
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|field| {
-                            field.data_type() == &datafusion::arrow::datatypes::DataType::Float64
-                        })
-                        .unwrap()
-                        .name(),
-                )
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap();
-            for row in 0..batch.num_rows() {
-                fused_rows.push((timestamps.value(row), value.value(row)));
-            }
-        }
-        let mut ordinary_rows = Vec::new();
-        for batch in &ordinary {
-            let timestamps = batch
-                .column_by_name(TIME)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            let value = batch
-                .column_by_name(
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|field| {
-                            field.data_type() == &datafusion::arrow::datatypes::DataType::Float64
-                        })
-                        .unwrap()
-                        .name(),
-                )
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap();
-            for row in 0..batch.num_rows() {
-                ordinary_rows.push((timestamps.value(row), value.value(row)));
-            }
-        }
-        fused_rows.sort_by_key(|row| row.0);
-        ordinary_rows.sort_by_key(|row| row.0);
-
+        let fused_rows = timestamped_rows(&fused_batches);
+        let ordinary_rows = timestamped_rows(&ordinary);
         // The fused path must cover exactly the evaluated grid.
         assert_eq!(
             fused_rows.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
@@ -1338,97 +1495,107 @@ mod e2e {
             "the fused path must report the same steps as the ordinary plan"
         );
         assert!(!fused_rows.is_empty());
-        // A counter rising 60 per 60s has a constant rate, whatever the window convention is, so
-        // every fused value must be positive, finite, and identical.
-        let first = fused_rows[0].1;
-        assert!(first.is_finite() && first > 0.0, "{fused_rows:?}");
+        // A counter rising 60 per 60 s has a constant rate, so every value must be the same
+        // positive reading, and the two paths must agree to within the last bits of a float.
+        let expected = 60.0 / 60_000.0 * 1_000.0;
         for (timestamp, value) in &fused_rows {
             assert!(
-                (value - first).abs() < 1e-9,
-                "rate of a linear counter is not constant at {timestamp}: {fused_rows:?}"
+                close_to(*value, expected),
+                "the fused rate at {timestamp} is not {expected}: {fused_rows:?}"
             );
         }
-        // The two paths disagree at a window boundary because the fused node keeps the sample at
-        // the window start while the ordinary fold drops it; the interior steps agree. This is
-        // asserted as a bound instead of equality so the test states the difference instead of
-        // hiding it: both are one-per-second-ish readings of the same counter.
-        let expected = 60.0 / 60_000.0 * 1_000.0;
-        for (timestamp, value) in &ordinary_rows {
+        for ((timestamp, value), (_, ordinary_value)) in fused_rows.iter().zip(&ordinary_rows) {
             assert!(
-                (value - expected).abs() < 0.25,
-                "the ordinary plan's rate at {timestamp} is far from {expected}: {ordinary_rows:?}"
+                close_to(*value, *ordinary_value),
+                "the fused and ordinary rates at {timestamp} disagree: \
+                 fused {value}, ordinary {ordinary_value}"
             );
         }
-        assert!(
-            (first - expected).abs() < 0.25,
-            "the fused rate is far from {expected}: {fused_rows:?}"
-        );
     }
 
-    /// The most common query shape, an aggregation over a range function, must fuse too.
+    /// `sum by (instance) (rate(...))` over a four-tag table, two storage partitions and two
+    /// instances that each own a series in both partitions.
     ///
-    /// The logical aggregate becomes physical nodes the logical tree does not describe one for one,
-    /// so the swapped subtree is found by its content: the projection whose output schema is the
-    /// matched subtree's own schema and which folds exactly one range window. The aggregate above
-    /// it keeps its own shape, which is what makes the swap an equivalent plan.
+    /// The four counters rise 1, 2, 3 and 4 per second, so a correct aggregation reports 3 for
+    /// `instance=x` and 7 for `instance=y` at every step. Those sums cannot be reached by
+    /// dropping a partition (which would give 1/3 or 2/4), by losing the tag subset (four
+    /// groups), or by mixing the instances (which would report a constant 5).
     #[tokio::test]
     async fn a_real_aggregated_rate_query_runs_through_the_fused_node() {
-        let state = engine_state();
-        let logical = PromPlanner::stmt_to_plan(table_provider(), &aggregate_eval_stmt(), &state)
-            .await
-            .unwrap();
-        let context = QueryEngineContext::new(state.session_state(), QueryContext::arc());
-        let logical = state
-            .optimize_by_extension_rules(logical, &context)
-            .unwrap();
-
-        // Bind the plan to the mock region, then plan physically with the engine's planner.
-        let region_id = RegionId::new(1, 1);
-        let metadata =
-            crate::optimizer::test_util::mock_table_provider(region_id).region_metadata();
-        let engine: RegionEngineRef = Arc::new(MockEngine {
-            metadata: metadata.clone(),
-            requests: Mutex::new(Vec::new()),
-        });
-        let dummy = DummyTableProvider::new(region_id, engine, metadata);
-        let logical = with_mock_source(logical, &dummy);
+        let fixture = Arc::new(aggregate_fixture());
+        let (state, _, _, on) = plan_arms(&aggregate_eval_stmt(), &fixture, true).await;
+        let (_, _, ordinary, off) = plan_arms(&aggregate_eval_stmt(), &fixture, false).await;
         let session = state.session_state();
-        let physical = session
-            .query_planner()
-            .create_physical_plan(&logical, &session)
-            .await
-            .unwrap();
+        // The flag off must not even ask the fused selection; the flag on must answer with a plan.
+        assert!(off.is_none(), "the flag-off arm selected a fused plan");
+        let fused = on.unwrap_or_else(|| {
+            panic!(
+                "the aggregated rate query was not fused:\n{}",
+                describe(&ordinary)
+            )
+        });
 
-        let fused = super::try_select_fused(&logical, &physical)
-            .unwrap()
-            .unwrap_or_else(|| {
-                panic!(
-                    "the aggregated rate query was not fused:\n{}",
-                    describe(&physical)
-                )
-            });
-        // The fused node must be there, and the aggregation must still be there above it.
+        // The flag off arm must be the ordinary plan: no fused node anywhere.
         assert!(
-            contains_fused(&fused),
-            "the selected plan has no FusedSeriesExec:\n{}",
+            !contains_fused(&ordinary),
+            "the flag-off plan must not fuse:\n{}",
+            describe(&ordinary)
+        );
+        // The flag on arm must fuse exactly once, and only for the range subtree: one logical
+        // `sum by (instance)` becomes one partial and one final aggregate, but a second fused node
+        // would mean the subtree was replaced twice.
+        assert_eq!(
+            count_fused(&fused),
+            1,
+            "the flag-on plan must hold exactly one FusedSeriesExec:\n{}",
             describe(&fused)
         );
+        // The aggregate must still sit above the fused node and must still be split the way the
+        // ordinary plan splits it: partial, repartition, final.
         assert!(
             has_aggregate_above_fused(&fused),
             "the fused node must keep the aggregate above it:\n{}",
             describe(&fused)
         );
-        // The aggregation itself must be untouched: a swap that dropped or changed it would answer
-        // a different question.
-        let ordinary_aggregates = aggregate_nodes(&physical);
+        let aggregate_shape = |plan: &Arc<dyn ExecutionPlan>| {
+            let mut names: Vec<String> = Vec::new();
+            collect_names(plan, &mut names);
+            names
+        };
+        let partial_final: Vec<String> = aggregate_shape(&ordinary)
+            .into_iter()
+            .filter(|name| name == "AggregateExec" || name == "RepartitionExec")
+            .collect();
+        assert!(
+            partial_final
+                .iter()
+                .filter(|n| *n == "AggregateExec")
+                .count()
+                == 2,
+            "one logical aggregate must become a partial and a final one:\n{}",
+            describe(&ordinary)
+        );
+        assert!(
+            partial_final.iter().any(|n| n == "RepartitionExec"),
+            "the partial and final aggregates must be separated by a repartition:\n{}",
+            describe(&ordinary)
+        );
         assert_eq!(
-            ordinary_aggregates,
+            aggregate_nodes(&ordinary),
             aggregate_nodes(&fused),
             "the swap changed the aggregation:\n{}",
             describe(&fused)
         );
+        // Both partitions must be real: the fused node keeps the scan's partitioning, and the
+        // fixture puts data in each one.
+        assert_eq!(
+            fused_partition_count(&fused),
+            Some(2),
+            "the fused node must keep the scan's two partitions:\n{}",
+            describe(&fused)
+        );
 
-        let ordinary = datafusion::physical_plan::collect(physical, session.task_ctx())
+        let ordinary_batches = datafusion::physical_plan::collect(ordinary, session.task_ctx())
             .await
             .unwrap();
         let fused_batches = datafusion::physical_plan::collect(fused, session.task_ctx())
@@ -1436,43 +1603,145 @@ mod e2e {
             .unwrap();
         assert!(!fused_batches.is_empty(), "the fused plan produced no rows");
 
-        let ordinary_rows = labelled_rows(&ordinary);
-        let fused_rows = labelled_rows(&fused_batches);
-        // The same series over the same steps, so the aggregation sees the same rows either way.
-        assert_eq!(
-            fused_rows
-                .iter()
-                .map(|(label, ts, _)| (label.clone(), *ts))
-                .collect::<Vec<_>>(),
-            ordinary_rows
-                .iter()
-                .map(|(label, ts, _)| (label.clone(), *ts))
-                .collect::<Vec<_>>(),
-            "the fused path must aggregate the same groups at the same steps"
-        );
-        assert!(!fused_rows.is_empty());
-        // A counter rising 60 per 60s has a constant rate, so every fused sum is the same positive
-        // reading. As in the bare-shape test, the two paths disagree at window boundaries because
-        // the fused node keeps the sample at the window start while the ordinary fold drops it, so
-        // equal timestamps and the same bound is asserted instead of bit equality.
-        let first = fused_rows[0].2;
-        assert!(first.is_finite() && first > 0.0, "{fused_rows:?}");
-        let expected = 60.0 / 60_000.0 * 1_000.0;
-        for ((label, ts, value), (_, _, ordinary_value)) in fused_rows.iter().zip(&ordinary_rows) {
-            assert!(
-                (value - first).abs() < 1e-9,
-                "rate of a linear counter is not constant at {label}@{ts}: {fused_rows:?}"
+        let fused_rows = instance_rows(&fused_batches);
+        let ordinary_rows = instance_rows(&ordinary_batches);
+        // The hand-computed answer: four steps (360, 420, 480, 540 s) for each of two instances.
+        let expected: Vec<(String, i64, f64)> = ["x", "y"]
+            .into_iter()
+            .flat_map(|instance| {
+                [360_000i64, 420_000, 480_000, 540_000]
+                    .into_iter()
+                    .map(move |ts| {
+                        (
+                            instance.to_string(),
+                            ts,
+                            if instance == "x" { 3.0 } else { 7.0 },
+                        )
+                    })
+            })
+            .collect();
+        assert_eq!(fused_rows.len(), 8, "eight rows expected: {fused_rows:?}");
+        for (actual, expected) in fused_rows.iter().zip(&expected) {
+            assert_eq!(
+                (&actual.0, actual.1),
+                (&expected.0, expected.1),
+                "labels or step differ"
             );
             assert!(
-                (value - expected).abs() < 0.25,
-                "the fused rate at {label}@{ts} is far from {expected}: {fused_rows:?}"
-            );
-            assert!(
-                (value - ordinary_value).abs() < 0.25,
-                "the fused and ordinary rates at {label}@{ts} disagree beyond the window \
-                 boundary slack: fused {value}, ordinary {ordinary_value}"
+                close_to(actual.2, expected.2),
+                "{} at {} s is {}, expected {}: {fused_rows:?}",
+                actual.0,
+                actual.1 / 1000,
+                actual.2,
+                expected.2
             );
         }
+        // The two arms must agree with each other as well as with the hand-computed values.
+        for ((label, ts, value), (ordinary_label, ordinary_ts, ordinary_value)) in
+            fused_rows.iter().zip(&ordinary_rows)
+        {
+            assert_eq!((label, ts), (ordinary_label, ordinary_ts));
+            assert!(
+                close_to(*value, *ordinary_value),
+                "the fused and ordinary sums at {label}@{ts} disagree: \
+                 fused {value}, ordinary {ordinary_value}"
+            );
+        }
+    }
+
+    /// Two finite values are equal to within the last bits of a float; non-finite values must
+    /// match exactly, since no tolerance can make two different infinities agree.
+    fn close_to(actual: f64, expected: f64) -> bool {
+        if !actual.is_finite() || !expected.is_finite() {
+            return actual.to_bits() == expected.to_bits();
+        }
+        (actual - expected).abs() <= 1e-9 * expected.abs().max(1.0)
+    }
+
+    /// The number of fused nodes in `plan`.
+    fn count_fused(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        usize::from(plan.name() == "FusedSeriesExec")
+            + plan
+                .children()
+                .iter()
+                .map(|child| count_fused(child))
+                .sum::<usize>()
+    }
+
+    /// The names of every node in `plan`, in plan order.
+    fn collect_names(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
+        out.push(plan.name().to_string());
+        for child in plan.children() {
+            collect_names(child, out);
+        }
+    }
+
+    /// The value column of a batch: the one `Float64` field, whatever the projection named it.
+    fn value_column(batch: &DfRecordBatch) -> &Float64Array {
+        batch
+            .column_by_name(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .find(|field| {
+                        field.data_type() == &datafusion::arrow::datatypes::DataType::Float64
+                    })
+                    .expect("every result has one float value column")
+                    .name(),
+            )
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+    }
+
+    /// `(timestamp, value)` for every row, sorted by timestamp.
+    fn timestamped_rows(batches: &[DfRecordBatch]) -> Vec<(i64, f64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let timestamps = batch
+                .column_by_name(TIME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let value = value_column(batch);
+            for row in 0..batch.num_rows() {
+                rows.push((timestamps.value(row), value.value(row)));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+        rows
+    }
+
+    /// `(instance, timestamp, value)` for every row of a `sum by (instance)` result, sorted.
+    fn instance_rows(batches: &[DfRecordBatch]) -> Vec<(String, i64, f64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let labels = batch
+                .column_by_name(INSTANCE)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let timestamps = batch
+                .column_by_name(TIME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let value = value_column(batch);
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    labels.value(row).to_string(),
+                    timestamps.value(row),
+                    value.value(row),
+                ));
+            }
+        }
+        rows.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+        rows
     }
 
     /// The configuration of every `AggregateExec`, in plan order, as its display string.
@@ -1492,50 +1761,6 @@ mod e2e {
         let mut out = Vec::new();
         walk(plan, &mut out);
         out
-    }
-
-    /// `(label, timestamp, value)` for every row of a `sum by (k0)` result.
-    fn labelled_rows(batches: &[DfRecordBatch]) -> Vec<(String, i64, f64)> {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let labels = batch
-                .column_by_name(TAG)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let timestamps = batch
-                .column_by_name(TIME)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            let value = batch
-                .column_by_name(
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .find(|field| {
-                            field.data_type() == &datafusion::arrow::datatypes::DataType::Float64
-                        })
-                        .unwrap()
-                        .name(),
-                )
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap();
-            for row in 0..batch.num_rows() {
-                rows.push((
-                    labels.value(row).to_string(),
-                    timestamps.value(row),
-                    value.value(row),
-                ));
-            }
-        }
-        rows.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
-        rows
     }
 }
 

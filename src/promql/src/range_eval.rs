@@ -50,6 +50,9 @@ pub(crate) struct FloatWindow<'a> {
     /// Sample timestamps shifted by the offset onto the evaluation timeline; non-empty.
     pub timestamps: &'a [i64],
     pub values: &'a [f64],
+    /// The counter resets this window contains, ascending by sample. Empty for every function
+    /// that does not correct counters and for every window of a series that never reset.
+    pub counter_resets: &'a [CounterReset],
     /// Evaluation timestamp `T`. `timestamps` lie in `(T - range_ms, T]`, except for an
     /// `@`-anchored `predict_linear`, which evaluates the first point's window at every `T`.
     pub eval_ts: i64,
@@ -116,6 +119,86 @@ struct FieldSamples {
     values: Vec<f64>,
     /// Samples before `head` are behind every remaining window.
     head: usize,
+    /// Sequence number of `values[0]`. Absolute and monotonic, so a reset keeps its position
+    /// when `head` samples are dropped instead of every index being renumbered.
+    base: u64,
+    /// Resets between consecutive retained samples, ascending by position: exactly the ones a
+    /// window over these samples can still contain. Maintained only for the counter-correcting
+    /// functions, and released as the samples they reach back to are dropped.
+    resets: Vec<CounterReset>,
+    /// Whether `resets` is maintained for this field.
+    index_resets: bool,
+}
+
+/// One counter reset: a sample that dropped below the sample before it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CounterReset {
+    /// Position of the later sample, as an absolute sequence number. Its predecessor is
+    /// `position - 1`, so a window holding the samples `[start, end)` contains this reset
+    /// exactly when `start < position < end`.
+    pub position: u64,
+    /// The value the reset adds back: the sample at `position - 1`, which is inside the window
+    /// whenever the reset is.
+    pub previous_value: f64,
+}
+
+impl FieldSamples {
+    fn new(index_resets: bool) -> Self {
+        Self {
+            index_resets,
+            ..Self::default()
+        }
+    }
+
+    /// Appends one valid sample, recording a counter reset when it dropped below the sample
+    /// before it.
+    fn push(&mut self, timestamp: i64, value: f64) {
+        if self.index_resets
+            && let Some(&previous_value) = self.values.last()
+            && value < previous_value
+        {
+            self.resets.push(CounterReset {
+                position: self.base + self.values.len() as u64,
+                previous_value,
+            });
+        }
+        self.timestamps.push(timestamp);
+        self.values.push(value);
+    }
+
+    /// Drops the samples before `head` and the resets whose predecessor is one of them.
+    fn advance(&mut self) {
+        let head = std::mem::take(&mut self.head);
+        if head == 0 {
+            return;
+        }
+        self.base += head as u64;
+        self.timestamps.drain(..head);
+        self.values.drain(..head);
+        // A reset at `base` would add back the last dropped sample, so it goes with it.
+        let dropped = self
+            .resets
+            .partition_point(|reset| reset.position <= self.base);
+        self.resets.drain(..dropped);
+    }
+
+    /// The resets inside the window holding `len` samples from `head`.
+    fn resets_in(&self, len: usize) -> &[CounterReset] {
+        let start = self.base + self.head as u64;
+        let end = start + len as u64;
+        // Left-open: a reset at `start` would add back a sample behind the window.
+        let first = self.resets.partition_point(|reset| reset.position <= start);
+        let count = self.resets[first..].partition_point(|reset| reset.position < end);
+        &self.resets[first..first + count]
+    }
+
+    fn clear(&mut self) {
+        self.timestamps.clear();
+        self.values.clear();
+        self.head = 0;
+        self.base = 0;
+        self.resets.clear();
+    }
 }
 
 impl RangeEvaluator {
@@ -156,6 +239,7 @@ impl RangeEvaluator {
             window,
             function.kernel(fold_offset),
             step_invariant,
+            function.indexes_counter_resets(),
         )?;
         evaluator.drops_metric_name = function.drops_metric_name();
         evaluator.window_error = window_error;
@@ -163,12 +247,15 @@ impl RangeEvaluator {
     }
 
     /// `step_invariant` tells whether an `@`-anchored result holds at every grid point.
+    /// `index_resets` tells whether the kernel corrects counters, which is the only case where
+    /// the per-field reset index is worth maintaining.
     pub(crate) fn with_kernel(
         input: &SeriesSchema,
         grid: Arc<EvalGrid>,
         mut window: RangeWindow,
         kernel: WindowKernel,
         step_invariant: bool,
+        index_resets: bool,
     ) -> Result<Self> {
         if window.range_ms <= 0 {
             return Err(DataFusionError::Plan(format!(
@@ -198,7 +285,7 @@ impl RangeEvaluator {
             fields: input
                 .fields
                 .iter()
-                .map(|_| FieldSamples::default())
+                .map(|_| FieldSamples::new(index_resets))
                 .collect(),
             row: Vec::with_capacity(input.fields.len()),
             drops_metric_name: false,
@@ -272,9 +359,7 @@ impl RangeEvaluator {
         self.evaluate(None)?;
         let mut state = self.series.take().expect("set by the caller");
         for field in &mut self.fields {
-            field.timestamps.clear();
-            field.values.clear();
-            field.head = 0;
+            field.clear();
         }
         if self.drops_metric_name {
             state.metric.remove_all(&METADATA_LABELS);
@@ -380,8 +465,7 @@ impl RangeEvaluator {
                 })?;
             for (field, value) in self.fields.iter_mut().zip(&self.row) {
                 if let Some(value) = value {
-                    field.timestamps.push(shifted);
-                    field.values.push(*value);
+                    field.push(shifted, *value);
                 }
             }
         }
@@ -474,9 +558,7 @@ impl RangeEvaluator {
             if state.cursor == points_read {
                 field.head = field.timestamps.len();
             }
-            field.timestamps.drain(..field.head);
-            field.values.drain(..field.head);
-            field.head = 0;
+            field.advance();
         }
         Ok(())
     }
@@ -511,6 +593,7 @@ fn evaluate_row(
             kernel(FloatWindow {
                 timestamps: &timestamps[..len],
                 values: &field.values[field.head..field.head + len],
+                counter_resets: field.resets_in(len),
                 eval_ts,
                 range_ms,
             })
