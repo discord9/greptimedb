@@ -18,10 +18,20 @@
 # round finishes: an arm that disagrees stops the sweep before the next round adds more
 # timings.
 #
-# Both arms must genuinely be different binaries. A rebuild that silently reused the
-# previous file would produce a clean "no difference"; check with
+# The two arms may also be the *same* binary with the native flag off and on, which is how the
+# fused path is compared against the ordinary plan. Set ARM_P=off ARM_F=on for that; the driver
+# refuses a flag-off arm that logs a fused selection, so the two cannot be confused.
+#
+#   # two commits, both fused
+#   BIN_P=<parent> BIN_F=<this> scripts/fused_series_bench_pair.sh
+#
+#   # one binary, ordinary plan against fused
+#   BIN_P=<this> BIN_F=<this> ARM_P=off ARM_F=on scripts/fused_series_bench_pair.sh
+#
+# When the arms are two commits rather than two flags, verify they are really different files:
+# a rebuild that silently reused the previous one produces a clean "no difference".
 #   strings <bin> | grep -c extrapolated_rate_batch
-# which is 0 for the parent commit and non-zero once the batch path exists.
+# is 0 before the batch path exists and non-zero after.
 #
 #   OUT=DIR DATA=DIR ROUNDS=3 CASES=S,G,W,C,control BIN_P=... BIN_F=... \
 #     scripts/fused_series_bench_pair.sh
@@ -55,17 +65,33 @@ RESULTS="$RUN/results"
 mkdir "$RESULTS"
 echo "writing this run into $RUN"
 
+# Checked before the array rather than with `${BIN_P:?...}`: an unquoted `:?` message
+# containing an apostrophe ends the parameter expansion early, and bash then silently drops the
+# rest of the assignment list -- which leaves `BIN[F]` unset and fails much later, at the point
+# of use, with a message that points at the wrong line.
+if [ -z "${BIN_P:-}" ]; then
+  echo "set BIN_P to the earlier arm's binary" >&2
+  exit 1
+fi
+if [ -z "${BIN_F:-}" ]; then
+  echo "set BIN_F to the later arm's binary" >&2
+  exit 1
+fi
 declare -A BIN=(
-  [P]=${BIN_P:?set BIN_P to the earlier commit's binary}
-  [F]=${BIN_F:?set BIN_F to the later commit's binary}
+  [P]="$BIN_P"
+  [F]="$BIN_F"
 )
 declare -A COMMIT=(
   [P]=${COMMIT_P:-unknown-P}
   [F]=${COMMIT_F:-unknown-F}
 )
 
-# Both arms flag-on: this compares two fused builds.
-ARM=on
+# Per-arm native flag, defaulting to `on` for both: two fused builds. `ARM_P=off ARM_F=on`
+# compares the ordinary plan against the fused one, with the driver's hit check keeping them
+# apart.
+ARM_P=${ARM_P:-on}
+ARM_F=${ARM_F:-on}
+declare -A FLAG=([P]="$ARM_P" [F]="$ARM_F")
 
 order_for_round() {
   case $(( ($1 - 1) % 2 )) in
@@ -79,11 +105,11 @@ for case in ${CASES//,/ }; do
     order=$(order_for_round "$round")
     files=()
     for arm in $order; do
-      echo "=== case $case round $round arm $arm (${COMMIT[$arm]}) ==="
+      echo "=== case $case round $round arm $arm (${COMMIT[$arm]}, flag ${FLAG[$arm]}) ==="
       python3 "$DRIVER" run \
         --data-home "$DATA" \
         --bin "${BIN[$arm]}" \
-        --arm "$ARM" \
+        --arm "${FLAG[$arm]}" \
         --commit "${COMMIT[$arm]}" \
         --cases "$case" \
         --out "$RUN/c${case}-r${round}-${arm}.json" \

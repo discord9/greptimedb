@@ -61,6 +61,10 @@ def load(pattern):
             "hits": [entry["hits"] for entry in record["cases"]],
             "expected": [entry["expected_hits"] for entry in record["cases"]],
             "commit": record.get("commit", "?"),
+            # "off" or "on": which native flag the arm ran with. Printed, because the same
+            # summariser serves two experiments -- two commits (both on) and one commit
+            # against the ordinary plan (off against on).
+            "flag": record.get("arm", "?"),
         }
     return records
 
@@ -78,6 +82,12 @@ def main():
 
     print(f"run: {run}")
     print(f"rounds: {', '.join(map(str, rounds))}")
+    print()
+
+    flags = {}
+    for (case, rnd, arm), record in records.items():
+        flags.setdefault(arm, record["flag"])
+    print("flags: " + ", ".join(f"{arm}={flag}" for arm, flag in sorted(flags.items())))
     print()
 
     header = (
