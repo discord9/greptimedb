@@ -16,6 +16,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use common_query::prometheus::is_prometheus_stale_nan;
 use datafusion::arrow::array::Array;
@@ -115,6 +116,25 @@ pub(crate) type BatchKernel = Box<dyn FnMut(&WindowBatch<'_>, &mut Vec<Option<f6
 /// Computes one window result; `None` means the window has no result.
 pub(crate) type WindowKernel = Box<dyn FnMut(FloatWindow<'_>) -> Option<f64> + Send>;
 
+/// Time spent in each of the three regions a batch is made of, summed over every series one
+/// evaluator served.
+///
+/// The regions are disjoint during a batch, so their sum is bounded by the wall time of the work
+/// that produced it. A profiler cannot split them: the batch kernel is inlined into the flush, and
+/// the flush into the evaluation, so a sample attributes to the whole region whichever part of it
+/// was running. These counters answer what a sampling attribution cannot -- whether the time went
+/// into preparing windows, into the kernel, or into appending the columns.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BatchTimers {
+    /// Filling the accumulator: for every point the loop examines while the clock runs, its
+    /// left-edge scan, its right-edge scan and its reset range, plus its append to the batch.
+    pub window_preparation: Duration,
+    /// The batch kernel calls of every flushed batch.
+    pub kernel: Duration,
+    /// Appending the flushed batch's columns to the output series.
+    pub columns: Duration,
+}
+
 /// Evaluates range windows over raw float series, one series at a time.
 ///
 /// Each series is pushed as its chunks in order and completes on the chunk marked `is_last`.
@@ -153,6 +173,12 @@ pub struct RangeEvaluator {
     batch_calls: usize,
     /// Windows accumulated for the next batch call.
     pending: PendingBatch,
+    /// Time spent in the three regions of a batch, accumulated over every series this evaluator
+    /// serves.
+    ///
+    /// Per evaluator rather than per series: `finish_series` clears the per-series state, and the
+    /// regions of a whole query have to survive that clear.
+    batch_timers: BatchTimers,
 }
 
 /// Grid points accumulated for the next batch call.
@@ -495,7 +521,15 @@ impl RangeEvaluator {
             #[cfg(test)]
             batch_calls: 0,
             pending: PendingBatch::with_fields(input.fields.len()),
+            batch_timers: BatchTimers::default(),
         })
+    }
+
+    /// The time spent in each batch region so far, over every series this evaluator served.
+    ///
+    /// Read before [`finish`](Self::finish), which consumes the evaluator.
+    pub(crate) fn batch_timers(&self) -> BatchTimers {
+        self.batch_timers
     }
 
     /// Whether the evaluator dispatches the function once per batch instead of once per point.
@@ -767,7 +801,26 @@ impl RangeEvaluator {
         let spec = self.grid.spec();
         let grid = self.grid.timestamps();
         let range = i128::from(range_ms);
+        // Window preparation is timed per batch, not per grid point.
+        //
+        // A batch is filled a point at a time, and the filling pauses and resumes: the loop exits
+        // when the next point is not ready yet or when no sample has arrived for it, and continues
+        // on a later `push`. The clock therefore runs only while a batch is actively being filled:
+        // it starts at the first point that may join the batch, so that point's left-edge scan is
+        // inside the region, and it stops at every exit that leaves points pending and before every
+        // flush. Two clock reads per batch and two per pause -- O(batches + loop exits), not
+        // O(points). A per-point `Instant::now()` was deliberately not used: this loop runs once
+        // per grid point per series, on the hot path of the query these counters exist to explain.
+        //
+        // Local on purpose: returning from `evaluate` drops it. That is what bounds a span to one
+        // call, so a future refactor that hoists it into `RangeEvaluator` beside `pending` would
+        // silently charge the wait between chunks to this region.
+        let mut filling: Option<Instant> = None;
         while state.cursor < points_read {
+            // Entering a batch, or resuming one that a previous `push` left partly filled.
+            if batched && filling.is_none() {
+                filling = Some(Instant::now());
+            }
             let eval_ts = grid[state.cursor];
             let lower = i128::from(eval_ts) - range;
             let mut earliest = None;
@@ -789,22 +842,28 @@ impl RangeEvaluator {
                 }
             }
             if ready.is_some_and(|ready| i128::from(eval_ts) > ready) {
+                // The batch keeps the points it has, the clock does not keep running: the wait for
+                // the next chunk is not preparation.
+                pause_filling(&mut filling, &mut self.batch_timers);
                 break;
             }
             // No retained sample: either the series is done or the next one is not here yet.
             let Some(earliest) = earliest else {
+                pause_filling(&mut filling, &mut self.batch_timers);
                 break;
             };
             if earliest > eval_ts {
                 // The skipped points break the run of grid indices, and a batch appends
                 // contiguous rows, so what is accumulated has to go out first.
                 if batched {
+                    pause_filling(&mut filling, &mut self.batch_timers);
                     flush_batch(
                         self.batch.as_mut().expect("checked above"),
                         &mut self.pending,
                         &self.fields,
                         range_ms,
                         &mut self.output,
+                        &mut self.batch_timers,
                         #[cfg(test)]
                         &mut self.batch_calls,
                     )?;
@@ -816,6 +875,7 @@ impl RangeEvaluator {
                 continue;
             }
             if let Some(error) = &self.window_error {
+                pause_filling(&mut filling, &mut self.batch_timers);
                 return Err(DataFusionError::Execution(error.clone()));
             }
 
@@ -838,12 +898,16 @@ impl RangeEvaluator {
                     self.pending.window_resets[field_index].push(resets);
                 }
                 if self.pending.len() == EVALUATION_BATCH {
+                    // A full batch is the batch boundary of this region: everything charged so far
+                    // was preparation for the flush.
+                    pause_filling(&mut filling, &mut self.batch_timers);
                     flush_batch(
                         self.batch.as_mut().expect("checked above"),
                         &mut self.pending,
                         &self.fields,
                         range_ms,
                         &mut self.output,
+                        &mut self.batch_timers,
                         #[cfg(test)]
                         &mut self.batch_calls,
                     )?;
@@ -895,12 +959,14 @@ impl RangeEvaluator {
         if batched {
             // The tail below advances every field, which renumbers the reset index the batch
             // ranges point into, so the rest of the batch has to be evaluated first.
+            pause_filling(&mut filling, &mut self.batch_timers);
             flush_batch(
                 self.batch.as_mut().expect("checked above"),
                 &mut self.pending,
                 &self.fields,
                 range_ms,
                 &mut self.output,
+                &mut self.batch_timers,
                 #[cfg(test)]
                 &mut self.batch_calls,
             )?;
@@ -926,17 +992,31 @@ impl RangeEvaluator {
     }
 }
 
+/// Stops the window-preparation clock if it is running and adds the span it measured.
+///
+/// A no-op outside the batch path, where the clock is never started.
+fn pause_filling(filling: &mut Option<Instant>, timers: &mut BatchTimers) {
+    if let Some(started) = filling.take() {
+        timers.window_preparation += started.elapsed();
+    }
+}
+
 /// Runs the batch kernel over the accumulated points and appends their rows to `output`.
 ///
 /// One call per batch per field, instead of one call per grid point per field. The kernel writes a
 /// whole column, and `push_columns` appends the columns together, so neither the row `Vec` nor the
 /// per-point output append exists on this path.
+///
+/// The kernel and column appends are the two regions timed here: one pair of clock reads per
+/// region per flush, and the caller has already stopped the window-preparation clock, so the three
+/// regions of a batch never overlap.
 fn flush_batch(
     kernel: &mut BatchKernel,
     pending: &mut PendingBatch,
     fields: &[FieldSamples],
     range_ms: i64,
     output: &mut GridSeriesBuilder,
+    timers: &mut BatchTimers,
     #[cfg(test)] batch_calls: &mut usize,
 ) -> Result<()> {
     if pending.is_empty() {
@@ -957,6 +1037,7 @@ fn flush_batch(
             window_resets,
             values,
         } = pending;
+        let kernel_started = Instant::now();
         for (field_index, field) in fields.iter().enumerate() {
             let batch = WindowBatch {
                 timestamps: &field.timestamps,
@@ -969,8 +1050,13 @@ fn flush_batch(
             };
             kernel(&batch, &mut values[field_index]);
         }
+        timers.kernel += kernel_started.elapsed();
         let columns: Vec<&[Option<f64>]> = values.iter().map(Vec::as_slice).collect();
-        output.push_columns(indices[0], rows, &columns)?;
+        let columns_started = Instant::now();
+        let appended = output.push_columns(indices[0], rows, &columns);
+        // Recorded before the error is propagated: a failed append still spent this time.
+        timers.columns += columns_started.elapsed();
+        appended?;
     }
     pending.clear_points();
     Ok(())

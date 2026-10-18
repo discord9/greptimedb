@@ -14,6 +14,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use common_query::prometheus::{PROMETHEUS_STALE_NAN_BITS, is_prometheus_stale_nan};
 use datafusion::arrow::array::{ArrayRef, Float64Array, TimestampMillisecondArray, UInt32Array};
@@ -1942,4 +1943,65 @@ fn the_batch_boundary_loses_no_rows() {
     let from_batch = from_batch.expect("a series");
     let from_points = from_points.expect("a series");
     assert_eq!(expand(&from_batch), expand(&from_points));
+}
+
+/// The three batch regions are timed, and together they fit inside the `push` that ran them.
+///
+/// Non-zero is the load-bearing part: a region whose clock starts after the flush reads zero, and
+/// zero is what a reader of these counters would take as "this region is free". The sum bound is
+/// what keeps them honest as a split of one job -- the three are disjoint intervals of the same
+/// `push`, so a sum above its wall time would mean a region was charged twice.
+#[test]
+fn the_three_batch_regions_are_timed_inside_one_push() {
+    let fields = 1;
+    // Enough grid points for two full batches and a tail, over a one-minute step.
+    let grid_len = 1_300;
+    let grid = grid(0, 60_000, grid_len);
+    let window = RangeWindow {
+        range_ms: 300_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    let rows: Vec<Row> = (0..grid_len as i64 * 2)
+        .map(|index| (index * 60_000, vec![Some(index as f64)]))
+        .collect();
+
+    let mut batched = RangeEvaluator::try_new(
+        &raw_schema(fields),
+        grid.clone(),
+        window,
+        RangeFunction::Rate,
+    )
+    .unwrap();
+    assert!(batched.evaluates_in_batches(), "the batch path must run");
+    let chunk = dense_chunk(&rows, fields, 0, true);
+
+    let started = Instant::now();
+    let series = batched.push(&chunk).unwrap();
+    let wall = started.elapsed();
+    // `finish` consumes the evaluator, so the regions are read out first.
+    let timers = batched.batch_timers();
+    let calls = batched.batch_call_count();
+    batched.finish().unwrap();
+
+    assert!(series.is_some(), "the fixture must produce rows");
+    // 1300 points at 512 per batch: two full batches and a tail of 276.
+    assert_eq!(calls, 3, "two full batches plus the tail");
+    assert!(
+        timers.window_preparation > Duration::ZERO,
+        "window preparation must be charged: {timers:?}"
+    );
+    assert!(
+        timers.kernel > Duration::ZERO,
+        "the batch kernel must be charged: {timers:?}"
+    );
+    assert!(
+        timers.columns > Duration::ZERO,
+        "the column append must be charged: {timers:?}"
+    );
+    let regions = timers.window_preparation + timers.kernel + timers.columns;
+    assert!(
+        regions <= wall,
+        "the regions {regions:?} cannot exceed the {wall:?} push that ran them"
+    );
 }

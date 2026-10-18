@@ -110,7 +110,7 @@ use futures::Stream;
 use store_api::region_engine::{RawLabelSource, SendableRawSeriesStream};
 
 use crate::map::{MathOp, map_math};
-use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
+use crate::range_eval::{BatchTimers, RangeEvaluator, RangeFunction, RangeWindow};
 use crate::source::materialize_raw_labels;
 
 #[cfg(test)]
@@ -147,6 +147,12 @@ const METRIC_EVALUATE: &str = "fused_evaluate_time";
 const METRIC_EMIT: &str = "fused_emit_time";
 /// Time spent concatenating buffered batches for downstream.
 const METRIC_FLUSH: &str = "fused_flush_time";
+/// Time the evaluator spent filling a batch's windows, summed over every series.
+const METRIC_WINDOW_PREP: &str = "fused_window_prep_time";
+/// Time the evaluator spent in the range function's batch kernel.
+const METRIC_KERNEL: &str = "fused_kernel_time";
+/// Time the evaluator spent appending a flushed batch's columns to its output.
+const METRIC_COLUMNS: &str = "fused_columns_time";
 /// Raw chunks received from the child.
 const METRIC_INPUT_CHUNKS: &str = "fused_input_chunks";
 /// Series the evaluator completed.
@@ -1018,13 +1024,17 @@ struct FusedSeriesStream {
     timers: FusedTimers,
 }
 
-/// The four block-scoped timers and three counters of one partition.
+/// The four block-scoped timers, the three batch-region timers and the three counters of one
+/// partition.
 #[derive(Clone)]
 struct FusedTimers {
     input_poll: Time,
     evaluate: Time,
     emit: Time,
     flush: Time,
+    window_prep: Time,
+    kernel: Time,
+    columns: Time,
     input_chunks: Count,
     series_completed: Count,
     series_emitted: Count,
@@ -1047,6 +1057,11 @@ impl FusedTimers {
         let evaluate = build_time(METRIC_EVALUATE);
         let emit = build_time(METRIC_EMIT);
         let flush = build_time(METRIC_FLUSH);
+        // The evaluator runs these three regions for every batch of every series; they are read
+        // once, when the evaluator is done, so the per-batch cost stays inside the evaluator.
+        let window_prep = build_time(METRIC_WINDOW_PREP);
+        let kernel = build_time(METRIC_KERNEL);
+        let columns = build_time(METRIC_COLUMNS);
 
         let build_count = |name: &'static str| {
             let count = Count::new();
@@ -1067,10 +1082,27 @@ impl FusedTimers {
             evaluate,
             emit,
             flush,
+            window_prep,
+            kernel,
+            columns,
             input_chunks,
             series_completed,
             series_emitted,
         }
+    }
+
+    /// Adds one evaluator's batch regions to this partition's timers.
+    ///
+    /// Called exactly once per evaluator, right after it is taken out of the stream: a `take`
+    /// leaves no evaluator behind, so the second path that could record has nothing to record and
+    /// no flag is needed to guard it.
+    fn record_batch_regions(&self, timers: BatchTimers) {
+        // Every field is added even when it is zero: the timer floors a recorded zero at one
+        // nanosecond, so a region that never ran reads as nothing instead of vanishing from the
+        // report and sending a reader after a missing metric.
+        self.window_prep.add_duration(timers.window_preparation);
+        self.kernel.add_duration(timers.kernel);
+        self.columns.add_duration(timers.columns);
     }
 }
 
@@ -1078,7 +1110,12 @@ impl FusedSeriesStream {
     /// Marks the stream terminal and gives everything it still retained back to the pool.
     fn abort(&mut self) {
         self.finished = true;
-        self.evaluator = None;
+        // The evaluator is dropped here, so its batch regions are read out first: a stream that
+        // failed partway still knows where the time of the batches it did run went, and a region
+        // it never reached records as nothing.
+        if let Some(evaluator) = self.evaluator.take() {
+            self.timers.record_batch_regions(evaluator.batch_timers());
+        }
         self.seen = HashMap::new();
         self.pending = Vec::new();
         self.pending_rows = 0;
@@ -1241,6 +1278,10 @@ impl FusedSeriesStream {
                         // Handled at the top of the loop; go back to it instead of assuming.
                         continue;
                     };
+                    // Read out before `finish` consumes the evaluator. The `take` above is also
+                    // what makes this the only place the regions can be recorded, so nothing
+                    // has to guard against a double record: a second path finds no evaluator.
+                    this.timers.record_batch_regions(evaluator.batch_timers());
                     if let Err(error) = evaluator.finish() {
                         this.abort();
                         return Poll::Ready(Some(Err(error)));

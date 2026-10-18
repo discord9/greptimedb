@@ -55,9 +55,10 @@ use store_api::region_engine::RawLabelSource;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 
 use super::{
-    FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_EMIT, METRIC_EVALUATE,
-    METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_SERIES_COMPLETED,
-    METRIC_SERIES_EMITTED, apply_maps, classify_output, occupancy, series_to_record_batch,
+    FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_COLUMNS, METRIC_EMIT,
+    METRIC_EVALUATE, METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_KERNEL,
+    METRIC_SERIES_COMPLETED, METRIC_SERIES_EMITTED, METRIC_WINDOW_PREP, apply_maps,
+    classify_output, occupancy, series_to_record_batch,
 };
 use crate::map::MathOp;
 use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
@@ -2255,5 +2256,68 @@ async fn a_series_that_keeps_every_row_shares_the_grid_instead_of_copying_it() {
         grid.slice(first, 0).as_ptr(),
         "every row was kept, so the time column must be a slice of the grid's buffer; a \
          different address means it was copied through an identity index"
+    );
+}
+
+/// The evaluator's three batch regions reach the node's own metric set.
+///
+/// The regions exist so a profile can order the parts of a batch without trusting how a sampling
+/// profiler splits inlined frames; a region that is planned but never recorded would leave that
+/// reader guessing whether the batch path ran at all. Enough grid points and series are needed to
+/// complete whole batches, because one short series would time only its tail flush.
+#[tokio::test]
+async fn the_batch_regions_of_the_evaluator_reach_the_metrics() {
+    const BATCHED_GRID_LEN: u64 = 1_100;
+    const SERIES: u8 = 3;
+    let grid = Arc::new(
+        EvalGrid::try_new(GridSpec::try_new(GRID_START, GRID_STEP, BATCHED_GRID_LEN).unwrap())
+            .unwrap(),
+    );
+    let chunks = (0..SERIES)
+        .map(|index| {
+            let host = format!("h{index}");
+            let rows = long_counter_rows(BATCHED_GRID_LEN as i64 + 5, 60.0);
+            chunk(index + 1, &host, &rows, true)
+        })
+        .collect::<Vec<_>>();
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_grid(grid);
+    let exec = case.fused(memory_child(&chunks)).unwrap();
+    let batches = collect(run_partition(&exec, 0).await);
+    assert!(!batches.is_empty(), "the fixture must produce rows");
+
+    let metrics = exec.metrics().expect("the node must report metrics");
+    // Each metric is registered per partition, so a name lookup must sum the partitions.
+    let value = |name: &str| -> u64 {
+        metrics
+            .sum_by_name(name)
+            .unwrap_or_else(|| panic!("metric {name} is missing: {metrics:?}"))
+            .as_usize() as u64
+    };
+
+    // Registration alone leaves a timer reading zero, so a non-zero value is what proves the
+    // recording ran when the evaluator finished. One assertion per name so a failure says which
+    // region went unrecorded.
+    for name in [METRIC_WINDOW_PREP, METRIC_KERNEL, METRIC_COLUMNS] {
+        assert!(
+            value(name) > 0,
+            "region {name} must be recorded once a batch has run: {metrics:?}"
+        );
+    }
+    // The three regions are disjoint parts of the evaluator's push, so together they can only be
+    // a part of the time the whole push is charged.
+    let regions = value(METRIC_WINDOW_PREP) + value(METRIC_KERNEL) + value(METRIC_COLUMNS);
+    assert!(
+        regions <= value(METRIC_EVALUATE),
+        "the batched regions ({regions} ns) must fit inside the evaluation: {metrics:?}"
     );
 }
