@@ -53,8 +53,9 @@ use futures::{Stream, StreamExt};
 use store_api::region_engine::RawLabelSource;
 
 use super::{
-    FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, apply_maps, classify_output,
-    series_to_record_batch,
+    FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_EMIT, METRIC_EVALUATE,
+    METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_SERIES_COMPLETED,
+    METRIC_SERIES_EMITTED, apply_maps, classify_output, series_to_record_batch,
 };
 use crate::map::MathOp;
 use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
@@ -653,6 +654,107 @@ async fn rate_over_three_chunks_matches_reference_and_prometheus() {
     assert_eq!(series.metric.get("host"), Some("a"));
     // `rate` drops the metric name on its own, so the reference keeps only the ordinary label.
     assert_eq!(series.metric.get("__name__"), None);
+}
+
+/// The node's own metrics must be observable: `ANALYZE VERBOSE` is the only place a reader can
+/// see where a fused query spends its time, and before this the node printed `metrics=[]` while
+/// doing the dominant work of the plan.
+#[tokio::test]
+async fn the_node_reports_its_own_timers_and_counters() {
+    let chunks = counter_chunks(1, "a", &counter_rows(60.0), &[5]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    );
+    let exec = case.fused(memory_child(&chunks)).unwrap();
+    let batches = collect(run_partition(&exec, 0).await);
+    assert!(!batches.is_empty(), "the fixture must produce rows");
+
+    let metrics = exec.metrics().expect("the node must report metrics");
+    // Each metric is registered per partition, so a name lookup must sum the partitions.
+    let value = |name: &str| -> u64 {
+        metrics
+            .sum_by_name(name)
+            .unwrap_or_else(|| panic!("metric {name} is missing: {metrics:?}"))
+            .as_usize() as u64
+    };
+
+    // Counters are exact: one chunk in, one completed series, one batch out.
+    assert_eq!(value(METRIC_INPUT_CHUNKS), chunks.len() as u64);
+    assert_eq!(value(METRIC_SERIES_COMPLETED), 1);
+    assert_eq!(value(METRIC_SERIES_EMITTED), 1);
+
+    // `Time` records at least a nanosecond whenever the block ran, so a nonzero value is
+    // evidence the block was entered rather than a precise measurement.
+    for name in [
+        METRIC_INPUT_POLL,
+        METRIC_EVALUATE,
+        METRIC_EMIT,
+        METRIC_FLUSH,
+    ] {
+        assert!(
+            value(name) > 0,
+            "timer {name} must be recorded once the block has run: {metrics:?}"
+        );
+    }
+
+    // `BaselineMetrics` supplies the standard counters, so the node is visible to any consumer
+    // that reads `output_rows` from a plan.
+    assert_eq!(value("output_rows"), GRID_LEN);
+    assert_eq!(value("output_batches"), 1);
+}
+
+/// A timer must not charge time in which the child was pending: the input-poll timer is skipped
+/// when the poll returns `Pending`, so a stream that wakes repeatedly does not accumulate.
+#[tokio::test]
+async fn the_input_timer_does_not_count_a_pending_poll() {
+    let chunks = counter_chunks(1, "a", &counter_rows(60.0), &[5]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    );
+    // A child that answers `Pending` on every other poll: each `Pending` is a wakeup the timer
+    // must not charge, and each `Ready` is a chunk it must.
+    let batches = chunks
+        .iter()
+        .flat_map(|chunk| frame_batches(std::slice::from_ref(chunk)))
+        .collect::<Vec<_>>();
+    let child = ProbeExec::new(
+        batches,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .pending_every_other();
+    let exec = case.fused(Arc::new(child)).unwrap();
+    let batches = collect(run_partition(&exec, 0).await);
+    assert!(!batches.is_empty());
+
+    let metrics = exec.metrics().expect("the node must report metrics");
+    let chunks_seen = metrics.sum_by_name(METRIC_INPUT_CHUNKS).unwrap().as_usize();
+    assert_eq!(
+        chunks_seen,
+        chunks.len(),
+        "every chunk must still be consumed"
+    );
+    let polled = metrics.sum_by_name(METRIC_INPUT_POLL).unwrap().as_usize();
+    // Two nanos per chunk is the floor `Time` guarantees (one per recorded block), so a value
+    // far above it would mean the pending polls were charged as well.
+    assert!(
+        polled < 1_000_000,
+        "the input timer must not accumulate wait time, got {polled} ns"
+    );
 }
 
 #[tokio::test]
@@ -1500,6 +1602,8 @@ struct ProbeExec {
     dropped: Arc<AtomicBool>,
     /// Number of batches the child stream handed out, i.e. the fused node's chunk inputs.
     yields: Arc<AtomicUsize>,
+    /// Answer `Pending` on every other poll, the way a child waiting on I/O would.
+    pending_every_other: bool,
 }
 
 impl ProbeExec {
@@ -1522,7 +1626,17 @@ impl ProbeExec {
             executes,
             dropped,
             yields: Arc::new(AtomicUsize::new(0)),
+            pending_every_other: false,
         }
+    }
+
+    /// Makes the child answer `Pending` on every other poll.
+    ///
+    /// The fused node must not charge that wait time to any of its block timers, which is the
+    /// difference between reporting work and reporting latency.
+    fn pending_every_other(mut self) -> Self {
+        self.pending_every_other = true;
+        self
     }
 }
 
@@ -1576,6 +1690,8 @@ impl ExecutionPlan for ProbeExec {
             schema: self.schema.clone(),
             dropped: Arc::clone(&self.dropped),
             yields: Arc::clone(&self.yields),
+            pending_every_other: self.pending_every_other,
+            polls: 0,
         }))
     }
 }
@@ -1585,6 +1701,8 @@ struct ProbeStream {
     schema: SchemaRef,
     dropped: Arc<AtomicBool>,
     yields: Arc<AtomicUsize>,
+    pending_every_other: bool,
+    polls: usize,
 }
 
 impl RecordBatchStream for ProbeStream {
@@ -1596,7 +1714,14 @@ impl RecordBatchStream for ProbeStream {
 impl Stream for ProbeStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polls += 1;
+        if self.pending_every_other && self.polls % 2 == 1 {
+            // A real child wakes itself when the work completes; doing that here keeps the
+            // stream progressing instead of stalling the test on a pending poll.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         let batch = self.batches.next();
         if batch.is_some() {
             self.yields.fetch_add(1, Ordering::SeqCst);

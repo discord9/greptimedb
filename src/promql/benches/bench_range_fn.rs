@@ -1336,9 +1336,163 @@ fn bench_native_range_eval(c: &mut Criterion) {
     group.finish();
 }
 
+/// Builds the legacy input for one series: `grid_points` 1 s evaluation timestamps over
+/// `samples` raw values taken every 15 s, each window holding the samples of the last
+/// `window_ms`, exactly what `PromRangeManipulate` hands the rate UDF in the real plan.
+fn make_legacy_grid_input(
+    values: &[f64],
+    grid_points: usize,
+    window_ms: i64,
+) -> Vec<ColumnarValue> {
+    const SAMPLE_INTERVAL_MS: i64 = 15_000;
+    const STEP_MS: i64 = 1_000;
+    let sample_ts: Vec<i64> = (0..values.len())
+        .map(|k| k as i64 * SAMPLE_INTERVAL_MS)
+        .collect();
+    let ts_array = Arc::new(TimestampMillisecondArray::from(sample_ts));
+    let val_array = Arc::new(Float64Array::from(values.to_vec()));
+
+    let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(grid_points);
+    let mut eval_ts: Vec<i64> = Vec::with_capacity(grid_points);
+    for i in 0..grid_points {
+        let now = i as i64 * STEP_MS;
+        let first = now - window_ms;
+        // Samples are aligned to the grid origin, so the index bounds are exact division.
+        let lo = if first <= 0 {
+            0
+        } else {
+            ((first + SAMPLE_INTERVAL_MS - 1) / SAMPLE_INTERVAL_MS) as usize
+        };
+        let hi = now / SAMPLE_INTERVAL_MS;
+        let hi = (hi as usize).min(values.len().saturating_sub(1));
+        if lo > hi {
+            continue;
+        }
+        ranges.push((lo as u32, (hi - lo + 1) as u32));
+        eval_ts.push(now);
+    }
+
+    let ts_range = RangeArray::from_ranges(ts_array, ranges.clone()).unwrap();
+    let val_range = RangeArray::from_ranges(val_array, ranges).unwrap();
+    vec![
+        ColumnarValue::Array(Arc::new(ts_range.into_dict())),
+        ColumnarValue::Array(Arc::new(val_range.into_dict())),
+        ColumnarValue::Array(Arc::new(TimestampMillisecondArray::from(eval_ts))),
+        ColumnarValue::Scalar(ScalarValue::Int64(Some(window_ms))),
+    ]
+}
+
+/// The two implementations of the same range function on identical input.
+///
+/// The fused node evaluates raw samples through [`RangeEvaluator`]; the ordinary plan expands
+/// each grid point into a sliding range and calls the UDF. Their difference is the only place
+/// the fused path can win or lose against the plan it replaces, and it is invisible in
+/// `EXPLAIN VERBOSE` because `FusedSeriesExec` reports no metrics.
+///
+/// **Three timed scopes, deliberately unequal:**
+///
+/// | case | scope | compares against |
+/// | --- | --- | --- |
+/// | `native/` | `RangeEvaluator::try_new` + `push` + `finish` | — |
+/// | `legacy_udf_only/` | the UDF call, input prepared outside | a lower bound, not a rival |
+/// | `legacy_full/` | `prom_range_manipulate` + the UDF call | `native/` |
+///
+/// `RangeEvaluator::push` both ingests raw samples and assembles every window, which in the
+/// ordinary plan is split between `PromRangeManipulate` and the UDF. Comparing `native/` against
+/// `legacy_udf_only/` therefore compares one side's whole job with the other's half of it.
+/// `legacy_full/` exists so the two arms are charged for the same work.
+///
+/// Input is one series of 2 880 samples at 15 s — 12 h of data, so a 2 h grid reads 480 of
+/// them — evaluated on the same 7 201-point 1 s grid for both, over a 5 min and a 1 h window.
+fn bench_native_vs_legacy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_vs_legacy");
+    const SAMPLES: usize = 2_880;
+    const GRID_POINTS: usize = 7_201;
+    const SAMPLE_INTERVAL_MS: i64 = 15_000;
+
+    let schema = Arc::new(SeriesSchema {
+        fields: vec![FieldSpec {
+            name: Arc::from("value"),
+        }]
+        .into(),
+        eval_grid: None,
+    });
+    let grid = Arc::new(
+        EvalGrid::try_new(GridSpec::try_new(0, 1_000, GRID_POINTS as u64).unwrap()).unwrap(),
+    );
+    let timestamps: Vec<i64> = (0..SAMPLES)
+        .map(|k| k as i64 * SAMPLE_INTERVAL_MS)
+        .collect();
+    let rising: Vec<f64> = (0..SAMPLES).map(|i| i as f64 * 15.0).collect();
+    let rate_udf = Rate::scalar_udf();
+
+    for (range_ms, window) in [(300_000i64, "5m"), (3_600_000, "1h")] {
+        let time = RawTimestamps::try_new(timestamps.clone().into()).unwrap();
+        let chunk = RawSeriesChunk::try_new(
+            &schema,
+            Buffer::from(vec![0u8]),
+            Some(MetricName::try_new(Some(Arc::from("metric")), vec![]).unwrap()),
+            time,
+            SeriesFields::try_from_vec(vec![Samples::from_float(Float64Array::from(
+                rising.clone(),
+            ))])
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        // The legacy input is built *after* the native case, not before both: a 1 h window holds
+        // 7 201 x 241 range indices (~1.7 M usizes), and holding that allocation alive during the
+        // native measurement would charge the native arm for allocator and cache pressure it does
+        // not cause.
+        group.bench_with_input(BenchmarkId::new("native/rate", window), &(), |b, _| {
+            b.iter(|| {
+                let mut evaluator = RangeEvaluator::try_new(
+                    &schema,
+                    grid.clone(),
+                    RangeWindow {
+                        range_ms,
+                        offset_ms: 0,
+                        anchor_ms: None,
+                    },
+                    RangeFunction::Rate,
+                )
+                .unwrap();
+                let series = evaluator.push(&chunk).unwrap();
+                evaluator.finish().unwrap();
+                series
+            })
+        });
+        // The UDF alone, with its input prepared outside the loop. This is what
+        // `ProjectionExec` pays, not what the whole legacy range-function path pays, so it is a
+        // lower bound rather than the number to compare against the evaluator.
+        let legacy = PreparedUdfCall::new(make_legacy_grid_input(&rising, GRID_POINTS, range_ms));
+        group.bench_with_input(
+            BenchmarkId::new("legacy_udf_only/rate", window),
+            &(),
+            |b, _| b.iter(|| invoke_prepared(&rate_udf, &legacy)),
+        );
+        drop(legacy);
+
+        // The legacy path's whole range-function cost: build the sliding ranges the way
+        // `PromRangeManipulate` does, then call the UDF. `RangeEvaluator::push` does both for the
+        // native arm -- it ingests raw samples and assembles each window -- so only this scope is
+        // comparable with the `native/` case above.
+        group.bench_with_input(BenchmarkId::new("legacy_full/rate", window), &(), |b, _| {
+            b.iter(|| {
+                let prepared =
+                    PreparedUdfCall::new(make_legacy_grid_input(&rising, GRID_POINTS, range_ms));
+                invoke_prepared(&rate_udf, &prepared)
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_native_range_eval,
+    bench_native_vs_legacy,
     bench_range_functions,
     bench_presence_range_functions,
     bench_delta_rate_comparison,

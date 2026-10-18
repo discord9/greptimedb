@@ -79,6 +79,7 @@ use std::mem::size_of;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use common_query::series_frame::unpack_raw_series;
 use datafusion::arrow::array::{
@@ -94,6 +95,9 @@ use datafusion::execution::context::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
@@ -132,6 +136,24 @@ struct TagEncoding {
     nullable: bool,
 }
 
+/// Time this node spends synchronously polling its input for one chunk.
+///
+/// The block ends before the poll returns `Pending`, so the value never includes time the
+/// child spent waiting on I/O or on a wakeup. It is block elapsed time, not exclusive CPU.
+const METRIC_INPUT_POLL: &str = "fused_input_poll_time";
+/// Time spent in `RangeEvaluator::push` plus the map kernels it feeds.
+const METRIC_EVALUATE: &str = "fused_evaluate_time";
+/// Time spent turning one evaluated series into a `RecordBatch` (time, value and tag columns).
+const METRIC_EMIT: &str = "fused_emit_time";
+/// Time spent concatenating buffered batches for downstream.
+const METRIC_FLUSH: &str = "fused_flush_time";
+/// Raw chunks received from the child.
+const METRIC_INPUT_CHUNKS: &str = "fused_input_chunks";
+/// Series the evaluator completed.
+const METRIC_SERIES_COMPLETED: &str = "fused_series_completed";
+/// Series that produced at least one kept row.
+const METRIC_SERIES_EMITTED: &str = "fused_series_emitted";
+
 /// Evaluates one range function followed by 0..N float map kernels per raw series.
 pub struct FusedSeriesExec {
     input: Arc<dyn ExecutionPlan>,
@@ -149,6 +171,7 @@ pub struct FusedSeriesExec {
     /// One entry per output column, in output column order.
     classification: Arc<[OutputColumn]>,
     properties: Arc<PlanProperties>,
+    metric: ExecutionPlanMetricsSet,
 }
 
 impl FusedSeriesExec {
@@ -218,6 +241,7 @@ impl FusedSeriesExec {
             time_column,
             classification: classification.into(),
             properties,
+            metric: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -249,6 +273,10 @@ impl DisplayAs for FusedSeriesExec {
 impl ExecutionPlan for FusedSeriesExec {
     fn name(&self) -> &str {
         Self::name()
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metric.clone_inner())
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -329,6 +357,8 @@ impl ExecutionPlan for FusedSeriesExec {
             self.function,
         )?;
         Ok(Box::pin(FusedSeriesStream {
+            baseline: BaselineMetrics::new(&self.metric, partition),
+            timers: FusedTimers::register(&self.metric, partition),
             input,
             evaluator: Some(evaluator),
             maps: self.maps.clone(),
@@ -924,6 +954,67 @@ struct FusedSeriesStream {
     /// otherwise.
     reservation: MemoryReservation,
     finished: bool,
+    /// Standard `output_rows` / `output_batches` / `elapsed_compute`.
+    baseline: BaselineMetrics,
+    /// Handles to the counters registered on this partition's metrics set. They are `Arc`-backed
+    /// clones, so recording on them updates what `metrics()` reports.
+    timers: FusedTimers,
+}
+
+/// The four block-scoped timers and three counters of one partition.
+#[derive(Clone)]
+struct FusedTimers {
+    input_poll: Time,
+    evaluate: Time,
+    emit: Time,
+    flush: Time,
+    input_chunks: Count,
+    series_completed: Count,
+    series_emitted: Count,
+}
+
+impl FusedTimers {
+    /// Registers the handles on `set` for `partition` and returns the clones the stream records on.
+    fn register(set: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let build_time = |name: &'static str| {
+            let time = Time::new();
+            MetricBuilder::new(set)
+                .with_partition(partition)
+                .build(MetricValue::Time {
+                    name: name.into(),
+                    time: time.clone(),
+                });
+            time
+        };
+        let input_poll = build_time(METRIC_INPUT_POLL);
+        let evaluate = build_time(METRIC_EVALUATE);
+        let emit = build_time(METRIC_EMIT);
+        let flush = build_time(METRIC_FLUSH);
+
+        let build_count = |name: &'static str| {
+            let count = Count::new();
+            MetricBuilder::new(set)
+                .with_partition(partition)
+                .build(MetricValue::Count {
+                    name: name.into(),
+                    count: count.clone(),
+                });
+            count
+        };
+        let input_chunks = build_count(METRIC_INPUT_CHUNKS);
+        let series_completed = build_count(METRIC_SERIES_COMPLETED);
+        let series_emitted = build_count(METRIC_SERIES_EMITTED);
+
+        Self {
+            input_poll,
+            evaluate,
+            emit,
+            flush,
+            input_chunks,
+            series_completed,
+            series_emitted,
+        }
+    }
 }
 
 impl FusedSeriesStream {
@@ -971,13 +1062,16 @@ impl FusedSeriesStream {
     ///
     /// `None` means the series holds no value at all, so it has no output row.
     fn emit(&mut self, series: &Series) -> Result<Option<RecordBatch>> {
+        let started = Instant::now();
         self.claim_label_set(series)?;
-        series_to_record_batch(
+        let batch = series_to_record_batch(
             &self.classification,
             &self.tags,
             &self.output_schema,
             series,
-        )
+        )?;
+        self.timers.emit.add_elapsed(started);
+        Ok(batch)
     }
 
     /// Buffers one emitted batch and reserves its bytes on the memory pool.
@@ -999,6 +1093,7 @@ impl FusedSeriesStream {
         if self.pending.is_empty() {
             return Ok(None);
         }
+        let started = Instant::now();
         let batches = std::mem::take(&mut self.pending);
         self.pending_rows = 0;
         // Concatenating allocates the result while the buffered batches are still alive, so the
@@ -1006,6 +1101,7 @@ impl FusedSeriesStream {
         let batch = concat_batches(&self.output_schema, &batches)?;
         let bytes = std::mem::take(&mut self.pending_bytes);
         self.reservation.try_shrink(bytes)?;
+        self.timers.flush.add_elapsed(started);
         Ok(Some(batch))
     }
 }
@@ -1021,6 +1117,17 @@ impl Stream for FusedSeriesStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
+        // `record_poll` owns the standard `output_rows`, `output_batches` and end timestamp;
+        // everything else is recorded inside the loop where the block actually runs.
+        let poll = this.poll_evaluated(cx);
+        this.baseline.record_poll(poll)
+    }
+}
+
+impl FusedSeriesStream {
+    /// The stream's own poll loop, without the baseline bookkeeping around it.
+    fn poll_evaluated(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+        let this = self;
         if this.finished {
             return Poll::Ready(None);
         }
@@ -1059,9 +1166,15 @@ impl Stream for FusedSeriesStream {
                     }
                 };
             }
+            let poll_started = Instant::now();
             let polled = this.input.as_mut().poll_next(cx);
+            if polled.is_pending() {
+                // The block did not produce a chunk, so charging it would fold wait time into a
+                // timer that claims to measure work.
+                return Poll::Pending;
+            }
+            this.timers.input_poll.add_elapsed(poll_started);
             let chunk = match polled {
-                Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     let Some(evaluator) = this.evaluator.take() else {
                         // Handled at the top of the loop; go back to it instead of assuming.
@@ -1079,8 +1192,11 @@ impl Stream for FusedSeriesStream {
                     return Poll::Ready(Some(Err(DataFusionError::External(Box::new(error)))));
                 }
                 Poll::Ready(Some(Ok(chunk))) => chunk,
+                Poll::Pending => unreachable!("a pending poll returned above"),
             };
             consumed += 1;
+            this.timers.input_chunks.add(1);
+            let evaluate_started = Instant::now();
             let evaluated = {
                 let maps = &this.maps;
                 let Some(evaluator) = this.evaluator.as_mut() else {
@@ -1092,6 +1208,7 @@ impl Stream for FusedSeriesStream {
                     None => Ok(None),
                 })
             };
+            this.timers.evaluate.add_elapsed(evaluate_started);
             let series = match evaluated {
                 Ok(series) => series,
                 Err(error) => {
@@ -1102,10 +1219,12 @@ impl Stream for FusedSeriesStream {
             let Some(series) = series else {
                 continue;
             };
+            this.timers.series_completed.add(1);
             match this.emit(&series) {
                 // A series without a single value has no row to contribute.
                 Ok(None) => continue,
                 Ok(Some(batch)) => {
+                    this.timers.series_emitted.add(1);
                     if let Err(error) = this.push_pending(batch) {
                         this.abort();
                         return Poll::Ready(Some(Err(error)));

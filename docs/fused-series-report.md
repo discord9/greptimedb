@@ -11,9 +11,11 @@ depends on the window width — a 1 h window costs the same as a 5 min one (1.00
 where the previous code paid 3.38x) — and at the compute level `rate[1h]` is
 4.24x faster. End to end that removed the wide-window regression (0.43x → 0.90x)
 and leaves the fused path 0.88x-0.93x at fine steps with narrow windows, with
-`max_over_time` as a 1% noise floor. The remaining gap is not range-function
-arithmetic: it is the raw series scan, 235 of the 279 ms of operator compute left
-in the fused plan. See section 4.4. `experimental_native_promql` stays off.**
+`max_over_time` as a 1% noise floor. The remaining gap is not the reset index and
+is not the raw series scan, as an earlier revision of this report claimed: on
+identical input the fused evaluator costs 3.35x the ordinary plan's range-function
+work, which accounts for the whole end-to-end CPU gap. See sections 4.4 and 4.5.
+`experimental_native_promql` stays off.**
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -344,45 +346,95 @@ fusion has **not** been shown to beat the ordinary plan on any of these shapes
 yet; what this round shows is that it no longer loses badly on the wide-window
 one.
 
-### 4.4 What the remaining gap is
+### 4.4 What the remaining gap is — an earlier claim, retracted
 
-`TQL ANALYZE VERBOSE` on `G`, median of the last 3 of 5 runs, per-operator
-`elapsed_compute`. Only the operators that matter are listed.
+An earlier version of this section said the remaining gap was the raw series scan
+(235 of 279 ms). **That claim is withdrawn; the table it came from does not measure
+what it was used for.** It is kept here because the reason it fails is the useful part.
 
-| arm | operator | compute |
-| --- | --- | ---: |
-| L | `SeriesScan` | 378 ms |
-| L | `ProjectionExec` | 51 ms |
-| L | `AggregateExec` | 40 ms |
-| L | `PromRangeManipulateExec` | 35 ms |
-| L | `PromSeriesDivideExec` | 26 ms |
-| L | `FilterExec` | 3 ms |
-| | **sum** | **537 ms** |
-| F | `SeriesScanExec` | 235 ms |
-| F | `AggregateExec` | 41 ms |
-| F | `SortPreservingMergeExec` | 2 ms |
-| F | `FilterExec` | 0.4 ms |
-| | **sum** | **279 ms** |
+**Why the per-operator table cannot decide anything.** Measured in one server run, both
+arms, same process:
 
-Two facts follow, and they answer "what is left":
+| arm | `/proc` CPU per query | sum of `elapsed_compute` over plan nodes |
+| --- | ---: | ---: |
+| L | 231.5 ms | 613.5 ms |
+| F | 360.0 ms | 295.0 ms |
 
-1. **The fused scan is already cheaper than the ordinary one** — 235 ms against
-   378 ms. The ordinary `SeriesScan` expands 192 000 raw rows into the columnar
-   path (`output_rows: 192 000`); the fused `SeriesScanExec` hands over 424 raw
-   chunks that never become columns. That is 143 ms the fused path does not
-   spend, and it is why `W` reaches 0.90x at all.
-2. **The fused plan has no range-function operator left to profile.** In the L
-   plan, `PromRangeManipulate` (35 ms) + `ProjectionExec` (51 ms) + `FilterExec`
-   (3 ms) + `PromSeriesDivide` (26 ms) is 115 ms of materialising work between
-   the scan and the aggregate. In the F plan, that work happens inside
-   `SeriesScanExec`, and the only node left above it is the aggregate, which the
-   two arms share (41 ms vs 40 ms). So F's 279 ms is ~235 ms scan + ~41 ms
-   aggregate, and the end-to-end 58.1 ms is that 279 ms of operator compute
-   divided across 20 partitions, plus response serialization.
+On `L` the sum of the plan nodes is 2.6x the process's total CPU, which is impossible.
+Three independent reasons, each enough on its own:
 
-So the remaining gap in `G`/`S` is **not** in the range function. It is the raw
-series scan — 235 of the 279 ms — which is the next distinct target, and it is
-out of scope for this round.
+- **`elapsed_compute` includes `elapsed_await`.** `L`'s `SeriesScan`: compute 424 ms, of
+  which `elapsed_await` 257 ms and `elapsed_poll` 0.96 ms. `F`'s `SeriesScanExec`:
+  compute 255 ms, of which `elapsed_await` 213 ms. Nearly all of the "scan" cost is
+  waiting for region I/O, not arithmetic.
+- **The partitions run concurrently**, so summing per-partition time over 20 partitions
+  counts the same wall-clock seconds many times.
+- **`FusedSeriesExec` carried no metrics at all** — it printed `metrics=[]`. The node
+  doing the dominant work of the fused plan was invisible in `ANALYZE VERBOSE`. This
+  round added its metrics; section 4.5 reports what they show.
+
+A fourth, smaller error in the same table: `F`'s `SeriesScanExec` reported
+`output_rows: 424` where `L`'s `SeriesScan` reported 192 000. 424 is one partition's
+last batch, not the scan's total.
+
+### 4.5 Where the fused arm's extra CPU actually goes
+
+Machine-wide process CPU counts, not per-operator self-reports. Two servers cannot share
+a data home (raft-engine holds an exclusive lock), so the arms alternate across restarts
+instead of running side by side; 2 warmup + 9 timed per arm.
+
+| arm | wall/query | CPU/query | busy |
+| --- | ---: | ---: | ---: |
+| L | 51.6 / 57.2 / 60.7 ms | 240 / 260 / 260 ms | 425-465% |
+| F | 72.0 / 80.6 / 94.3 ms | 370 / 390 / 390 ms | 413-514% |
+
+`F` does about **1.5x the CPU** of `L` per query and spreads it over more threads. The
+regression is real work, not latency or scheduling. Collapsing the pipeline to one
+partition keeps the gap (1 partition: `L` 160 ms CPU / 143 ms wall, `F` 210 / 197;
+20 partitions: `L` 250 / 59, `F` 350 / 61), so it is not a per-partition fixed cost.
+
+**A marginal test separates per-row work from per-scan work.** `C` and `G` scan the
+identical 192 000 raw samples and differ only in grid step, so 60x more output rows:
+
+| arm | `C` (48 400 rows) | `G` (2 868 400 rows) | d CPU | per added row |
+| --- | ---: | ---: | ---: | ---: |
+| L | 70 ms | 250 ms | 180 ms | 64 ns |
+| F | 40 ms | 330 ms | 290 ms | 103 ns |
+
+`F` is *cheaper* than `L` on the coarse grid — it skips `ProjectionExec`,
+`PromSeriesDivideExec` and `PromSeriesNormalizeExec` — and more expensive on the fine
+grid. The extra cost tracks output rows, not the scan.
+
+**The two implementations of the range function, on identical input.** One series of
+2 880 samples at 15 s on the same 7 201-point 1 s grid, criterion, 100 samples. The
+scopes are deliberately listed because comparing the wrong pair is how this section went
+wrong twice:
+
+| case | timed scope | 5 m window | 1 h window |
+| --- | --- | ---: | ---: |
+| `native/` | `RangeEvaluator::try_new` + `push` + `finish` | 419.4 us | 423.7 us |
+| `legacy_udf_only/` | the UDF call, input prepared outside the loop | 91.3 us | 88.8 us |
+| `legacy_full/` | build the sliding ranges, then call the UDF | 125.2 us | 115.1 us |
+
+`native/` must be compared against `legacy_full/`, not `legacy_udf_only/`:
+`RangeEvaluator::push` both ingests raw samples and assembles every window, which in the
+ordinary plan is split between `PromRangeManipulate` and the UDF. Against the wrong
+scope the ratio reads 4.6x; against the right one it is **3.35x**.
+
+That 3.35x accounts for the whole end-to-end gap: 400 series x (419.4 - 125.2) us =
+117.6 ms, against the 128.5 ms of CPU `G` costs `F` over `L` (360 vs 231.5 ms). So the
+remaining regression is in the evaluator, not in the scan, the output or the flush.
+
+**What is not yet known.** The evaluator costs ~58 ns per grid point, and the candidates
+are the per-point `partition_point` in `evaluate_row`, the per-window kernel call, and
+`GridSeriesBuilder::push` per point. The fused node also materialises all four tag
+columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans every
+grid point twice per series (`claim_label_set` then `series_to_record_batch`). None of
+these is measured yet, and their rough sizes do not add up to 3.35x, so the more likely
+explanation is structural: the legacy UDF processes a batch of windows at once while the
+native evaluator calls a scalar kernel once per window. Section 4.5 therefore does not
+yet name the next change; the `fused_*` partition metrics added this round are what will
+name it.
 
 ## 5. What is not shown
 
@@ -391,8 +443,10 @@ out of scope for this round.
   against the ordinary plan at fine steps with narrow windows. There is no
   evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
-- **The remaining cost is located, not fixed.** Section 4.4 shows the raw series
-  scan is 235 of the 279 ms of `G`'s operator compute. Making that cheaper is the
+- **The remaining cost is located approximately, not fixed.** Section 4.5 shows the
+  fused evaluator costs 3.35x the ordinary plan's range-function work on identical
+  input, and that this accounts for the whole end-to-end CPU gap. Which part of the
+  evaluator is the next change is not yet determined. Making it cheaper is the
   next change, and it is a different one.
 - **The output path was not measured.** The node targets 4 096 rows per batch
   (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20

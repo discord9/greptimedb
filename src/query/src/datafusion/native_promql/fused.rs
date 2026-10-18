@@ -714,6 +714,10 @@ mod e2e {
     use std::task::{Context, Poll};
     use std::time::{Duration, UNIX_EPOCH};
 
+    // The production routing entry point lives one level above `fused`, so `super` is not
+    // enough from inside this module.
+    use crate::datafusion::native_promql::try_select;
+
     use api::region::RegionResponse;
     use api::v1::SemanticType;
     use async_trait::async_trait;
@@ -1417,14 +1421,17 @@ mod e2e {
             .create_physical_plan(&logical, &session)
             .await
             .unwrap();
-        // The flag is what routes a plan through the fused selection in production, so the same
-        // entry point is called here; a change in that routing fails the test rather than
-        // silently comparing the ordinary plan with itself.
-        let selected = if native {
-            super::try_select_fused(&logical, &physical).unwrap()
+        // Route through the same function production uses, gated by the same flag the state
+        // carries. A change to either the routing or the flag handling fails these tests instead
+        // of silently comparing the ordinary plan with itself.
+        let selected = if state.experimental_native_promql() {
+            try_select(&logical, Arc::clone(&physical)).await.unwrap()
         } else {
-            None
+            Arc::clone(&physical)
         };
+        // `try_select` returns the input unchanged when nothing matched, so "selected" means the
+        // plan actually changed.
+        let selected = (!Arc::ptr_eq(&selected, &physical)).then_some(selected);
         (state, logical, physical, selected)
     }
 
@@ -1595,6 +1602,40 @@ mod e2e {
             describe(&fused)
         );
 
+        // The folded node itself still emits every visible tag, and the aggregate above it is what
+        // selects `instance`. Pinning this is the point of the test: the tag-subset semantics live
+        // in the plan above the node, not in the node. A change that narrowed the node's schema
+        // would break the parent's column references, and a change that made the node refuse a
+        // tag-subset plan would stop these queries from fusing at all. Checking the final result
+        // alone sees neither, because the aggregate narrows the columns on both arms.
+        {
+            let folded = find_node(&fused, "FusedSeriesExec")
+                .unwrap_or_else(|| panic!("the fused plan lost its node:\n{}", describe(&fused)));
+            let folded_schema = folded.schema();
+            let folded_names: Vec<&str> = folded_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect();
+            assert_eq!(
+                folded_names.len(),
+                2 + TAGS.len(),
+                "the folded node must emit its time column, its value column and every tag: \
+                 {folded_names:?}"
+            );
+            assert!(
+                folded_schema.column_with_name(TIME).is_some(),
+                "the folded node lost its time column: {folded_names:?}"
+            );
+            for tag in TAGS {
+                assert!(
+                    folded_schema.column_with_name(tag).is_some(),
+                    "the folded node must still carry tag `{tag}` for its parent to select from: \
+                     {folded_names:?}"
+                );
+            }
+        }
+
         let ordinary_batches = datafusion::physical_plan::collect(ordinary, session.task_ctx())
             .await
             .unwrap();
@@ -1603,9 +1644,31 @@ mod e2e {
             .unwrap();
         assert!(!fused_batches.is_empty(), "the fused plan produced no rows");
 
+        // The aggregate above the fold is what narrows the labels: both arms must end at
+        // exactly the grouping label, never at a subset of it and never with a stray tag.
+        for (arm, batches) in [("fused", &fused_batches), ("ordinary", &ordinary_batches)] {
+            let schema = batches
+                .first()
+                .unwrap_or_else(|| panic!("the {arm} plan produced no rows"))
+                .schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(
+                names,
+                vec![INSTANCE, TIME, schema.field(2).name().as_str()],
+                "the {arm} arm's result must carry `{INSTANCE}`, `{TIME}` and one value: {names:?}"
+            );
+            for absent in TAGS.iter().filter(|tag| **tag != INSTANCE) {
+                assert!(
+                    schema.column_with_name(absent).is_none(),
+                    "the {arm} arm still carries tag `{absent}`: {names:?}"
+                );
+            }
+        }
+
         let fused_rows = instance_rows(&fused_batches);
         let ordinary_rows = instance_rows(&ordinary_batches);
         // The hand-computed answer: four steps (360, 420, 480, 540 s) for each of two instances.
+        // Summing by instance across the two partitions gives x = 1 + 2 and y = 3 + 4.
         let expected: Vec<(String, i64, f64)> = ["x", "y"]
             .into_iter()
             .flat_map(|instance| {
@@ -1620,31 +1683,46 @@ mod e2e {
                     })
             })
             .collect();
-        assert_eq!(fused_rows.len(), 8, "eight rows expected: {fused_rows:?}");
-        for (actual, expected) in fused_rows.iter().zip(&expected) {
+        // Both arms are compared against the hand-computed answer in full. Comparing them only
+        // with each other would pass if both were wrong the same way, and a `zip` against the
+        // expectation would pass if either list were short.
+        for (arm, rows) in [("fused", &fused_rows), ("ordinary", &ordinary_rows)] {
             assert_eq!(
-                (&actual.0, actual.1),
-                (&expected.0, expected.1),
-                "labels or step differ"
+                rows.len(),
+                expected.len(),
+                "the {arm} arm returned {} rows, expected {}: {rows:?}",
+                rows.len(),
+                expected.len()
             );
-            assert!(
-                close_to(actual.2, expected.2),
-                "{} at {} s is {}, expected {}: {fused_rows:?}",
-                actual.0,
-                actual.1 / 1000,
-                actual.2,
-                expected.2
-            );
+            for (actual, want) in rows.iter().zip(&expected) {
+                assert_eq!(
+                    (&actual.0, actual.1),
+                    (&want.0, want.1),
+                    "the {arm} arm's labels or step differ: {rows:?}"
+                );
+                assert!(
+                    close_to(actual.2, want.2),
+                    "the {arm} arm has {} at {} s = {}, expected {}: {rows:?}",
+                    actual.0,
+                    actual.1 / 1000,
+                    actual.2,
+                    want.2
+                );
+            }
         }
-        // The two arms must agree with each other as well as with the hand-computed values.
-        for ((label, ts, value), (ordinary_label, ordinary_ts, ordinary_value)) in
-            fused_rows.iter().zip(&ordinary_rows)
-        {
-            assert_eq!((label, ts), (ordinary_label, ordinary_ts));
+        // Equal lengths are established above, so this comparison cannot silently truncate.
+        for (fused_row, ordinary_row) in fused_rows.iter().zip(&ordinary_rows) {
+            assert_eq!(
+                (&fused_row.0, fused_row.1),
+                (&ordinary_row.0, ordinary_row.1)
+            );
             assert!(
-                close_to(*value, *ordinary_value),
-                "the fused and ordinary sums at {label}@{ts} disagree: \
-                 fused {value}, ordinary {ordinary_value}"
+                close_to(fused_row.2, ordinary_row.2),
+                "the fused and ordinary sums at {}@{} disagree: fused {}, ordinary {}",
+                fused_row.0,
+                fused_row.1,
+                fused_row.2,
+                ordinary_row.2
             );
         }
     }
@@ -1666,6 +1744,19 @@ mod e2e {
                 .iter()
                 .map(|child| count_fused(child))
                 .sum::<usize>()
+    }
+
+    /// The first node of `plan` named `name`, searched depth first.
+    fn find_node<'a>(
+        plan: &'a Arc<dyn ExecutionPlan>,
+        name: &str,
+    ) -> Option<&'a Arc<dyn ExecutionPlan>> {
+        if plan.name() == name {
+            return Some(plan);
+        }
+        plan.children()
+            .iter()
+            .find_map(|child| find_node(child, name))
     }
 
     /// The names of every node in `plan`, in plan order.
