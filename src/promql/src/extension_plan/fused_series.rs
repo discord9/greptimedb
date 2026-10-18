@@ -13,13 +13,25 @@
 // limitations under the License.
 
 //! One physical node that evaluates one range function and then 0..N float map kernels over raw
-//! series, converting every completed evaluated series directly into one output batch.
+//! series, converting every completed evaluated series directly into output rows.
 //!
 //! There is no `SeriesFrame` pack/unpack and no intermediate `RecordBatch` between the evaluation
 //! and the map kernels: both stages run over typed [`Series`] values inside this node.
 //!
-//! Phase 1 scope: the child produces raw frames of one partition with explicit labels and is not
-//! interleaved, and the output schema must classify into exactly one timestamp column, one
+//! The node runs one evaluator per input partition: its partition count is its child's, and
+//! `execute(partition, ..)` evaluates exactly the child stream of that partition with its own
+//! label-set state. A `PerSeries`-distributed raw-series scan hands every partition whole series --
+//! never one series split across partitions -- so evaluating each partition on its own is correct
+//! and needs no final merge for the range function. Cross-partition state is deliberately absent
+//! for the same reason: two partitions own disjoint series, so a final label set can only collide
+//! with one inside a single partition.
+//!
+//! The completed series of one stream do not each become a batch: the node coalesces their rows
+//! into output batches of up to `MAX_ROWS_PER_BATCH` rows, because one batch per series would hand
+//! downstream hundreds of tiny batches per query.
+//!
+//! Phase 1 scope: the child produces raw frames with explicit labels that are not interleaved, and
+//! the output schema must classify into exactly one timestamp column, one
 //! `Float64` column per series field, and one string column per declared tag. A tag column is
 //! either `Utf8` or `Dictionary(UInt32, Utf8)`, because the PromQL plan reports dictionary-encoded
 //! labels; every row of one series carries the same single label value, so the dictionary holds
@@ -33,7 +45,7 @@
 //! Rows follow the ordinary PromQL plan's semantics: that plan keeps `<value> IS NOT NULL` above
 //! its projection, so a grid point at which the series has no value never reaches the result. This
 //! node therefore omits every row whose value columns are all null, and a series without any value
-//! emits no batch at all instead of a batch of null rows.
+//! contributes no row at all instead of a batch of null rows.
 //!
 //! This node computes floats only, and admitting raw samples is the caller's responsibility:
 //! validating the declared frame schema cannot prove that the samples are float, so a histogram
@@ -45,13 +57,15 @@
 //! `__name__`, so two distinct raw series can reach the same final label set; if both have a
 //! sample at the same evaluation timestamp that is an error (`vector cannot contain metrics with
 //! the same labelset`), while series whose occupied grid points are disjoint are legal and
-//! Prometheus merges them into one output series. This node emits such series as separate batches
-//! and defers that merge to matrix assembly, so no sample is dropped.
+//! Prometheus merges them into one output series. This node emits such series as separate rows
+//! and defers that merge to matrix assembly, so no sample is dropped. The occupancy state that
+//! detects a collision belongs to one stream, so it is per partition.
 //!
-//! Memory: the only state retained across polls that grows with the output is the per-stream
-//! label-set occupancy map, and its bytes are reserved on the task's memory pool. The range-window
-//! samples [`RangeEvaluator`] retains across chunks and the batches already handed downstream are
-//! deliberately not reserved here.
+//! Memory: the state retained across polls that grows with the output is the per-stream label-set
+//! occupancy map and the buffered rows of the batch being filled, and the bytes of both are
+//! reserved on the task's memory pool. The reservation of the buffered rows is released when they
+//! are handed downstream. The range-window samples [`RangeEvaluator`] retains across chunks and the
+//! batches already handed downstream are deliberately not reserved here.
 //!
 //! The child's `is_last` is the only completion signal. This node neither recomputes finality
 //! across inputs nor emits a series it has not seen finalized, so a child that merges regions must
@@ -71,7 +85,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
     UInt32Array,
 };
-use datafusion::arrow::compute::take;
+use datafusion::arrow::compute::{concat_batches, take};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -154,10 +168,10 @@ impl FusedSeriesExec {
         time_column: String,
     ) -> Result<Self> {
         let partition_count = input.properties().partitioning.partition_count();
-        if partition_count != 1 {
-            return Err(DataFusionError::Plan(format!(
-                "FusedSeriesExec requires a single-partition input, got {partition_count} partitions"
-            )));
+        if partition_count == 0 {
+            return Err(DataFusionError::Plan(
+                "FusedSeriesExec requires an input with at least one partition".into(),
+            ));
         }
         if series_schema.eval_grid.is_some() {
             return Err(DataFusionError::Plan(
@@ -184,7 +198,9 @@ impl FusedSeriesExec {
         let classification = classify_output(&output_schema, &series_schema, &tags, &time_column)?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
+            // One partition per input partition: `execute` runs the child stream of the partition
+            // it is given, and each stream owns its own evaluator and label-set state.
+            Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -286,13 +302,14 @@ impl ExecutionPlan for FusedSeriesExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
+        let partition_count = self.properties.output_partitioning().partition_count();
+        if partition >= partition_count {
             return Err(DataFusionError::Execution(format!(
-                "FusedSeriesExec has a single partition, got partition {partition}"
+                "FusedSeriesExec has {partition_count} partitions, got partition {partition}"
             )));
         }
         let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
-        let frame = self.input.execute(0, context)?;
+        let frame = self.input.execute(partition, context)?;
         let input = unpack_raw_series(
             frame,
             self.series_schema.clone(),
@@ -320,6 +337,9 @@ impl ExecutionPlan for FusedSeriesExec {
             classification: self.classification.clone(),
             // Fresh per stream: two streams must never share duplicate-label-set state.
             seen: HashMap::new(),
+            pending: Vec::new(),
+            pending_rows: 0,
+            pending_bytes: 0,
             reservation: MemoryConsumer::new("FusedSeriesStream").register(&memory_pool),
             finished: false,
         }))
@@ -511,12 +531,14 @@ fn classify_output(
     Ok(classification)
 }
 
-/// Converts one evaluated series into one output batch, or into nothing at all.
+/// Converts one evaluated series into one batch, or into nothing at all.
 ///
-/// The time column is the trimmed absolute interval of the series, missing samples are nulls and
-/// ordinary NaN stays a value. A row whose every value column is null is not a point of the
-/// series, so it is omitted, exactly like the `<value> IS NOT NULL` filter the ordinary PromQL
-/// plan keeps above its projection; a series without any value therefore emits no batch.
+/// The batch holds only this series' rows; the stream buffers it and coalesces several series into
+/// one output batch. The time column is the trimmed absolute interval of the series, missing
+/// samples are nulls and ordinary NaN stays a value. A row whose every value column is null is not
+/// a point of the series, so it is omitted, exactly like the `<value> IS NOT NULL` filter the
+/// ordinary PromQL plan keeps above its projection; a series without any value therefore
+/// contributes no row at all.
 fn series_to_record_batch(
     classification: &[OutputColumn],
     tags: &[String],
@@ -710,6 +732,13 @@ fn apply_maps(evaluator: &RangeEvaluator, maps: &[MathOp], series: Series) -> Re
 /// budget is per poll, so a poll that returns a batch starts the next one fresh.
 const MAX_CHUNKS_PER_POLL: usize = 64;
 
+/// Rows the output batches of one stream are filled to before they are handed downstream.
+///
+/// One completed series produces at most one grid of rows, so without buffering a query over `n`
+/// series hands downstream `n` tiny batches and pays the per-batch overhead `n` times. A few
+/// thousand rows amortizes that overhead while keeping one buffered batch small enough to hold.
+const MAX_ROWS_PER_BATCH: usize = 4_096;
+
 /// A canonical, collision-free encoding of a final label set.
 ///
 /// [`MetricName`] implements `PartialEq + Eq` but not `Hash`, and it is a dependency-owned type,
@@ -871,19 +900,28 @@ fn merge_runs(stored: &mut Vec<(usize, usize)>, new: &[(usize, usize)]) {
     *stored = merged;
 }
 
-/// Turns raw series chunks into one output batch per completed series.
+/// Turns raw series chunks into output batches of coalesced completed series.
 struct FusedSeriesStream {
     input: SendableRawSeriesStream,
-    /// `None` once the stream is finished; `finish(self)` consumes the evaluator.
+    /// `None` once the child ended; `finish(self)` consumes the evaluator.
     evaluator: Option<RangeEvaluator>,
     maps: Vec<MathOp>,
     tags: Arc<[String]>,
     output_schema: SchemaRef,
     classification: Arc<[OutputColumn]>,
     /// The grid positions each final label set already occupies, as merged, sorted runs.
+    ///
+    /// Per stream, hence per partition: each partition owns whole series of its own, so a label
+    /// set only ever collides with one inside the same partition.
     seen: HashMap<LabelsKey, Vec<(usize, usize)>>,
-    /// Accounts for `seen`; batches already handed downstream are not reserved. Released at
-    /// [`Self::abort`] on every error path, and by [`MemoryReservation`]'s own `Drop` otherwise.
+    /// Batches of completed series not yet handed downstream, and the rows they hold.
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    /// Bytes of `pending`, reserved on `reservation` like the label-set state.
+    pending_bytes: usize,
+    /// Accounts for `seen` and `pending`; batches already handed downstream are not reserved.
+    /// Released at [`Self::abort`] on every error path, and by [`MemoryReservation`]'s own `Drop`
+    /// otherwise.
     reservation: MemoryReservation,
     finished: bool,
 }
@@ -894,6 +932,9 @@ impl FusedSeriesStream {
         self.finished = true;
         self.evaluator = None;
         self.seen = HashMap::new();
+        self.pending = Vec::new();
+        self.pending_rows = 0;
+        self.pending_bytes = 0;
         self.reservation.free();
     }
 
@@ -901,8 +942,8 @@ impl FusedSeriesStream {
     ///
     /// A collision is an error only when both series hold a sample at the same evaluation
     /// timestamp, which is Prometheus' range-query rule. Series with disjoint points are legal:
-    /// Prometheus merges them into one output series, while this node emits them as separate
-    /// batches and defers that merge to matrix assembly, so every sample survives.
+    /// Prometheus merges them into one output series, while this node emits them as separate rows
+    /// and defers that merge to matrix assembly, so every sample survives.
     fn claim_label_set(&mut self, series: &Series) -> Result<()> {
         let runs = occupied_runs(series)?;
         let key = LabelsKey::new(&series.metric);
@@ -918,8 +959,6 @@ impl FusedSeriesStream {
                 merge_runs(stored, &runs);
             }
             Entry::Vacant(entry) => {
-                // Only the label-set state is this node's own cross-poll state that grows with
-                // the output, so it is the only thing reserved here.
                 let bytes = entry.key().len() + runs.len() * 2 * size_of::<usize>();
                 self.reservation.try_grow(bytes)?;
                 entry.insert(runs);
@@ -940,6 +979,35 @@ impl FusedSeriesStream {
             series,
         )
     }
+
+    /// Buffers one emitted batch and reserves its bytes on the memory pool.
+    fn push_pending(&mut self, batch: RecordBatch) -> Result<()> {
+        let bytes = batch.get_array_memory_size();
+        self.reservation.try_grow(bytes)?;
+        self.pending_bytes += bytes;
+        self.pending_rows += batch.num_rows();
+        self.pending.push(batch);
+        Ok(())
+    }
+
+    /// Hands the buffered batches downstream as one concatenated batch.
+    ///
+    /// `None` means nothing was buffered. The reservation of the buffered rows is released here:
+    /// the batch belongs to the caller afterwards, exactly like the batches the child hands this
+    /// node. `concat_batches` accepts dictionary columns, so tag columns keep their encoding.
+    fn flush(&mut self) -> Result<Option<RecordBatch>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let batches = std::mem::take(&mut self.pending);
+        self.pending_rows = 0;
+        // Concatenating allocates the result while the buffered batches are still alive, so the
+        // buffered bytes stay reserved until it succeeded.
+        let batch = concat_batches(&self.output_schema, &batches)?;
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        self.reservation.try_shrink(bytes)?;
+        Ok(Some(batch))
+    }
 }
 
 impl RecordBatchStream for FusedSeriesStream {
@@ -959,30 +1027,52 @@ impl Stream for FusedSeriesStream {
         // Every call starts a fresh budget, so returning a batch below resets it.
         let mut consumed = 0usize;
         loop {
+            // A finished evaluator means the child already ended and its last series is emitted:
+            // the buffered rows are all that is left, so they are flushed before the end is
+            // reported. The stream therefore never reports the end with rows still buffered.
+            if this.evaluator.is_none() {
+                return match this.flush() {
+                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+                    Ok(None) => {
+                        this.finished = true;
+                        Poll::Ready(None)
+                    }
+                    Err(error) => {
+                        this.abort();
+                        Poll::Ready(Some(Err(error)))
+                    }
+                };
+            }
             if consumed == MAX_CHUNKS_PER_POLL {
-                // The whole budget went into chunks that produced no batch; hand the executor
-                // thread back instead of draining an always-ready child here.
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+                // The whole budget went into chunks that filled no batch: hand the buffered rows
+                // downstream if there are any, and otherwise give the executor thread back
+                // instead of draining an always-ready child here.
+                return match this.flush() {
+                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+                    Ok(None) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Err(error) => {
+                        this.abort();
+                        Poll::Ready(Some(Err(error)))
+                    }
+                };
             }
             let polled = this.input.as_mut().poll_next(cx);
             let chunk = match polled {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     let Some(evaluator) = this.evaluator.take() else {
-                        this.finished = true;
-                        return Poll::Ready(None);
+                        // Handled at the top of the loop; go back to it instead of assuming.
+                        continue;
                     };
-                    return match evaluator.finish() {
-                        Ok(()) => {
-                            this.finished = true;
-                            Poll::Ready(None)
-                        }
-                        Err(error) => {
-                            this.abort();
-                            Poll::Ready(Some(Err(error)))
-                        }
-                    };
+                    if let Err(error) = evaluator.finish() {
+                        this.abort();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    // The last series is emitted, so the loop flushes and reports the end.
+                    continue;
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.abort();
@@ -994,8 +1084,8 @@ impl Stream for FusedSeriesStream {
             let evaluated = {
                 let maps = &this.maps;
                 let Some(evaluator) = this.evaluator.as_mut() else {
-                    this.finished = true;
-                    return Poll::Ready(None);
+                    // Handled at the top of the loop; go back to it instead of assuming.
+                    continue;
                 };
                 evaluator.push(&chunk).and_then(|series| match series {
                     Some(series) => apply_maps(evaluator, maps, series).map(Some),
@@ -1012,9 +1102,26 @@ impl Stream for FusedSeriesStream {
             let Some(series) = series else {
                 continue;
             };
-            return match this.emit(&series) {
-                Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
+            match this.emit(&series) {
                 // A series without a single value has no row to contribute.
+                Ok(None) => continue,
+                Ok(Some(batch)) => {
+                    if let Err(error) = this.push_pending(batch) {
+                        this.abort();
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                }
+                Err(error) => {
+                    this.abort();
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+            // Below the row target the batch stays buffered, so one series does not cost a batch.
+            if this.pending_rows < MAX_ROWS_PER_BATCH {
+                continue;
+            }
+            return match this.flush() {
+                Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
                 Ok(None) => continue,
                 Err(error) => {
                     this.abort();

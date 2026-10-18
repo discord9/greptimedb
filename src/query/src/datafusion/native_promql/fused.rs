@@ -27,10 +27,13 @@
 //! folding the window into range arrays first.
 //!
 //! The fused subtree may sit anywhere in the plan, so an aggregation over a range function (the
-//! common query shape) is fused too: the subtree is located by its child-index path from the
-//! logical root, the physical plan is descended along the same path, and only the physical node at
-//! the end of that path is swapped. Every ancestor keeps its own configuration and its properties.
-//! Two or more candidate subtrees are rejected, because phase 1 fuses exactly one.
+//! common query shape) is fused too. Planning does not keep logical and physical nodes in step --
+//! one logical aggregate becomes a partial and a final aggregate around a repartition -- so the
+//! physical node to swap is located by its content, not by a position in the tree: it is the one
+//! projection that outputs exactly the schema of the matched subtree and folds exactly one range
+//! window below itself. Every ancestor keeps its own configuration and recomputes its properties
+//! around the new child. Two or more candidate subtrees or candidate nodes are rejected, because
+//! phase 1 fuses exactly one.
 //!
 //! Every gate failure returns `Ok(None)`, which means "run the ordinary plan". Nothing here may
 //! turn an unrecognized shape into a query error: the ordinary plan is always a correct answer, so
@@ -42,14 +45,13 @@ use api::v1::SemanticType;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::union::UnionExec;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result as DfResult, ScalarValue};
 use datafusion_expr::logical_plan::{SubqueryAlias, TableScan};
 use datafusion_expr::{Expr, Extension, LogicalPlan, Operator};
@@ -75,10 +77,9 @@ pub(crate) fn try_select_fused(
     let Some(shape) = FusedShape::discover(logical) else {
         return Ok(None);
     };
-    // The plan may be wrapped once at the root; that wrapper has to survive the swap.
-    let root = unwrap_cooperative(original).unwrap_or_else(|| Arc::clone(original));
-    let root_cooperative = !Arc::ptr_eq(&root, original);
-    let Some(target) = pick(&root, logical, &shape.path) else {
+    // The subtree is located by its content, so it is found under an aggregate and under any
+    // wrapper node the plan carries at its root.
+    let Some(target) = pick(original, &shape) else {
         return Ok(None);
     };
     let Some((scan, scan_cooperative)) = fused_scan(&target) else {
@@ -91,38 +92,24 @@ pub(crate) fn try_select_fused(
             return Ok(None);
         }
     };
-    let Some(replaced) = rebuild(&root, logical, &shape.path, &fused) else {
+    let Some(replaced) = rebuild(original, &target, &fused) else {
         return Ok(None);
     };
+    // A replacement that changes the caller's output is not an equivalent plan.
+    if replaced.schema() != original.schema() {
+        return Ok(None);
+    }
     // Operators need to know which path ran; a fallback is silent by design.
     common_telemetry::debug!(
         "Fused series selection succeeded: {:?} over {}",
         shape.function,
         shape.scan.table_name
     );
-    let result = if root_cooperative {
-        Arc::clone(original)
-            .replace_children(
-                vec![replaced],
-                datafusion::physical_plan::ReplaceChildrenOptions::new(
-                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
-                ),
-            )
-            .ok()
-    } else {
-        Some(replaced)
-    };
-    // A replacement that changes the caller's output is not an equivalent plan.
-    let Some(result) = result.filter(|result| result.schema() == original.schema()) else {
-        return Ok(None);
-    };
-    Ok(Some(result))
+    Ok(Some(replaced))
 }
 
 /// One matched fused subtree, with everything the fused node needs to run it.
 struct FusedShape {
-    /// Child indices from the logical root down to the topmost node of the fused subtree.
-    path: Vec<usize>,
     /// The single range function the subtree applies.
     function: RangeFunction,
     /// The scan the range window reads.
@@ -154,18 +141,17 @@ impl FusedShape {
     /// Finds the single fused subtree of `plan`, or `None` if there is none or more than one.
     fn discover(plan: &LogicalPlan) -> Option<Self> {
         let mut found = Vec::new();
-        collect(plan, &mut Vec::new(), &mut found);
+        collect(plan, &mut found);
         let [shape] = found.try_into().ok()?;
         Some(shape)
     }
 
     /// Matches the chain of projections and filters whose bottom is one `RangeManipulate`.
-    fn match_chain(plan: &LogicalPlan, path: &[usize]) -> Option<Self> {
+    fn match_chain(plan: &LogicalPlan) -> Option<Self> {
         let mut call = None;
         let fold = fold(plan, &mut call)?;
         let call = call?;
         Some(Self {
-            path: path.to_vec(),
             function: call.function,
             scan: fold.scan,
             start: fold.start,
@@ -254,19 +240,64 @@ impl FusedShape {
         }
         let field_names = vec![self.field.clone()];
 
-        // One partition, exactly like the existing raw-series path forces the scan.
-        let ranges = scan.get_partition_ranges();
-        let prepared = Arc::new(
-            scan.with_new_partitions(vec![ranges], 1)
-                .map_err(|_| "scan cannot be pinned to one partition")?,
-        );
-        let native =
-            match prepared.try_to_named_series_scan(&metric_name, &logical_tags, &field_names) {
-                Ok(Some(native)) => native,
-                // A leaf this shape cannot use, or one the scanner refuses, is a fallback.
-                Ok(None) => return Err("scan offers no named raw-series leaf"),
-                Err(_) => return Err("scan refused the named raw-series leaf"),
-            };
+        // The scan keeps every partition it was planned with, so the fused node runs one evaluator
+        // per stream instead of serializing the whole scan through one. A `PerSeries`-distributed
+        // raw-series scan hands every partition whole series, so those streams stay independent of
+        // each other and need no final merge for the range function.
+        let partitions = scan.get_uncollapsed_partition_ranges();
+        let partitions = if partitions.is_empty() {
+            // A scan with no range at all still runs its one (empty) partition.
+            vec![Vec::new()]
+        } else {
+            partitions
+        };
+        let partition_count = partitions.len();
+        // The leaf's partition count becomes the fused node's, so the ranges the scan is read with
+        // must be the partitions the scan declared.
+        if partition_count != scan.properties().output_partitioning().partition_count() {
+            return Err("scan partition ranges disagree with its own partitioning");
+        }
+        // The named raw-series binding is only resolved against a scanner prepared as one
+        // partition, so the ranges are collapsed for the resolution. A single-partition scan that
+        // is already prepared is used as it is; otherwise the scan is prepared again for every
+        // partition it will actually run, because the fused node inherits the leaf's partition
+        // count.
+        let collapsed = if partition_count == 1 && scan.is_partition_set() {
+            scan.clone()
+        } else {
+            Arc::new(
+                scan.with_new_partitions(vec![scan.get_partition_ranges()], 1)
+                    .map_err(|_| "scan cannot be prepared for its named raw-series leaf")?,
+            )
+        };
+        let binding = match collapsed.clone().try_to_named_series_binding(
+            &metric_name,
+            &logical_tags,
+            &field_names,
+        ) {
+            Ok(Some((binding, _))) => binding,
+            // A leaf this shape cannot use, or one the scanner refuses, is a fallback.
+            Ok(None) => return Err("scan offers no named raw-series leaf"),
+            Err(_) => return Err("scan refused the named raw-series leaf"),
+        };
+        let prepared = if partition_count == 1 {
+            collapsed
+        } else {
+            Arc::new(
+                scan.with_new_partitions(partitions, partition_count)
+                    .map_err(|_| "scan cannot keep its own partition ranges")?,
+            )
+        };
+        let native = match prepared.try_to_bound_series_scan(&binding) {
+            Ok(Some(native)) => native,
+            // A leaf this shape cannot use, or one the scanner refuses, is a fallback.
+            Ok(None) => return Err("scan offers no named raw-series leaf"),
+            Err(_) => return Err("scan refused the named raw-series leaf"),
+        };
+        // The leaf's partition count is the fused node's, so it must cover every range.
+        if native.properties().output_partitioning().partition_count() != partition_count {
+            return Err("raw-series leaf does not cover every partition range");
+        }
         // The leaf must read exactly the value column the pattern matched, and the scan it came
         // from must still declare the columns the fused output claims, so that the output the
         // fused node produces is the output the ordinary plan would have produced. The leaf's own
@@ -401,17 +432,15 @@ fn is_not_null_only(expr: &Expr) -> bool {
 }
 
 /// Walks the whole plan and collects every fused subtree.
-fn collect(plan: &LogicalPlan, path: &mut Vec<usize>, out: &mut Vec<FusedShape>) {
+fn collect(plan: &LogicalPlan, out: &mut Vec<FusedShape>) {
     if matches!(plan, LogicalPlan::Projection(_) | LogicalPlan::Filter(_))
-        && let Some(shape) = FusedShape::match_chain(plan, path)
+        && let Some(shape) = FusedShape::match_chain(plan)
     {
         out.push(shape);
         return;
     }
-    for (index, child) in plan.inputs().into_iter().enumerate() {
-        path.push(index);
-        collect(child, path, out);
-        path.pop();
+    for child in plan.inputs() {
+        collect(child, out);
     }
 }
 
@@ -516,82 +545,97 @@ fn folding_pipeline(plan: &LogicalPlan) -> Option<TableScan> {
     }
 }
 
-/// Returns the physical node at `path`, whose logical counterpart must also be reached by `path`.
-fn pick(
-    physical: &Arc<dyn ExecutionPlan>,
-    logical: &LogicalPlan,
-    path: &[usize],
-) -> Option<Arc<dyn ExecutionPlan>> {
-    let physical = unwrap_cooperative(physical).unwrap_or_else(|| Arc::clone(physical));
-    let Some((&index, rest)) = path.split_first() else {
-        return Some(physical);
+/// Returns the one physical node the fused node replaces, or `None` if it is absent or ambiguous.
+///
+/// Aggregation turns one logical node into several physical nodes and the optimizer inserts
+/// partitioning nodes, so nothing in the physical plan can be reached by mirroring the logical
+/// tree. The node is identified by its content instead: it is the only projection that outputs
+/// exactly the schema of the matched subtree and that folds exactly one range window below itself.
+/// The projection is what the fused node replaces; filters, aggregates and every other ancestor
+/// above it keep their own configuration.
+fn pick(physical: &Arc<dyn ExecutionPlan>, shape: &FusedShape) -> Option<Arc<dyn ExecutionPlan>> {
+    let mut found = Vec::new();
+    collect_candidates(physical, shape, &mut found);
+    // Zero candidates is an unfamiliar plan; several would mean the swap is ambiguous. Both fall
+    // back to the ordinary plan.
+    let [candidate] = found.as_slice() else {
+        return None;
     };
-    if !corresponds(logical, physical.as_ref()) {
-        return None;
-    }
-    let logical_children = logical.inputs();
-    let children = physical.children();
-    if logical_children.len() != children.len() {
-        return None;
-    }
-    let logical_child = logical_children.get(index)?;
-    let physical_child = children.get(index)?;
-    pick(physical_child, logical_child, rest)
+    Some(Arc::clone(candidate))
 }
 
-/// Rebuilds the physical plan with the node at `path` swapped for `fused`.
+/// Collects every physical node that is the top of the matched fused subtree.
+fn collect_candidates(
+    node: &Arc<dyn ExecutionPlan>,
+    shape: &FusedShape,
+    out: &mut Vec<Arc<dyn ExecutionPlan>>,
+) {
+    if is_candidate(node, shape) {
+        out.push(Arc::clone(node));
+        return;
+    }
+    for child in node.children() {
+        collect_candidates(child, shape, out);
+    }
+}
+
+/// Whether `node` is the projection the fused node replaces.
 ///
-/// Every ancestor is cloned with its own configuration and with only the child on the way down
-/// replaced, so no ancestor changes beyond receiving the new subtree.
+/// It must be a projection, because the swap only moves columns and applies the one range function,
+/// it must output exactly the columns of the matched subtree, and the single-child chain below it
+/// must hold exactly one range fold. A chain that branches is not one folded range window.
+fn is_candidate(node: &Arc<dyn ExecutionPlan>, shape: &FusedShape) -> bool {
+    if (node.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<ProjectionExec>()
+        .is_none()
+        || node.schema() != shape.output_schema
+    {
+        return false;
+    }
+    let mut windows = 0;
+    let mut node = Arc::clone(node);
+    loop {
+        if (node.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<RangeManipulateExec>()
+            .is_some()
+        {
+            windows += 1;
+            // Two folds are two windows, which one fused node cannot reproduce.
+            if windows > 1 {
+                return false;
+            }
+        }
+        match node.children().as_slice() {
+            [] => return windows == 1,
+            [child] => node = Arc::clone(child),
+            _ => return false,
+        }
+    }
+}
+
+/// Rebuilds the physical plan with `target` swapped for `fused`.
+///
+/// Only the node that is `target` itself is swapped, by pointer identity, so no other node is
+/// mistaken for it. Every ancestor is kept with its own configuration and recomputes its properties
+/// around its new child, so an aggregate above the fused node keeps its own plan shape.
 fn rebuild(
     physical: &Arc<dyn ExecutionPlan>,
-    logical: &LogicalPlan,
-    path: &[usize],
+    target: &Arc<dyn ExecutionPlan>,
     fused: &Arc<dyn ExecutionPlan>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    if unwrap_cooperative(physical).is_some() {
-        let children = physical.children();
-        let [child] = children.as_slice() else {
-            return None;
-        };
-        let rebuilt = rebuild(child, logical, path, fused)?;
-        // The wrapper survives the swap, with properties recomputed for its new child.
-        return physical
-            .clone()
-            .replace_children(vec![rebuilt], recompute())
-            .ok();
-    }
-    let Some((&index, rest)) = path.split_first() else {
-        // The subtree is replaced only by a node with exactly its output columns.
-        return (physical.schema() == fused.schema()).then(|| Arc::clone(fused));
-    };
-    if !corresponds(logical, physical.as_ref()) {
-        return None;
-    }
-    let logical_children = logical.inputs();
-    let children = physical.children();
-    if logical_children.len() != children.len() {
-        return None;
-    }
-    let logical_child = logical_children.get(index)?;
-    let child = children.get(index)?;
-    let rebuilt = rebuild(child, logical_child, rest, fused)?;
-    let mut new_children = children
-        .iter()
-        .map(|child| Arc::clone(child))
-        .collect::<Vec<_>>();
-    new_children[index] = rebuilt;
-    physical
-        .clone()
-        .replace_children(new_children, recompute())
-        .ok()
-}
-
-/// The options for a child swap that changes the children's properties.
-fn recompute() -> datafusion::physical_plan::ReplaceChildrenOptions {
-    datafusion::physical_plan::ReplaceChildrenOptions::new(
-        datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
-    )
+    let rebuilt = Arc::clone(physical)
+        .transform_up(|node| {
+            // Only the candidate itself is swapped; every other node is left as it is, and a parent
+            // is rebuilt only because its child changed.
+            if Arc::ptr_eq(&node, target) {
+                Ok(Transformed::yes(Arc::clone(fused)))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })
+        .ok()?
+        .data;
+    Some(rebuilt)
 }
 
 /// Returns the input of a `CooperativeExec`, which corresponds to no logical node.
@@ -599,23 +643,6 @@ fn unwrap_cooperative(physical: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execu
     (physical.as_ref() as &dyn std::any::Any)
         .downcast_ref::<CooperativeExec>()
         .map(|wrapper| Arc::clone(wrapper.input()))
-}
-
-/// Whether `physical` is the physical counterpart of `logical`.
-///
-/// Only operators whose physical node keeps one child per logical child are admitted, so a plan
-/// with an injected repartition or a distributed merge is a fallback instead of a swap in the
-/// wrong place.
-fn corresponds(logical: &LogicalPlan, physical: &dyn ExecutionPlan) -> bool {
-    let any = physical as &dyn std::any::Any;
-    match logical {
-        LogicalPlan::Projection(_) => any.downcast_ref::<ProjectionExec>().is_some(),
-        LogicalPlan::Filter(_) => any.downcast_ref::<FilterExec>().is_some(),
-        LogicalPlan::Aggregate(_) => any.downcast_ref::<AggregateExec>().is_some(),
-        LogicalPlan::Sort(_) => any.downcast_ref::<SortExec>().is_some(),
-        LogicalPlan::Union(_) => any.downcast_ref::<UnionExec>().is_some(),
-        _ => false,
-    }
 }
 
 /// Returns the single region scan the matched subtree reads, and whether it was wrapped.
@@ -634,8 +661,9 @@ fn fused_scan(target: &Arc<dyn ExecutionPlan>) -> Option<(Arc<RegionScanExec>, b
         if let Some(scan) = any.downcast_ref::<RegionScanExec>() {
             return saw_fold.then(|| (Arc::new(scan.clone()), cooperative.is_some()));
         }
-        // The fused node reads the scan itself on one partition, so the partitioning nodes the
-        // optimizer inserts between the fold and the scan are exactly what the swap removes.
+        // The fused node reads the scan itself, one stream per partition, so the partitioning
+        // nodes the optimizer inserts between the fold and the scan are exactly what the swap
+        // removes.
         let folded = is_folded_range(any);
         if !folded
             && any.downcast_ref::<ProjectionExec>().is_none()
@@ -816,6 +844,14 @@ mod e2e {
         }
     }
 
+    /// `sum by (k0) (rate(some_metric[5m]))`, the most common query shape, over the same range.
+    fn aggregate_eval_stmt() -> EvalStmt {
+        EvalStmt {
+            expr: parser::parse(&format!("sum by ({TAG}) (rate({TABLE}[5m]))")).unwrap(),
+            ..eval_stmt()
+        }
+    }
+
     /// A region engine serving one series with both an ordinary and a raw-series scan.
     struct MockEngine {
         metadata: RegionMetadataRef,
@@ -989,31 +1025,36 @@ mod e2e {
             &self,
             _ctx: &QueryScanContext,
             _metrics: &ExecutionPlanMetricsSet,
-            _partition: usize,
+            partition: usize,
             label_source: &RawLabelSource,
         ) -> Result<Option<SendableRawSeriesStream>, BoxedError> {
             let schema = self.raw_schema();
-            let samples = samples();
-            let fields = SeriesFields::try_from_vec(vec![Samples::from_float(Float64Array::from(
-                samples.iter().map(|(_, v)| Some(*v)).collect::<Vec<_>>(),
-            ))])
-            .unwrap();
-            let chunk = RawSeriesChunk::try_new(
-                &schema,
-                Buffer::from(dense_primary_key("alpha").as_slice()),
-                None,
-                RawTimestamps::try_new(
-                    samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>().into(),
+            // A `PerSeries` scan owns each series in exactly one partition, so the fixture's one
+            // series is served by the first partition and the others are empty. Serving it from
+            // every partition would report the same series once per partition.
+            let chunk = (partition == 0).then(|| {
+                let samples = samples();
+                let fields = SeriesFields::try_from_vec(vec![Samples::from_float(
+                    Float64Array::from(samples.iter().map(|(_, v)| Some(*v)).collect::<Vec<_>>()),
+                )])
+                .unwrap();
+                RawSeriesChunk::try_new(
+                    &schema,
+                    Buffer::from(dense_primary_key("alpha").as_slice()),
+                    None,
+                    RawTimestamps::try_new(
+                        samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>().into(),
+                    )
+                    .unwrap(),
+                    fields,
+                    true,
                 )
-                .unwrap(),
-                fields,
-                true,
-            )
-            .unwrap();
+                .unwrap()
+            });
             Ok(Some(Box::pin(SampleStream {
                 schema,
                 label_source: label_source.clone(),
-                chunk: Some(chunk),
+                chunk,
             })))
         }
         fn raw_series_ordering(&self) -> SeriesOrdering {
@@ -1111,6 +1152,30 @@ mod e2e {
         plan.children().iter().any(|child| contains_fused(child))
     }
 
+    /// The output partition count of the one fused node in `plan`.
+    fn fused_partition_count(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+        if plan.name() == "FusedSeriesExec" {
+            return Some(plan.properties().output_partitioning().partition_count());
+        }
+        plan.children()
+            .iter()
+            .find_map(|child| fused_partition_count(child))
+    }
+
+    /// Whether a fused node sits below an `AggregateExec` of the same plan.
+    fn has_aggregate_above_fused(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        fn walk(node: &Arc<dyn ExecutionPlan>, aggregate_above: bool) -> bool {
+            if node.name() == "FusedSeriesExec" {
+                return aggregate_above;
+            }
+            let aggregate_above = aggregate_above || node.name() == "AggregateExec";
+            node.children()
+                .iter()
+                .any(|child| walk(child, aggregate_above))
+        }
+        walk(plan, false)
+    }
+
     fn describe(plan: &Arc<dyn ExecutionPlan>) -> String {
         format!(
             "{}",
@@ -1153,8 +1218,8 @@ mod e2e {
                 logical.display_indent()
             )
         });
-        let target = super::pick(&physical, &logical, &shape.path)
-            .unwrap_or_else(|| panic!("the physical plan does not mirror the logical path"));
+        let target = super::pick(&physical, &shape)
+            .unwrap_or_else(|| panic!("the physical plan does not hold the fused subtree"));
         let (scan, _) = super::fused_scan(&target).unwrap_or_else(|| {
             panic!(
                 "no single region scan under the fused subtree:\n{}",
@@ -1182,7 +1247,15 @@ mod e2e {
             "the selected plan has no FusedSeriesExec:\n{}",
             describe(&fused)
         );
-
+        // The fused node inherits the scan's partitioning instead of collapsing the scan into one
+        // partition, so it runs one stream per partition the scan declares.
+        let scan_partitions = scan.properties().output_partitioning().partition_count();
+        assert_eq!(
+            fused_partition_count(&fused),
+            Some(scan_partitions),
+            "the fused node must keep the scan's {scan_partitions} partitions:\n{}",
+            describe(&fused)
+        );
         // The fused result must equal the ordinary plan's result over the same samples.
         let ordinary = datafusion::physical_plan::collect(physical, session.task_ctx())
             .await
@@ -1283,6 +1356,179 @@ mod e2e {
             (first - expected).abs() < 0.25,
             "the fused rate is far from {expected}: {fused_rows:?}"
         );
+    }
+
+    /// The most common query shape, an aggregation over a range function, must fuse too.
+    ///
+    /// The logical aggregate becomes physical nodes the logical tree does not describe one for one,
+    /// so the swapped subtree is found by its content: the projection whose output schema is the
+    /// matched subtree's own schema and which folds exactly one range window. The aggregate above
+    /// it keeps its own shape, which is what makes the swap an equivalent plan.
+    #[tokio::test]
+    async fn a_real_aggregated_rate_query_runs_through_the_fused_node() {
+        let state = engine_state();
+        let logical = PromPlanner::stmt_to_plan(table_provider(), &aggregate_eval_stmt(), &state)
+            .await
+            .unwrap();
+        let context = QueryEngineContext::new(state.session_state(), QueryContext::arc());
+        let logical = state
+            .optimize_by_extension_rules(logical, &context)
+            .unwrap();
+
+        // Bind the plan to the mock region, then plan physically with the engine's planner.
+        let region_id = RegionId::new(1, 1);
+        let metadata =
+            crate::optimizer::test_util::mock_table_provider(region_id).region_metadata();
+        let engine: RegionEngineRef = Arc::new(MockEngine {
+            metadata: metadata.clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let dummy = DummyTableProvider::new(region_id, engine, metadata);
+        let logical = with_mock_source(logical, &dummy);
+        let session = state.session_state();
+        let physical = session
+            .query_planner()
+            .create_physical_plan(&logical, &session)
+            .await
+            .unwrap();
+
+        let fused = super::try_select_fused(&logical, &physical)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the aggregated rate query was not fused:\n{}",
+                    describe(&physical)
+                )
+            });
+        // The fused node must be there, and the aggregation must still be there above it.
+        assert!(
+            contains_fused(&fused),
+            "the selected plan has no FusedSeriesExec:\n{}",
+            describe(&fused)
+        );
+        assert!(
+            has_aggregate_above_fused(&fused),
+            "the fused node must keep the aggregate above it:\n{}",
+            describe(&fused)
+        );
+        // The aggregation itself must be untouched: a swap that dropped or changed it would answer
+        // a different question.
+        let ordinary_aggregates = aggregate_nodes(&physical);
+        assert_eq!(
+            ordinary_aggregates,
+            aggregate_nodes(&fused),
+            "the swap changed the aggregation:\n{}",
+            describe(&fused)
+        );
+
+        let ordinary = datafusion::physical_plan::collect(physical, session.task_ctx())
+            .await
+            .unwrap();
+        let fused_batches = datafusion::physical_plan::collect(fused, session.task_ctx())
+            .await
+            .unwrap();
+        assert!(!fused_batches.is_empty(), "the fused plan produced no rows");
+
+        let ordinary_rows = labelled_rows(&ordinary);
+        let fused_rows = labelled_rows(&fused_batches);
+        // The same series over the same steps, so the aggregation sees the same rows either way.
+        assert_eq!(
+            fused_rows
+                .iter()
+                .map(|(label, ts, _)| (label.clone(), *ts))
+                .collect::<Vec<_>>(),
+            ordinary_rows
+                .iter()
+                .map(|(label, ts, _)| (label.clone(), *ts))
+                .collect::<Vec<_>>(),
+            "the fused path must aggregate the same groups at the same steps"
+        );
+        assert!(!fused_rows.is_empty());
+        // A counter rising 60 per 60s has a constant rate, so every fused sum is the same positive
+        // reading. As in the bare-shape test, the two paths disagree at window boundaries because
+        // the fused node keeps the sample at the window start while the ordinary fold drops it, so
+        // equal timestamps and the same bound is asserted instead of bit equality.
+        let first = fused_rows[0].2;
+        assert!(first.is_finite() && first > 0.0, "{fused_rows:?}");
+        let expected = 60.0 / 60_000.0 * 1_000.0;
+        for ((label, ts, value), (_, _, ordinary_value)) in fused_rows.iter().zip(&ordinary_rows) {
+            assert!(
+                (value - first).abs() < 1e-9,
+                "rate of a linear counter is not constant at {label}@{ts}: {fused_rows:?}"
+            );
+            assert!(
+                (value - expected).abs() < 0.25,
+                "the fused rate at {label}@{ts} is far from {expected}: {fused_rows:?}"
+            );
+            assert!(
+                (value - ordinary_value).abs() < 0.25,
+                "the fused and ordinary rates at {label}@{ts} disagree beyond the window \
+                 boundary slack: fused {value}, ordinary {ordinary_value}"
+            );
+        }
+    }
+
+    /// The configuration of every `AggregateExec`, in plan order, as its display string.
+    fn aggregate_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        fn walk(node: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
+            if node.name() == "AggregateExec" {
+                out.push(
+                    datafusion::physical_plan::displayable(node.as_ref())
+                        .one_line()
+                        .to_string(),
+                );
+            }
+            for child in node.children() {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(plan, &mut out);
+        out
+    }
+
+    /// `(label, timestamp, value)` for every row of a `sum by (k0)` result.
+    fn labelled_rows(batches: &[DfRecordBatch]) -> Vec<(String, i64, f64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let labels = batch
+                .column_by_name(TAG)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let timestamps = batch
+                .column_by_name(TIME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let value = batch
+                .column_by_name(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .find(|field| {
+                            field.data_type() == &datafusion::arrow::datatypes::DataType::Float64
+                        })
+                        .unwrap()
+                        .name(),
+                )
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    labels.value(row).to_string(),
+                    timestamps.value(row),
+                    value.value(row),
+                ));
+            }
+        }
+        rows.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+        rows
     }
 }
 

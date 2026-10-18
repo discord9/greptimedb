@@ -29,6 +29,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt32Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -52,7 +53,8 @@ use futures::{Stream, StreamExt};
 use store_api::region_engine::RawLabelSource;
 
 use super::{
-    FusedSeriesExec, MAX_CHUNKS_PER_POLL, apply_maps, classify_output, series_to_record_batch,
+    FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, apply_maps, classify_output,
+    series_to_record_batch,
 };
 use crate::map::MathOp;
 use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
@@ -270,6 +272,16 @@ fn memory_child_of(schema: &SeriesSchema, chunks: &[RawSeriesChunk]) -> Arc<dyn 
     )
 }
 
+/// A child with one partition per element, each holding its own series: the shape a
+/// `PerSeries`-distributed raw-series scan reports, where every partition owns whole series.
+fn partitioned_child(partitions: &[&[RawSeriesChunk]]) -> Arc<dyn ExecutionPlan> {
+    let batches = partitions
+        .iter()
+        .map(|chunks| frame_batches(chunks))
+        .collect::<Vec<_>>();
+    Arc::new(TestMemoryExec::try_new(&batches, frame_schema(), None).unwrap())
+}
+
 fn grid() -> Arc<EvalGrid> {
     Arc::new(
         EvalGrid::try_new(GridSpec::try_new(GRID_START, GRID_STEP, GRID_LEN).unwrap()).unwrap(),
@@ -341,6 +353,13 @@ impl Case {
         }
     }
 
+    fn with_grid(&self, grid: Arc<EvalGrid>) -> Self {
+        Self {
+            grid,
+            ..self.clone()
+        }
+    }
+
     fn fused(&self, child: Arc<dyn ExecutionPlan>) -> Result<FusedSeriesExec> {
         FusedSeriesExec::try_new(
             child,
@@ -384,7 +403,14 @@ impl Case {
 }
 
 async fn run(exec: FusedSeriesExec) -> Vec<Result<RecordBatch>> {
-    let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+    run_partition(&exec, 0).await
+}
+
+/// Runs one partition of the node, so a test can execute a multi-partition node.
+async fn run_partition(exec: &FusedSeriesExec, partition: usize) -> Vec<Result<RecordBatch>> {
+    let mut stream = exec
+        .execute(partition, Arc::new(TaskContext::default()))
+        .unwrap();
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
         items.push(item);
@@ -471,70 +497,83 @@ fn grid_range(series: &Series) -> (usize, usize) {
     (range.start(), range.len())
 }
 
-/// Asserts the node emitted exactly the reference batches, comparing values bit for bit.
+/// Asserts the node emitted exactly the reference rows, comparing values bit for bit.
+///
+/// The node coalesces completed series into batches of up to [`MAX_ROWS_PER_BATCH`] rows, so a
+/// series no longer maps to one batch. Both sides are therefore concatenated first: the comparison
+/// is over the rows the node produced, not over the batch boundaries it chose.
 fn assert_matches_reference(
     actual: &[RecordBatch],
     reference: &[(Series, RecordBatch)],
     context: &str,
 ) {
+    let expected = reference
+        .iter()
+        .map(|(_, batch)| batch.clone())
+        .collect::<Vec<_>>();
+    assert_same_rows(actual, &expected, context);
+}
+
+/// Asserts two batch streams hold the same rows, in the same order, under the same schema.
+fn assert_same_rows(actual: &[RecordBatch], expected: &[RecordBatch], context: &str) {
+    let Some(first) = actual.first().or_else(|| expected.first()) else {
+        return;
+    };
+    let schema = first.schema();
+    for batch in actual.iter().chain(expected.iter()) {
+        assert_eq!(batch.schema(), schema, "{context}: schema");
+    }
+    let actual = concat_batches(&schema, actual).unwrap();
+    let expected = concat_batches(&schema, expected).unwrap();
     assert_eq!(
-        actual.len(),
-        reference.len(),
-        "{context}: batch count, actual {actual:?}"
+        actual.num_rows(),
+        expected.num_rows(),
+        "{context}: row count"
     );
-    for (index, (actual, (_, expected))) in actual.iter().zip(reference).enumerate() {
-        let context = format!("{context} batch {index}");
-        assert_eq!(actual.schema(), expected.schema(), "{context}: schema");
-        assert_eq!(
-            actual.num_rows(),
-            expected.num_rows(),
-            "{context}: row count"
-        );
-        for (actual, expected) in actual.columns().iter().zip(expected.columns()) {
-            match expected.data_type() {
-                DataType::Float64 => {
-                    let actual = actual.as_any().downcast_ref::<Float64Array>().unwrap();
-                    let expected = expected.as_any().downcast_ref::<Float64Array>().unwrap();
-                    let bits = |array: &Float64Array| {
-                        (0..array.len())
-                            .map(|row| array.is_valid(row).then(|| array.value(row).to_bits()))
-                            .collect::<Vec<_>>()
-                    };
-                    assert_eq!(bits(actual), bits(expected), "{context}: value column");
-                }
-                DataType::Utf8 => {
-                    assert_eq!(
-                        string_values(actual),
-                        string_values(expected),
-                        "{context}: string column"
-                    );
-                }
-                DataType::Dictionary(key, value)
-                    if **key == DataType::UInt32 && **value == DataType::Utf8 =>
-                {
-                    assert_eq!(
-                        dictionary_values(actual),
-                        dictionary_values(expected),
-                        "{context}: dictionary column"
-                    );
-                }
-                DataType::Timestamp(TimeUnit::Millisecond, None) => {
-                    let actual = actual
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .unwrap();
-                    let expected = expected
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .unwrap();
-                    assert_eq!(
-                        actual.values().to_vec(),
-                        expected.values().to_vec(),
-                        "{context}: timestamp column"
-                    );
-                }
-                other => panic!("{context}: unexpected column type {other:?}"),
+    for (actual, expected) in actual.columns().iter().zip(expected.columns()) {
+        match expected.data_type() {
+            DataType::Float64 => {
+                let actual = actual.as_any().downcast_ref::<Float64Array>().unwrap();
+                let expected = expected.as_any().downcast_ref::<Float64Array>().unwrap();
+                let bits = |array: &Float64Array| {
+                    (0..array.len())
+                        .map(|row| array.is_valid(row).then(|| array.value(row).to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(actual), bits(expected), "{context}: value column");
             }
+            DataType::Utf8 => {
+                assert_eq!(
+                    string_values(actual),
+                    string_values(expected),
+                    "{context}: string column"
+                );
+            }
+            DataType::Dictionary(key, value)
+                if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+            {
+                assert_eq!(
+                    dictionary_values(actual),
+                    dictionary_values(expected),
+                    "{context}: dictionary column"
+                );
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, None) => {
+                let actual = actual
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                let expected = expected
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                assert_eq!(
+                    actual.values().to_vec(),
+                    expected.values().to_vec(),
+                    "{context}: timestamp column"
+                );
+            }
+            other => panic!("{context}: unexpected column type {other:?}"),
         }
     }
 }
@@ -704,22 +743,19 @@ async fn two_series_in_one_frame_stay_separate() {
     let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
     assert_matches_reference(&batches, &reference, "two series");
 
-    assert_eq!(batches.len(), 2);
+    // Both series fit in one output batch, so it is cut by their rows instead.
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    let hosts = string_column(&batches[0], "host");
+    let values = float_column(&batches[0], VALUE);
+    assert_eq!(hosts[..5].to_vec(), vec![Some("a".to_string()); 5]);
     assert_eq!(
-        string_column(&batches[0], "host"),
-        vec![Some("a".to_string()); 5]
-    );
-    assert_eq!(
-        float_column(&batches[0], VALUE),
+        values[..5].to_vec(),
         vec![Some(1.0); 5],
         "series a must not see series b's counter"
     );
+    assert_eq!(hosts[5..].to_vec(), vec![Some("b".to_string()); 5]);
     assert_eq!(
-        string_column(&batches[1], "host"),
-        vec![Some("b".to_string()); 5]
-    );
-    assert_eq!(
-        float_column(&batches[1], VALUE),
+        values[5..].to_vec(),
         vec![Some(2.0); 5],
         "series b must not see series a's counter"
     );
@@ -745,13 +781,14 @@ async fn duplicate_final_label_set_at_one_grid_point_is_an_error() {
         vec![],
     );
     let items = run(case.fused(memory_child(&chunks)).unwrap()).await;
+    // The first series is buffered, not yet handed downstream, so the collision surfaces as the
+    // only item: a failed stream yields its error and nothing else.
     assert_eq!(
         items.len(),
-        2,
-        "the first series is emitted, then the collision surfaces"
+        1,
+        "expected exactly the error item, got {items:?}"
     );
-    assert!(items[0].is_ok(), "{:?}", items[0]);
-    let error = items.into_iter().nth(1).unwrap().err().unwrap();
+    let error = items.into_iter().next().unwrap().err().unwrap();
     let message = error_chain(&error);
     assert!(
         message.contains("vector cannot contain metrics with the same labelset"),
@@ -767,7 +804,7 @@ async fn duplicate_final_label_set_at_one_grid_point_is_an_error() {
 async fn duplicate_final_label_set_with_disjoint_grid_points_is_emitted() {
     // `a_total` only has a window result at 300s while `b_total` only has them at 480s and 540s,
     // so the two series share a final label set but no evaluation timestamp: Prometheus merges
-    // them into one output series, this node emits both batches instead.
+    // them into one output series, this node emits both series as separate rows instead.
     let chunks = vec![
         named_chunk(
             "a_total",
@@ -798,19 +835,22 @@ async fn duplicate_final_label_set_with_disjoint_grid_points_is_emitted() {
     let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
     assert_matches_reference(&batches, &reference, "disjoint label sets");
 
-    assert_eq!(batches.len(), 2, "{batches:?}");
+    // Both series are coalesced into one batch of three rows: the two label sets collide without
+    // sharing a single grid point, so both survive as separate rows.
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].num_rows(), 3, "no point may be lost");
+    let hosts = string_column(&batches[0], "host");
     assert_eq!(
-        batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .collect::<Vec<_>>(),
-        vec![1, 2],
+        hosts,
+        vec![Some("x".to_string()); 3],
+        "both series carry the same label set"
+    );
+    let timestamps = timestamp_column(&batches[0], TIME);
+    assert_eq!(
+        timestamps,
+        vec![300_000, 480_000, 540_000],
         "each series keeps the points its own windows produced"
     );
-    let timestamps = batches
-        .iter()
-        .flat_map(|batch| timestamp_column(batch, TIME))
-        .collect::<Vec<_>>();
     let mut distinct = timestamps.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -818,16 +858,6 @@ async fn duplicate_final_label_set_with_disjoint_grid_points_is_emitted() {
         distinct.len(),
         timestamps.len(),
         "no grid point may repeat: {timestamps:?}"
-    );
-    assert_eq!(
-        distinct,
-        vec![300_000, 480_000, 540_000],
-        "both series must survive with every point"
-    );
-    assert_eq!(
-        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        3,
-        "no point may be lost"
     );
 }
 
@@ -1167,11 +1197,14 @@ async fn construction_rejects_unsupported_inputs() {
         vec![],
     );
 
-    let two_partitions: Arc<dyn ExecutionPlan> =
-        Arc::new(TestMemoryExec::try_new(&[vec![], vec![]], frame_schema(), None).unwrap());
-    let error = case.fused(two_partitions).err().unwrap();
+    let no_partition: Arc<dyn ExecutionPlan> =
+        Arc::new(TestMemoryExec::try_new(&[], frame_schema(), None).unwrap());
+    let error = case.fused(no_partition).err().unwrap();
     assert!(matches!(error, DataFusionError::Plan(_)), "{error}");
-    assert!(error.to_string().contains("single-partition"), "{error}");
+    assert!(
+        error.to_string().contains("at least one partition"),
+        "{error}"
+    );
 
     let mut fields = output_schema(&["host"])
         .fields()
@@ -1300,7 +1333,7 @@ async fn a_non_nullable_tag_column_uses_the_empty_label_value() {
 }
 
 #[tokio::test]
-async fn execute_rejects_a_nonzero_partition() {
+async fn execute_rejects_a_partition_past_the_end() {
     let case = Case::new(
         &["host"],
         RangeWindow {
@@ -1311,12 +1344,15 @@ async fn execute_rejects_a_nonzero_partition() {
         RangeFunction::Rate,
         vec![],
     );
+    // A single-partition child yields a single-partition node, so partition 1 is out of range.
     let exec = case.fused(memory_child(&[])).unwrap();
+    assert_eq!(exec.properties().output_partitioning().partition_count(), 1);
     let error = exec
         .execute(1, Arc::new(TaskContext::default()))
         .err()
         .unwrap();
     assert!(matches!(error, DataFusionError::Execution(_)), "{error}");
+    assert!(error.to_string().contains("partitions"), "{error}");
 }
 
 #[tokio::test]
@@ -1349,20 +1385,23 @@ async fn explain_shows_the_function_and_the_map_chain() {
 
 #[tokio::test]
 async fn dropping_the_stream_releases_the_child() {
-    let chunks = vec![
-        chunk(
-            1,
-            "a",
-            &[(60_000, Some(60.0)), (120_000, Some(120.0))],
-            true,
-        ),
-        chunk(
-            2,
-            "b",
-            &[(60_000, Some(120.0)), (120_000, Some(240.0))],
-            true,
-        ),
-    ];
+    // Enough rows for more than one output batch, so the first batch is handed downstream while
+    // the child still has input left to give.
+    const SERIES: u8 = 60;
+    let grid = Arc::new(
+        EvalGrid::try_new(GridSpec::try_new(GRID_START, GRID_STEP, 100).unwrap()).unwrap(),
+    );
+    let chunks = (0..SERIES)
+        .map(|index| {
+            let host = format!("h{index}");
+            chunk(
+                index + 1,
+                &host,
+                &long_counter_rows(160, f64::from(index) + 60.0),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
     let dropped = Arc::new(AtomicBool::new(false));
     let plan = ProbeExec::new(
         frame_batches(&chunks),
@@ -1372,19 +1411,20 @@ async fn dropping_the_stream_releases_the_child() {
     let case = Case::new(
         &["host"],
         RangeWindow {
-            range_ms: 300_000,
+            range_ms: 60_000,
             offset_ms: 0,
             anchor_ms: None,
         },
-        RangeFunction::Rate,
+        RangeFunction::SumOverTime,
         vec![],
-    );
+    )
+    .with_grid(grid);
     let exec = case.fused(Arc::new(plan)).unwrap();
     let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
     assert!(stream.next().await.unwrap().is_ok());
     assert!(
         !dropped.load(Ordering::SeqCst),
-        "the child stream is still owned"
+        "the child stream is still owned while it has input left"
     );
     drop(stream);
     assert!(
@@ -1697,36 +1737,53 @@ async fn a_gap_only_drops_the_null_rows() {
         vec![],
     );
     let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
-    assert_eq!(batches.len(), 3, "one batch per series with a value");
-    let hosts = batches
-        .iter()
-        .map(|batch| string_column(batch, "host")[0].clone().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(hosts, vec!["a", "b", "c"]);
-    for batch in &batches {
-        let values = float_column(batch, VALUE);
-        assert!(
-            values.iter().all(|value| value.is_some()),
-            "a null row survived: {values:?}"
-        );
-        assert_eq!(
-            batch.num_rows(),
-            values.len(),
-            "the timestamp column must be cut like every other column"
-        );
-        assert_eq!(
-            timestamp_column(batch, TIME).len(),
-            values.len(),
-            "row counts of all columns must agree"
-        );
-    }
+    // The three series are coalesced into one batch, which is cut by their rows: `b` has a single
+    // sample in range, so it contributes one row between the five rows of `a` and of `c`.
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    let batch = &batches[0];
+    let hosts = string_column(batch, "host");
+    let mut distinct = hosts.clone();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string())
+        ],
+        "every series with a value keeps its own rows: {hosts:?}"
+    );
+    assert_eq!(
+        hosts
+            .iter()
+            .filter(|host| **host == Some("b".to_string()))
+            .count(),
+        1,
+        "the gapped series contributes only the grid point that holds a value: {hosts:?}"
+    );
+    let values = float_column(batch, VALUE);
+    assert!(
+        values.iter().all(|value| value.is_some()),
+        "a null row survived: {values:?}"
+    );
+    assert_eq!(
+        batch.num_rows(),
+        values.len(),
+        "the timestamp column must be cut like every other column"
+    );
+    assert_eq!(
+        timestamp_column(batch, TIME).len(),
+        values.len(),
+        "row counts of all columns must agree"
+    );
 }
 
 #[tokio::test]
 async fn an_all_null_series_emits_no_batch() {
     // The evaluator itself never produces an all-null series (its trimmed interval starts and
     // ends with a value), so the conversion rule is exercised on the series value directly: a
-    // non-empty grid whose every row is empty is not a batch of nulls but no batch at all.
+    // non-empty grid whose every row is empty is not a batch of nulls but no batch at all, and so
+    // contributes no row to whatever the stream coalesces.
     let grid = grid();
     // A grid series is validated against the schema's own grid, so the fixture declares it.
     let schema = Arc::new(SeriesSchema {
@@ -1775,4 +1832,174 @@ async fn an_all_null_series_emits_no_batch() {
         .unwrap()
         .expect("a series with values must emit a batch");
     assert_eq!(batch.num_rows(), 2, "only the non-null rows are emitted");
+}
+
+/// A counter sampled once a minute for `count` minutes, rising `step` per sample.
+fn long_counter_rows(count: i64, step: f64) -> Vec<Row> {
+    (1..=count)
+        .map(|minute| (minute * 60_000, Some(minute as f64 * step)))
+        .collect()
+}
+
+#[tokio::test]
+async fn each_input_partition_runs_on_its_own_stream() {
+    // Two partitions, each owning whole series: the shape a `PerSeries`-distributed raw-series
+    // scan reports, where no series is ever split across partitions.
+    let left = counter_chunks(1, "a", &counter_rows(60.0), &[9]);
+    let right = counter_chunks(2, "b", &counter_rows(120.0), &[9]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    );
+    let exec = case
+        .fused(partitioned_child(&[&left, &right]))
+        .expect("a multi-partition child is legal");
+    assert_eq!(
+        exec.properties().output_partitioning().partition_count(),
+        2,
+        "the node must report one partition per input partition"
+    );
+
+    let first = collect(run_partition(&exec, 0).await);
+    let second = collect(run_partition(&exec, 1).await);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(second.len(), 1, "{second:?}");
+
+    // Each partition emits exactly the series it owns, so neither sees the other's samples.
+    let first_hosts = string_column(&first[0], "host");
+    assert_eq!(first_hosts.len(), GRID_LEN as usize);
+    assert!(
+        first_hosts.iter().all(|host| host.as_deref() == Some("a")),
+        "partition 0 must not hold the other partition's series: {first_hosts:?}"
+    );
+    assert_eq!(
+        float_column(&first[0], VALUE),
+        vec![Some(1.0); GRID_LEN as usize],
+        "series a's counter rises 60 per minute"
+    );
+    let second_hosts = string_column(&second[0], "host");
+    assert_eq!(second_hosts.len(), GRID_LEN as usize);
+    assert!(
+        second_hosts.iter().all(|host| host.as_deref() == Some("b")),
+        "partition 1 must not hold the other partition's series: {second_hosts:?}"
+    );
+    assert_eq!(
+        float_column(&second[0], VALUE),
+        vec![Some(2.0); GRID_LEN as usize],
+        "series b's counter rises 120 per minute"
+    );
+
+    // Both partitions together reproduce the single-partition reference over the same series.
+    let reference = case.reference(&[left, right].concat());
+    let mut both = first;
+    both.extend(second);
+    assert_matches_reference(&both, &reference, "two partitions");
+}
+
+#[tokio::test]
+async fn completed_series_are_coalesced_into_few_batches() {
+    // Far more rows than the row target: every series fills a long grid, so the uncoalesced shape
+    // would hand downstream one batch per series.
+    const SERIES: u8 = 50;
+    let grid = Arc::new(
+        EvalGrid::try_new(GridSpec::try_new(GRID_START, GRID_STEP, 100).unwrap()).unwrap(),
+    );
+    let chunks = (0..SERIES)
+        .map(|index| {
+            let host = format!("h{index}");
+            chunk(index + 1, &host, &long_counter_rows(160, 60.0), true)
+        })
+        .collect::<Vec<_>>();
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 60_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::SumOverTime,
+        vec![],
+    )
+    .with_grid(grid);
+    let reference = case.reference(&chunks);
+    let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+
+    let expected_rows = reference
+        .iter()
+        .map(|(_, batch)| batch.num_rows())
+        .sum::<usize>();
+    assert!(
+        expected_rows > MAX_ROWS_PER_BATCH,
+        "the fixture must cross the row target, got {expected_rows} rows"
+    );
+    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert_eq!(rows, expected_rows, "the coalesced rows must be the same");
+    // The reference path is the uncoalesced shape: one batch per completed series.
+    assert_eq!(
+        reference.len(),
+        usize::from(SERIES),
+        "the fixture must produce one batch per series without coalescing"
+    );
+    // Every batch but the last one was flushed at the row target, so the number of batches is
+    // bounded by the row target and, above all, is far below the number of series.
+    for batch in &batches[..batches.len() - 1] {
+        assert!(
+            batch.num_rows() >= MAX_ROWS_PER_BATCH,
+            "a batch below the row target was flushed early: {} rows",
+            batch.num_rows()
+        );
+    }
+    assert!(
+        batches.len() >= 2,
+        "the row target must be reached and flushed before the input ends"
+    );
+    assert!(
+        batches.len() <= expected_rows.div_ceil(MAX_ROWS_PER_BATCH),
+        "{SERIES} series over {expected_rows} rows produced {} batches, expected at most one per \
+         {MAX_ROWS_PER_BATCH} rows",
+        batches.len()
+    );
+    assert!(
+        batches.len() * 4 < usize::from(SERIES),
+        "coalescing must produce far fewer batches than series: {} batches for {SERIES} series",
+        batches.len()
+    );
+    // The rows themselves are unchanged by the batching: the same values, in the same order.
+    assert_matches_reference(&batches, &reference, "coalesced");
+}
+
+#[tokio::test]
+async fn the_last_batch_is_flushed_below_the_row_target() {
+    // Total rows stay far below the target, so nothing but the end of the input flushes them.
+    let chunks = counter_chunks(1, "a", &counter_rows(60.0), &[9]);
+    let case = Case::new(
+        &["host"],
+        RangeWindow {
+            range_ms: 300_000,
+            offset_ms: 0,
+            anchor_ms: None,
+        },
+        RangeFunction::Rate,
+        vec![],
+    );
+    let reference = case.reference(&chunks);
+    let batches = collect(run(case.fused(memory_child(&chunks)).unwrap()).await);
+
+    let expected_rows = reference
+        .iter()
+        .map(|(_, batch)| batch.num_rows())
+        .sum::<usize>();
+    assert!(
+        expected_rows < MAX_ROWS_PER_BATCH,
+        "the fixture must stay below the row target, got {expected_rows} rows"
+    );
+    assert_eq!(batches.len(), 1, "the pending rows must be flushed once");
+    assert_eq!(batches[0].num_rows(), expected_rows);
+    assert_matches_reference(&batches, &reference, "final flush");
 }
