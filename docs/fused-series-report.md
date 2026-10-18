@@ -1172,10 +1172,11 @@ section is the controlled test of deleting them, on the experiment branch only.
 **What changed.** `PendingBatch` holds `first_index: usize` and `len: usize` instead of
 `indices: Vec<usize>` and `eval_ts: Vec<i64>`; `flush_batch` reconstructs the evaluation
 timestamps by slicing the grid it is handed. `WindowBatch`, `BatchKernel`, the retained spans, the
-reset ranges, the batch size and the flush placement are byte-for-byte unchanged, so the kernel is
-a negative control inside every round. Per point this removes two `Vec::push`es and adds one
-`usize` add-and-store; a `debug_assert` pins the contiguity convention, and a deliberate
-off-by-one in it fails 21 tests, including the batch-boundary and gap cases.
+reset ranges, the batch size and the flush placement are byte-for-byte unchanged. That makes the
+kernel a **drift reference region** for the measurement below — not a negative control, see the
+assumptions it rests on. Per point this removes two `Vec::push`es and adds one `usize`
+add-and-store; a `debug_assert` pins the contiguity convention, and a deliberate off-by-one in it
+fails 21 tests, including the batch-boundary and gap cases.
 
 **The first answer was wrong, and the control said so.** Three rounds of the two binaries gave an
 evaluator ratio of 0.897 — "10% faster". The same binary against itself, same script, same
@@ -1183,33 +1184,53 @@ arithmetic, gave 0.976: doing nothing was "2.4% faster". Two sessions 30 s apart
 differ by 6.2-6.7 ms standard deviation on a 28 ms region, so a single paired difference cannot
 resolve an effect of order 1 ms. That reversal is recorded here rather than quietly rerun.
 
-**The measurement, with the kernel as the covariate.** Eight paired rounds per case, arm order
-alternating, plus eight rounds of the same binary against itself per case. Subtracting each
+**The measurement, using the kernel as a drift reference.** Eight paired rounds per case, arm
+order alternating, plus eight rounds of the same binary against itself per case. Subtracting each
 round's kernel difference from its `prep` difference, pooled over both cases (16 rounds each):
+
+This is an estimate under two assumptions, and the change guarantees neither. First, that the
+kernel's own cost is essentially unchanged: its arithmetic is unchanged, but `eval_ts` is no
+longer a copied `Vec` — it is a slice borrowed from the grid, so the data source and the cache
+behaviour of that access both change and the kernel's cost can move with them. Second, that drift
+is roughly additive in milliseconds and shared across regions within a round. The same-binary
+control checks the second as far as identical code can and cannot establish either one after a
+code change, so it shows the adjustment is not grossly biased — not that it is unbiased.
 
 | region | A/B adjusted | negative | self-control adjusted | negative | separates? |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `prep` **(changed)** | **−1.77 ms** | **16/16** | +0.60 ms | 6/16 | **yes, −2.37 ms** |
 | `evaluate` (contains prep) | −2.10 ms | 14/16 | −1.79 ms | 10/16 | no: control moves too |
 | `columns` (untouched) | +0.82 ms | 6/16 | +1.76 ms | 6/16 | no: same in both |
-| `kernel` (the covariate) | 0.00 by construction | — | 0.00 | — | by construction |
+| `kernel` (drift reference) | 0.00 by construction | — | 0.00 | — | the reference |
 
 The two untouched regions are what make this usable: `columns` reads nearly the same in the A/B as
 in the self-control, so the adjustment's offset is a property of the adjustment; `evaluate` reads
 −1.79 in the control, so its own number is not evidence; and `prep`, the one region the change can
 move, is negative in 16 of 16 rounds in the A/B against 6 of 16 in the control.
 
-**−2.37 ms, about 5.6 standard errors of the difference, is −0.83 ns per point** over 2 868 400
-points. That is −6.3% of window preparation at this shape, and at least −2.9% of the whole
-evaluator, since `prep` is a subset of it and nothing else inside it changed. Two `Vec::push`es
-costing ~0.8 ns is two to three cycles — the measurement is the only thing that predicted it:
-deleting 16 of 48 bytes per point said nothing about how the cost was distributed across the four
-vectors.
+**Three estimates at three levels, which are not interchangeable.** The adjusted shift of `prep` is
+−1.77 ms (16 of 16 rounds negative, standard error 0.25); the self-control's own adjusted shift is
++0.60 (6 of 16); their difference is −2.37 ms, about 5.6 standard errors. Over 2 868 400 points
+that difference is **−0.83 ns per point**. Relative to `prep`'s 28.05 ms at this shape the first
+estimate is **−6.3%** and the second **≈ −8.5%**, the gap being the size of the control's own
+shift.
+
+The −0.83 ns is a net differential estimate **for this path change**: two `Vec::push`es deleted,
+`eval_ts` switched from a copied vector to a slice of the shared grid, one counter update added.
+It is not the measured cost of a `Vec::push` instruction, and this measurement cannot separate
+those three contributions from each other.
+
+**What that establishes is narrow.** Under the assumptions above there is evidence of a small
+improvement in `prep`. The **total evaluator and the end-to-end query were not resolved**: the
+evaluator's own A/B reading (−2.10 ms) is indistinguishable from its control's (−1.79 ms), so no
+lower bound is claimed for it — `prep` being a subset does not fix what the rest of the evaluator
+did. The definite value of the change is that it deletes derivable duplicate data while leaving
+the computation semantics unchanged.
 
 **End to end, nothing is resolvable.** Wall clock moves −0.62 ms with a standard error of 1.39;
 `/proc` CPU reads −0.00 with a standard error of 9.13, because its ticks are 10 ms against a
-~150 ms query. No speed claim is made for the query, and the ~1% of CPU the region arithmetic
-implies is not a measurement of it.
+~150 ms query. No speed claim is made for the query; the region arithmetic that would put it near
+1% is not a measurement of it, and is not quoted as one.
 
 **This is experiment-branch only.** The split branch lets a batch span a skipped gap — its
 `PendingBatch` says so in its own comment — so its `indices` is load-bearing and cannot become a
@@ -1255,9 +1276,11 @@ counter until that changes.
   did separate them, and the answer is that they are equal (45.5-46.2% against 45.2-45.8%), which
   is why no single hotspot is named inside the evaluator. What the timers do **not** do is split
   window preparation itself: whether its 9.6-9.8 ns per point is metadata traffic or the cursor
-  scans is arithmetic here, not measurement. Section 4.10 removes one of the four metadata
-  vectors and measures 0.83 ns per point back, which is a lower bound on that traffic rather than
-  a split of it.
+  scans is arithmetic here, not measurement. Section 4.10 deletes two of the four metadata
+  vectors and measures a net 0.83 ns per point for the whole path change, under that section's
+  drift-reference assumptions. That is not a split of the traffic either: it bundles the two
+  deleted appends with the switch to a borrowed grid and one added counter update, and it does not
+  say how much of the 9.6-9.8 ns the remaining metadata accounts for.
 - **Nothing here splits the scan into region read, memtable and merge.** The scan is 17.8-18.6%
   of the query and the profile attributes it to `mito2` as one region. Its sub-parts are not
   separated, and the block timers cannot either: `SeriesScanExec` reports one `scan_cost`.
