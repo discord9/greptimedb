@@ -4,6 +4,12 @@ Status of the `feat/narthex-integrated-chain` branch after bringing up an
 end-to-end fused range-function path. This document records what was built,
 what was measured, and — importantly — what the measurements do **not** show.
 
+**Headline: the node is correct, and it is faster only in one narrow shape
+(fine step, small window, 1.38x). At fine steps with a wider window or a longer
+span it is a regression (0.42x-0.78x), because its kernel evaluation is
+`O(grid points x samples per window)`. See section 4.3.** Do not enable it by
+default on the strength of this work.
+
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
 
@@ -118,54 +124,87 @@ two benchmark runs produced meaningless numbers.
 
 ## 4. Performance
 
-### 4.1 Method
+### 4.1 Where the work actually is
 
-Two standalone servers, one with `experimental_native_promql = true` and one with
-`false`, over the same data written to disk, run **sequentially** (the data set
-does not fit twice on this machine). Each query: 2 warmup iterations, 11 timed
-iterations, wall clock over HTTP. A control query that phase 1 never fuses
-(`max_over_time`, which is not a range fold over windowed arrays in the same
-sense) runs the identical plan on both arms and therefore measures the noise
-floor of the comparison.
+A per-operator profile of the ordinary plan (`TQL ANALYZE VERBOSE`, same data)
+showed that the fusion target is only worth anything when the query is
+compute-bound, and that **the window width is not what makes it compute-bound**:
 
-Data: 400 series × 2880 samples at 15 s = 1,152,000 rows, one mito region.
-Query span: 2 h or 12 h, 1-minute grid.
+| query | SeriesScan | all compute operators | compute share |
+| --- | ---: | ---: | ---: |
+| `rate[5m]`, step 1m | 243 ms | 38 ms | 13% |
+| `rate[1h]`, step 1m | 363 ms | 37 ms | 9% |
+| `rate[4h]`, step 1m | 206 ms | 33 ms | 14% |
+| `rate[5m]`, step 1s | 89 ms | 61 ms | 41% |
+| `rate[1h]`, step 1s | 70 ms | 50 ms | 42% |
 
-### 4.2 Results
+Widening the window 48x (5m to 4h) leaves compute unchanged at 1-minute steps,
+which is why the first benchmark's `rate[5m]` and `rate[1h]` rows were identical
+to within noise. The lever is the **step**: a 1-second step multiplies grid
+points by 15 and lifts the compute share to 41%. Any honest test of this node
+must use a fine step, not a wide window.
+
+### 4.2 Results, compute-bound regime
+
+400 series x 2880 samples, `sum by (instance)`, two standalone servers run
+sequentially over the same data directory. 2 warmup, 9 timed iterations. All
+row sets verified identical (relative tolerance 1e-9) before timing was read.
 
 | query | rows | fused hits | ordinary p50 | fused p50 | ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `small-agg-rate-5m` | 480 | 14 | 26.1 ms | 24.4 ms | 1.07x |
-| `small-bare-rate-5m` | 48 000 | 14 | 64.5 ms | 61.8 ms | 1.04x |
-| `large-agg-rate-5m` | 2 880 | 14 | 79.9 ms | 78.5 ms | 1.02x |
-| `large-agg-rate-1h` | 2 880 | 14 | 80.7 ms | 79.7 ms | 1.01x |
-| **`control-max-over-time`** | 2 880 | 0 | 81.2 ms | 78.1 ms | **1.04x** |
+| step 1s, `rate[5m]`, 30 min span (1800 steps) | 7 204 | 12 | 28.3 ms | 20.4 ms | **1.38x** |
+| step 1s, `rate[5m]`, 2 h span (7200 steps) | 28 804 | 12 | 46.8 ms | 60.1 ms | **0.78x** |
+| step 1s, `rate[1h]`, 2 h span | 28 804 | 12 | 49.4 ms | 118.5 ms | **0.42x** |
+| step 1m, `rate[5m]`, 2 h span | 484 | 12 | 24.9 ms | 27.0 ms | 0.92x |
+| `control-max-over-time` (never fuses) | 28 804 | 0 | 61.3 ms | 57.1 ms | 1.07x |
 
-`fused hits` is the count of `Fused series selection succeeded` lines emitted
-during that query's timed iterations, so a row with 0 hits is not a measurement
-of fusion at all. The control row has 0 by construction.
+`fused hits` counts `Fused series selection succeeded` lines emitted during that
+query's iterations, so every fused row here really ran the fused node.
 
-### 4.3 Reading
+### 4.3 Reading: a win that turns into a regression as the grid grows
 
-**The comparison does not show a benefit.** The control query — which runs the
-identical plan on both arms — "improves" by 1.04x. Every fused query lands
-between 1.01x and 1.07x, i.e. inside or barely outside that floor. Since the two
-arms run sequentially, part of that 1.04x is warm-up drift: the ordinary arm
-always runs second and is consistently the slower one across every query
-including the control.
+The small compute-bound case is the only one where fusion helps, and it helps by
+a margin well above the 1.07x noise floor.
 
-Two further observations point the same way:
+It then reverses. Going from 1 800 to 7 200 grid points (4x) raises the fused
+time by 2.9x but the ordinary time by only 1.65x. Widening the window from 5m to
+1h at 1-second steps **doubles** the fused time (60.1 to 118.5 ms) while the
+ordinary plan barely moves (46.8 to 49.4 ms). The spread confirms this is not
+noise: fused samples run 105.8-167.8 ms against ordinary 42.5-87.3 ms.
 
-- **The window width barely matters.** `rate[5m]` at 79.9 ms and `rate[1h]` at
-  80.7 ms, despite a 12x larger window. Whatever dominates these queries is not
-  the per-window work that fusion removes.
-- **The removed work is small in absolute terms.** Per-operator figures from
-  `TQL ANALYZE VERBOSE` on the ordinary plan at this scale:
-  `PromSeriesDivideExec` 12 ms, `PromRangeManipulateExec` 1.0 ms, range-UDF
-  `ProjectionExec` 0.98 ms, `FilterExec` 0.43 ms — against a scan spread over
-  13 partitions. The fused path can eliminate roughly 15 ms of CPU that is
-  already spread across partitions; it cannot touch the scan, the aggregation,
-  or the JSON serialisation of the result, which dominate the wall clock.
+**Mechanism, confirmed in the code.** `RangeEvaluator::evaluate_row`
+(`src/promql/src/range_eval.rs`) hands the kernel the whole window slice for
+every grid point:
+
+```rust
+let len = timestamps.partition_point(|&timestamp| timestamp <= window_end);
+kernel(FloatWindow { timestamps: &timestamps[..len], values: ..., ... })
+```
+
+The `rate` kernel then walks every value in that slice. The retained-sample
+buffer is advanced by a cursor, so sample *ingestion* is linear, but kernel
+*evaluation* is `O(grid points x samples per window)`:
+
+- 1s step, 5m window, 30 min span: 1800 x 20 x 400 = 14 M visits -> 20 ms
+- 1s step, 1h window, 2 h span: 7200 x 240 x 400 = 691 M visits -> 118 ms
+
+The ratio of visits (49x) and the ratio of measured time (5.8x) are the same
+order once fixed per-call overhead is accounted for. The ordinary path
+materialises each window once in `RangeManipulate` and evaluates it in
+`prom_rate`, and its measured cost is far less sensitive to the window, so the
+per-grid-point rescan is the difference.
+
+**Therefore: the node is correct but its evaluation strategy does not scale.**
+It should either be restricted to shapes where `grid points x window samples`
+stays small, or the kernel contract needs an incremental/aggregate form so that
+a sliding window does not rescan its overlap. The second is the real fix and is
+out of scope here.
+
+### 4.4 Scan-bound shapes
+
+At 1-minute steps the compute share is 9-14% and the node measures neutral
+(0.92x), inside the noise floor. This is expected and is not a defect: it
+removes work that was never the bottleneck.
 
 ### 4.4 What earlier, discarded runs showed
 
@@ -180,13 +219,17 @@ fixed — an illustration of why the hit counter is mandatory:
 
 ## 5. What is not shown
 
-- **No proven speedup.** In this data layout, at these query sizes, fusion
-  measured neutral. There is no evidence here to justify enabling it by default,
-  and `experimental_native_promql` remains off by default.
-- **No test of a compute-bound regime.** Everything measured is scan- and
-  serialisation-bound. A regime where window iteration dominates — all data in
-  memory, or `[1d]`-class windows — was not measured. That would establish the
-  ceiling of the approach, but it is not the o11ybench query shape.
+- **No general speedup.** Fusion helps one narrow shape (fine step, small
+  window) and regresses two larger ones. There is no evidence here to justify
+  enabling it by default; `experimental_native_promql` remains off.
+- **The scaling fix is not attempted.** Section 4.3 identifies
+  `O(grid x window)` kernel evaluation as the cause. Making the kernel
+  incremental — so a sliding window reuses the previous point's work instead of
+  rescanning its overlap — is the change that would make fusion pay off at fine
+  steps and wide windows. Not done.
+- **No large-window ceiling measured.** Whether an incremental kernel would make
+  wide windows *faster* than the ordinary materialising path, rather than merely
+  no worse, is unmeasured.
 - **No `EXPLAIN` visibility from the frontend.** In standalone, TQL is planned as
   a `MergeScan` pushed to the datanode, and fusion happens when the datanode
   builds its physical plan. `TQL EXPLAIN` at the frontend therefore never shows
@@ -211,7 +254,7 @@ of data). The shape of it is:
 3. Start `greptime standalone start` twice, once per flag value, on disjoint
    port sets (`--http-addr`, `--grpc-bind-addr`, `--mysql-addr`,
    `--postgres-addr`; two instances otherwise collide on the defaults).
-4. Run each query with `TQL EVAL (start, end, '1m') <expr>` over
+4. Run each query with `TQL EVAL (start, end, '<step>') <expr>` over
    `POST /v1/sql` form-encoded, alternating or sequential, and count
    `Fused series selection succeeded` lines per query to prove which arm is
    which.
