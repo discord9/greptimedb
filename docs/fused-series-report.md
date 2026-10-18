@@ -494,8 +494,10 @@ independent search pairs:
 **This is an upper bound and should be read as one.** It assumes all of the bookkeeping
 amortizes, but only the window-boundary searches can: the `FloatWindow` construction, the
 `dyn` call and `GridSeriesBuilder::push` remain per point, and their share of the 36.88 ns
-is not measured. The honest statement is that batching removes the largest identified
-component and the ceiling is parity-plus, not that it delivers 0.89x.
+is not measured. It also leaves ingest untouched, which is the cost that dominates once a
+series is large (table below). The honest statement is that batching removes the largest
+component at the benchmark shape and lands near parity there — not that it delivers 0.89x,
+and not that it helps a big series.
 
 **Not measured, and not needed to explain the gap.** The fused node materializes all four
 tag columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans
@@ -503,32 +505,59 @@ every grid point twice per series (`claim_label_set` then `series_to_record_batc
 are real, both are smaller than the bookkeeping/kernel split above, and neither changes
 the conclusion.
 
-**Why it calls a scalar kernel 7 201 times instead of batching.** The batching form
-already exists in this repo and is what the ordinary plan uses: `RangeArray`
-(`src/promql/src/range_array.rs`) is a dictionary array whose keys are packed
-`(offset, length)` pairs into a single shared child array, so 7 201 overlapping sliding
-windows are 7 201 keys pointing into one copy of the series. `RangeManipulate` builds it
-once per batch and the UDF then runs over the whole batch.
+**Why it calls a scalar kernel 7 201 times, and why memory is not the reason.** The
+batching form already exists in this repo: `RangeArray` (`src/promql/src/range_array.rs`)
+is a dictionary array whose keys are packed `(offset, length)` pairs into one shared child
+array, so 7 201 overlapping windows cost 7 201 keys rather than 7 201 windows.
+`RangeManipulate` builds it once per batch and the UDF runs over the batch.
 
-The fused evaluator does not, and the reason is memory rather than oversight: it is
-incremental. Samples arrive chunk by chunk, a grid point is evaluated as soon as its
-window is complete, and the samples no later window can still use are dropped
-(`FieldSamples::advance`). Retention is therefore O(range / sample interval), independent
-of series length.
+An earlier revision of this section said the fused evaluator avoids that "for memory
+reasons". **That is wrong, and it conflates two separate decisions.** Memory rules out one
+thing only: holding the *whole series* in a single array, i.e. O(series length) retention.
+It does not rule out batching. Evaluating `B` consecutive grid points per call needs
+samples covering `[T_first - range, T_last]`, which is O(range + B × step) — for `B = 32`
+at a 1 s step that is 32 extra seconds of samples, about two samples at a 15 s interval.
+So batching costs essentially nothing in memory, and memory is no defence of the per-point
+shape.
 
-A `RangeArray` needs the whole series in one array, i.e. O(series length) retention. For
-this benchmark's series that is 45 KiB per field and, with one series in flight per
-partition, roughly 900 KiB across 20 partitions — negligible. But a raw series has no
-length bound, and a long-lived counter with 200M samples would be 3.2 GB per field held
-until that series completes. So the current shape is a defensible choice with a measured
-price.
+What actually produced it is the shape of the two interfaces the evaluator was built
+around:
 
-The change that would cross the structural line is a middle ground: evaluate a batch of
-`B` consecutive grid points at once, keeping retention O(range + B × step) rather than
-O(series). That keeps the memory property and still amortizes both binary searches and
-the kernel call over `B` points. It is a redesign of `evaluate_row` and of the
-`RangeFunction` dispatch (26 variants), not a patch, so it is recorded here as the next
-decision rather than applied.
+- `WindowKernel` is `Box<dyn FnMut(FloatWindow<'_>) -> Option<f64>>` — one window in, one
+  value out. Making 26 functions closures of that type is what keeps each of them short
+  enough to check line by line against Prometheus, which is how their correctness was
+  established.
+- `GridSeriesBuilder::push(index, row)` appends a single row, and `Replay::Once` /
+  `Replay::EveryPoint` replay one evaluated row at many indices.
+
+Both are the simplest uniform thing for those goals, and neither is about memory. The
+price is 36.9 ns per grid point of run-time bookkeeping, measured above.
+
+**The cost that actually dominates at scale, which this report had been missing.** The
+evaluator re-materializes every sample: `FieldSamples` holds growable `Vec<i64>` and
+`Vec<f64>`, `push` appends each sample, and `advance` slides the window by `drain`ing the
+front. Ingest is therefore O(samples in range) of per-sample Rust work — a bounds check, a
+checked add, and two `Vec` pushes — and it is paid for *every* sample even though only
+grid points produce output.
+
+For the benchmark shape (2 880 samples, 7 201 grid points) that is small: about 14 us of
+ingest against 265 us of point bookkeeping. For a series whose range holds 50 M samples it
+is the other way round, by two orders of magnitude:
+
+| series content in range | ingest at 3-8 ns/sample | point bookkeeping (12 h at 1 s) |
+| --- | ---: | ---: |
+| 2 880 samples (benchmark) | 0.01 ms | 1.6 ms |
+| 50 M samples (800 MB) | **150-400 ms** | 1.6 ms |
+
+The ordinary plan pays neither: the scan hands over Arrow arrays it does not copy, ranges
+are index arithmetic over those arrays, and the UDF reads the shared child. So legacy is
+cheaper on **both** axes — per output row and per input sample.
+
+That is why the batching estimate below tops out at parity rather than a win: it removes
+one of the two costs. Getting a genuine advantage would also require not re-materializing
+samples, which means keeping the incoming Arrow arrays and expressing windows as
+`(offset, length)` into them, only dropping whole chunks once no later window reaches
+them. That is a redesign of `RangeEvaluator`'s storage, not of `evaluate_row`.
 
 ## 5. What is not shown
 
@@ -540,10 +569,15 @@ decision rather than applied.
 - **The remaining cost is located but not fixed.** Section 4.5 shows the fused evaluator
   costs 2.83x the ordinary plan's range-function work on identical input, that this
   accounts for the whole end-to-end regression, and that the ratio splits into a kernel
-  already at 0.89x and per-point bookkeeping at 1.95x. The bookkeeping is the next
-  change, and it is a structural one: batching consecutive grid points so one forward
-  scan replaces a search pair per point. Section 4.5 gives an upper bound on what that
-  can win and states plainly that the bound assumes more than batching delivers.
+  already at 0.89x and per-point bookkeeping at 1.95x.
+- **The evaluator pays twice, and only the smaller half was addressed here.** It pays
+  36.9 ns per *grid point* in bookkeeping and, separately, per-sample Rust work to copy
+  every input sample into growable `Vec`s so the window can slide by `drain`ing the front.
+  At the benchmark shape the first dominates (265 us vs 14 us); for a range holding 50 M
+  samples the second does, by two orders of magnitude (150-400 ms vs 1.6 ms). The ordinary
+  plan avoids both — it copies no samples and evaluates windows as index arithmetic over
+  one shared array. So batching grid points, measured here as an upper bound of parity,
+  fixes the smaller half at scale and none of the larger one.
 - **The output path was not measured.** The node targets 4 096 rows per batch
   (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
   series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
