@@ -1,0 +1,255 @@
+[bin]  timed 5: wall median 44.9 ms, CPU median 160.0 ms
+[bin]  #1  evaluate   57.50  prep   25.93  kernel   26.52  columns   3.69  regions/evaluate  97.6%  prep/kernel 0.978
+[bin]  #2  evaluate   57.08  prep   26.50  kernel   25.53  columns   3.72  regions/evaluate  97.7%  prep/kernel 1.038
+[bin]  #3  evaluate   92.02  prep   40.57  kernel   43.59  columns   5.82  regions/evaluate  97.8%  prep/kernel 0.931
+[bin]  #4  evaluate   59.48  prep   26.98  kernel   27.43  columns   3.71  regions/evaluate  97.7%  prep/kernel 0.984
+[bin]  #5  evaluate   58.00  prep   25.98  kernel   26.94  columns   3.73  regions/evaluate  97.7%  prep/kernel 0.965
+[bin]  #6  evaluate   64.20  prep   28.86  kernel   29.84  columns   4.11  regions/evaluate  97.8%  prep/kernel 0.967
+[bin]  #7  evaluate   54.04  prep   24.60  kernel   24.69  columns   3.48  regions/evaluate  97.7%  prep/kernel 0.996
+[bin]  #8  evaluate   53.60  prep   24.28  kernel   24.56  columns   3.46  regions/evaluate  97.6%  prep/kernel 0.989
+[bin]  #9  evaluate   63.35  prep   28.46  kernel   29.26  columns   4.16  regions/evaluate  97.7%  prep/kernel 0.972
+[compare-bin]  timed 5: wall median 44.4 ms, CPU median 150.0 ms
+[compare-bin]  #1  evaluate   54.62  prep   23.91  kernel   25.78  columns   3.60  regions/evaluate  97.6%  prep/kernel 0.928
+[compare-bin]  #2  evaluate   77.33  prep   33.73  kernel   36.81  columns   4.93  regions/evaluate  97.6%  prep/kernel 0.916
+[compare-bin]  #3  evaluate   58.87  prep   25.77  kernel   27.97  columns   3.76  regions/evaluate  97.7%  prep/kernel 0.921
+[compare-bin]  #4  evaluate   60.97  prep   26.00  kernel   29.53  columns   4.05  regions/evaluate  97.7%  prep/kernel 0.880
+[compare-bin]  #5  evaluate   62.05  prep   27.21  kernel   29.45  columns   4.00  regions/evaluate  97.8%  prep/kernel 0.924
+[compare-bin]  #6  evaluate   48.05  prep   21.45  kernel   22.20  columns   3.23  regions/evaluate  97.6%  prep/kernel 0.966
+[compare-bin]  #7  evaluate   54.04  prep   24.16  kernel   25.01  columns   3.59  regions/evaluate  97.6%  prep/kernel 0.966
+[compare-bin]  #8  evaluate   60.40  prep   25.85  kernel   29.17  columns   3.96  regions/evaluate  97.7%  prep/kernel 0.886
+[compare-bin]  #9  evaluate   58.29  prep   25.48  kernel   27.69  columns   3.79  regions/evaluate  97.7%  prep/kernel 0.920
+
+round 1 of 8, execution order bin then compare-bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              44.93        44.36    0.987
+  cpu              160.00       150.00    0.938
+  evaluate          58.00        58.87    1.015
+  prep              26.50        25.77    0.973
+  kernel            26.94        27.97    1.038
+  columns            3.72         3.79    1.018
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[compare-bin]  timed 5: wall median 41.5 ms, CPU median 130.0 ms
+[compare-bin]  #1  evaluate   55.22  prep   24.02  kernel   26.32  columns   3.62  regions/evaluate  97.7%  prep/kernel 0.913
+[compare-bin]  #2  evaluate   54.56  prep   23.42  kernel   26.41  columns   3.47  regions/evaluate  97.7%  prep/kernel 0.887
+[compare-bin]  #3  evaluate   52.56  prep   22.78  kernel   25.15  columns   3.40  regions/evaluate  97.7%  prep/kernel 0.906
+[compare-bin]  #4  evaluate   51.11  prep   22.31  kernel   24.29  columns   3.30  regions/evaluate  97.6%  prep/kernel 0.919
+[compare-bin]  #5  evaluate   56.18  prep   24.38  kernel   26.87  columns   3.65  regions/evaluate  97.7%  prep/kernel 0.907
+[compare-bin]  #6  evaluate   49.66  prep   22.07  kernel   23.08  columns   3.29  regions/evaluate  97.6%  prep/kernel 0.956
+[compare-bin]  #7  evaluate   53.57  prep   23.46  kernel   25.33  columns   3.50  regions/evaluate  97.6%  prep/kernel 0.926
+[compare-bin]  #8  evaluate   52.22  prep   22.89  kernel   24.65  columns   3.43  regions/evaluate  97.6%  prep/kernel 0.929
+[compare-bin]  #9  evaluate   62.78  prep   26.71  kernel   30.65  columns   4.04  regions/evaluate  97.8%  prep/kernel 0.871
+[bin]  timed 5: wall median 42.2 ms, CPU median 160.0 ms
+[bin]  #1  evaluate   59.80  prep   26.56  kernel   27.88  columns   3.92  regions/evaluate  97.6%  prep/kernel 0.952
+[bin]  #2  evaluate   60.59  prep   27.14  kernel   28.16  columns   3.89  regions/evaluate  97.7%  prep/kernel 0.964
+[bin]  #3  evaluate   64.49  prep   28.20  kernel   30.62  columns   4.23  regions/evaluate  97.8%  prep/kernel 0.921
+[bin]  #4  evaluate   71.98  prep   31.66  kernel   34.01  columns   4.67  regions/evaluate  97.7%  prep/kernel 0.931
+[bin]  #5  evaluate  139.42  prep   64.23  kernel   63.12  columns   8.97  regions/evaluate  97.8%  prep/kernel 1.018
+[bin]  #6  evaluate   61.79  prep   27.43  kernel   28.86  columns   4.05  regions/evaluate  97.7%  prep/kernel 0.950
+[bin]  #7  evaluate   60.92  prep   27.07  kernel   28.60  columns   3.87  regions/evaluate  97.8%  prep/kernel 0.947
+[bin]  #8  evaluate   70.53  prep   32.45  kernel   31.89  columns   4.57  regions/evaluate  97.7%  prep/kernel 1.018
+[bin]  #9  evaluate   57.70  prep   25.66  kernel   26.89  columns   3.80  regions/evaluate  97.7%  prep/kernel 0.954
+
+round 2 of 8, execution order compare-bin then bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              42.20        41.54    0.984
+  cpu              160.00       130.00    0.813
+  evaluate          61.79        53.57    0.867
+  prep              27.43        23.42    0.854
+  kernel            28.86        25.33    0.877
+  columns            4.05         3.47    0.856
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[bin]  timed 5: wall median 48.2 ms, CPU median 160.0 ms
+[bin]  #1  evaluate   59.84  prep   26.46  kernel   28.14  columns   3.85  regions/evaluate  97.7%  prep/kernel 0.940
+[bin]  #2  evaluate   54.21  prep   24.08  kernel   25.43  columns   3.44  regions/evaluate  97.7%  prep/kernel 0.947
+[bin]  #3  evaluate   64.85  prep   28.74  kernel   30.40  columns   4.26  regions/evaluate  97.8%  prep/kernel 0.945
+[bin]  #4  evaluate   56.01  prep   24.73  kernel   26.19  columns   3.78  regions/evaluate  97.7%  prep/kernel 0.944
+[bin]  #5  evaluate   67.09  prep   29.61  kernel   31.50  columns   4.35  regions/evaluate  97.6%  prep/kernel 0.940
+[bin]  #6  evaluate   53.59  prep   24.73  kernel   24.02  columns   3.51  regions/evaluate  97.5%  prep/kernel 1.029
+[bin]  #7  evaluate   68.50  prep   29.14  kernel   33.54  columns   4.25  regions/evaluate  97.7%  prep/kernel 0.869
+[bin]  #8  evaluate   54.01  prep   24.75  kernel   24.40  columns   3.55  regions/evaluate  97.6%  prep/kernel 1.014
+[bin]  #9  evaluate   61.17  prep   27.09  kernel   28.69  columns   4.00  regions/evaluate  97.7%  prep/kernel 0.944
+[compare-bin]  timed 5: wall median 42.5 ms, CPU median 150.0 ms
+[compare-bin]  #1  evaluate   51.65  prep   22.79  kernel   24.19  columns   3.42  regions/evaluate  97.6%  prep/kernel 0.942
+[compare-bin]  #2  evaluate   69.86  prep   29.86  kernel   34.04  columns   4.44  regions/evaluate  97.8%  prep/kernel 0.877
+[compare-bin]  #3  evaluate   56.34  prep   24.37  kernel   26.88  columns   3.73  regions/evaluate  97.6%  prep/kernel 0.907
+[compare-bin]  #4  evaluate   51.94  prep   22.66  kernel   24.54  columns   3.45  regions/evaluate  97.5%  prep/kernel 0.923
+[compare-bin]  #5  evaluate   62.14  prep   26.69  kernel   29.96  columns   4.06  regions/evaluate  97.7%  prep/kernel 0.891
+[compare-bin]  #6  evaluate   54.00  prep   23.84  kernel   25.37  columns   3.49  regions/evaluate  97.6%  prep/kernel 0.940
+[compare-bin]  #7  evaluate   53.07  prep   23.45  kernel   24.91  columns   3.46  regions/evaluate  97.6%  prep/kernel 0.941
+[compare-bin]  #8  evaluate   58.52  prep   25.46  kernel   27.89  columns   3.84  regions/evaluate  97.7%  prep/kernel 0.913
+[compare-bin]  #9  evaluate   59.03  prep   25.63  kernel   28.27  columns   3.81  regions/evaluate  97.8%  prep/kernel 0.907
+
+round 3 of 8, execution order bin then compare-bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              48.24        42.46    0.880
+  cpu              160.00       150.00    0.937
+  evaluate          59.84        56.34    0.941
+  prep              26.46        24.37    0.921
+  kernel            28.14        26.88    0.955
+  columns            3.85         3.73    0.967
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[compare-bin]  timed 5: wall median 45.6 ms, CPU median 160.0 ms
+[compare-bin]  #1  evaluate   58.85  prep   25.44  kernel   28.19  columns   3.87  regions/evaluate  97.7%  prep/kernel 0.903
+[compare-bin]  #2  evaluate   57.05  prep   24.67  kernel   27.32  columns   3.73  regions/evaluate  97.7%  prep/kernel 0.903
+[compare-bin]  #3  evaluate   61.51  prep   26.96  kernel   29.26  columns   3.89  regions/evaluate  97.7%  prep/kernel 0.921
+[compare-bin]  #4  evaluate   49.93  prep   22.05  kernel   23.37  columns   3.31  regions/evaluate  97.6%  prep/kernel 0.943
+[compare-bin]  #5  evaluate   60.63  prep   26.28  kernel   29.07  columns   3.91  regions/evaluate  97.7%  prep/kernel 0.904
+[compare-bin]  #6  evaluate   57.08  prep   25.12  kernel   26.90  columns   3.70  regions/evaluate  97.6%  prep/kernel 0.934
+[compare-bin]  #7  evaluate   51.85  prep   22.89  kernel   24.44  columns   3.32  regions/evaluate  97.7%  prep/kernel 0.937
+[compare-bin]  #8  evaluate   63.23  prep   27.49  kernel   30.17  columns   4.09  regions/evaluate  97.7%  prep/kernel 0.911
+[compare-bin]  #9  evaluate   57.18  prep   24.96  kernel   27.01  columns   3.83  regions/evaluate  97.6%  prep/kernel 0.924
+[bin]  timed 5: wall median 39.9 ms, CPU median 160.0 ms
+[bin]  #1  evaluate   60.90  prep   26.91  kernel   28.61  columns   3.95  regions/evaluate  97.7%  prep/kernel 0.941
+[bin]  #2  evaluate   74.13  prep   31.40  kernel   35.61  columns   4.65  regions/evaluate  96.7%  prep/kernel 0.882
+[bin]  #3  evaluate   62.60  prep   27.86  kernel   29.08  columns   4.11  regions/evaluate  97.5%  prep/kernel 0.958
+[bin]  #4  evaluate   61.20  prep   26.78  kernel   28.90  columns   4.07  regions/evaluate  97.7%  prep/kernel 0.927
+[bin]  #5  evaluate   61.26  prep   27.15  kernel   28.81  columns   3.89  regions/evaluate  97.7%  prep/kernel 0.942
+[bin]  #6  evaluate   64.90  prep   28.23  kernel   31.04  columns   4.16  regions/evaluate  97.7%  prep/kernel 0.909
+[bin]  #7  evaluate   66.45  prep   28.91  kernel   31.71  columns   4.30  regions/evaluate  97.7%  prep/kernel 0.912
+[bin]  #8  evaluate   63.53  prep   28.27  kernel   29.72  columns   4.05  regions/evaluate  97.7%  prep/kernel 0.951
+[bin]  #9  evaluate   64.09  prep   28.35  kernel   30.00  columns   4.24  regions/evaluate  97.7%  prep/kernel 0.945
+
+round 4 of 8, execution order compare-bin then bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              39.86        45.59    1.144
+  cpu              160.00       160.00    1.000
+  evaluate          63.53        57.18    0.900
+  prep              28.23        25.12    0.890
+  kernel            29.72        27.32    0.919
+  columns            4.11         3.83    0.932
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[bin]  timed 5: wall median 44.6 ms, CPU median 150.0 ms
+[bin]  #1  evaluate   58.55  prep   26.41  kernel   26.99  columns   3.78  regions/evaluate  97.7%  prep/kernel 0.978
+[bin]  #2  evaluate   61.18  prep   27.16  kernel   28.67  columns   3.97  regions/evaluate  97.7%  prep/kernel 0.947
+[bin]  #3  evaluate   68.10  prep   29.80  kernel   32.39  columns   4.37  regions/evaluate  97.7%  prep/kernel 0.920
+[bin]  #4  evaluate   53.63  prep   24.25  kernel   24.67  columns   3.46  regions/evaluate  97.7%  prep/kernel 0.983
+[bin]  #5  evaluate   50.26  prep   22.80  kernel   22.89  columns   3.33  regions/evaluate  97.6%  prep/kernel 0.996
+[bin]  #6  evaluate   59.69  prep   26.45  kernel   28.04  columns   3.84  regions/evaluate  97.7%  prep/kernel 0.943
+[bin]  #7  evaluate   65.43  prep   29.54  kernel   30.17  columns   4.21  regions/evaluate  97.7%  prep/kernel 0.979
+[bin]  #8  evaluate   63.31  prep   27.64  kernel   29.98  columns   4.17  regions/evaluate  97.6%  prep/kernel 0.922
+[bin]  #9  evaluate   65.19  prep   29.33  kernel   30.15  columns   4.23  regions/evaluate  97.7%  prep/kernel 0.973
+[compare-bin]  timed 5: wall median 48.5 ms, CPU median 150.0 ms
+[compare-bin]  #1  evaluate   48.00  prep   21.33  kernel   22.21  columns   3.24  regions/evaluate  97.5%  prep/kernel 0.961
+[compare-bin]  #2  evaluate   52.16  prep   22.66  kernel   24.82  columns   3.44  regions/evaluate  97.6%  prep/kernel 0.913
+[compare-bin]  #3  evaluate   57.87  prep   24.98  kernel   27.73  columns   3.81  regions/evaluate  97.7%  prep/kernel 0.901
+[compare-bin]  #4  evaluate   52.73  prep   23.10  kernel   24.94  columns   3.43  regions/evaluate  97.6%  prep/kernel 0.926
+[compare-bin]  #5  evaluate   55.41  prep   24.49  kernel   26.05  columns   3.57  regions/evaluate  97.7%  prep/kernel 0.940
+[compare-bin]  #6  evaluate   55.12  prep   24.29  kernel   25.92  columns   3.60  regions/evaluate  97.6%  prep/kernel 0.937
+[compare-bin]  #7  evaluate   52.54  prep   23.28  kernel   24.50  columns   3.52  regions/evaluate  97.6%  prep/kernel 0.950
+[compare-bin]  #8  evaluate   66.69  prep   28.50  kernel   32.39  columns   4.31  regions/evaluate  97.8%  prep/kernel 0.880
+[compare-bin]  #9  evaluate   55.88  prep   24.23  kernel   26.60  columns   3.74  regions/evaluate  97.7%  prep/kernel 0.911
+
+round 5 of 8, execution order bin then compare-bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              44.57        48.48    1.088
+  cpu              150.00       150.00    1.000
+  evaluate          61.18        55.12    0.901
+  prep              27.16        24.23    0.892
+  kernel            28.67        25.92    0.904
+  columns            3.97         3.57    0.900
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[compare-bin]  timed 5: wall median 40.3 ms, CPU median 140.0 ms
+[compare-bin]  #1  evaluate   49.99  prep   22.23  kernel   23.19  columns   3.35  regions/evaluate  97.6%  prep/kernel 0.958
+[compare-bin]  #2  evaluate   51.37  prep   22.88  kernel   23.70  columns   3.49  regions/evaluate  97.5%  prep/kernel 0.966
+[compare-bin]  #3  evaluate   69.20  prep   29.82  kernel   33.19  columns   4.61  regions/evaluate  97.7%  prep/kernel 0.898
+[compare-bin]  #4  evaluate   54.88  prep   23.88  kernel   26.17  columns   3.53  regions/evaluate  97.6%  prep/kernel 0.912
+[compare-bin]  #5  evaluate   56.29  prep   25.12  kernel   26.16  columns   3.69  regions/evaluate  97.7%  prep/kernel 0.960
+[compare-bin]  #6  evaluate   52.54  prep   23.43  kernel   24.41  columns   3.46  regions/evaluate  97.6%  prep/kernel 0.960
+[compare-bin]  #7  evaluate   58.71  prep   25.35  kernel   28.17  columns   3.84  regions/evaluate  97.7%  prep/kernel 0.900
+[compare-bin]  #8  evaluate   59.61  prep   26.14  kernel   28.08  columns   3.92  regions/evaluate  97.5%  prep/kernel 0.931
+[compare-bin]  #9  evaluate   63.66  prep   27.30  kernel   30.57  columns   4.26  regions/evaluate  97.6%  prep/kernel 0.893
+[bin]  timed 5: wall median 44.5 ms, CPU median 150.0 ms
+[bin]  #1  evaluate   58.80  prep   26.18  kernel   27.38  columns   3.86  regions/evaluate  97.6%  prep/kernel 0.956
+[bin]  #2  evaluate   62.55  prep   28.30  kernel   28.73  columns   4.09  regions/evaluate  97.7%  prep/kernel 0.985
+[bin]  #3  evaluate   51.56  prep   23.72  kernel   23.18  columns   3.43  regions/evaluate  97.6%  prep/kernel 1.023
+[bin]  #4  evaluate   52.88  prep   24.17  kernel   23.99  columns   3.43  regions/evaluate  97.6%  prep/kernel 1.007
+[bin]  #5  evaluate   56.35  prep   25.48  kernel   25.94  columns   3.62  regions/evaluate  97.7%  prep/kernel 0.983
+[bin]  #6  evaluate   59.46  prep   26.18  kernel   28.04  columns   3.86  regions/evaluate  97.7%  prep/kernel 0.934
+[bin]  #7  evaluate   55.62  prep   25.35  kernel   25.40  columns   3.55  regions/evaluate  97.6%  prep/kernel 0.998
+[bin]  #8  evaluate   55.13  prep   25.26  kernel   24.99  columns   3.56  regions/evaluate  97.6%  prep/kernel 1.011
+[bin]  #9  evaluate   55.34  prep   24.76  kernel   25.64  columns   3.58  regions/evaluate  97.5%  prep/kernel 0.966
+
+round 6 of 8, execution order compare-bin then bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              44.52        40.27    0.905
+  cpu              150.00       140.00    0.933
+  evaluate          55.62        56.29    1.012
+  prep              25.35        25.12    0.991
+  kernel            25.64        26.17    1.021
+  columns            3.58         3.69    1.032
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[bin]  timed 5: wall median 40.5 ms, CPU median 150.0 ms
+[bin]  #1  evaluate   60.91  prep   27.83  kernel   27.75  columns   3.95  regions/evaluate  97.7%  prep/kernel 1.003
+[bin]  #2  evaluate   63.37  prep   28.84  kernel   28.91  columns   4.12  regions/evaluate  97.6%  prep/kernel 0.998
+[bin]  #3  evaluate   62.09  prep   27.50  kernel   28.90  columns   4.18  regions/evaluate  97.6%  prep/kernel 0.952
+[bin]  #4  evaluate   50.15  prep   23.14  kernel   22.49  columns   3.28  regions/evaluate  97.5%  prep/kernel 1.029
+[bin]  #5  evaluate   66.83  prep   29.55  kernel   31.44  columns   4.37  regions/evaluate  97.8%  prep/kernel 0.940
+[bin]  #6  evaluate   59.11  prep   26.03  kernel   27.88  columns   3.84  regions/evaluate  97.7%  prep/kernel 0.933
+[bin]  #7  evaluate   59.35  prep   26.52  kernel   27.65  columns   3.81  regions/evaluate  97.7%  prep/kernel 0.959
+[bin]  #8  evaluate   53.51  prep   23.93  kernel   24.78  columns   3.52  regions/evaluate  97.6%  prep/kernel 0.966
+[bin]  #9  evaluate   59.30  prep   29.16  kernel   25.38  columns   3.50  regions/evaluate  97.9%  prep/kernel 1.149
+[compare-bin]  timed 5: wall median 39.5 ms, CPU median 150.0 ms
+[compare-bin]  #1  evaluate   57.81  prep   25.15  kernel   27.56  columns   3.76  regions/evaluate  97.7%  prep/kernel 0.913
+[compare-bin]  #2  evaluate   55.03  prep   24.40  kernel   25.76  columns   3.58  regions/evaluate  97.7%  prep/kernel 0.947
+[compare-bin]  #3  evaluate   61.42  prep   26.73  kernel   29.41  columns   3.88  regions/evaluate  97.7%  prep/kernel 0.909
+[compare-bin]  #4  evaluate   53.17  prep   23.30  kernel   25.10  columns   3.48  regions/evaluate  97.6%  prep/kernel 0.928
+[compare-bin]  #5  evaluate   57.85  prep   25.00  kernel   27.75  columns   3.75  regions/evaluate  97.7%  prep/kernel 0.901
+[compare-bin]  #6  evaluate   58.98  prep   25.34  kernel   28.48  columns   3.78  regions/evaluate  97.6%  prep/kernel 0.890
+[compare-bin]  #7  evaluate   48.36  prep   21.25  kernel   22.70  columns   3.22  regions/evaluate  97.5%  prep/kernel 0.936
+[compare-bin]  #8  evaluate   54.60  prep   24.08  kernel   25.63  columns   3.61  regions/evaluate  97.7%  prep/kernel 0.940
+[compare-bin]  #9  evaluate   60.84  prep   26.09  kernel   29.29  columns   3.98  regions/evaluate  97.6%  prep/kernel 0.891
+
+round 7 of 8, execution order bin then compare-bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              40.49        39.48    0.975
+  cpu              150.00       150.00    1.000
+  evaluate          59.35        57.81    0.974
+  prep              27.50        25.00    0.909
+  kernel            27.75        27.56    0.993
+  columns            3.84         3.75    0.977
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+[compare-bin]  timed 5: wall median 44.5 ms, CPU median 150.0 ms
+[compare-bin]  #1  evaluate   59.12  prep   25.69  kernel   28.33  columns   3.76  regions/evaluate  97.7%  prep/kernel 0.907
+[compare-bin]  #2  evaluate   59.55  prep   25.70  kernel   28.64  columns   3.85  regions/evaluate  97.7%  prep/kernel 0.897
+[compare-bin]  #3  evaluate   52.11  prep   23.39  kernel   24.05  columns   3.44  regions/evaluate  97.6%  prep/kernel 0.972
+[compare-bin]  #4  evaluate   50.67  prep   22.54  kernel   23.60  columns   3.31  regions/evaluate  97.6%  prep/kernel 0.955
+[compare-bin]  #5  evaluate   54.25  prep   23.73  kernel   25.80  columns   3.46  regions/evaluate  97.7%  prep/kernel 0.920
+[compare-bin]  #6  evaluate   57.90  prep   24.91  kernel   27.76  columns   3.88  regions/evaluate  97.7%  prep/kernel 0.897
+[compare-bin]  #7  evaluate   51.53  prep   22.70  kernel   23.99  columns   3.55  regions/evaluate  97.5%  prep/kernel 0.946
+[compare-bin]  #8  evaluate   54.23  prep   23.74  kernel   25.61  columns   3.58  regions/evaluate  97.6%  prep/kernel 0.927
+[compare-bin]  #9  evaluate   51.39  prep   22.69  kernel   23.88  columns   3.53  regions/evaluate  97.5%  prep/kernel 0.950
+[bin]  timed 5: wall median 47.4 ms, CPU median 190.0 ms
+[bin]  #1  evaluate   73.96  prep   33.41  kernel   34.01  columns   4.79  regions/evaluate  97.6%  prep/kernel 0.982
+[bin]  #2  evaluate  121.80  prep   55.49  kernel   55.71  columns   7.95  regions/evaluate  97.8%  prep/kernel 0.996
+[bin]  #3  evaluate  182.27  prep   84.05  kernel   81.74  columns  12.08  regions/evaluate  97.6%  prep/kernel 1.028
+[bin]  #4  evaluate   54.24  prep   24.95  kernel   24.40  columns   3.55  regions/evaluate  97.5%  prep/kernel 1.023
+[bin]  #5  evaluate  104.33  prep   48.22  kernel   46.67  columns   7.11  regions/evaluate  97.8%  prep/kernel 1.033
+[bin]  #6  evaluate   53.50  prep   24.08  kernel   24.68  columns   3.48  regions/evaluate  97.6%  prep/kernel 0.976
+[bin]  #7  evaluate  119.03  prep   55.30  kernel   53.19  columns   7.73  regions/evaluate  97.6%  prep/kernel 1.040
+[bin]  #8  evaluate  130.82  prep   60.15  kernel   58.97  columns   8.68  regions/evaluate  97.7%  prep/kernel 1.020
+[bin]  #9  evaluate   62.49  prep   28.76  kernel   28.03  columns   4.14  regions/evaluate  97.5%  prep/kernel 1.026
+
+round 8 of 8, execution order compare-bin then bin
+  quantity            bin  compare-bin  cmp/bin
+  wall              47.39        44.52    0.939
+  cpu              190.00       150.00    0.789
+  evaluate         104.33        54.23    0.520
+  prep              48.22        23.73    0.492
+  kernel            46.67        25.61    0.549
+  columns            7.11         3.55    0.499
+  cmp/bin is compare-bin / bin: two medians from this round, and only this round
+
+order per round: bin->compare-bin, compare-bin->bin, bin->compare-bin, compare-bin->bin, bin->compare-bin, compare-bin->bin, bin->compare-bin, compare-bin->bin
+medians per session: wall and CPU over 5 timed execution(s), regions over 9 ANALYZE record(s)
+
+ratio compare-bin / bin: one per round, each from that round's two medians
+quantity        r1      r2      r3      r4      r5      r6      r7      r8   median         range  rounds
+wall         0.987   0.984   0.880   1.144   1.088   0.905   0.975   0.939    0.980   0.880-1.144     8/8
+cpu          0.938   0.813   0.937   1.000   1.000   0.933   1.000   0.789    0.937   0.789-1.000     8/8
+evaluate     1.015   0.867   0.941   0.900   0.901   1.012   0.974   0.520    0.921   0.520-1.015     8/8
+prep         0.973   0.854   0.921   0.890   0.892   0.991   0.909   0.492    0.901   0.492-0.991     8/8
+kernel       1.038   0.877   0.955   0.919   0.904   1.021   0.993   0.549    0.937   0.549-1.038     8/8
+columns      1.018   0.856   0.967   0.932   0.900   1.032   0.977   0.499    0.950   0.499-1.032     8/8
+
+same rows and values on both binaries: case W, 3 columns (1 label(s), 1 timestamp(s), 1 value(s)), 28684 rows
+wrote /tmp/abregions/W-8r.json

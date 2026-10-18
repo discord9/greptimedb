@@ -942,9 +942,13 @@ measurements taken in one execution (`docs/bench-records/20261018T134000Z/`):
 | `fused_kernel_time` | 27.40 ms | 45.2% | 27.71 ms | 45.8% |
 | `fused_columns_time` | 3.83 ms | 6.3% | 3.95 ms | 6.5% |
 
-The three regions sum to **97.7-97.8%** of the counter they subdivide, and the residual is `ingest`
-— which the profile independently put at 0.5-0.6%. Two instruments, one region, agreeing within a
-point, so the split is complete rather than merely consistent.
+The three regions sum to **97.7-97.8%** of the counter they subdivide. The remaining 2.2-2.3% is
+not attributed: it contains `ingest`, the loop's own bookkeeping and the flush's `clear_points`,
+and no measurement here separates those. The profile did put `ingest` at 0.5-0.6% of the
+evaluator, but that is a separate instrument measuring a differently-scoped number, so it is a
+consistency hint and not an identification of the residual. What the 97.7-97.8% does establish is
+that the three regions cover essentially the whole counter, which is the check that the
+instrumentation is complete.
 
 Per record the `prep/kernel` ratio reads 0.995 (`W`) and 0.997 (`G`) by median, with preparation
 above the kernel in 8 of 18 records and a worst excursion of 10.9% — against the 25% drift of the
@@ -954,22 +958,34 @@ profile's 50/50 was not an artifact of inlining; it was the answer.
 **Both halves are fixed cost per `(series, grid point)`, not per sample in the window.** `W` holds
 240 samples per window and `G` 20 — a factor of 12 — over the same grid, and every region costs
 the same in both: kernel 27.40 against 27.71 ms, preparation 28.05 against 27.55 ms, whole
-`push` 60.69 against 60.50 ms. That is 21.1 ns per point on either case, and it is the same
-property the earlier round found end to end (`rate[1h]` = `rate[5m]`, 1.003x). 400 series x
-7 171 points x 21 ns is the 60 ms here, and the 33-38% of a 173 ms query the profile attributes to
-this module.
+`push` 60.69 against 60.50 ms. Averaged over this fixture that is 21.1 ns per point on either
+case — an amortized figure for this shape only (400 series of 15 s samples over 7 171 grid points
+at a 1 s step, wall-clock timers on this machine), not a rate that transfers to another series
+count, step or sample density. It is the same property the earlier round found end to end
+(`rate[1h]` = `rate[5m]`, 1.003x): 400 series x 7 171 points x 21 ns is the 60 ms here, and the
+33-38% of a 173 ms query the profile attributes to this module.
 
 **What that implies for the next change.** Asking "preparation or kernel" has no answer, and the
 previous revision's mistake was to demand one. What both halves share is the per-point machinery
-rather than either half's arithmetic: preparation writes 48 bytes per point per field into four
-parallel `Vec`s — the retained span (16), the reset range (16), the grid index (8), the evaluation
-timestamp (8) — and the kernel reads them back. At this shape that is **138 MB of metadata per
-query**, written and then read, against 11.5 MB of actual `rate` results (2 868 400 `f64`). The
-index and the timestamp are both derivable, because a batch's grid indices are contiguous and
-ascending by the struct's own contract, so `eval_ts[k] = grid[first + k]`. That is a hypothesis
-from the arithmetic, not a measurement: this round establishes that the regions are equal and
-window-independent, and it does not establish how much of preparation is metadata traffic. Removing
-those two `Vec`s and measuring the same three regions again is the cheap test.
+rather than either half's arithmetic: preparation appends, for each grid point, a 16-byte window
+span and a 16-byte reset range **per field**, plus an 8-byte grid index and an 8-byte evaluation
+timestamp that are shared across fields, all into four parallel `Vec`s that the kernel then reads
+back. On this fixture — one value field — that is 48 bytes per point, so 2 868 400 points give
+**137.7 MB of cumulative logical writes per query**. That is the sum of what is pushed into the
+four vectors, not resident memory: they reallocate as they grow and the allocator's footprint is a
+different number this section does not measure.
+
+The actual `rate` result payload is **22.95 MB** — 2 868 400 `f64` at 8 bytes — so the
+per-point window metadata is six times the size of the values it produces.
+
+Two of the four are derivable, because a batch's grid indices are contiguous and ascending by the
+flushing convention above: `indices` is `first_index + k` and `eval_ts[k]` is
+`grid[first_index + k]`. Removing both deletes 16 of those 48 bytes — **a third on a single-field
+series, and less as fields grow**, since the span and the reset range scale with the field count
+while these two do not. The remaining two thirds carry the window boundaries themselves. That the
+deleted third is the *expensive* third is exactly what arithmetic cannot answer: it says nothing
+about how the write cost distributes across the four vectors, which is why the change is measured
+rather than predicted.
 
 **What the block timers say, and what they may not be compared to.** These are medians over four
 replications of the same statement (`sum by (instance) (rate(vmbench[5m]))`, 120 min at 1 s, 400
@@ -1115,8 +1131,8 @@ materialises the whole range matrix per query: `TQL ANALYZE` on `control`'s own 
 its `output_bytes` as **176 MB**, against 7 MB for the `SeriesScan` beneath it and 81 MB for the
 `ProjectionExec` above it. That figure is identical for `max_over_time[5m]`, `rate[5m]` and
 `rate[1h]` — 176 MB and 2 874 400 rows in all three — so it scales with the grid, not with the
-window. A query allocating and freeing that every call measures jemalloc's variance, not the machine's
-quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier
+window. A query allocating and freeing that every call measures jemalloc's variance, not the
+machine's quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier
 version of the script gated on `control` and rejected a pass in which `G400`'s ratio was steady
 to 0.5% — the wrong instrument, and the reason it was replaced is recorded here rather than only
 in a commit message.
@@ -1132,16 +1148,72 @@ already wins, but it is a fifth of the query rather than a third, and the module
 Nothing *inside* that 34% is a better target than the aggregate, and that is now measured rather
 than unknown: section 4.8's three batch regions put window preparation at 45.5-46.2% of the
 evaluator and the kernel at 45.2-45.8%, so there is no larger half, and the remaining 6.3-6.5% is
-the column append. The evaluator's cost is 21 ns per `(series, grid point)` regardless of window
-width — `rate[1h]` and `rate[5m]` cost the same in every region — so shrinking it means removing
-per-point machinery, not picking between two halves that measure the same.
+the column append. The evaluator's cost is a fixed ~21 ns per `(series, grid point)` on this
+fixture regardless of window width — `rate[1h]` and `rate[5m]` cost the same in every region —
+so shrinking it means removing per-point machinery, not picking between two halves that measure the
+same.
 
 That is the comparison the next round should make: a fused partial aggregate is worth at most
 40.7 ms of a 173.0 ms query and is well understood, while the evaluator's 60.7 ms is spread over
-2.87 M points at a fixed cost each, with 138 MB of per-point window metadata written and read back.
-The shapes where a partial aggregate would do nothing are exactly the shapes where fusion already
-does nothing: at 1:1 there is no redundancy to collapse, and `G400`'s 2.28 s is the cost of
-producing 2.87 M output rows that the user asked for.
+2.87 M points at a fixed cost each, on top of 137.7 MB of cumulative per-point window-metadata
+writes that exceed the 22.95 MB of values the query returns. The shapes where a partial aggregate
+would do nothing are exactly the shapes where fusion already does nothing: at 1:1 there is no
+redundancy to collapse, and `G400`'s 2.28 s is the cost of producing 2.87 M output rows that the
+user asked for.
+
+### 4.10 Removing two of the four accumulator vectors, and the drift that nearly faked it
+
+Section 4.8 ends on a hypothesis it could not test: window preparation writes 48 bytes per point
+per field into four parallel `Vec`s, two of which — the grid index and the evaluation
+timestamp — are derivable, because the evaluator flushes the batch before it skips grid points
+and before the tail `advance`, so a batch's indices are `first_index..first_index + len`. This
+section is the controlled test of deleting them, on the experiment branch only.
+
+**What changed.** `PendingBatch` holds `first_index: usize` and `len: usize` instead of
+`indices: Vec<usize>` and `eval_ts: Vec<i64>`; `flush_batch` reconstructs the evaluation
+timestamps by slicing the grid it is handed. `WindowBatch`, `BatchKernel`, the retained spans, the
+reset ranges, the batch size and the flush placement are byte-for-byte unchanged, so the kernel is
+a negative control inside every round. Per point this removes two `Vec::push`es and adds one
+`usize` add-and-store; a `debug_assert` pins the contiguity convention, and a deliberate
+off-by-one in it fails 21 tests, including the batch-boundary and gap cases.
+
+**The first answer was wrong, and the control said so.** Three rounds of the two binaries gave an
+evaluator ratio of 0.897 — "10% faster". The same binary against itself, same script, same
+arithmetic, gave 0.976: doing nothing was "2.4% faster". Two sessions 30 s apart on this machine
+differ by 6.2-6.7 ms standard deviation on a 28 ms region, so a single paired difference cannot
+resolve an effect of order 1 ms. That reversal is recorded here rather than quietly rerun.
+
+**The measurement, with the kernel as the covariate.** Eight paired rounds per case, arm order
+alternating, plus eight rounds of the same binary against itself per case. Subtracting each
+round's kernel difference from its `prep` difference, pooled over both cases (16 rounds each):
+
+| region | A/B adjusted | negative | self-control adjusted | negative | separates? |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `prep` **(changed)** | **−1.77 ms** | **16/16** | +0.60 ms | 6/16 | **yes, −2.37 ms** |
+| `evaluate` (contains prep) | −2.10 ms | 14/16 | −1.79 ms | 10/16 | no: control moves too |
+| `columns` (untouched) | +0.82 ms | 6/16 | +1.76 ms | 6/16 | no: same in both |
+| `kernel` (the covariate) | 0.00 by construction | — | 0.00 | — | by construction |
+
+The two untouched regions are what make this usable: `columns` reads nearly the same in the A/B as
+in the self-control, so the adjustment's offset is a property of the adjustment; `evaluate` reads
+−1.79 in the control, so its own number is not evidence; and `prep`, the one region the change can
+move, is negative in 16 of 16 rounds in the A/B against 6 of 16 in the control.
+
+**−2.37 ms, about 5.6 standard errors of the difference, is −0.83 ns per point** over 2 868 400
+points. That is −6.3% of window preparation at this shape, and at least −2.9% of the whole
+evaluator, since `prep` is a subset of it and nothing else inside it changed. Two `Vec::push`es
+costing ~0.8 ns is two to three cycles — the measurement is the only thing that predicted it:
+deleting 16 of 48 bytes per point said nothing about how the cost was distributed across the four
+vectors.
+
+**End to end, nothing is resolvable.** Wall clock moves −0.62 ms with a standard error of 1.39;
+`/proc` CPU reads −0.00 with a standard error of 9.13, because its ticks are 10 ms against a
+~150 ms query. No speed claim is made for the query, and the ~1% of CPU the region arithmetic
+implies is not a measurement of it.
+
+**This is experiment-branch only.** The split branch lets a batch span a skipped gap — its
+`PendingBatch` says so in its own comment — so its `indices` is load-bearing and cannot become a
+counter until that changes.
 
 ## 5. What is not shown
 
@@ -1183,7 +1255,9 @@ producing 2.87 M output rows that the user asked for.
   did separate them, and the answer is that they are equal (45.5-46.2% against 45.2-45.8%), which
   is why no single hotspot is named inside the evaluator. What the timers do **not** do is split
   window preparation itself: whether its 9.6-9.8 ns per point is metadata traffic or the cursor
-  scans is arithmetic here, not measurement.
+  scans is arithmetic here, not measurement. Section 4.10 removes one of the four metadata
+  vectors and measures 0.83 ns per point back, which is a lower bound on that traffic rather than
+  a split of it.
 - **Nothing here splits the scan into region read, memtable and merge.** The scan is 17.8-18.6%
   of the query and the profile attributes it to `mito2` as one region. Its sub-parts are not
   separated, and the block timers cannot either: `SeriesScanExec` reports one `scan_cost`.
@@ -1289,6 +1363,22 @@ python3 scripts/fused_series_profile.py --data-home <dir> --bin <greptime> --cas
 python3 scripts/fused_series_profile.py --data-home <dir> --bin <greptime> --case C \
     --arm on --analyze-only --analyze-out analyze-C.json
 python3 scripts/fused_plan_budget.py analyze-G.json --json budget-G.json
+```
+
+Section 4.10 compares two binaries and needs the same-binary control to mean anything:
+
+```bash
+# From the repository root. Each run writes its JSON into the archive directory.
+ARCH=docs/bench-records/20261018T143000Z
+for case in W G; do
+  python3 scripts/fused_series_regions.py $OLD $DATA $case 9 --timed 5 \
+      --compare-bin $NEW --rounds 8 --json $ARCH/$case-8r.json
+  python3 scripts/fused_series_regions.py $OLD $DATA $case 9 --timed 5 \
+      --compare-bin $OLD --rounds 8 --json $ARCH/$case-self8.json
+done
+# The tables of that section, from the four runs above.
+python3 $ARCH/analyse.py $ARCH/W-8r.json $ARCH/W-self8.json \
+    $ARCH/G-8r.json $ARCH/G-self8.json
 ```
 
 The three data shapes of section 2 are seeded and measured by

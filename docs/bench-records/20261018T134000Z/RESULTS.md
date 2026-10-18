@@ -31,10 +31,13 @@ Per `(series, grid point)`, i.e. over 400 x 7 171 = 2 868 400 points:
 | kernel | 9.55 ns | 9.66 ns |
 | columns | 1.34 ns | 1.38 ns |
 
-**The three regions cover 97.7-97.8% of the counter they subdivide** (median of the nine per-record sums over the median `push`; every individual record is within 97.5-97.8%). That is the check that the
-instrument is complete: the residual is `ingest` plus the loop's own arithmetic, and the corrected
-profile independently put `ingest` at 0.5-0.6% of the evaluator. Two instruments, one region,
-agreeing within a point.
+**The three regions cover 97.7-97.8% of the counter they subdivide** (median of the nine
+per-record sums over the median `push`; every individual record is within 97.5-97.8%). That is
+the check that the instrumentation is complete: the three regions cover essentially the whole
+counter. The remaining 2.2-2.3% is **not** attributed. It contains `ingest`, the loop's own
+bookkeeping and the flush's `clear_points`, and nothing here separates them; the profile's
+0.5-0.6% for `ingest` is a differently-scoped number from a different instrument, so it is a
+consistency hint and not an identification of the residual.
 
 ## prep/kernel is one, not 50/50-by-coincidence
 
@@ -60,9 +63,12 @@ neither region scales with the window's sample count. Both are **fixed cost per 
 point)**: the kernel's per-window work is O(1) arithmetic over `first_t`/`last_t`/`eval_ts` plus
 the reset fold, and preparation's scan is O(1) amortized per point by construction.
 
-That is why the earlier round's `rate[1h]` = `rate[5m]` result (1.003x) holds, and it means the
-evaluator's cost is ~21 ns per point whatever the window is. 400 series x 7 171 points x 21 ns =
-60 ms, which is the 33-38% of a 173 ms query the profile attributes here.
+That is why the earlier round's `rate[1h]` = `rate[5m]` result (1.003x) holds. Averaged over this
+fixture the evaluator costs ~21 ns per point whatever the window is; that is an amortized figure
+for this shape only — 400 series of 15 s samples, 7 171 grid points at a 1 s step, wall-clock
+timers on this machine — and not a rate that transfers to another series count, step or sample
+density. 400 series x 7 171 points x 21 ns = 60 ms, which is the 33-38% of a 173 ms query the
+profile attributes here.
 
 ## Consequence for the next change
 
@@ -71,18 +77,28 @@ measurement's own resolution. Picking one would be arbitrary, which is what the 
 did when it read a sampling split as an ordering.
 
 What both halves share, and what the invariance points at, is the per-point machinery rather than
-either half's arithmetic: preparation writes 48 bytes per point per field into four parallel `Vec`s
-— the retained span (16), the reset range (16), the grid index (8) and the evaluation timestamp (8)
-— and the kernel reads them back. At this shape that is **138 MB per query** of metadata written
-and then read, against 11.5 MB of actual `rate` results (2 868 400 `f64`). The index and the
-timestamp are both derivable: a batch's grid indices are contiguous and ascending (the struct's
-own contract), so `eval_ts[k] = grid[first_index + k]` and the index is `first_index + k`. Removing
-those two `Vec`s deletes a third of the metadata traffic and two `push`es per point without
-changing what is computed.
+either half's arithmetic: preparation appends, for each grid point, a 16-byte window span and a
+16-byte reset range **per field**, plus an 8-byte grid index and an 8-byte evaluation timestamp
+shared across fields, all into four parallel `Vec`s that the kernel then reads back. On this
+fixture — one value field — that is 48 bytes per point, so 2 868 400 points give **137.7 MB of
+cumulative logical writes per query**. That is the sum of what is pushed into the four vectors, not
+resident memory: they reallocate as they grow and the allocator's footprint is a different number
+this file does not measure.
 
-That is a hypothesis from the arithmetic, not a measurement: this round establishes that the two
-regions are equal and window-independent, and it does not establish how much of preparation is
-metadata traffic. The cheap test is the removal itself, measured the same way as this file.
+The actual `rate` result payload is **22.95 MB** — 2 868 400 `f64` at 8 bytes — so the per-point
+window metadata is six times the size of the values it produces.
+
+Two of the four are derivable, because a batch's grid indices are contiguous and ascending by the
+flushing convention (the evaluator flushes before it skips grid points and before the tail
+`advance`): `indices` is `first_index + k` and `eval_ts[k]` is `grid[first_index + k]`. Removing
+both deletes 16 of those 48 bytes — **a third on a single-field series, and less as fields grow**,
+since the span and the reset range scale with the field count while these two do not. The remaining
+two thirds carry the window boundaries themselves.
+
+That the deleted third is the *expensive* third is exactly what arithmetic cannot say. It says
+nothing about how the write cost distributes across the four vectors, so the change is measured,
+and the measurement is reported even if it shows nothing: fewer bytes written is not a speed
+claim.
 
 ## Instrument overhead
 

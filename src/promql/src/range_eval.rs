@@ -188,10 +188,14 @@ pub struct RangeEvaluator {
 /// call and the output append, which then cover the whole batch at once.
 #[derive(Default)]
 struct PendingBatch {
-    /// Grid index of each accumulated point, ascending and contiguous.
-    indices: Vec<usize>,
-    /// Evaluation timestamp of each accumulated point.
-    eval_ts: Vec<i64>,
+    /// Grid index of the first accumulated point.
+    ///
+    /// Later points are contiguous and ascending, because the evaluator flushes the batch before it
+    /// skips grid points and before the tail `advance`, so the batch's indices are
+    /// `first_index..first_index + len` and storing them would be storing a counter.
+    first_index: usize,
+    /// How many grid points the batch holds.
+    len: usize,
     /// The retained-sample span of each point's window, one list per field.
     spans: Vec<Vec<WindowSpan>>,
     /// The resets inside each point's window, as ranges into the field's reset index.
@@ -204,8 +208,8 @@ impl PendingBatch {
     /// Sizes the per-field lists for `fields` fields.
     fn with_fields(fields: usize) -> Self {
         Self {
-            indices: Vec::new(),
-            eval_ts: Vec::new(),
+            first_index: 0,
+            len: 0,
             spans: vec![Vec::new(); fields],
             window_resets: vec![Vec::new(); fields],
             values: vec![Vec::new(); fields],
@@ -213,17 +217,17 @@ impl PendingBatch {
     }
 
     fn len(&self) -> usize {
-        self.indices.len()
+        self.len
     }
 
     fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.len == 0
     }
 
     /// Drops the accumulated points, keeping the allocations.
     fn clear_points(&mut self) {
-        self.indices.clear();
-        self.eval_ts.clear();
+        self.first_index = 0;
+        self.len = 0;
         for spans in &mut self.spans {
             spans.clear();
         }
@@ -862,6 +866,7 @@ impl RangeEvaluator {
                         &mut self.pending,
                         &self.fields,
                         range_ms,
+                        grid,
                         &mut self.output,
                         &mut self.batch_timers,
                         #[cfg(test)]
@@ -884,8 +889,14 @@ impl RangeEvaluator {
                 // right edge per field, one range of the reset index per field, and the point
                 // joins the batch.
                 let cursor = state.cursor;
-                self.pending.indices.push(cursor);
-                self.pending.eval_ts.push(eval_ts);
+                if self.pending.is_empty() {
+                    self.pending.first_index = cursor;
+                }
+                // The convention that lets the batch store one index instead of a `Vec` of them.
+                // Checked in debug builds, which is where the whole test suite runs; zero cost in
+                // the nightly build.
+                debug_assert_eq!(cursor, self.pending.first_index + self.pending.len);
+                self.pending.len += 1;
                 for (field_index, field) in self.fields.iter_mut().enumerate() {
                     let start = field.head;
                     let mut right = field.right.max(start);
@@ -906,6 +917,7 @@ impl RangeEvaluator {
                         &mut self.pending,
                         &self.fields,
                         range_ms,
+                        grid,
                         &mut self.output,
                         &mut self.batch_timers,
                         #[cfg(test)]
@@ -965,6 +977,7 @@ impl RangeEvaluator {
                 &mut self.pending,
                 &self.fields,
                 range_ms,
+                grid,
                 &mut self.output,
                 &mut self.batch_timers,
                 #[cfg(test)]
@@ -1010,11 +1023,19 @@ fn pause_filling(filling: &mut Option<Instant>, timers: &mut BatchTimers) {
 /// The kernel and column appends are the two regions timed here: one pair of clock reads per
 /// region per flush, and the caller has already stopped the window-preparation clock, so the three
 /// regions of a batch never overlap.
+///
+/// `grid` reconstructs the evaluation timestamps: the batch holds a first index and a count, so
+/// point `k` of a batch evaluates at `grid[first_index + k]`.
+// The parameters are the disjoint pieces the flush touches; bundling them into a struct would add
+// an indirection on a path that runs once per 512 points while separating `grid` from the
+// `pending` it indexes.
+#[allow(clippy::too_many_arguments)]
 fn flush_batch(
     kernel: &mut BatchKernel,
     pending: &mut PendingBatch,
     fields: &[FieldSamples],
     range_ms: i64,
+    grid: &[i64],
     output: &mut GridSeriesBuilder,
     timers: &mut BatchTimers,
     #[cfg(test)] batch_calls: &mut usize,
@@ -1029,13 +1050,15 @@ fn flush_batch(
         *batch_calls += 1;
     }
     let rows = pending.len();
+    // Read out before the destructure below borrows the batch's fields mutably.
+    let first_index = pending.first_index;
+    let eval_ts = &grid[first_index..first_index + rows];
     {
         let PendingBatch {
-            indices,
-            eval_ts,
             spans,
             window_resets,
             values,
+            ..
         } = pending;
         let kernel_started = Instant::now();
         for (field_index, field) in fields.iter().enumerate() {
@@ -1053,7 +1076,7 @@ fn flush_batch(
         timers.kernel += kernel_started.elapsed();
         let columns: Vec<&[Option<f64>]> = values.iter().map(Vec::as_slice).collect();
         let columns_started = Instant::now();
-        let appended = output.push_columns(indices[0], rows, &columns);
+        let appended = output.push_columns(first_index, rows, &columns);
         // Recorded before the error is propagated: a failed append still spent this time.
         timers.columns += columns_started.elapsed();
         appended?;
