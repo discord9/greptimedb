@@ -10,7 +10,8 @@ host values `h0000`..`h0399`.
 
 `scripts/fused_series_scale.py --rounds 3 --warmup 2 --iterations 9`. Seven cases, off and on arm
 per round, arm order rotated, CPU from `/proc/<pid>/stat`. `cases[].rounds[].off/on` hold every
-per-iteration sample, so the medians and the per-round ratios can be recomputed:
+per-iteration sample, so the medians and the per-round ratios can be recomputed. The commands in
+this file run from this directory:
 
 ```bash
 python3 - <<'PY'
@@ -22,8 +23,40 @@ print(d["pass"])
 PY
 ```
 
-`pass.quiet` is `false`: `n100`'s ratio spread 11% against a 10% gate (`control` 10%). Section
-4.9 states which cases the conclusion rests on.
+`cpu_ratio_spread_over_median` is the key this run's script wrote (`max(ratio) / median - 1`);
+the current script writes `cpu_ratio_deviation_over_median`, so the archived JSON keeps the old
+key and is left as recorded. The gate is now two-sided, and recomputing it from the per-round
+ratios stored here changes which cases pass:
+
+```bash
+python3 - <<'EOF'
+import json, statistics
+d = json.load(open("scale.json"))
+for c in d["cases"]:
+    rs = c["cpu_per_round"]
+    med = statistics.median(rs)
+    dev = max(abs(r - med) / med for r in rs)
+    worst = rs.index(min(rs, key=lambda r: -abs(r - med))) + 1
+    print(f'{c["label"]:8} {[round(r, 3) for r in rs]} median {med:.3f} dev {100*dev:5.1f}%'
+          f' worst round {worst}')
+EOF
+```
+
+| case | per-round ratios | median | two-sided dev | worst round |
+| --- | --- | ---: | ---: | ---: |
+| `G4` | 0.714 / 0.682 / 0.567 | 0.682 | **16.9%** | 3 |
+| `G400` | 0.970 / 0.974 / 0.966 | 0.970 | 0.5% | 3 |
+| `G1` | 0.682 / 0.657 / 0.727 | 0.682 | 6.7% | 3 |
+| `n100` | 0.909 / 0.818 / 0.818 | 0.818 | 11.1% | 1 |
+| `n1` | 1.000 / 1.000 / 1.000 | 1.000 | 0.0% | 1 |
+| `raw` | 0.967 / 0.967 / 0.952 | 0.967 | 1.6% | 3 |
+| `control` | 0.829 / 1.127 / 1.023 | 1.023 | 19.0% | 1 |
+
+The one-sided gate recorded this pass as `quiet: false` with `n100` worst at 11.1%, while `G4`
+showed 4.8% and looked quiet. It was not: `G4`'s third round reads 0.567 against a 0.682 median,
+a 17% excursion *below* the median, which `max(ratio) / median - 1` cannot see. Counting both
+directions makes `G4` the worst case in the pass, ahead of `n100`, and section 4.9 quotes `G4`'s
+ratio with its 0.567-0.714 range.
 
 ## `plan-delta.json` — section 4.8, the first and rejected attempt
 

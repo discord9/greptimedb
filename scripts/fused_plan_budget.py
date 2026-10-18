@@ -44,6 +44,13 @@ INTERESTING = (
     "fused_series_emitted",
     "fused_input_poll_time",
     "fused_evaluate_time",
+    # `fused_evaluate_time` wraps `push`, which ingests, evaluates and builds columns, so it
+    # says nothing about where inside the evaluator the time went. These three subdivide it per
+    # batch of grid points -- the whole reason they exist is the split the sampler cannot make
+    # when the kernel is inlined into `evaluate`.
+    "fused_window_prep_time",
+    "fused_kernel_time",
+    "fused_columns_time",
     "fused_emit_time",
     "fused_flush_time",
     "aggregation_time",

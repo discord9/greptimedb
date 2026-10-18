@@ -54,6 +54,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import fused_profile_summarize as summarize
 import fused_series_bench as bench
 
 
@@ -242,17 +243,21 @@ def main():
 
         if "text" not in profile:
             raise SystemExit(f"the profiler request failed: {profile.get('error')}")
-        # One line per sample; identical stacks repeat rather than being counted inline. The
-        # sample count is reported because a window that yields a few hundred samples cannot
-        # support a percentage claim even when the wall window was long.
+        # `pprof` writes one line per *distinct* stack plus the number of samples that had it
+        # (`{frames} {count}`, pprof-0.15.0/src/report.rs:150), so neither the line count nor a
+        # per-frame tally over lines is a sample count. Everything below is weighted by that
+        # trailing integer, through the same parser the summariser uses so the two cannot
+        # drift apart.
         stacks = [line for line in profile["text"].splitlines() if line.strip()]
-        frames = {}
+        weighted = []
         for stack in stacks:
-            for frame in stack.split(" -> "):
-                name = frame.replace("FRAME: ", "", 1)
-                if name.startswith("THREAD:"):
-                    continue
-                frames[name] = frames.get(name, 0) + 1
+            frames_text, weight, thread = summarize.parse_line(stack)
+            weighted.append((summarize.frames_of(frames_text), weight, thread))
+        sample_total = sum(weight for _, weight, _ in weighted)
+        frames = {}
+        for frame_list, weight, _ in weighted:
+            for name in frame_list:
+                frames[name] = frames.get(name, 0) + weight
         with open(args.profile_out, "w") as handle:
             handle.write(profile["text"])
 
@@ -281,13 +286,17 @@ def main():
             "PromSeries",
             "topk",
         ]
+        # Weighted: a marker's count is the samples that contain it, not the lines.
         by_marker = {
-            marker: sum(1 for stack in stacks if marker in stack) for marker in markers
+            marker: sum(
+                weight for frame_list, weight, _ in weighted if any(marker in f for f in frame_list)
+            )
+            for marker in markers
         }
         summary = {
             "case": args.case,
-            "samples": len(stacks),
-            "distinct_stacks": len(set(stacks)),
+            "samples": sample_total,
+            "distinct_stacks": len(stacks),
             "samples_with_marker": by_marker,
             "top_frames": sorted(frames.items(), key=lambda kv: -kv[1])[:25],
             "arm": args.arm,
@@ -305,19 +314,37 @@ def main():
             if queries
             else None,
             "output_rows_per_query": sorted({q["output_rows"] for q in queries}),
+            # The sampler's rate against the CPU actually burned in the same window. ITIMER_PROF
+            # fires on process CPU, so `expected` is what a perfect sampler would have produced;
+            # anything much below it means lost signals and a share that is not a share of CPU.
+            "expected_samples_at_frequency": cpu_ms / 1000.0 * args.frequency,
+            "captured_fraction": (
+                sample_total / (cpu_ms / 1000.0 * args.frequency)
+                if cpu_ms > 0 and args.frequency
+                else None
+            ),
             "queries": queries,
         }
         if args.summary_out:
             with open(args.summary_out, "w") as handle:
                 json.dump(summary, handle, indent=2)
-        print(f"  {len(stacks)} samples, {len(set(stacks))} distinct stacks")
+        expected = summary["expected_samples_at_frequency"]
+        print(
+            f"  {sample_total} samples, {len(stacks)} distinct stacks"
+            + (
+                f"; {cpu_ms / 1000.0:.1f} s of CPU at {args.frequency} Hz should give "
+                f"~{expected:.0f}, so {100.0 * summary['captured_fraction']:.0f}% were captured"
+                if expected
+                else ""
+            )
+        )
         for marker, count in sorted(by_marker.items(), key=lambda kv: -kv[1]):
             if count:
-                print(f"  samples containing {marker:52} {count:5}")
+                print(f"  samples containing {marker:52} {count:6}")
         print()
         for name, count in summary["top_frames"]:
-            share = 100.0 * count / len(stacks) if stacks else 0.0
-            print(f"  {share:5.1f}%  {count:5}  {name[:110]}")
+            share = 100.0 * count / sample_total if sample_total else 0.0
+            print(f"  {share:5.1f}%  {count:6}  {name[:110]}")
         print()
         print(
             f"case {args.case} arm {args.arm}: {len(queries)} queries in "

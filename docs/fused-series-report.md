@@ -836,104 +836,145 @@ establish a wall-clock win: wall reads 0.90-1.00, and `C` is flat at 0.997. Nor 
 establish anything about other query shapes -- these are one table, four series, `rate` and
 `max_over_time` only (section 5).
 
-### 4.8 What the intermediate rows cost, per operator
+### 4.8 Where the CPU goes, by module — and four withdrawn conclusions
 
-**Every figure here is a median over replicated passes, not one pass.** A first version of this
-section quoted a single `TQL ANALYZE` per step; replication moved the two headline numbers from
-22.1/17.4 to 20.1/13.5 ns per row. Where a number comes from one pass, the text says so.
+**Retracted first, because everything below replaces them.** An earlier revision of this
+section turned a sampling profile into an attribution of CPU. Two defects in that pipeline, both
+confirmed by independent review and both now fixed, invalidated four conclusions:
 
-**How this section is measured, and why the first answer was wrong.** The profile in the
-previous revision of this section came from the CPU sampler
-(`POST /debug/prof/cpu`) and attributed 6.0% of the query to the evaluator, 14.2% to the
-fused node's stream and 13.7% to the aggregate. Two independent checks contradict that
-split; the raw profile and both ANALYZE plans are committed under `docs/bench-records/`:
+| withdrawn claim | what was wrong | corrected |
+| --- | --- | --- |
+| "the sampler recovered 13% of the CPU" | it counted profile *lines*, not the sample count each line carries | **62%** (run `W-on3`) and 72% (`W-on2`) |
+| "the evaluator is 6.0% of the query" | shares were computed from those line counts, and each line was assigned by a fixed category priority that let an outer frame win over an inner one | **33.3%** (`W-on2`) / **37.6%** (`W-on3`) |
+| "the kernel is the largest remaining cost; optimize it first" | it rested on the 6.0%, and the split inside the evaluator came from single unreplicated passes | inside the evaluator, kernel and window preparation are **50/50** and this data cannot order them |
+| "a fused partial aggregate is bounded at 27% of the grid-dependent CPU" | derived from the same single pass | **22.5%** of the fused query's total CPU |
 
-1. **The sampler does not recover the CPU it should.** pprof 0.15 samples with `ITIMER_PROF`,
-   which counts process CPU, so 215.0 s of CPU at 199 Hz should yield ~42 800 samples. Run
-   `W-on3` yielded 5 621 — 13%.
-2. **Its shares cannot cover a 78% drop.** Holding the scan, the series and the window fixed and
-   coarsening only the grid step from 1 s to 60 s cuts the emitted rows 60x (2 868 400 to 48 000)
-   and the query's CPU from 173.0 to 39.0 ms — **78% of the query's CPU disappears**. Everything
-   that shrinks must therefore have been at least 78% of the query. The sampler's buckets that
-   shrink with rows are evaluator 6.0, stream 14.2, aggregate 13.7, sort 7.3, shuffle 4.9 and
-   http 10.8: **56.9% even counting all of them**, against 78% required.
+**Defect 1: the sample count is per line, not one per line.** `pprof` 0.15's
+`Debug for Report` writes `{frames:?} {count}` (`pprof-0.15.0/src/report.rs:150`), so one line is
+one *distinct stack* and the trailing integer is how many samples had it. `W-on3` is 5 621 lines
+and **26 529 samples** — a factor of 4.7, and the deficit is not uniform across lines, so every
+share computed from line counts was distorted rather than merely scaled. Both scripts now parse
+the weight and accumulate everything — totals, per-owner shares, per-marker counts — weighted.
+`fused_profile_summarize.py --self-test` checks it against a two-record fixture whose answer is
+known: 99 samples in the evaluator and 1 in the aggregate must give 99.00% / 1.00% and a total of
+100, and a line count of that fixture would say 50/50.
 
-   Two caveats on that arithmetic, since it is doing real work. The 56.9% are shares of
-   *samples*, and they are only comparable to a share of *CPU* because the sampler claims to
-   sample CPU — which is the thing being falsified, so the argument is slightly self-referential:
-   it shows the two cannot both be right, not which one is. And the scan's invariance across the
-   two steps is asserted from the fixture (the same 192 000 samples, the same window) rather than
-   shown by a scan-side timer, which `step-sweep.json` does not carry; the closest evidence is
-   `fused_input_poll_time` reading 6.2 ms at 1 s against 4.8 ms at 60 s, which is small and moves
-   the wrong way to rescue the sampler.
+**Defect 2: owners were resolved by category priority, not by stack position.** The old code
+iterated the owner list in order and asked whether *any* frame in the stack matched *that owner*.
+Because `fused: stream` was checked before `scan`, a sample taken inside a mito2 read reached
+through `FusedSeriesStream` was charged to the fused stream. The fix walks the frames from the
+leaf outwards and stops at the first frame that names a known component, so the frame nearest the
+sampled instruction decides. Unrecognised samples are reported as such with their leaf frame, at
+2.1% of the total, never folded into a named bucket.
 
-**The two instruments also disagree directly, on one region.** In a pass that measured both, the
-process used 173.0 ms of CPU per query (median over four replications) and the batch kernel's
-block timer read 58.4 ms, i.e. the kernel is 34% of the query's CPU. The sampler attributed 6.0%
-to `promql::range_eval`. Both numbers claim to be the same quantity for the same code, and they
-differ by 5.6x. The timer is the one that survives the checks below.
+**The corrected profile.** Case `W` (`sum by (instance) (rate(vmbench[1h]))`, 120 min at a 1 s
+step), fused, `POST /debug/prof/cpu`, `--frequency 199`. Two independent runs, because a single
+profile from this machine has been wrong before:
 
-So this section uses the operators' **own block timers** instead, and treats
-`elapsed_compute` as unavailable for the reason it always was: nested operators count their
-children and a partitioned plan counts once per partition, so it cannot be summed. The block
-timers (`fused_evaluate_time`, `fused_emit_time`, `fused_flush_time`) wrap one statement in the
-stream's poll loop, one partition at a time, so their sum over 20 partitions is that block's
-wall time. Turning that into CPU needs one assumption: that the blocks are not waiting. Two
-measurements support it here — `fused_input_poll_time`, which times exactly the wait for the
-child, is 6.2 ms against `fused_evaluate_time`'s 58.4 ms, and the query as a whole runs at
-173.0 ms CPU over 46.7 ms wall, 3.7 cores busy against 19 query-runtime workers, so a block is
-unlikely to be descheduled for long. So the sum is read as CPU, with the assumption stated
-rather than hidden, and it is checked below against an independent `/proc` counter and never by
-being added to another operator's time.
+| owner | `W-on2` (23 111 samples, 160.4 s CPU) | `W-on3` (26 529 samples, 215.0 s CPU) |
+| --- | ---: | ---: |
+| **fused: evaluator** (`promql::range_eval`) | **33.3%** | **37.6%** |
+| **aggregate** (the `sum by` hash path) | **26.1%** | **26.3%** |
+| scan (`mito2`, `SeriesScan`, region read) | 18.6% | 17.8% |
+| fused: output build (`grid_series`) | 2.1% | 2.3% |
+| fused: stream (emit/flush) | 2.8% | 2.6% |
+| http response / JSON | 3.5% | 4.4% |
+| sort | 2.3% | 2.8% |
+| planning | 2.1% | 2.3% |
+| shuffle | 1.4% | 1.3% |
+| logging / plan formatting | 3.0% | 0.4% |
+| unrecognised | 4.7% | 2.1% |
 
-**Case `G`, `sum by (instance) (rate(vmbench[5m]))`, 120 min at a 1 s step, 400 series, on
-`a2d345cc76c` fused.** Medians over four replications, each replication taking both instruments
-in one server:
+Two modules hold 60-64% of the query between them and the rest is a long tail. The two runs
+agree to within 4 points on the top three, which is the noise this instrument has at these sample
+counts.
 
-| counter | value | 
-| --- | ---: |
-| `fused_series_completed` / `emitted` | 400 / 400 |
-| `output_batches` | 400 |
-| `output_rows` | 2 868 400 |
-| `fused_evaluate_time` | 58.40 ms |
-| `fused_input_poll_time` | 8.9 ms |
-| `fused_emit_time` | 1.84 ms |
-| `fused_flush_time` | 0.22 ms |
-| aggregate partial `aggregation_time` | 38.87 ms |
-| aggregate final `aggregation_time` | 3.65 ms |
-| `/proc` CPU per query | 173.0 ms |
+**The capture rate, measured against the same window's CPU.** `ITIMER_PROF` fires on process CPU,
+so a sampler asked for 199 Hz over a window in which the server burned 215.0 s of CPU should
+produce ~42 800 samples. It produced 26 529: **62%**, or 123 samples per CPU second. `W-on2` is
+72%. That is lost signals, not a wrong denominator, and it is the reason a single profile here
+gets two runs and a cross-check. What it does *not* do is bias the shares systematically: a
+uniformly lossy sampler keeps its proportions, which is why the corrected shares are usable even
+at 62%.
 
-**The marginal test, which is what makes the split checkable, and which had to be repeated.**
-`G` and `C` scan the same 192 000 raw samples with the same window and differ only in grid step,
-so the only quantity that changes is the number of emitted rows — 2 868 400 against 48 000.
-Differencing the same operator across the two steps gives its cost per *added* row.
+**`fused_evaluate_time` is the whole evaluator, not the kernel.** The previous revision labelled
+this counter "the batch kernel". It is not. It wraps one call to `RangeEvaluator::push`, which
+contains **ingest** (`push` → `ingest`, ~0.5% of the evaluator by profile), **window
+preparation** (advancing the four cursors and building each batch's spans, indices and reset
+ranges), **the kernel** (`flush_batch`'s `kernel(&batch, …)`), and **result column construction**
+(`flush_batch`'s `output.push_columns`). Everything in this section that used that counter as a
+kernel figure is restated accordingly.
 
-A first attempt took each step **once** and reported 22.1 and 17.4 ns/row. That is not
-reportable: the same record shows these timers swinging 40-50% between passes, so a 27% gap on a
-single differenced pair cannot order anything. Repeated six times, the pair read 17.9 and 12.3
-ns/row with the kernel larger in **6 of 6**. The pair below repeats four more times and adds the
-process counter to each replication, so the operators' share is a ratio of two quantities from
-the *same* pass:
+**Inside the evaluator, the profile resolves into two halves and stops there.** Restricting to
+the samples attributed to `promql::range_eval` and looking at their leaf frames:
+
+| leaf frame, within the evaluator | `W-on2` | `W-on3` | region |
+| --- | ---: | ---: | --- |
+| `extrapolated_rate_batch::<true, true>` | 50.5% | 49.4% | the kernel's arithmetic |
+| `<RangeEvaluator>::evaluate` (own body) | 47.8% | 49.4% | window preparation, cursor advance |
+| `<RangeEvaluator>::ingest` | 0.6% | 0.5% | copying samples in |
+| `flush_batch` (own body) | — | 0.2% | batch bookkeeping |
+
+**Window preparation costs as much as the kernel arithmetic.** That is the one substantive thing
+this correction adds, and it is not what the previous revision said. Half of the largest region in
+the query is spent deciding *which samples each window covers* — the forward cursors for the left
+edge, the right edge and the two reset boundaries — and half is the `rate` arithmetic itself. They
+are 18.5% and 18.8% of the query, i.e. within 1-2 points of each other.
+
+**Which is why this cannot be ordered from the profile, and why a timer is the next step.** The
+two halves are adjacent code in one `#[inline]`-heavy function; a sampling attribution of inlined
+frames is not precise enough to separate 18.5% from 18.8%, and the previous revision's error was
+exactly to treat a sampling split as an ordering. So the next change adds three **batch-level**
+timing intervals inside the evaluator — window preparation, kernel, result columns — recorded
+once per batch flush (512 grid points), not once per point. That is 14 intervals per series at
+this shape against 7 171 points, so the timers are cheaper than the thing they measure by two
+orders of magnitude, and they will say which half to attack.
+
+**What the block timers say, and what they may not be compared to.** These are medians over four
+replications of the same statement (`sum by (instance) (rate(vmbench[5m]))`, 120 min at 1 s, 400
+series), each replication taking `/proc` CPU and the operator counters in one server:
+
+| counter | median | share of the query's CPU |
+| --- | ---: | ---: |
+| `fused_evaluate_time` (the whole evaluator) | 58.40 ms | 34% |
+| aggregate partial `aggregation_time` | 38.87 ms | 22% |
+| aggregate final `aggregation_time` | 3.65 ms | 2% |
+| `fused_emit_time` (`occupancy` + build output batch) | 1.84 ms | 1% |
+| `fused_flush_time` (`concat_batches`) | 0.22 ms | — |
+| `/proc` CPU per query | 173.0 ms | 100% |
+
+The profile's independent estimate for the same two modules is 33.3-37.6% and 26.1-26.3%. A
+sampling share and a block timer's share of `/proc` CPU are different instruments measuring the
+same two regions, and they agree to within a few points: the evaluator is the largest, the
+aggregate is second, and both are a fifth to a third of the query.
+
+**One ratio this section will not quote.** An earlier revision wrote the evaluator as 28.2% of
+the query by dividing a 65.45 ms block timer from one record by a 232.5 ms `/proc` figure from a
+different record. Two numbers from different server runs are not a ratio: the pass-to-pass drift
+on these timers is 40-50%, which is larger than the quantity being divided. Every percentage
+above is either a share of one profile's own weighted total, or a ratio whose two terms were
+measured in the same replication as the table says.
+
+**The marginal test, replicated, for the cost of one intermediate row.** `G` and `C` scan the
+same 192 000 raw samples with the same window and differ only in grid step, so the emitted rows
+differ 60x — 2 868 400 against 48 000 — and differencing the same operator across the two gives
+its cost per added row. A single pair gave 22.1 and 17.4 ns/row; that is not reportable, since a
+27% gap on two unreplicated differences is inside this machine's drift. Six replications of the
+pair put the kernel above the aggregate in 6 of 6 at 17.9 and 12.3 ns/row; four more, with
+`/proc` CPU taken in the same pass, gave:
 
 | operator | median ns/row, 4 reps | range | share of the CPU delta |
 | --- | ---: | ---: | ---: |
-| `fused_evaluate_time` | **20.06** | 18.20-22.62 | 43% |
-| aggregate partial `aggregation_time` | **13.48** | 12.52-15.54 | 29% |
-| aggregate final `aggregation_time` | 1.25 | 1.15-1.69 | 3% |
+| `fused_evaluate_time` (whole evaluator) | 20.06 | 18.20-22.62 | 43% |
+| aggregate partial | 13.48 | 12.52-15.54 | 29% |
+| aggregate final | 1.25 | 1.15-1.69 | 3% |
 | `fused_emit_time` | 0.50 | 0.44-0.66 | 1% |
 | `fused_flush_time` | -0.09 | -0.13--0.07 | 0% |
 
-The five sum to 99.3 ms against a CPU delta of 132.3 ms: **75%**, per-replication 68 / 81 / 81 /
-83%. A subset cannot exceed its total, and 68-83% is a subset. The remaining 17-32% is outside
-these five — the scan's own per-batch work, the sort, the response, planning — none of which is
-claimed here. `fused_flush_time` is negative because `C`'s 20 batches cost slightly more than
-`G`'s 400: below the timer's resolution, as the table shows, not a saving.
-
-The kernel is larger than the aggregate in **4 of 4** replications here and 6 of 6 in the
-kernel-only repeat, with medians 20.1 against 13.5 and non-overlapping ranges (18.2-22.6 against
-12.5-15.5). **The kernel is the larger of the two remaining costs**; the ordering is what the
-replications establish, and the single-pass ns/row figures this section first quoted were
-inflated by about 25%.
+The five sum to 99.3 ms against a CPU delta of 132.3 ms — **75%**, per replication 68 / 81 / 81 /
+83%, so the operators are a subset of the total as they must be. The other 25% is outside these
+five and is not claimed here. These per-row figures are the *whole evaluator's* marginal cost,
+not the kernel's: the batch-level timers of the next change are what will divide it.
 
 **Two measurement artifacts this round had to remove.** Both would have inflated the fused
 node's apparent cost:
@@ -951,17 +992,15 @@ node's apparent cost:
    read 53.8 ms against 42.7 ms with the filter narrowed to
    `info,query::datafusion::native_promql::fused=debug`.
 
-**What a fused partial aggregate could remove, at this measurement.** Of the 132.3 ms that a
-finer grid adds, the aggregate's generic hash work is 38.9 ms (29% of the delta) and the emit
-1.8 ms. Take that ~41 ms as the **ceiling**, not a prediction: a fused accumulator still adds
-every value into its group, which is far cheaper than the hash-table path but not free, and it
-is only available when the group cardinality is known or bounded — which `sum by` over a finite
-label set gives and a general aggregate does not. The `FilterExec` between the two nodes is pure
-transport (`selectivity = 0`, every row passes) but is not added, because no `C`-side
-measurement of it was taken. And the kernel's 58.4 ms stays whatever happens to the aggregation:
-`rate` is per series, so every `(series, point)` value must be computed wherever it is summed.
-**The kernel, not the aggregation, is the larger of the two remaining costs**, and a fused
-partial aggregate would address at most a third of the grid-dependent CPU.
+**What a fused partial aggregate could remove, at this measurement.** Of the 173.0 ms the fused
+arm's query costs, the aggregate's generic hash path is 38.9 ms (22.5%) and `emit` 1.8 ms.
+Collapsing the intermediate rows inside the fused node could therefore address at most 40.7 ms —
+the fused arm would land near 132 ms. That is a **ceiling, not a prediction**: a fused accumulator
+still adds every value into its group, which is far cheaper than the hash-table path but not free,
+and it is only available when the group cardinality is known or bounded, which `sum by` over a
+finite label set gives and a general aggregate does not. The `FilterExec` between the two nodes is
+pure transport (`selectivity = 0`, every row passes) but is not added, because no `C`-side
+measurement of it was taken.
 
 ### 4.9 Varying series count and group count
 
@@ -988,9 +1027,10 @@ iterations; the ratio is the median over rounds.
 100:1 or 400:1 the fused path costs 0.68 of the ordinary plan; where nothing is collapsed
 (`G400`, `raw`) it costs 0.97, and with a single series it is 1.000. The three 1:1 cases are
 also the most repeatable in the table — `G400` reads 0.97 in all three rounds, `n1` 1.00 in all
-three, `raw` 0.97/0.97/0.95 — while the two high-ratio cases carry the most spread
-(`G4` 0.71/0.68/0.57). That is the direction one wants: the effect is largest where the noise
-is, and absent where the noise is not.
+three, `raw` 0.97/0.97/0.95 — while the two cases with a group count worth collapsing carry
+the most spread (`G4` 0.71/0.68/0.57, `n100` 0.91/0.82/0.82). The effect is largest where the
+noise is, and absent where the noise is not; `G4`'s gain is 29-43% across its rounds, not the
+32% its median alone suggests.
 
 **Why the ratio matters more than the series count.** `n100` has the same 100:1 ratio as `G4`
 but a quarter of the series, and reads 0.818 rather than 0.682. Both arms shrink with the series
@@ -999,16 +1039,37 @@ per-intermediate-row work, and at 100 series the fixed part is a larger share of
 total. `n1` is the limit of that progression: one series, no aggregation to speak of, ratio
 exactly 1.000.
 
-**The gate on this pass.** The script's gate compares each case's per-round ratios and this pass
-reported **not quiet**: `n100` spread 11% against a 10% gate (0.91 / 0.82 / 0.82), and
-`control` spread 10% (0.83 / 1.13 / 1.02). Both are reported rather than gated away. The
-conclusion above rests on `G1`, `G4`, `G400`, `raw` and `n1`, whose spreads are 6.7%, 4.8%,
-0.4%, 0.0% and 0.0%; `n100`'s 0.818 should be read with its three rounds in view, not as a
-point estimate.
+**The gate on this pass.** It compares each case's per-round ratios against their median and
+this pass reported **not quiet**: at a 10% gate, `G4` deviates **16.9%** (round 3, 0.567 below a
+0.682 median), `n100` 11.1% (round 1, 0.909 above a 0.818 median), and `control` 19.0% (0.829,
+1.127, 1.023). The conclusion above rests on `G1` (6.7%), `G400` (0.5%), `raw` (1.6%) and `n1`
+(0.0%); `G4` and `n100` should be read with their rounds in view.
+
+The gate used to measure `max(ratio) / median - 1`, which only sees a case drifting *up*. That
+let `G4` pass at 4.8% in the same pass where its third round read 0.567 against a 0.682 median —
+a 17% excursion on the low side, invisible to one-sided arithmetic, and larger than the 11.1%
+that did trip the gate. The 4.8% figure was therefore not a quietness claim about `G4` and no
+longer appears. Nothing below is derived from it: `G4`'s 0.682 is quoted with its 0.567-0.714
+range wherever a ratio of ratios is used, and the marginal-cost measurements in section 4.8 come
+from the `TQL ANALYZE` timers and `/proc` CPU of repeated identical statements, not from this
+scale pass.
+
+**What the two arms were compared on.** This pass compared them on **row count only**: the
+script read `rows[off] != rows[on]` and stopped there, so a flag-on arm returning the right
+number of wrong numbers would have been timed and reported. The script now runs one dedicated
+correctness query per arm — its own execution, never a timed one — before the warmups, and
+compares the two through `fused_series_bench.compare_pair`: schema names and types, every row's
+label tuple, every timestamp, the row count, then every value at a relative tolerance of `1e-9`.
+That comparator was exercised on the values it has to reject (a 4% value change, a changed label,
+a moved timestamp, an extra row, a NULL against a number) and on the one it must accept (a
+relative change of `1e-13`, and `NaN` against `NaN`). The archived pass predates the check, so
+the equality evidence for it is its matching row counts plus section 4.7's value comparison on
+the same binary, where the same 28 684-row `sum by (instance)` shape was compared value by value
+and agreed in every round. The next scale run carries its own evidence.
 
 **`control` is a poor gate and is kept only as a diagnostic.** It is `max_over_time`, which does
 not fuse, so both arms run the ordinary plan and the ratio must be 1.00 — it reads 1.023, which
-is fine. But its spread is 10% because the ordinary plan's `PromRangeManipulateExec`
+is fine. But it deviates 19% round to round because the ordinary plan's `PromRangeManipulateExec`
 materialises the whole range matrix per query: `TQL ANALYZE` on `control`'s own statement reports
 its `output_bytes` as **176 MB**, against 7 MB for the `SeriesScan` beneath it and 81 MB for the
 `ProjectionExec` above it. That figure is identical for `max_over_time[5m]`, `rate[5m]` and
@@ -1016,7 +1077,7 @@ its `output_bytes` as **176 MB**, against 7 MB for the `SeriesScan` beneath it a
 window. A query allocating and freeing that every call measures jemalloc's variance, not the machine's
 quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier
 version of the script gated on `control` and rejected a pass in which `G400`'s ratio was steady
-to 0.4% — the wrong instrument, and the reason it was replaced is recorded here rather than only
+to 0.5% — the wrong instrument, and the reason it was replaced is recorded here rather than only
 in a commit message.
 
 **What this implies for a fused partial aggregate.** Take `G4`, the shape PromQL users actually
@@ -1024,11 +1085,16 @@ write: the fused arm is 173.0 ms of CPU, of which the aggregate's generic hash p
 (22.5%) and `emit` 1.8 ms. Collapsing the intermediate rows inside the fused node could
 therefore address at most 40.7 ms of that 173.0 — the fused arm would land near 132 ms, not the
 120 ms a single un-replicated pass implied. That is a real saving on top of the 32% fusion
-already wins, but it is a fifth of the query rather than a third, and the kernel (58.4 ms, 34%)
-is the larger target. The shapes where it would do nothing are exactly the shapes where fusion
+already wins, but it is a fifth of the query rather than a third, and the module above it
+(`fused_evaluate_time`, 58.4 ms, 34%) is larger as a whole.
+
+Whether anything *inside* that 34% is a better target than the aggregate is not yet known:
+section 4.8's corrected profile divides the evaluator 50/50 between window preparation and the
+kernel arithmetic, which is too close for a sampling attribution of inlined frames to order, and
+that is why the next change instruments the three regions at batch level rather than picking one
+now. The shapes where a partial aggregate would do nothing are exactly the shapes where fusion
 already does nothing: at 1:1 there is no redundancy to collapse, and `G400`'s 2.28 s is the cost
-of producing 2.87 M output rows that the user asked for. That is why this section does not
-propose it as a general improvement, only as the second item after the kernel.
+of producing 2.87 M output rows that the user asked for.
 
 ## 5. What is not shown
 
@@ -1062,13 +1128,15 @@ propose it as a general improvement, only as the second item after the kernel.
 - **No large-window ceiling measured.** `W` is the widest window measured (1 h
   against a 2 h span). Nothing here says whether a still-wider window would now
   become *faster* than the ordinary plan rather than merely equal.
-- **No CPU sampling profile that can allocate CPU.** A profile was taken this round and is in
-  the record, but this build's sampler does not recover the CPU it should: 5 621 samples
-  against the ~42 800 that 215.0 s of CPU at 199 Hz implies, and its row-dependent shares add
-  up to 56.9% where the grid step alone accounts for 78% of the query's CPU. Section 4.8 therefore attributes cost with the
-  operators' own block timers, corroborated by `/proc` CPU. The consequence is a real gap:
-  nothing here splits the **scan's** 22% (as the profile called it) into region read, memtable
-  and merge, because the only instrument that could is the one that does not allocate.
+- **The profile is usable but lossy, and it cannot order two adjacent regions.** Section 4.8's
+  corrected pipeline attributes 33-38% to the evaluator and 26% to the aggregate across two runs,
+  and recovers 62-72% of the samples the requested rate implies. What it cannot do is separate
+  the two halves *inside* the evaluator — window preparation and the kernel arithmetic, 47.8-50.5%
+  and 49.4% of it — because they are adjacent code in one inlined function. That is why three
+  batch-level timers are the next change rather than a larger profile.
+- **Nothing here splits the scan into region read, memtable and merge.** The scan is 17.8-18.6%
+  of the query and the profile attributes it to `mito2` as one region. Its sub-parts are not
+  separated, and the block timers cannot either: `SeriesScanExec` reports one `scan_cost`.
 - **No `EXPLAIN` visibility from the frontend.** In standalone, TQL is planned as
   a `MergeScan` pushed to the datanode, and fusion happens when the datanode
   builds its physical plan. `TQL EXPLAIN` at the frontend therefore never shows
@@ -1185,9 +1253,19 @@ and the summary that attributes its stacks, are
 
 Sections 4.8 and 4.9's numbers are in `docs/bench-records/20261018T122000Z/`, with the
 per-iteration samples behind every median; section 2's three data shapes and the
-`vfrag`/`vmreset` comparison are in `docs/bench-records/20261018T124000Z/`. Both have a
-`RESULTS.md` naming which figure comes from which file and, where a measurement was rejected,
-why.
+`vfrag`/`vmreset` comparison are in `docs/bench-records/20261018T124000Z/`; and the raw text
+profiles behind section 4.8's corrected shares, gzipped exactly as the server wrote them, are in
+`docs/bench-records/20261018T131500Z/`. Each has a `RESULTS.md` naming which figure comes from
+which file, and where a measurement was rejected, why. The profile post-processing has a
+self-test, so the arithmetic that was wrong twice can be checked in one command:
+
+```bash
+python3 scripts/fused_profile_summarize.py --self-test
+gunzip -c docs/bench-records/20261018T131500Z/W-on3.txt.gz > /tmp/W-on3.txt
+# the owner table, the capture rate, and the leaf-frame split inside the evaluator
+python3 scripts/fused_profile_summarize.py /tmp/W-on3.txt --cpu-seconds 214.96 --frequency 199 \
+    --inside 'fused: evaluator'
+```
 
 The correctness *results* of that run are ~300 KB each and are not committed;
 `docs/bench-records/20261018T073117Z/RESULTS.md` lists each one's row count and sha256 so a

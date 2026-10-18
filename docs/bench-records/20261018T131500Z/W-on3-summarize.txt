@@ -1,0 +1,46 @@
+/tmp/W-on3.txt: 5621 distinct stacks, 26529 samples
+  against 215.0 s of server CPU at 199 Hz the sampler should have produced ~42777 samples: captured 62%
+  123.4 samples per CPU second, 62% of the requested rate
+
+CPU by innermost owner (disjoint, weighted; shares sum to 100%)
+  share   samples   stacks  owner
+--------------------------------------------------------------------
+  37.6%      9969      157  fused: evaluator
+  26.3%      6990      769  aggregate
+  17.8%      4731     1506  scan
+   4.4%      1170      610  http response
+   2.8%       735      413  sort
+   2.6%       701      469  fused: stream (emit/flush)
+   2.3%       618      618  planning
+   2.3%       615      182  fused: output build
+   2.1%       558      517  unrecognised
+   1.3%       338      276  shuffle
+   0.4%       104      104  logging / plan formatting
+
+  of the unrecognised samples, by leaf frame:
+      0.2%       40  <tokio::runtime::scheduler::multi_thread::worker::Context>::
+      0.1%       33  <datafusion_physical_expr_common::metrics::ExecutionPlanMetr
+      0.1%       27  datafusion_common_runtime::trace_utils::trace_future::<core:
+      0.1%       19  <tokio::runtime::scheduler::multi_thread::queue::Steal<alloc
+      0.1%       16  <datafusion_physical_plan::repartition::distributor_channels
+      0.1%       15  _rjem_je_arena_ptr_array_flush
+      0.1%       14  <parking_lot::condvar::Condvar>::wait_until_internal
+      0.1%       14  common_recordbatch::adapter::collect_lightweight_query_load_
+
+inside 'fused: evaluator': 9969 samples (37.6% of the profile), by leaf frame
+  share   samples  leaf
+--------------------------------------------------------------------
+  49.44%      4929  <promql::range_eval::RangeEvaluator>::evaluate
+  49.39%      4924  promql::range_eval::function::extrapolated_rate_batch::<true, true>
+   0.50%        50  <promql::range_eval::RangeEvaluator>::ingest
+   0.19%        19  promql::range_eval::flush_batch
+   0.10%        10  <promql::range_eval::RangeEvaluator>::push
+   0.07%         7  <datatypes::series::MetricName>::remove_all
+   0.06%         6  malloc
+   0.06%         6  sdallocx
+   0.05%         5  core::ptr::drop_glue::<[datatypes::series::Label]>
+   0.04%         4  <alloc::vec::Vec<datatypes::series::Label> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<
+   0.02%         2  do_rallocx
+   0.01%         1  alloc::boxed::box_new_uninit
+   0.01%         1  _rjem_je_sdallocx_default
+   0.01%         1  _rjem_je_bin_dalloc_locked_handle_newly_empty

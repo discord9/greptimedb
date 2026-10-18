@@ -32,8 +32,12 @@ per row of the table below.
 
 Everything else matches `fused_series_bench.py`: same server startup, same `/v1/sql`, same
 `--arm off` / `--arm on` crossed order, same CPU accounting from `/proc/<pid>/stat`, and the
-same check that a flag-off arm logs no fused selection while a flag-on arm logs one. Cases are
-compared across arms within a round through the same `compare` path.
+same check that a flag-off arm logs no fused selection while a flag-on arm logs one. Each arm
+runs one dedicated correctness query before its timed iterations, and the two arms' results are
+compared row by row and value by value through `fused_series_bench.compare_pair`: a case whose
+arms disagree on schema, labels, timestamps, row count or any value stops the run, because that
+is a correctness bug and not a measurement. Comparing row counts alone, as this script used to,
+cannot see it -- a wrong value in the right number of rows passes.
 
     scripts/fused_series_scale.py --data-home DIR --bin PATH --out records/x.json \\
         --rounds 3 --warmup 2 --iterations 9
@@ -41,8 +45,11 @@ compared across arms within a round through the same `compare` path.
 Each case runs an off arm and an on arm per round, with the arm order rotated every round, and
 the reported ratio is the median over rounds. **The gate is whether the rounds agree**, not
 whether a proxy case looks quiet: a second, differently-shaped query cannot say whether this
-query's ratio repeats. `control` is kept as a diagnostic and is deliberately not the gate --
-`max_over_time` does not fuse, so both of its arms run the ordinary plan, whose
+query's ratio repeats. Agreement is measured two-sided -- the worst round's distance from the
+median in *either* direction, with that round and side named per case -- because the one-sided
+`max/median - 1` used earlier was blind to a round below the median, and `G4`'s round 3 read
+16% low while that formula scored it 4%. `control` is kept as a diagnostic and is deliberately
+not the gate -- `max_over_time` does not fuse, so both of its arms run the ordinary plan, whose
 `PromRangeManipulateExec` materialises the entire range matrix (176 MB per query at a 1 h
 window, from `TQL ANALYZE`'s `output_bytes`). A query churning that much measures jemalloc's
 variance rather than the machine's, and it read a 60% spread while a 2.3 s case read 11%.
@@ -116,8 +123,65 @@ def aggregate_cpu(timed):
     return sum(sample["cpu_ms"] for sample in timed) / len(timed) if timed else 0.0
 
 
-def run_arm(server, label, statement, warmup, iterations, expect_rows=True):
-    """Warm up, then one timing per iteration, with the fused-hit check per query."""
+def ratio_deviation(ratios):
+    """How far a case's worst round sits from its median ratio, as a fraction of that median.
+
+    Returns `(deviation, worst_round, side)`, with `worst_round` 1-based and `side` one of
+    `above`, `below`, `at`.
+
+    Two-sided on purpose. The one-sided `max(ratios) / median - 1` this replaces could only
+    see a round *above* the median: rounds reading 0.57 / 0.68 / 0.71 scored 0.71 / 0.68 - 1 =
+    4%, so the case passed a 10% gate although 0.57 sits 16% below the median. That was `G4`'s
+    round 3, and it is a property of the formula, not of that run -- a maximum is blind to the
+    side it does not look at. The worst round is named with its side because a bare magnitude
+    is what let the low round hide.
+    """
+    median = statistics.median(ratios)
+    if not median:
+        return 0.0, 1, "at"
+    distances = [abs(ratio - median) / median for ratio in ratios]
+    deviation = max(distances)
+    worst_round = distances.index(deviation) + 1
+    delta = ratios[worst_round - 1] - median
+    side = "above" if delta > 0 else "below" if delta < 0 else "at"
+    return deviation, worst_round, side
+
+
+def run_arm(server, label, arm, statement, warmup, iterations, expect_rows=True):
+    """One correctness pass, then the warmups, then one timing per iteration.
+
+    The correctness pass is its own execution, never one of the timed ones: comparing a timed
+    query's result would make the run's numbers depend on the query it timed. Its result and
+    hit count are kept, and the two arms' results are compared through `bench.compare_pair`, so
+    a flag-on arm that returns the wrong numbers stops the run instead of being timed.
+    """
+    server.begin_query()
+    payload, _ = server.sql(statement)
+    hits = server.hits_since()
+    if hits != server.expected_hits:
+        raise SystemExit(
+            f"case {label} arm {arm} correctness: expected {server.expected_hits} fused "
+            f"selection(s), the server logged {hits}"
+        )
+    correctness_hits = hits
+    schema, corrected_rows = bench.flatten(payload)
+    if expect_rows and not corrected_rows:
+        # A label matcher that matches nothing returns an empty result with a valid schema and
+        # a normal-looking time. Reporting that as a case would be a measurement of nothing.
+        raise SystemExit(
+            f"case {label} returned 0 rows; the statement selects nothing: {statement}"
+        )
+    # Shaped like the result files `bench.compare` reads, because `bench.compare_pair` is the
+    # comparator and names the case and arm from these fields.
+    correctness = {
+        "case": label,
+        "arm": arm,
+        "stem": f"{label}-{arm}",
+        "tql": statement,
+        "schema": schema,
+        "row_count": len(corrected_rows),
+        "rows": corrected_rows,
+    }
     for _ in range(warmup):
         server.begin_query()
         server.sql(statement)
@@ -162,7 +226,57 @@ def run_arm(server, label, statement, warmup, iterations, expect_rows=True):
                 "load1": os.getloadavg()[0],
             }
         )
-    return results
+    return {"result": correctness, "correctness_hits": correctness_hits, "timed": results}
+
+
+def check_arms(label, statement, arms):
+    """Fails unless both arms returned rows and the same result, row for row."""
+    counts = {arm: arms[arm]["result"]["row_count"] for arm in ("off", "on")}
+    for arm, count in counts.items():
+        if count == 0:
+            raise SystemExit(
+                f"case {label} arm {arm} returned 0 rows; a case that measures nothing is "
+                f"not a measurement ({statement})"
+            )
+    if counts["off"] != counts["on"]:
+        raise SystemExit(
+            f"case {label}: the arms disagree on row count: "
+            f"{counts['off']} (off) vs {counts['on']} (on)"
+        )
+    # Order-preserving, field by field: schema, labels, timestamps, row count, values.
+    # Flag-off is the baseline because both arms must return the ordinary plan's answer.
+    # A row count that matches says nothing about the numbers inside the rows, which is what
+    # this script used to skip: `rows["off"] != rows["on"]` and nothing else.
+    bench.compare_pair(arms["off"]["result"], arms["on"]["result"])
+
+
+def quietness_gate(cases, gate):
+    """The verdict: the worst two-sided ratio deviation over every case but `control`.
+
+    `control` is excluded because it is a diagnostic, not the gate: it runs the same ordinary
+    plan on both arms, so its ratio measures the drift of the whole call -- 60% on a query that
+    materialises a 176 MB range matrix per call -- and would fail every pass for reasons that
+    are not this script's subject. Its recorded numbers stay in the output for the reader.
+    """
+    worst = {"case": None, "deviation": 0.0, "round": None, "side": None}
+    for row in cases:
+        if row["label"] == "control":
+            continue
+        if row["cpu_ratio_deviation_over_median"] > worst["deviation"]:
+            worst = {
+                "case": row["label"],
+                "deviation": row["cpu_ratio_deviation_over_median"],
+                "round": row["cpu_ratio_worst_round"],
+                "side": row["cpu_ratio_worst_side"],
+            }
+    return {
+        "max_ratio_deviation_over_median": worst["deviation"],
+        "worst_case": worst["case"],
+        "worst_round": worst["round"],
+        "worst_side": worst["side"],
+        "gate": gate,
+        "quiet": worst["deviation"] <= gate,
+    }
 
 
 def main():
@@ -185,9 +299,11 @@ def main():
         type=float,
         default=0.10,
         help=(
-            "how far a case's slowest round may sit above its median on/off ratio for the pass "
-            "to count as quiet. This is a test of the reported quantity's own repeatability, "
-            "which is what a proxy query was trying and failing to provide."
+            "how far a case's worst round may sit from its median on/off ratio, in either "
+            "direction, for the pass to count as quiet. Two-sided because the one-sided "
+            "`max/median - 1` could not see a round below the median. This is a test of the "
+            "reported quantity's own repeatability, which is what a proxy query was trying "
+            "and failing to provide."
         ),
     )
     args = parser.parse_args()
@@ -215,18 +331,24 @@ def main():
                 # case that does not fuse must log none on either arm.
                 server.expected_hits = 1 if (fuses and arm == "on") else 0
                 with server:
-                    arms[arm] = run_arm(server, label, statement, args.warmup, args.iterations)
-            rows = {a: arms[a][0]["rows"] for a in ("off", "on")}
-            if rows["off"] != rows["on"]:
-                raise SystemExit(
-                    f"case {label}: the arms disagree on row count: "
-                    f"{rows['off']} (off) vs {rows['on']} (on)"
-                )
+                    arms[arm] = run_arm(
+                        server, label, arm, statement, args.warmup, args.iterations
+                    )
+            # Schema, labels, timestamps, row count and every value: the two arms must return
+            # the same answer, and the flag-on answer is not allowed to be merely similar.
+            check_arms(label, statement, arms)
+            rows = {a: arms[a]["result"]["row_count"] for a in ("off", "on")}
+            # The row counts are `rows` above; what the correctness pass adds is the proof that
+            # each arm took the path it was supposed to, so only the hit counts are kept.
+            correctness_hits = {a: arms[a]["correctness_hits"] for a in ("off", "on")}
             cpu_median = {
-                a: statistics.median([r["cpu_ms"] for r in arms[a]]) for a in ("off", "on")
+                a: statistics.median([r["cpu_ms"] for r in arms[a]["timed"]])
+                for a in ("off", "on")
             }
-            cpu_total = {a: aggregate_cpu(arms[a]) for a in ("off", "on")}
-            wall = {a: statistics.median([r["ms"] for r in arms[a]]) for a in ("off", "on")}
+            cpu_total = {a: aggregate_cpu(arms[a]["timed"]) for a in ("off", "on")}
+            wall = {
+                a: statistics.median([r["ms"] for r in arms[a]["timed"]]) for a in ("off", "on")
+            }
             entry = {
                 "round": round_index + 1,
                 "order": list(order),
@@ -234,14 +356,15 @@ def main():
                 "statement": statement,
                 "fuses": fuses,
                 "rows": rows["on"],
+                "correctness_hits": correctness_hits,
                 "cpu_median_ms": cpu_median,
                 "cpu_aggregate_ms": cpu_total,
                 "wall_median_ms": wall,
                 "cpu_on_over_off": cpu_median["on"] / cpu_median["off"],
                 "cpu_aggregate_on_over_off": cpu_total["on"] / cpu_total["off"],
                 "wall_on_over_off": wall["on"] / wall["off"],
-                "off": arms["off"],
-                "on": arms["on"],
+                "off": arms["off"]["timed"],
+                "on": arms["on"]["timed"],
             }
             per_case_rounds[label].append(entry)
             print(
@@ -262,7 +385,7 @@ def main():
         ratios = [e["cpu_on_over_off"] for e in entries]
         agg_ratios = [e["cpu_aggregate_on_over_off"] for e in entries]
         median_ratio = statistics.median(ratios)
-        spread_over_median = (max(ratios) / median_ratio - 1.0) if median_ratio else 0.0
+        deviation, worst_round, worst_side = ratio_deviation(ratios)
         record["cases"].append(
             {
                 "label": label,
@@ -288,7 +411,9 @@ def main():
                 "median_vs_aggregate_gap": abs(median_ratio - statistics.median(agg_ratios)),
                 "cpu_per_round": ratios,
                 "cpu_aggregate_per_round": agg_ratios,
-                "cpu_ratio_spread_over_median": spread_over_median,
+                "cpu_ratio_deviation_over_median": deviation,
+                "cpu_ratio_worst_round": worst_round,
+                "cpu_ratio_worst_side": worst_side,
                 "wall_on_over_off": statistics.median([e["wall_on_over_off"] for e in entries]),
                 "rounds": entries,
             }
@@ -297,43 +422,34 @@ def main():
     print()
     print(
         f"{'case':8} {'rows':>9} {'CPUoff':>8} {'CPUon':>8} {'on/off':>7} "
-        f"{'per-round':>22} {'wall':>7}"
+        f"{'per-round':>22} {'dev':>5} {'worst round':>11} {'wall':>7}"
     )
     for row in record["cases"]:
         c = row["cpu_median_ms"]
         per_round = " ".join(f"{r:.2f}" for r in row["cpu_per_round"])
+        worst = f"r{row['cpu_ratio_worst_round']} {row['cpu_ratio_worst_side']}"
         print(
             f"{row['label']:8} {row['rows']:>9} {c['off']:>8.0f} {c['on']:>8.0f} "
-            f"{row['cpu_on_over_off']:>7.3f} {per_round:>22} {row['wall_on_over_off']:>7.3f}",
+            f"{row['cpu_on_over_off']:>7.3f} {per_round:>22} "
+            f"{100 * row['cpu_ratio_deviation_over_median']:>4.0f}% {worst:>11} "
+            f"{row['wall_on_over_off']:>7.3f}",
             flush=True,
         )
 
-    # The gate. Applying it to `control` alone was wrong and is recorded here because the reason
-    # is useful: `control` is `max_over_time`, which does not fuse, and the ordinary plan's
-    # `PromRangeManipulateExec` materialises the whole range matrix -- 176 MB for this fixture at
-    # a 1 h window, measured as `output_bytes` in `TQL ANALYZE`. A query that churns that much
-    # per call measures the allocator's variance, not the machine's quietness, and it duly read
-    # 60% spread while the 2.3 s cases read 11%. So the gate is the repeatability of each case's
-    # own ratio across rounds, and `control` is kept as a diagnostic of that allocator noise.
-    worst_case, worst_spread = None, 0.0
-    for row in record["cases"]:
-        if row["label"] == "control":
-            continue
-        if row["cpu_ratio_spread_over_median"] > worst_spread:
-            worst_case, worst_spread = row["label"], row["cpu_ratio_spread_over_median"]
-    quiet = worst_spread <= args.max_ratio_spread
-    record["pass"] = {
-        "max_ratio_spread_over_median": worst_spread,
-        "worst_case": worst_case,
-        "gate": args.max_ratio_spread,
-        "quiet": quiet,
-    }
+    # The verdict, over every case but `control` (see `quietness_gate` for why the control is a
+    # diagnostic and not the gate). The deviation is two-sided: the `max / median - 1` this used
+    # to compare against the gate could only see a round above the median, which is how `G4`'s
+    # round 3 passed a 10% gate while reading 16% low.
+    verdict = quietness_gate(record["cases"], args.max_ratio_spread)
+    record["pass"] = verdict
     print()
     print(
-        f"pass: worst per-round ratio spread {100 * worst_spread:.0f}% (case {worst_case}), "
-        f"gate {100 * args.max_ratio_spread:.0f}%"
+        f"pass: worst two-sided per-round ratio deviation "
+        f"{100 * verdict['max_ratio_deviation_over_median']:.0f}% "
+        f"(case {verdict['worst_case']}, round {verdict['worst_round']} "
+        f"{verdict['worst_side']} the median), gate {100 * args.max_ratio_spread:.0f}%"
     )
-    if quiet:
+    if verdict["quiet"]:
         print("  quiet: the rounds agree, so each case's median ratio is repeatable.")
     else:
         print(
