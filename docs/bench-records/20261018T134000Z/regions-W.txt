@@ -1,0 +1,20 @@
+  #1  evaluate   62.89  prep   28.11  kernel   29.31  columns   4.03  regions/evaluate  97.7%  prep/kernel 0.959
+  #2  evaluate   60.69  prep   28.05  kernel   27.30  columns   3.95  regions/evaluate  97.7%  prep/kernel 1.027
+  #3  evaluate   60.72  prep   28.18  kernel   27.40  columns   3.79  regions/evaluate  97.8%  prep/kernel 1.028
+  #4  evaluate   58.99  prep   26.19  kernel   27.65  columns   3.81  regions/evaluate  97.7%  prep/kernel 0.947
+  #5  evaluate   56.47  prep   26.05  kernel   25.22  columns   3.83  regions/evaluate  97.6%  prep/kernel 1.033
+  #6  evaluate   58.30  prep   26.15  kernel   27.02  columns   3.78  regions/evaluate  97.7%  prep/kernel 0.968
+  #7  evaluate   62.29  prep   28.35  kernel   28.48  columns   4.06  regions/evaluate  97.7%  prep/kernel 0.995
+  #8  evaluate   53.38  prep   25.06  kernel   23.58  columns   3.45  regions/evaluate  97.6%  prep/kernel 1.062
+  #9  evaluate   67.68  prep   30.28  kernel   31.52  columns   4.41  regions/evaluate  97.8%  prep/kernel 0.961
+
+case W, 9 ANALYZE records from one server
+region                      median ms      min      max  of evaluate
+fused_evaluate_time             60.69    53.38    67.68       100.0%
+fused_window_prep_time          28.05    25.06    30.28        46.2%
+fused_kernel_time               27.40    23.58    31.52        45.2%
+fused_columns_time               3.83     3.45     4.41         6.3%
+
+prep/kernel per record: [0.959, 1.027, 1.028, 0.947, 1.033, 0.968, 0.995, 1.062, 0.961]
+  median 0.995, range 0.947-1.062, prep above kernel in 4/9
+  distance from parity: median 3.3%, worst 6.2%

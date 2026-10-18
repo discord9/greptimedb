@@ -846,7 +846,7 @@ confirmed by independent review and both now fixed, invalidated four conclusions
 | --- | --- | --- |
 | "the sampler recovered 13% of the CPU" | it counted profile *lines*, not the sample count each line carries | **62%** (run `W-on3`) and 72% (`W-on2`) |
 | "the evaluator is 6.0% of the query" | shares were computed from those line counts, and each line was assigned by a fixed category priority that let an outer frame win over an inner one | **33.3%** (`W-on2`) / **37.6%** (`W-on3`) |
-| "the kernel is the largest remaining cost; optimize it first" | it rested on the 6.0%, and the split inside the evaluator came from single unreplicated passes | inside the evaluator, kernel and window preparation are **50/50** and this data cannot order them |
+| "the kernel is the largest remaining cost; optimize it first" | it rested on the 6.0%, and the split inside the evaluator came from single unreplicated passes | inside the evaluator, kernel **45.2-45.8%** and window preparation **45.5-46.2%**: equal, and neither is the largest thing to attack |
 | "a fused partial aggregate is bounded at 27% of the grid-dependent CPU" | derived from the same single pass | **22.5%** of the fused query's total CPU |
 
 **Defect 1: the sample count is per line, not one per line.** `pprof` 0.15's
@@ -918,17 +918,58 @@ the samples attributed to `promql::range_eval` and looking at their leaf frames:
 **Window preparation costs as much as the kernel arithmetic.** That is the one substantive thing
 this correction adds, and it is not what the previous revision said. Half of the largest region in
 the query is spent deciding *which samples each window covers* — the forward cursors for the left
-edge, the right edge and the two reset boundaries — and half is the `rate` arithmetic itself. They
-are 18.5% and 18.8% of the query, i.e. within 1-2 points of each other.
+edge, the right edge and the two reset boundaries — and half is the `rate` arithmetic itself. The
+profile puts them at 18.5% and 18.8% of the query, within 1-2 points of each other, and the batch
+timers below confirm the tie with an instrument that does not depend on resolving inlined
+frames.
 
-**Which is why this cannot be ordered from the profile, and why a timer is the next step.** The
+**Which is why this could not be ordered from the profile, so it was measured directly.** The
 two halves are adjacent code in one `#[inline]`-heavy function; a sampling attribution of inlined
-frames is not precise enough to separate 18.5% from 18.8%, and the previous revision's error was
-exactly to treat a sampling split as an ordering. So the next change adds three **batch-level**
-timing intervals inside the evaluator — window preparation, kernel, result columns — recorded
-once per batch flush (512 grid points), not once per point. That is 14 intervals per series at
-this shape against 7 171 points, so the timers are cheaper than the thing they measure by two
-orders of magnitude, and they will say which half to attack.
+frames cannot separate 18.5% from 18.8%, and the previous revision's error was exactly to treat a
+sampling split as an ordering. Three **batch-level** intervals now time the evaluator instead —
+window preparation, the batch kernel, and appending the flushed columns — once per batch of 512
+grid points, so six clock reads per flush rather than two per point: 90 reads per series against
+7 171 points, one per 80, worth an estimated 0.4% of the query.
+
+**The timers say the two halves are equal, and that both are per-point cost.** Nine `TQL ANALYZE`
+records per case, one server per case, every figure from a single record so each ratio is of two
+measurements taken in one execution (`docs/bench-records/20261018T134000Z/`):
+
+| region | `W` (`rate[1h]`) | of evaluator | `G` (`rate[5m]`) | of evaluator |
+| --- | ---: | ---: | ---: | ---: |
+| `fused_evaluate_time` (whole `push`) | 60.69 ms | 100% | 60.50 ms | 100% |
+| `fused_window_prep_time` | 28.05 ms | 46.2% | 27.55 ms | 45.5% |
+| `fused_kernel_time` | 27.40 ms | 45.2% | 27.71 ms | 45.8% |
+| `fused_columns_time` | 3.83 ms | 6.3% | 3.95 ms | 6.5% |
+
+The three regions sum to **97.7-97.8%** of the counter they subdivide, and the residual is `ingest`
+— which the profile independently put at 0.5-0.6%. Two instruments, one region, agreeing within a
+point, so the split is complete rather than merely consistent.
+
+Per record the `prep/kernel` ratio reads 0.995 (`W`) and 0.997 (`G`) by median, with preparation
+above the kernel in 8 of 18 records and a worst excursion of 10.9% — against the 25% drift of the
+absolute times between records of the same case. **There is no larger half to attack.** The
+profile's 50/50 was not an artifact of inlining; it was the answer.
+
+**Both halves are fixed cost per `(series, grid point)`, not per sample in the window.** `W` holds
+240 samples per window and `G` 20 — a factor of 12 — over the same grid, and every region costs
+the same in both: kernel 27.40 against 27.71 ms, preparation 28.05 against 27.55 ms, whole
+`push` 60.69 against 60.50 ms. That is 21.1 ns per point on either case, and it is the same
+property the earlier round found end to end (`rate[1h]` = `rate[5m]`, 1.003x). 400 series x
+7 171 points x 21 ns is the 60 ms here, and the 33-38% of a 173 ms query the profile attributes to
+this module.
+
+**What that implies for the next change.** Asking "preparation or kernel" has no answer, and the
+previous revision's mistake was to demand one. What both halves share is the per-point machinery
+rather than either half's arithmetic: preparation writes 48 bytes per point per field into four
+parallel `Vec`s — the retained span (16), the reset range (16), the grid index (8), the evaluation
+timestamp (8) — and the kernel reads them back. At this shape that is **138 MB of metadata per
+query**, written and then read, against 11.5 MB of actual `rate` results (2 868 400 `f64`). The
+index and the timestamp are both derivable, because a batch's grid indices are contiguous and
+ascending by the struct's own contract, so `eval_ts[k] = grid[first + k]`. That is a hypothesis
+from the arithmetic, not a measurement: this round establishes that the regions are equal and
+window-independent, and it does not establish how much of preparation is metadata traffic. Removing
+those two `Vec`s and measuring the same three regions again is the cheap test.
 
 **What the block timers say, and what they may not be compared to.** These are medians over four
 replications of the same statement (`sum by (instance) (rate(vmbench[5m]))`, 120 min at 1 s, 400
@@ -1088,13 +1129,19 @@ therefore address at most 40.7 ms of that 173.0 — the fused arm would land nea
 already wins, but it is a fifth of the query rather than a third, and the module above it
 (`fused_evaluate_time`, 58.4 ms, 34%) is larger as a whole.
 
-Whether anything *inside* that 34% is a better target than the aggregate is not yet known:
-section 4.8's corrected profile divides the evaluator 50/50 between window preparation and the
-kernel arithmetic, which is too close for a sampling attribution of inlined frames to order, and
-that is why the next change instruments the three regions at batch level rather than picking one
-now. The shapes where a partial aggregate would do nothing are exactly the shapes where fusion
-already does nothing: at 1:1 there is no redundancy to collapse, and `G400`'s 2.28 s is the cost
-of producing 2.87 M output rows that the user asked for.
+Nothing *inside* that 34% is a better target than the aggregate, and that is now measured rather
+than unknown: section 4.8's three batch regions put window preparation at 45.5-46.2% of the
+evaluator and the kernel at 45.2-45.8%, so there is no larger half, and the remaining 6.3-6.5% is
+the column append. The evaluator's cost is 21 ns per `(series, grid point)` regardless of window
+width — `rate[1h]` and `rate[5m]` cost the same in every region — so shrinking it means removing
+per-point machinery, not picking between two halves that measure the same.
+
+That is the comparison the next round should make: a fused partial aggregate is worth at most
+40.7 ms of a 173.0 ms query and is well understood, while the evaluator's 60.7 ms is spread over
+2.87 M points at a fixed cost each, with 138 MB of per-point window metadata written and read back.
+The shapes where a partial aggregate would do nothing are exactly the shapes where fusion already
+does nothing: at 1:1 there is no redundancy to collapse, and `G400`'s 2.28 s is the cost of
+producing 2.87 M output rows that the user asked for.
 
 ## 5. What is not shown
 
@@ -1128,12 +1175,15 @@ of producing 2.87 M output rows that the user asked for.
 - **No large-window ceiling measured.** `W` is the widest window measured (1 h
   against a 2 h span). Nothing here says whether a still-wider window would now
   become *faster* than the ordinary plan rather than merely equal.
-- **The profile is usable but lossy, and it cannot order two adjacent regions.** Section 4.8's
+- **The profile is usable but lossy, and it needed a timer to finish the job.** Section 4.8's
   corrected pipeline attributes 33-38% to the evaluator and 26% to the aggregate across two runs,
-  and recovers 62-72% of the samples the requested rate implies. What it cannot do is separate
-  the two halves *inside* the evaluator — window preparation and the kernel arithmetic, 47.8-50.5%
-  and 49.4% of it — because they are adjacent code in one inlined function. That is why three
-  batch-level timers are the next change rather than a larger profile.
+  and recovers 62-72% of the samples the requested rate implies. It could not separate the two
+  halves *inside* the evaluator — window preparation and the kernel arithmetic, 47.8-50.5% and
+  49.4% of it — because they are adjacent code in one inlined function. The three batch timers
+  did separate them, and the answer is that they are equal (45.5-46.2% against 45.2-45.8%), which
+  is why no single hotspot is named inside the evaluator. What the timers do **not** do is split
+  window preparation itself: whether its 9.6-9.8 ns per point is metadata traffic or the cursor
+  scans is arithmetic here, not measurement.
 - **Nothing here splits the scan into region read, memtable and merge.** The scan is 17.8-18.6%
   of the query and the profile attributes it to `mito2` as one region. Its sub-parts are not
   separated, and the block timers cannot either: `SeriesScanExec` reports one `scan_cost`.
