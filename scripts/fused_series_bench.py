@@ -24,14 +24,32 @@ Three subcommands, so seeding, measuring and checking stay separable:
     scripts/fused_series_bench.py seed --data-home DIR
     scripts/fused_series_bench.py run --data-home DIR --bin PATH --arm off \
         --out FILE --log FILE --results DIR
+    scripts/fused_series_bench.py run --data-home DIR --bin PATH --arm on \
+        --partial on --out FILE --log FILE
     scripts/fused_series_bench.py compare DIR/cC-r1-L-C.json DIR/cC-r1-F-C.json
 
 `seed` writes the fixture once. `run` starts one server over that data directory, runs
 every case, and writes a JSON record; with `--results` it also writes the complete
 correctness-pass result of each case, which `compare` then checks across arms, field by
-field and outside the timing loop. An arm is one `(binary, flag)` pair; the driver does
-not build binaries, so the caller decides which commit each arm is, and a crossed order
-(L->N->F, N->F->L, F->L->N) is just three invocations per arm.
+field and outside the timing loop. An arm is one `(binary, query flag, partial-SUM switch)`
+triple, and the three arms of `ARMS` come out of one binary started three ways:
+
+| arm | `experimental_native_promql` | `GREPTIME_FUSED_PARTIAL_SUM` |
+| --- | --- | --- |
+| `off` | `false` | (irrelevant) |
+| `on` | `true` | `0` |
+| `sum` | `true` | `1` |
+
+`--arm {off,on}` picks the native flag and `--partial {on,off}` the environment variable, which
+is read by the server process and is not a config option; the record's `arm` is derived from
+those two flags, so a record can never claim an arm it was not measured as. The driver does not
+build binaries, so the caller decides which commit each arm is, and a crossed order
+(L->N->F, N->F->L, F->L->N) is just one invocation per arm.
+
+The `sum` arm needs a server that reads `GREPTIME_FUSED_PARTIAL_SUM` and logs
+`Fused series selection succeeded: partial sum of ...`. Against a binary without that half the
+`sum` arm fails at its first correctness pass -- one expected partial sum, none logged -- rather
+than being timed as a second `on` arm. Nothing here builds or verifies the server side.
 
 ## Fixture, exactly as measured
 
@@ -100,18 +118,24 @@ width. `C` is the shape the original query actually has.
 
 ## What the record holds
 
-Per case, per iteration: wall-clock milliseconds, output row count, response bytes, and
-the number of `Fused series selection succeeded` lines the server logged **during that
-iteration**, read from the byte offset the log had when the query started. A correctness
-pass runs before the warmup, its result is what `--results` saves, and its hit count is
-recorded apart from the warmup and timed ones.
+Per case, per iteration: wall-clock milliseconds, output row count, response bytes, and the
+number of `Fused series selection succeeded` lines the server logged **during that
+iteration**, read from the byte offset the log had when the query started — plus
+`partial_hits`, how many of those lines were the partial-SUM variant. Both markers share the
+`selection succeeded` prefix, so the total count keeps meaning the same thing now that a third
+arm logs a longer line. A correctness pass runs before the warmup, its result is what
+`--results` saves, and its hit counts are recorded apart from the warmup and timed ones. The
+record names the arm (`arm`, always one of `ARMS`, derived from the flags rather than
+supplied by the caller) and the partial flag (`partial`) it ran with.
 
 Every execution — correctness, every warmup, every timed iteration — is checked against an
-explicit expected hit count derived from the case definition: `fuses: true` means exactly
-one selection on a flag-on arm and zero on a flag-off arm; `fuses: false` means zero
-always. A mismatch stops the run with the case, the phase, the expected count and the
-observed one. Counting only the correctness pass let a warmup or a timed iteration quietly
-fall back to the ordinary plan while the timings still looked plausible.
+explicit expected hit count derived from the case definition and the arm: `fuses: true` means
+exactly one selection on the `on` and `sum` arms and zero on `off`, of which the `sum` arm must
+report exactly one partial sum and the `on` arm none; `fuses: false` means zero of either,
+always. A mismatch stops the run with the case, the phase, the expected counts and the observed
+ones. Counting only the correctness pass let a warmup or a timed iteration quietly fall back to
+the ordinary plan while the timings still looked plausible, and a `sum` arm that logged a plain
+selection would be a `sum` run measuring the `on` arm.
 
 ## Comparing two arms
 
@@ -305,20 +329,66 @@ def check_fixture(where, count, first_ts, last_ts):
         )
 
 
-def expected_hits(case, arm):
-    """How many fused selections one execution of `case` must log on `arm`."""
-    if not case["fuses"]:
+def arm_overlay(native, partial):
+    """The environment overlay one arm adds to the server process, or `None` for no overlay.
+
+    `GREPTIME_FUSED_PARTIAL_SUM` is read by the server, not a config option, so it travels in
+    the child's environment. A flag-off arm gets no overlay at all rather than `{"0"}`-style
+    padding: `partial=None` has to leave the child's environment exactly as it is today.
+    """
+    if not native:
+        return None
+    return {"GREPTIME_FUSED_PARTIAL_SUM": "1" if partial else "0"}
+
+
+# The three arms this harness can run, as `(native flag, environment overlay)`. `sum` is the
+# same binary as `on` with the partial-SUM step left on, which is why `sum / on` isolates that
+# step alone: same code, same config, one environment variable apart.
+ARMS = {
+    "off": (False, arm_overlay(False, False)),
+    "on": (True, arm_overlay(True, False)),
+    "sum": (True, arm_overlay(True, True)),
+}
+
+
+def expected_hits(fuses, arm):
+    """How many fused selections one execution of a fusing (or non-fusing) case must log.
+
+    `arm` is one of `ARMS`. Both flag-on arms fuse, so both log exactly one; the partial-SUM
+    switch does not change the prefix the selection line starts with. Taken as the `fuses` flag
+    rather than the case dict so the scale script can ask without building one.
+    """
+    if not fuses:
         return 0
-    return 1 if arm == "on" else 0
+    return 0 if arm == "off" else 1
 
 
-def check_hits(case, arm, phase, actual):
-    """Fails unless one execution logged exactly the expected number of selections."""
-    expected = expected_hits(case, arm)
-    if actual != expected:
+def expected_partial_hits(fuses, arm):
+    """How many of `expected_hits` must be the `partial sum` variant: only the `sum` arm."""
+    if not fuses:
+        return 0
+    return 1 if arm == "sum" else 0
+
+
+def check_hits(case, arm, phase, actual, partial):
+    """Fails unless one execution logged exactly the expected selections and partial sums.
+
+    `partial` is required rather than defaulted: a caller that does not sample
+    `partial_hits_since()` would otherwise assert, silently, that the arm it is measuring never
+    runs the partial SUM -- which is true only of the drivers that have no `sum` arm.
+    """
+    expected = expected_hits(case["fuses"], arm)
+    expected_partial = expected_partial_hits(case["fuses"], arm)
+    if partial > actual:
+        raise SystemExit(
+            f"case {case['name']} phase {phase}: {partial} partial-sum line(s) but only "
+            f"{actual} fused selection line(s); the counts are not about the same executions"
+        )
+    if actual != expected or partial != expected_partial:
         raise SystemExit(
             f"case {case['name']} phase {phase}: expected {expected} fused selection(s) on "
-            f"the flag-{arm} arm, the server logged {actual}"
+            f"the {arm} arm, {expected_partial} of them partial sums; the server logged "
+            f"{actual} ({partial} partial sums)"
         )
     return expected
 
@@ -326,10 +396,16 @@ def check_hits(case, arm, phase, actual):
 class Server:
     """One standalone server over a data directory, on its own port set."""
 
-    def __init__(self, binary, data_home, http, grpc, mysql, postgres, native, log_path):
+    def __init__(
+        self, binary, data_home, http, grpc, mysql, postgres, native, log_path, partial=None
+    ):
         self.binary = binary
         self.data_home = data_home
         self.native = native
+        # The environment overlay this arm adds to the child: `None` (or an empty mapping) means
+        # no `env=` is passed at all, so the server inherits this process's environment exactly
+        # as it did before the partial-SUM arm existed.
+        self.partial = dict(partial or {})
         self.http = http
         self.grpc = grpc
         self.mysql = mysql
@@ -348,7 +424,11 @@ class Server:
         self.log_offset = 0
 
     def __enter__(self):
-        config = os.path.join(self.data_home, "..", f"fused-bench-arm-{int(self.native)}.toml")
+        config = os.path.join(
+            self.data_home,
+            "..",
+            f"fused-bench-arm-{int(self.native)}-{int(bool(self.partial))}.toml",
+        )
         with open(config, "w") as handle:
             handle.write(
                 'mode = "standalone"\n\n'
@@ -358,6 +438,9 @@ class Server:
                 f"experimental_native_promql = {str(self.native).lower()}\n"
             )
         self.log_file = open(self.log_path, "w")
+        # Merged over `os.environ` rather than replacing it, so the child keeps PATH and the
+        # rest of what it needs to start; an arm without an overlay passes no `env=` at all.
+        env = {**os.environ, **self.partial} if self.partial else {}
         self.process = subprocess.Popen(
             [
                 self.binary,
@@ -380,6 +463,7 @@ class Server:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            **({"env": env} if env else {}),
         )
         deadline = time.time() + 600
         while time.time() < deadline:
@@ -435,14 +519,33 @@ class Server:
         """Records where the log ends, so the next query's hits can be counted alone."""
         self.log_offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
 
-    def hits_since(self):
-        """The number of fused selections logged since `begin_query`."""
+    def _tail_since(self):
+        """The log bytes written since `begin_query`."""
         if not os.path.exists(self.log_path):
-            return 0
+            return b""
         with open(self.log_path, "rb") as handle:
             handle.seek(self.log_offset)
-            tail = handle.read()
-        return tail.count(b"Fused series selection succeeded")
+            return handle.read()
+
+    def hits_since(self):
+        """The number of fused selections logged since `begin_query`.
+
+        The partial-SUM arm logs `Fused series selection succeeded: partial sum of ...`, which
+        starts with the same prefix as the plain one, so this count keeps its meaning: every
+        fused selection of either kind.
+        """
+        return self._tail_since().count(b"Fused series selection succeeded")
+
+    def partial_hits_since(self):
+        """How many of those selections, line by line, were the partial-SUM variant.
+
+        Counted per line rather than as a substring: a log record that quotes the selection
+        message -- a plan dump, a retry notice -- would inflate a substring count past
+        `hits_since()`, which is a nonsense ratio to hold a run to. Reading the same tail as
+        `hits_since()` keeps the two counts about the same bytes.
+        """
+        marker = b"selection succeeded: partial sum"
+        return sum(1 for line in self._tail_since().splitlines() if marker in line)
 
 
 def flatten(payload):
@@ -612,8 +715,12 @@ def classify(schema):
 
 
 def describe(result):
-    """An arm's identity: both flag-on arms share `arm: on`, so name the file too."""
-    return f"{result['stem']} [flag {result['arm']}, {result.get('commit', 'unknown')}]"
+    """An arm's identity: the arm name from the record, plus the file it came from.
+
+    `arm` is the arm the record ran (`off`, `on`, `sum`, or a caller's own label), so a file
+    saved by the `sum` arm says `sum` and not `on`.
+    """
+    return f"{result['stem']} [arm {result['arm']}, {result.get('commit', 'unknown')}]"
 
 
 def first_difference(left_rows, right_rows, columns):
@@ -747,6 +854,18 @@ def compare(args):
 def run(args):
     """Runs every case against one arm and writes the JSON record."""
     check_ranges()
+    native = args.arm == "on"
+    partial = args.partial == "on"
+    if partial and not native:
+        raise SystemExit(
+            "--partial on needs the fused path, because the partial SUM is computed inside the "
+            "fused node; pass --arm on as well (or leave --partial at its default, off)"
+        )
+    # The arm name is derived, never supplied: `--arm` and `--partial` already say everything
+    # about how this server was started, and a caller-chosen label would let a record claim an
+    # arm it was not measured as. A record's `arm` is therefore always one of `ARMS`.
+    arm = "sum" if (native and partial) else args.arm
+    overlay = arm_overlay(native, partial)
     with Server(
         args.bin,
         args.data_home,
@@ -754,8 +873,9 @@ def run(args):
         args.grpc,
         args.mysql,
         args.postgres,
-        args.arm == "on",
+        native,
         args.log,
+        partial=overlay,
     ) as server:
         # The fixture is checked before anything is timed, so no measurement can come from
         # a table that is not the one the record claims.
@@ -769,7 +889,8 @@ def run(args):
         )
 
         record = {
-            "arm": args.arm,
+            "arm": arm,
+            "partial": args.partial,
             "bin": args.bin,
             "commit": args.commit,
             "build_profile": args.profile,
@@ -810,18 +931,23 @@ def run(args):
             server.begin_query()
             correctness_payload, _ = server.sql(statement)
             correctness_hits = server.hits_since()
-            expected = check_hits(case, args.arm, "correctness", correctness_hits)
+            correctness_partial_hits = server.partial_hits_since()
+            expected = check_hits(
+                case, arm, "correctness", correctness_hits, correctness_partial_hits
+            )
             schema, correctness_rows = flatten(correctness_payload)
             log(
-                f"{case['name']}: {len(correctness_rows)} rows, {correctness_hits} hits "
-                f"(correctness, expected {expected})"
+                f"{case['name']}: {len(correctness_rows)} rows, {correctness_hits} hits, "
+                f"correctness, expected {expected} "
+                f"({correctness_partial_hits} partial sums, expected "
+                f"{expected_partial_hits(case['fuses'], arm)})"
             )
             if args.results:
                 saved = save_result(
                     args.results,
                     args.results_stem,
                     case,
-                    args.arm,
+                    arm,
                     args.commit,
                     statement,
                     schema,
@@ -831,15 +957,25 @@ def run(args):
 
             # Warmup, then the timed runs, each with its own hit count. The three kinds of hit
             # are kept apart so a total can never be mistaken for a per-iteration count, and
-            # every single execution is held to the same expected count.
+            # every single execution is held to the same expected counts, totals and partials.
             warmup_hits = []
+            warmup_partial_hits = []
             for warmup in range(args.warmup):
                 server.begin_query()
                 server.sql(statement)
                 hits = server.hits_since()
-                check_hits(case, args.arm, f"warmup {warmup + 1}/{args.warmup}", hits)
+                partials = server.partial_hits_since()
+                check_hits(
+                    case,
+                    arm,
+                    f"warmup {warmup + 1}/{args.warmup}",
+                    hits,
+                    partials,
+                )
                 warmup_hits.append(hits)
+                warmup_partial_hits.append(partials)
             timed_hits = []
+            timed_partial_hits = []
             for iteration in range(args.iterations):
                 server.begin_query()
                 cpu_before = server.cpu_seconds()
@@ -848,13 +984,21 @@ def run(args):
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 cpu_ms = (server.cpu_seconds() - cpu_before) * 1000.0
                 hits = server.hits_since()
-                check_hits(case, args.arm, f"iteration {iteration + 1}/{args.iterations}", hits)
+                partials = server.partial_hits_since()
+                check_hits(
+                    case,
+                    arm,
+                    f"iteration {iteration + 1}/{args.iterations}",
+                    hits,
+                    partials,
+                )
                 rows = sum(
                     len(block["records"]["rows"])
                     for block in payload.get("output", [])
                     if block.get("records")
                 )
                 timed_hits.append(hits)
+                timed_partial_hits.append(partials)
                 record["cases"].append(
                     {
                         "load1": os.getloadavg()[0],
@@ -871,7 +1015,9 @@ def run(args):
                         "ms": elapsed_ms,
                         "cpu_ms": cpu_ms,
                         "hits": hits,
+                        "partial_hits": partials,
                         "expected_hits": expected,
+                        "expected_partial_hits": expected_partial_hits(case['fuses'], arm),
                     }
                 )
 
@@ -881,20 +1027,31 @@ def run(args):
                     "name": case["name"],
                     "fuses": case["fuses"],
                     "expected": expected,
+                    "expected_partial": expected_partial_hits(case['fuses'], arm),
                     "correctness": correctness_hits,
+                    "correctness_partial": correctness_partial_hits,
                     "warmup": warmup_hits,
+                    "warmup_partial": warmup_partial_hits,
                     "timed": timed_hits,
+                    "timed_partial": timed_partial_hits,
                 }
             )
             log(
                 f"  {case['name']}: {len(timed)} timed runs, {timed[0]['rows']} rows, "
-                f"hits correctness={correctness_hits} warmup={sorted(set(warmup_hits))} "
-                f"timed={sorted(set(timed_hits))} (expected {expected}), "
+                f"hits correctness={correctness_hits}/{correctness_partial_hits} partial "
+                f"warmup={sorted(set(warmup_hits))}/{sorted(set(warmup_partial_hits))} partial "
+                f"timed={sorted(set(timed_hits))}/{sorted(set(timed_partial_hits))} partial "
+                f"(expected {expected}/{expected_partial_hits(case['fuses'], arm)}), "
                 f"min {min(c['ms'] for c in timed):.1f} ms"
             )
 
-        if args.arm == "off" and any(c["hits"] for c in record["cases"]):
+        if arm == "off" and any(c["hits"] for c in record["cases"]):
             raise SystemExit("the flag-off arm logged fused selections; it is not the baseline")
+        if arm != "sum" and any(c["partial_hits"] for c in record["cases"]):
+            raise SystemExit(
+                f"the {arm} arm logged partial sums; only the sum arm may, so this record is "
+                "not the arm it claims to be"
+            )
 
         with open(args.out, "w") as handle:
             json.dump(record, handle, indent=2)
@@ -917,7 +1074,23 @@ def main():
     seed_parser.set_defaults(func=lambda a: seed(a.data_home, a.bin, a.http, a.grpc, a.mysql, a.postgres))
 
     run_parser = sub.add_parser("run", parents=[common], help="measure one arm")
-    run_parser.add_argument("--arm", choices=["off", "on"], required=True)
+    run_parser.add_argument(
+        "--arm",
+        choices=["off", "on"],
+        required=True,
+        help="the experimental_native_promql flag: off is the ordinary plan, on the fused one",
+    )
+    run_parser.add_argument(
+        "--partial",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "the GREPTIME_FUSED_PARTIAL_SUM environment variable the server reads: on computes "
+            "the partial SUM inside the fused node, off does not. Ignored by --arm off, and "
+            "refused with it, because a flag-off arm has no fused node to compute it in. "
+            "`--arm on --partial off` is the `on` arm, `--arm on --partial on` the `sum` arm"
+        ),
+    )
     run_parser.add_argument("--out", required=True, help="the JSON record to write")
     run_parser.add_argument("--log", required=True, help="the server log to read hits from")
     run_parser.add_argument("--commit", default="unknown", help="the commit this binary is")

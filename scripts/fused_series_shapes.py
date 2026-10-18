@@ -397,7 +397,8 @@ def run_arm(server, case, arm, warmup, iterations):
     server.begin_query()
     payload, _ = server.sql(statement)
     hits = server.hits_since()
-    bench.check_hits(case, arm, "correctness", hits)
+    # This driver has no `sum` arm, so no execution of it may log a partial sum.
+    bench.check_hits(case, arm, "correctness", hits, server.partial_hits_since())
     correctness_hits = hits
     schema, rows = bench.flatten(payload)
     if not rows:
@@ -421,7 +422,9 @@ def run_arm(server, case, arm, warmup, iterations):
         server.begin_query()
         server.sql(statement)
         hits = server.hits_since()
-        bench.check_hits(case, arm, f"warmup {index + 1}/{warmup}", hits)
+        bench.check_hits(
+            case, arm, f"warmup {index + 1}/{warmup}", hits, server.partial_hits_since()
+        )
         warmup_hits.append(hits)
 
     timed = []
@@ -433,7 +436,9 @@ def run_arm(server, case, arm, warmup, iterations):
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         cpu_ms = (server.cpu_seconds() - cpu_before) * 1000.0
         hits = server.hits_since()
-        bench.check_hits(case, arm, f"iteration {index + 1}/{iterations}", hits)
+        bench.check_hits(
+            case, arm, f"iteration {index + 1}/{iterations}", hits, server.partial_hits_since()
+        )
         timed_rows = len(bench.flatten(payload)[1])
         if timed_rows != len(rows):
             raise SystemExit(
