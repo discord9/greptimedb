@@ -1816,6 +1816,25 @@ fn the_batch_flushes_in_the_middle_of_a_long_series() {
 /// the per-point path over identical data delivered as one chunk.
 #[test]
 fn the_batch_path_matches_across_chunk_boundaries() {
+    // The samples reach past the last grid point, so the array's final sample never enters a
+    // window: the right edge stops because it crossed the evaluation time, not because it ran out
+    // of array. That is the common shape, but it means an off-by-one at the array's end would go
+    // unnoticed here.
+    let past_the_grid: Vec<Row> = (0..45)
+        .map(|index| (index * 60_000, vec![Some(index as f64 * 3.0)]))
+        .collect();
+    // Here the array's last sample is the last one a window selects, so the right edge is decided
+    // by `len` at the final points.
+    let to_the_grid: Vec<Row> = (0..40)
+        .map(|index| (index * 60_000, vec![Some(index as f64 * 3.0)]))
+        .collect();
+    for rows in [past_the_grid, to_the_grid] {
+        the_chunked_delivery_matches_the_whole_one(&rows);
+    }
+}
+
+/// Drives one row set through the batch path whole, then split at window-interior points.
+fn the_chunked_delivery_matches_the_whole_one(rows: &[Row]) {
     let fields = 1;
     let grid = grid(0, 60_000, 40);
     let window = RangeWindow {
@@ -1823,12 +1842,8 @@ fn the_batch_path_matches_across_chunk_boundaries() {
         offset_ms: 0,
         anchor_ms: None,
     };
-    // A sample every 60 s over the whole grid, so each 5 min window holds six samples.
-    let rows: Vec<Row> = (0..45)
-        .map(|index| (index * 60_000, vec![Some(index as f64 * 3.0)]))
-        .collect();
 
-    let whole = dense_chunk(&rows, fields, 0, true);
+    let whole = dense_chunk(rows, fields, 0, true);
     let mut one_chunk = RangeEvaluator::try_new(
         &raw_schema(fields),
         grid.clone(),
