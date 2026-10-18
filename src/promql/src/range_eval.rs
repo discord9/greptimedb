@@ -593,7 +593,13 @@ fn evaluate_row(
             kernel(FloatWindow {
                 timestamps: &timestamps[..len],
                 values: &field.values[field.head..field.head + len],
-                counter_resets: field.resets_in(len),
+                // Only a counter-correcting field maintains the index, so every other function
+                // reads the empty slice instead of searching an index that is not there.
+                counter_resets: if field.index_resets {
+                    field.resets_in(len)
+                } else {
+                    &[]
+                },
                 eval_ts,
                 range_ms,
             })

@@ -91,9 +91,11 @@ comparison between two arms that both ran the ordinary plan measures nothing.
 
 ## Traps this driver encodes
 
-- TQL window arguments are **seconds**; `INSERT` time literals are **milliseconds**. A
-  mismatch puts the data in 1970 and every query returns zero rows while `SELECT count(*)`
-  still looks healthy.
+- `TQL EVAL (start, end, step)` takes its start and end in **seconds**, like the PromQL
+  API, while the timestamps it returns are in **milliseconds** and `INSERT` literals are
+  milliseconds. Passing milliseconds to `EVAL` asks for a range about 50 000 years in the
+  future: every query returns zero rows with a valid schema, and `SELECT count(*)` still
+  looks healthy. The driver derives the range from `START_MS // 1000`.
 - `region`, `zone` and `mode` are SQL reserved words and cannot be column names.
 - `POST /v1/sql` needs form encoding; a JSON body is rejected with 415.
 - Two servers need disjoint ports (`--http-addr`, `--grpc-bind-addr`, `--mysql-addr`,
@@ -336,17 +338,16 @@ def seed(data_home, binary, http, grpc, mysql, postgres):
 
 
 def case_window(case):
-    """The `(start, end)` milliseconds and the step of one case."""
-    end = START_MS + case["span_minutes"] * 60 * 1000
-    return START_MS, end, case["step"]
+    """The `(start, end)` of one case in seconds, which is what `TQL EVAL` takes."""
+    return START_MS // 1000, START_MS // 1000 + case["span_minutes"] * 60
 
 
 def tql(case, aggregate=True):
     expr = case["expr"].format(table=TABLE)
     if aggregate:
         expr = f"sum by (instance) ({expr})"
-    start, end, step = case_window(case)
-    return f"TQL EVAL ({start}, {end}, '{step}') {expr}"
+    start, end = case_window(case)
+    return f"TQL EVAL ({start}, {end}, '{case['step']}') {expr}"
 
 
 def run(args):
@@ -395,7 +396,12 @@ def run(args):
             "cases": [],
         }
 
-        for case in CASES:
+        wanted: set[str] = (
+            {name.strip() for name in args.cases.split(",") if name.strip()}
+            if args.cases
+            else set()
+        )
+        for case in [c for c in CASES if not wanted or c["name"] in wanted]:
             statement = tql(case)
             # Correctness first, and its hits recorded apart from the timed ones.
             server.begin_query()
@@ -425,6 +431,7 @@ def run(args):
                 timed_hits.append(hits)
                 record["cases"].append(
                     {
+                        "load1": os.getloadavg()[0],
                         "name": case["name"],
                         "expr": case["expr"],
                         "step": case["step"],
@@ -500,6 +507,11 @@ def main():
     run_parser.add_argument("--profile", default="nightly", help="the Cargo profile it was built with")
     run_parser.add_argument("--warmup", type=int, default=2)
     run_parser.add_argument("--iterations", type=int, default=9)
+    run_parser.add_argument(
+        "--cases",
+        default="",
+        help="comma-separated case names to run; empty runs every case",
+    )
     run_parser.set_defaults(func=run)
 
     args = parser.parse_args()

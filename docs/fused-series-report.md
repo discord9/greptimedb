@@ -1,14 +1,19 @@
 # FusedSeriesExec: implementation report and measured performance
 
-Status of the `feat/narthex-integrated-chain` branch after bringing up an
-end-to-end fused range-function path. This document records what was built,
-what was measured, and — importantly — what the measurements do **not** show.
+Status of the `feat/narthex-integrated-chain` branch after removing the
+per-grid-point counter-reset rescan from the native range evaluator. This
+document records what was built, what was measured, and — importantly — what the
+measurements do **not** show.
 
-**Headline: the node is correct, and it is faster only in one narrow shape
-(fine step, small window, 1.38x). At fine steps with a wider window or a longer
-span it is a regression (0.42x-0.78x), because its kernel evaluation is
-`O(grid points x samples per window)`. See section 4.3.** Do not enable it by
-default on the strength of this work.
+**Headline: the algorithm regression is gone, but that has not made the fused
+path faster than the ordinary plan. `rate`/`increase` evaluation no longer
+depends on the window width — a 1 h window costs the same as a 5 min one (1.003x,
+where the previous code paid 3.38x) — and at the compute level `rate[1h]` is
+4.24x faster. End to end that removed the wide-window regression (0.43x → 0.90x)
+and leaves the fused path 0.88x-0.93x at fine steps with narrow windows, with
+`max_over_time` as a 1% noise floor. The remaining gap is not range-function
+arithmetic: it is the raw series scan, 235 of the 279 ms of operator compute left
+in the fused plan. See section 4.4. `experimental_native_promql` stays off.**
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -40,6 +45,9 @@ What this node adds on top of those is:
 - Row semantics identical to the ordinary plan: a grid point where every value
   column is NULL contributes no row, matching the `<value> IS NOT NULL` filter
   the ordinary plan always places above its projection.
+- Output coalescing to `MAX_ROWS_PER_BATCH = 4_096` rows per batch per stream
+  (`src/promql/src/extension_plan/fused_series.rs`), so a query over *n* series
+  does not hand downstream *n* tiny batches.
 
 Construction-time rejections (never a silent fallback): zero partitions, an
 evaluation-grid input schema, `Interleaved` ordering, an illegal window or
@@ -68,28 +76,84 @@ It runs behind the existing `experimental_native_promql` flag
 it takes effect, so an operator can tell a fused run from an ordinary one
 without reading plans.
 
+### 1.3 The counter-reset index — this round's change
+
+`src/promql/src/range_eval.rs`, `src/promql/src/range_eval/function.rs`
+
+**The defect.** `evaluate_row` hands the kernel the window as a slice pair — a
+shared backing array with an offset and a length, *not* a copy — and `rate` then
+walked that whole slice looking for drops:
+
+```rust
+let len = timestamps.partition_point(|&timestamp| timestamp <= window_end);
+kernel(FloatWindow { timestamps: &timestamps[..len], values: ..., .. })
+```
+
+Sample *ingestion* was already linear (a `head` cursor advances), but kernel
+*evaluation* was `O(grid points x samples per window)`. On the measured fixture,
+`rate[1h]` at a 1 s step over 2 h visits 7 201 x 241 x 400 = 694 M samples.
+
+**The fix.** Each field records the position of every sample that dropped below
+its predecessor, at ingest time, when the comparison is free — the new sample is
+already next to the previous one. A window then asks for the resets it contains
+by binary search over that per-field index, and the kernel adds back the same
+predecessors in the same order:
+
+```rust
+result = counter_resets
+    .iter()
+    .fold(result, |result, reset| result + reset.previous_value);
+```
+
+Properties that keep this safe rather than merely faster:
+
+- **Same arithmetic, same order.** `last - first`, then each reset's preceding
+  value in sample order, then the unchanged extrapolation. No prefix sums, no
+  subtraction of partial sums.
+- **Positions are absolute sequence numbers** (`base + index`), so dropping the
+  samples behind the next window renumbers nothing and a reset keeps its
+  position across chunk boundaries and drains.
+- **Left-open window membership.** A reset at position `j` counts exactly when
+  `L < j < R`, so a reset whose predecessor sits on the window's left edge — the
+  sample the window excludes — does not count.
+- **The index is released with the samples.** A reset is dropped together with
+  the predecessor it reads, so the index cannot retain history no window can
+  reach.
+- **Per field, per series.** `WindowKernel` is shared across fields, so the index
+  lives on `FieldSamples`, never in the kernel closure; `finish_series` clears it
+  with the rest of the series' state.
+- **Only `rate` and `increase` maintain it** (`RangeFunction::indexes_counter_resets`).
+  Every other function reads an empty slice, so a function that never corrects
+  counters pays nothing for the machinery: `max_over_time` measures within 0.4%
+  of the previous code (section 4.2).
+
+**This is not strict `O(1)` per window.** A window that contains resets still
+walks them in order; the improvement is that it no longer walks the samples that
+do *not* reset, which on real counters is the overwhelming majority.
+
 ## 2. Correctness
 
-Four independent layers, all currently green.
+Five independent layers, all currently green.
 
 1. **Node unit tests** — `src/promql/src/extension_plan/fused_series/tests.rs`
-2. **Real storage scan** — `tests-integration/.../nested_merge_scan_capability_test.rs`,
-   `test_fused_series_exec_over_real_storage_scan`: a real mito2 region whose
-   labels are bound to the primary key. Asserts, against values derived from the
-   inserted fixture rather than from re-running the implementation under test:
-   `rate == 1.0` on five grid points, `host == "alpha"` (proving primary-key
-   label decoding), and the exact timestamps `[300000, 360000, 420000, 480000,
-   540000]`.
-3. **Real PromQL query through the planner** — `a_real_rate_query_runs_through_the_fused_node`
-   and `a_real_aggregated_rate_query_runs_through_the_fused_node`: build the plan
-   through `PromPlanner`, plan physically with the engine's own planner (which is
-   what installs `PromExtensionPlanner`), assert the result really contains a
-   `FusedSeriesExec`, then execute both arms and compare rows.
-4. **Standalone server A/B** — five queries, fused vs ordinary, row sets compared.
-   All five `identical=True`.
+2. **Evaluator differential tests** — `src/promql/src/range_eval/tests.rs`. The
+   reference side of every random test computes a window's resets by *scanning*
+   it, and the probe kernel hashes them, so all 500 random grids × 3 series × 3
+   fields also check the index. Verified by mutation: making `resets_in` return
+   an empty slice fails `evaluator_matches_brute_force_reference`,
+   `range_functions_match_prometheus` and `subquery_series_match_references`.
+3. **Targeted state tests** — the reset that is the first sample of a later
+   chunk; the reset whose predecessor lands exactly on a window's left edge and
+   must not count; a reset entering a window whole; two fields with different
+   NULL/reset layouts in the same window; the same evaluator serving a second
+   series with no state leaking; and an index that stays bounded under
+   continuous draining.
+4. **Real storage scan** — `tests-integration/.../nested_merge_scan_capability_test.rs`,
+   `test_fused_series_exec_over_real_storage_scan`.
+5. **Real PromQL query through the planner** — see section 3.
 
-`cargo nextest run -p promql` → 454 passed.
-`cargo nextest run -p query` → 885 passed.
+`cargo nextest run -p promql` → 457 passed.
+`cargo nextest run -p query` → 885 passed, 2 skipped.
 `cargo clippy -p promql -p query --all-targets -- -D warnings` → clean.
 
 ### Window semantics
@@ -99,168 +163,297 @@ as documented and implemented in `src/promql/src/range_eval.rs`. The ordinary
 fold's `scan_ranges` (`src/promql/src/extension_plan/range_manipulate.rs`) uses
 the same `<= window_start` exclusion, so the two agree. Where the two
 implementations differ is the last bits of a float sum, because they accumulate
-in a different order; the standalone A/B above confirms row identity under a
+in a different order; the comparison in section 4.1 confirms row identity under a
 relative tolerance of 1e-9.
 
 ## 3. Bugs found by measuring, not by testing
 
-Both of these compiled, passed every unit test, and silently disabled fusion for
-the queries that matter. They are recorded because they are the reason the first
-two benchmark runs produced meaningless numbers.
+These compiled, passed their unit tests, and silently disabled or masked the
+behaviour under test. They are recorded because each one made an earlier
+benchmark number meaningless.
 
-1. **`sum by (...)(rate(...))` never fused.** The matcher walked a logical
-   child-index path to find the physical node to swap. DataFusion plans one
-   logical `Aggregate` as `AggregateExec(Partial) → RepartitionExec →
-   AggregateExec(Final)`, so the lockstep walk desynchronised and returned
-   `None`. Fixed by identifying the physical node by schema and content.
+1. **`sum by (...)` never fused.** The matcher walked a logical child-index path
+   to find the physical node to swap. DataFusion plans one logical `Aggregate` as
+   `AggregateExec(Partial) → RepartitionExec → AggregateExec(Final)`, so the
+   lockstep walk desynchronised and returned `None`. Fixed by identifying the
+   physical node by schema and content.
 2. **A tag subset was rejected.** The builder required the fused output to carry
    *every* table tag. A `sum by (one_label)` projection is pruned to the labels
    the aggregate groups by, so on any table with more than one tag — that is,
    every real table — the gate rejected the most common PromQL query shape. The
-   single-tag test table could not show it, because there the aggregate happens
-   to project all tags. Fixed by requiring one time column and one value column
-   and letting the projection decide the tag columns; duplicate detection still
-   compares each series' complete label set, so no identity is lost.
+   single-tag test table could not show it. Fixed by requiring one time column
+   and one value column and letting the projection decide the tag columns.
+3. **The wiring test could not see either bug.** It used a one-tag table, one
+   partition, and compared the fused arm against the ordinary arm with a `0.25`
+   tolerance. A tag-subset projection had nothing to prune, and the tolerance
+   would have hidden a wrong value. It is now a four-tag table (`host`,
+   `instance`, `job`, `l1`) with two storage partitions, one series per instance
+   per partition, and `sum by (instance)`; the expected sums (3 and 7 per second)
+   are computed by hand and cannot be reached by dropping a partition, losing the
+   tag subset, or mixing the instances. Tolerance is now `1e-9` relative.
+4. **The benchmark driver asked for the wrong time range.** `TQL EVAL (start,
+   end, step)` takes seconds, while `INSERT` literals and returned timestamps are
+   milliseconds. The first driver run passed milliseconds, so every query covered
+   a range ~50 000 years in the future: zero rows, valid schema, `SELECT
+   count(*)` still healthy. Caught only because the never-fused control took
+   363 ms for zero rows.
 
 ## 4. Performance
 
-### 4.1 Where the work actually is
+### 4.1 The measurement setup
 
-A per-operator profile of the ordinary plan (`TQL ANALYZE VERBOSE`, same data)
-showed that the fusion target is only worth anything when the query is
-compute-bound, and that **the window width is not what makes it compute-bound**:
+The fixture is one mito table, seeded once and reused by every arm:
 
-| query | SeriesScan | all compute operators | compute share |
-| --- | ---: | ---: | ---: |
-| `rate[5m]`, step 1m | 243 ms | 38 ms | 13% |
-| `rate[1h]`, step 1m | 363 ms | 37 ms | 9% |
-| `rate[4h]`, step 1m | 206 ms | 33 ms | 14% |
-| `rate[5m]`, step 1s | 89 ms | 61 ms | 41% |
-| `rate[1h]`, step 1s | 70 ms | 50 ms | 42% |
+| Property | Value |
+| --- | --- |
+| Tags (primary key, in order) | `host`, `instance`, `job`, `l1` |
+| Field / time index | `metric_value` DOUBLE / `ts` TIMESTAMP(3) |
+| Series | 400 (`host=h0..h399`, `instance=i0..i3`, `job=j`, `l1=l`) |
+| Samples per series | 2 880 at 15 s |
+| Span | `1700000015000`..`1700043200000` ms = 43 185 s |
+| Rows | 1 152 000 |
+| Counter resets / NULLs | **0 / 0** (values rise `15 × (host+1)` per sample) |
+| Storage partitions | 20 |
 
-Widening the window 48x (5m to 4h) leaves compute unchanged at 1-minute steps,
-which is why the first benchmark's `rate[5m]` and `rate[1h]` rows were identical
-to within noise. The lever is the **step**: a 1-second step multiplies grid
-points by 15 and lifts the compute share to 41%. Any honest test of this node
-must use a fine step, not a wide window.
+A strictly rising value is deliberate: `rate` over it needs **no** counter
+correction, so any cost it shows is the fixed per-window work plus whatever the
+kernel spends looking for resets that are not there. That is exactly the cost
+this round removes, and it means a regression cannot be blamed on reset
+arithmetic. The index's correctness on real resets is covered by section 2, where
+the expected values can be computed by hand.
 
-### 4.2 Results, compute-bound regime
+Three arms, all over the same data directory, sequentially:
 
-400 series x 2880 samples, `sum by (instance)`, two standalone servers run
-sequentially over the same data directory. 2 warmup, 9 timed iterations. All
-row sets verified identical (relative tolerance 1e-9) before timing was read.
+| Arm | Commit | Native flag | Range evaluation |
+| --- | --- | --- | --- |
+| **L** | `f387830a020` | off | ordinary materialising plan |
+| **N** | `f387830a020` | on | fused, per-window rescan |
+| **F** | `f387830a020` + this change | on | fused, per-field reset index |
 
-| query | rows | fused hits | ordinary p50 | fused p50 | ratio |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| step 1s, `rate[5m]`, 30 min span (1800 steps) | 7 204 | 12 | 28.3 ms | 20.4 ms | **1.38x** |
-| step 1s, `rate[5m]`, 2 h span (7200 steps) | 28 804 | 12 | 46.8 ms | 60.1 ms | **0.78x** |
-| step 1s, `rate[1h]`, 2 h span | 28 804 | 12 | 49.4 ms | 118.5 ms | **0.42x** |
-| step 1m, `rate[5m]`, 2 h span | 484 | 12 | 24.9 ms | 27.0 ms | 0.92x |
-| `control-max-over-time` (never fuses) | 28 804 | 0 | 61.3 ms | 57.1 ms | 1.07x |
+Cases, all `sum by (instance) (<fn>(vmbench[window]))`:
 
-`fused hits` counts `Fused series selection succeeded` lines emitted during that
-query's iterations, so every fused row here really ran the fused node.
+| Name | Span | Step | Window | Grid points | Samples per window | Sample visits |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| `S` | 30 min | 1 s | 5 min | 1 801 | 21 | 15 M |
+| `G` | 2 h | 1 s | 5 min | 7 201 | 21 | 61 M |
+| `W` | 2 h | 1 s | 1 h | 7 201 | 241 | 694 M |
+| `C` | 2 h | 1 min | 5 min | 121 | 21 | 1 M |
+| `control` | 2 h | 1 s | 5 min | 7 201 | 21 | — (`max_over_time`, never fuses) |
 
-### 4.3 Reading: a win that turns into a regression as the grid grows
+`S` and `G` differ only in span, so the pair separates "more grid points" from
+"more samples per window"; `G` and `W` differ only in window. `C` is the shape
+the original query actually has.
 
-The small compute-bound case is the only one where fusion helps, and it helps by
-a margin well above the 1.07x noise floor.
+Arms are interleaved **per case** — L, N, F, then N, F, L, then F, L, N — not run
+as three whole sweeps. A whole-sweep order was tried first and produced a 3.4x
+swing on `control`, which never fuses and therefore cannot differ between arms at
+all. That swing was machine drift, and interleaving per case makes drift land on
+every arm instead of one. The machine is shared, so this is not an idle host: the
+host load average was 9.6-18.6 on 20 cores during the measured runs below (and
+4.1-6.7 during the aborted whole-sweep attempt). That is why `control` carries
+weight — it fixes the noise floor at 1% rather than leaving it to be assumed.
+2 warmup iterations and 9 timed iterations per case per arm per round, 3 rounds,
+so 27 timed samples per arm per case. Every individual timing, with the load
+average beside it, is in the JSON records.
 
-It then reverses. Going from 1 800 to 7 200 grid points (4x) raises the fused
-time by 2.9x but the ordinary time by only 1.65x. Widening the window from 5m to
-1h at 1-second steps **doubles** the fused time (60.1 to 118.5 ms) while the
-ordinary plan barely moves (46.8 to 49.4 ms). The spread confirms this is not
-noise: fused samples run 105.8-167.8 ms against ordinary 42.5-87.3 ms.
+### 4.2 Compute: the evaluator alone
 
-**Mechanism, confirmed in the code.** `RangeEvaluator::evaluate_row`
-(`src/promql/src/range_eval.rs`) hands the kernel the whole window slice for
-every grid point:
+`src/promql/benches/bench_range_fn.rs`, group `native_range_eval`. One series of
+2 880 samples at 15 s on a 7 201-point 1 s grid, one value field, evaluated by
+`RangeEvaluator` directly. **Timed scope, identical in every case:**
+`try_new` + one `push` + `finish`. The chunk, schema and grid are built once
+before timing and borrowed by `push`, so no case pays for input construction or
+adaptation inside the measurement.
 
-```rust
-let len = timestamps.partition_point(|&timestamp| timestamp <= window_end);
-kernel(FloatWindow { timestamps: &timestamps[..len], values: ..., ... })
-```
+Criterion, `--warm-up-time 2 --measurement-time 5`, two independent rounds. CIs
+do not overlap between the two binaries in any row.
 
-The `rate` kernel then walks every value in that slice. The retained-sample
-buffer is advanced by a cursor, so sample *ingestion* is linear, but kernel
-*evaluation* is `O(grid points x samples per window)`:
+| case | values | window | before | after | speedup |
+| --- | --- | --- | ---: | ---: | ---: |
+| `rate` | rising | 5 min | 527.5 µs | 418.9 µs | **1.26x** |
+| `rate` | rising | 1 h | 1 781.4 µs | 420.1 µs | **4.24x** |
+| `rate` | resets every 240 samples | 5 min | 521.6 µs | 425.6 µs | 1.23x |
+| `rate` | resets every 240 samples | 1 h | 1 781.1 µs | 431.1 µs | 4.13x |
+| `max_over_time` | rising | 5 min | 348.6 µs | 349.4 µs | 1.00x |
+| `max_over_time` | rising | 1 h | 2 286.9 µs | 2 268.6 µs | 1.01x |
+| `max_over_time` | resets every 240 samples | 5 min | 348.9 µs | 350.4 µs | 1.00x |
+| `max_over_time` | resets every 240 samples | 1 h | 2 287.1 µs | 2 265.2 µs | 1.01x |
 
-- 1s step, 5m window, 30 min span: 1800 x 20 x 400 = 14 M visits -> 20 ms
-- 1s step, 1h window, 2 h span: 7200 x 240 x 400 = 691 M visits -> 118 ms
+Three things this table says:
 
-The ratio of visits (49x) and the ratio of measured time (5.8x) are the same
-order once fixed per-call overhead is accounted for. The ordinary path
-materialises each window once in `RangeManipulate` and evaluates it in
-`prom_rate`, and its measured cost is far less sensitive to the window, so the
-per-grid-point rescan is the difference.
+1. **The window dependence is gone.** After the fix, `rate` over a 1 h window
+   costs 1.003x what it costs over a 5 min window. Before, that ratio was 3.38x —
+   close to the 11.5x ratio of samples per window, damped by the fixed
+   per-window cost. This is the direct evidence that the rescan is gone, and it
+   is stronger than any single speedup number, because it does not depend on
+   where the fixed costs happen to sit.
+2. **The narrow-window gain is real but modest** (1.26x): a 5 min window holds 21
+   samples, so the rescan was never the dominant cost there.
+3. **The reset work itself is small.** With resets present, the fixed algorithm
+   costs 1.6-2.6% more than with a strictly rising counter, because it then walks
+   the resets it reports. That is the honest price of the correction, not a
+   regression.
+4. **Functions that do not correct counters are untouched.** `max_over_time`
+   moved from 348.6 to 349.4 µs at 5 min and from 2 286.9 to 2 268.6 µs at 1 h,
+   both inside the run-to-run spread. An earlier draft read the index for every
+   function and cost `max_over_time` a reproducible 4.9%; the `index_resets`
+   guard in `evaluate_row` is what removed that, and this row is why the guard
+   exists.
 
-**Therefore: the node is correct but its evaluation strategy does not scale.**
-It should either be restricted to shapes where `grid points x window samples`
-stays small, or the kernel contract needs an incremental/aggregate form so that
-a sliding window does not rescan its overlap. The second is the real fix and is
-out of scope here.
+### 4.3 End to end
 
-### 4.4 Scan-bound shapes
+Driver: `scripts/fused_series_bench.py` (seeding and one arm per invocation),
+`scripts/fused_series_bench_crossed.sh` (the interleaved order above),
+`scripts/fused_series_bench_summarize.py` (the tables below, from the raw JSON).
+Every invocation checks that the flag-off arm logs zero fused selections and that
+the flag-on arm logs exactly one per `rate` case and zero for `control`, so a
+comparison can never silently measure the ordinary plan twice.
 
-At 1-minute steps the compute share is 9-14% and the node measures neutral
-(0.92x), inside the noise floor. This is expected and is not a defect: it
-removes work that was never the bottleneck.
+All 27 timed samples per arm per case; medians in ms.
 
-### 4.4 What earlier, discarded runs showed
+| case | L (off) | N (rescan) | F (indexed) | L/N | L/F | N/F | N→F |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `S` | 18.5 | 20.3 | 19.9 | 0.91 | 0.93 | 1.02 | +2% |
+| `G` | 51.2 | 61.8 | 58.1 | 0.83 | 0.88 | 1.06 | +6% |
+| `W` | 48.2 | 111.8 | 53.7 | 0.43 | **0.90** | **2.08** | **+52%** |
+| `C` | 25.4 | 24.3 | 23.8 | 1.05 | 1.07 | 1.02 | +2% |
+| `control` | 53.6 | 53.6 | 52.8 | 1.00 | 1.00 | 1.00 | +1% |
 
-Kept for context, because the numbers moved a lot once the bugs above were
-fixed — an illustration of why the hit counter is mandatory:
+Row counts were identical across arms in every case (7 084 / 28 684 / 28 684 /
+480 / 28 744), so the timings compare the same work.
 
-- Before the aggregate-matcher fix, `sum by (...)` did not fuse at all, so its
-  row in the table compared the ordinary plan against itself.
-- Before the tag-subset fix, on a 400-series multi-tag table, *no* `sum by`
-  query fused. The measured ratios (0.97x–1.06x) and a `MISMATCHED RESULT SETS`
-  correctness line were both artifacts of this.
+Where the ratios land:
+
+- **`W` is the case this round was for.** The wide-window regression went from
+  0.43x to 0.90x; between N and F it is a 2.08x improvement. That is the whole
+  arithmetic half of the regression.
+- **`S` and `G` do not improve** (0.93x and 0.88x against the ordinary plan),
+  because their windows are narrow and the rescan was not what made them slow.
+- **`C`, the original business shape**, is now slightly *faster* than the
+  ordinary plan (1.07x) instead of level with it.
+- **`control` is within 1% across all three arms** (L/N 1.00x, L/F 1.01x, N/F
+  1.01x), which is the noise floor this measurement actually has. No ratio in
+  this table smaller than ~1.03 should be read as an effect.
+
+The earlier report quoted `S` at 1.38x. That number does not reproduce: `S`
+measures 0.85x-0.93x in every run collected here, including the earlier
+whole-sweep attempt (0.88x) that predates the reset work. The 1.38x came from a
+whole-arm sequential sweep whose drift is visible as the 3.4x `control` swing in
+4.1, and it is withdrawn rather than explained away. The correct reading is that
+fusion has **not** been shown to beat the ordinary plan on any of these shapes
+yet; what this round shows is that it no longer loses badly on the wide-window
+one.
+
+### 4.4 What the remaining gap is
+
+`TQL ANALYZE VERBOSE` on `G`, median of the last 3 of 5 runs, per-operator
+`elapsed_compute`. Only the operators that matter are listed.
+
+| arm | operator | compute |
+| --- | --- | ---: |
+| L | `SeriesScan` | 378 ms |
+| L | `ProjectionExec` | 51 ms |
+| L | `AggregateExec` | 40 ms |
+| L | `PromRangeManipulateExec` | 35 ms |
+| L | `PromSeriesDivideExec` | 26 ms |
+| L | `FilterExec` | 3 ms |
+| | **sum** | **537 ms** |
+| F | `SeriesScanExec` | 235 ms |
+| F | `AggregateExec` | 41 ms |
+| F | `SortPreservingMergeExec` | 2 ms |
+| F | `FilterExec` | 0.4 ms |
+| | **sum** | **279 ms** |
+
+Two facts follow, and they answer "what is left":
+
+1. **The fused scan is already cheaper than the ordinary one** — 235 ms against
+   378 ms. The ordinary `SeriesScan` expands 192 000 raw rows into the columnar
+   path (`output_rows: 192 000`); the fused `SeriesScanExec` hands over 424 raw
+   chunks that never become columns. That is 143 ms the fused path does not
+   spend, and it is why `W` reaches 0.90x at all.
+2. **The fused plan has no range-function operator left to profile.** In the L
+   plan, `PromRangeManipulate` (35 ms) + `ProjectionExec` (51 ms) + `FilterExec`
+   (3 ms) + `PromSeriesDivide` (26 ms) is 115 ms of materialising work between
+   the scan and the aggregate. In the F plan, that work happens inside
+   `SeriesScanExec`, and the only node left above it is the aggregate, which the
+   two arms share (41 ms vs 40 ms). So F's 279 ms is ~235 ms scan + ~41 ms
+   aggregate, and the end-to-end 58.1 ms is that 279 ms of operator compute
+   divided across 20 partitions, plus response serialization.
+
+So the remaining gap in `G`/`S` is **not** in the range function. It is the raw
+series scan — 235 of the 279 ms — which is the next distinct target, and it is
+out of scope for this round.
 
 ## 5. What is not shown
 
-- **No general speedup.** Fusion helps one narrow shape (fine step, small
-  window) and regresses two larger ones. There is no evidence here to justify
-  enabling it by default; `experimental_native_promql` remains off.
-- **The scaling fix is not attempted.** Section 4.3 identifies
-  `O(grid x window)` kernel evaluation as the cause. Making the kernel
-  incremental — so a sliding window reuses the previous point's work instead of
-  rescanning its overlap — is the change that would make fusion pay off at fine
-  steps and wide windows. Not done.
-- **No large-window ceiling measured.** Whether an incremental kernel would make
-  wide windows *faster* than the ordinary materialising path, rather than merely
-  no worse, is unmeasured.
+- **No general speedup.** The algorithm regression is eliminated and one shape
+  (`W`) improved 2.08x between N and F, but the fused path is still 0.88x-0.93x
+  against the ordinary plan at fine steps with narrow windows. There is no
+  evidence here to justify enabling `experimental_native_promql` by default; it
+  remains off.
+- **The remaining cost is located, not fixed.** Section 4.4 shows the raw series
+  scan is 235 of the 279 ms of `G`'s operator compute. Making that cheaper is the
+  next change, and it is a different one.
+- **The output path was not measured.** The node targets 4 096 rows per batch
+  (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
+  series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
+  Those numbers are arithmetic from the configuration, not a measurement: no
+  batch count, rows-per-batch, or emit/flush cost was collected, and no threshold
+  was changed on the strength of them.
+- **No large-window ceiling measured.** `W` is the widest window measured (1 h
+  against a 2 h span). Nothing here says whether a still-wider window would now
+  become *faster* than the ordinary plan rather than merely equal.
+- **No CPU sampling profile.** Section 4.4 is operator-level `elapsed_compute`
+  from `TQL ANALYZE VERBOSE`, not a sampled stack profile, so it attributes cost
+  to operators rather than to functions within the scan.
 - **No `EXPLAIN` visibility from the frontend.** In standalone, TQL is planned as
   a `MergeScan` pushed to the datanode, and fusion happens when the datanode
   builds its physical plan. `TQL EXPLAIN` at the frontend therefore never shows
-  `FusedSeriesExec`; the debug log is the way to confirm a fused run. Surfacing
-  this through `EXPLAIN ANALYZE` remote plans was not done.
+  `FusedSeriesExec`; the debug log is the way to confirm a fused run.
 - **No distributed or multi-region path.** Phase 1 is single-region,
   single-node. `RangeEvaluator` has no partial-aggregate contract, and one was
   deliberately not invented here.
 - **No `PartialAggregate`, vector matching, or planner-level fusion.** Out of
   scope by design.
+- **Nothing here covers a counter that resets inside every window at scale.**
+  The unit and integration tests prove the index is correct with resets
+  (including across chunk boundaries and window edges); the 1 152 000-row
+  benchmark fixture has none, so no end-to-end timing includes real reset
+  traffic.
 
 ## 6. Reproduction
 
-The benchmark driver is not committed (it is scaffolding, and it writes ~18 GB
-of data). The shape of it is:
+Two commands per arm, over one shared data directory:
 
-1. Seed one mito table with `host, instance, job, l1` tags, one value column, a
-   time index, and `PRIMARY KEY(host, instance, job, l1)`, one row per series per
-   15 s.
-2. Write that data directory once; copy it is not needed if the arms run
-   sequentially against it.
-3. Start `greptime standalone start` twice, once per flag value, on disjoint
-   port sets (`--http-addr`, `--grpc-bind-addr`, `--mysql-addr`,
-   `--postgres-addr`; two instances otherwise collide on the defaults).
-4. Run each query with `TQL EVAL (start, end, '<step>') <expr>` over
-   `POST /v1/sql` form-encoded, alternating or sequential, and count
-   `Fused series selection succeeded` lines per query to prove which arm is
-   which.
-5. Compare row sets with a float tolerance before trusting any timing.
+```bash
+# Once: write the fixture (refuses to add to a directory of a different shape).
+python3 scripts/fused_series_bench.py seed \
+    --data-home ~/.cache/fused-scale/data-seed --bin <greptime>
 
-Two traps worth recording: TQL window arguments are **seconds** while `INSERT`
-literals are **milliseconds** (a mismatch puts the data in 1970 and every query
-returns zero rows while `SELECT count(*)` looks healthy), and `region`, `zone`
-and `mode` are reserved words and cannot be used as column names unquoted.
+# Per arm, per case: run and record. `--arm off` must log zero fused hits.
+python3 scripts/fused_series_bench.py run \
+    --data-home ~/.cache/fused-scale/data-seed --bin <greptime> \
+    --arm on --commit <sha> --cases W \
+    --out records/cW-r1-N.json --log records/cW-r1-N.log
+
+# The interleaved L/N/F order, three rounds, all cases:
+bash scripts/fused_series_bench_crossed.sh
+
+# The tables above, from the raw records:
+python3 scripts/fused_series_bench_summarize.py records
+```
+
+The compute benchmark is a normal criterion group in the promql package:
+`cargo bench -p promql --profile nightly -- bench_main native_range_eval`.
+
+Traps this driver encodes, each of which produced a wrong measurement first:
+
+- `TQL EVAL (start, end, step)` takes **seconds**; `INSERT` literals and returned
+  timestamps are **milliseconds**. A mismatch yields zero rows with a valid
+  schema while `SELECT count(*)` looks healthy.
+- `region`, `zone` and `mode` are SQL reserved words and cannot be column names.
+- `POST /v1/sql` needs form encoding; a JSON body is rejected with 415.
+- Two servers need disjoint port sets (`--http-addr`, `--grpc-bind-addr`,
+  `--mysql-addr`, `--postgres-addr`), or they collide on the defaults.
+- `pkill -f "greptime standalone"` matches the shell running it. Stop servers by
+  PID.
