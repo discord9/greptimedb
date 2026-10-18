@@ -936,8 +936,12 @@ ones the profile named:
   `concat_batches`: `emit` is 0.5 ns/row and `flush` is unmeasurable at this resolution. The
   cost is the per-point arithmetic itself — 400 series x 7 171 points = 2.87 M evaluations of
   `extrapolated_rate_batch`, including its saturating `i64` subtraction and extrapolation.
-  Section 4.5 measured that kernel at 16.8 ns per point with criterion on one series; 22.1 ns
-  end to end, including the window cursors and `push_columns`, is the same order.
+  Section 4.5 measured the *per-point* form's kernel at 16.8 ns/point and its bookkeeping at
+  36.9 ns/point, 53.7 ns together, with criterion on one series. The 22.1 ns here is the batch
+  form's whole marginal cost per point, bookkeeping and `push_columns` included, so the two are
+  not the same quantity and are not compared: what this section adds is that the batch form's
+  *total* per-point cost is now the dominant term of the fused node, where the per-point form
+  spent most of its time on bookkeeping.
 - **The partial aggregate's generic hash table is second: 17.4 ns per intermediate row, 49.1 ms
   per query, 26% of that CPU.** The fused node hands downstream one batch per series and the
   aggregate hashes every row against `(instance, ts)`.
@@ -1020,10 +1024,11 @@ materialises the whole range matrix per query: `TQL ANALYZE` on `control`'s own 
 its `output_bytes` as **176 MB**, against 7 MB for the `SeriesScan` beneath it and 81 MB for the
 `ProjectionExec` above it. That figure is identical for `max_over_time[5m]`, `rate[5m]` and
 `rate[1h]` — 176 MB and 2 874 400 rows in all three — so it scales with the grid, not with the
-window. A query allocating and freeing that every call measures jemalloc's variance, not the
-machine's quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier version of the script gated
-on `control` and rejected a pass whose 2.3 s cases were steady to 11% — the wrong instrument,
-and the reason it was replaced is recorded here rather than in a commit message.
+window. A query allocating and freeing that every call measures jemalloc's variance, not the machine's
+quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier
+version of the script gated on `control` and rejected a pass in which `G400`'s ratio was steady
+to 0.4% — the wrong instrument, and the reason it was replaced is recorded here rather than only
+in a commit message.
 
 **What this implies for a fused partial aggregate.** Take `G4`, the shape PromQL users actually
 write: the fused arm is 170 ms of CPU, and section 4.8 puts 49.9 ms of that in the aggregate's
