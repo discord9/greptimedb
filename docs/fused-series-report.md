@@ -14,8 +14,12 @@ and leaves the fused path 0.88x-0.93x at fine steps with narrow windows, with
 `max_over_time` as a 1% noise floor. The remaining gap is not the reset index and
 is not the raw series scan, as an earlier revision of this report claimed: on
 identical input the fused evaluator costs 3.35x the ordinary plan's range-function
-work, which accounts for the whole end-to-end CPU gap. See sections 4.4 and 4.5.
-`experimental_native_promql` stays off.**
+work, which accounts for the whole end-to-end CPU gap. Splitting that 3.35x shows
+why it is structural rather than a missed optimization — the fused evaluator with
+its per-point bookkeeping removed entirely would still cost 1.47x the ordinary
+plan, because it calls a scalar kernel once per grid point where the ordinary
+plan assembles every window in one columnar pass and vectorizes the kernel over
+the batch. See sections 4.4 and 4.5. `experimental_native_promql` stays off.**
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -425,16 +429,47 @@ That 3.35x accounts for the whole end-to-end gap: 400 series x (419.4 - 125.2) u
 117.6 ms, against the 128.5 ms of CPU `G` costs `F` over `L` (360 vs 231.5 ms). So the
 remaining regression is in the evaluator, not in the scan, the output or the flush.
 
-**What is not yet known.** The evaluator costs ~58 ns per grid point, and the candidates
-are the per-point `partition_point` in `evaluate_row`, the per-window kernel call, and
-`GridSeriesBuilder::push` per point. The fused node also materialises all four tag
-columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans every
-grid point twice per series (`claim_label_set` then `series_to_record_batch`). None of
-these is measured yet, and their rough sizes do not add up to 3.35x, so the more likely
-explanation is structural: the legacy UDF processes a batch of windows at once while the
-native evaluator calls a scalar kernel once per window. Section 4.5 therefore does not
-yet name the next change; the `fused_*` partition metrics added this round are what will
-name it.
+**Splitting the evaluator into bookkeeping and kernel.** `present_over_time`'s kernel
+returns a constant, so its time is the per-point bookkeeping and nothing else; `rate`
+adds the extrapolation arithmetic to it. Same input as the table above:
+
+| function | 5 m | 1 h | what it measures |
+| --- | ---: | ---: | --- |
+| `present_over_time` | 244.4 us | 243.7 us | bookkeeping only |
+| `max_over_time` | 354.7 us | 2 307.9 us | bookkeeping + a kernel that reads the window |
+| `rate` | 428.0 us | 427.2 us | bookkeeping + an O(1) kernel |
+
+`rate` splits into **244.4 us bookkeeping (57%, 33.9 ns/point) and 183.6 us kernel (43%,
+25.5 ns/point)**, and both halves are the same at 5 m and 1 h, which is what the
+reset-index work predicted: neither the window assembly nor the kernel any longer depends
+on the window width.
+
+**Why this is structural, not a missed optimization.** Compare against `legacy_full/`,
+125.2 us for the same 7 201 points: the fused evaluator with its bookkeeping reduced to
+*zero* would still cost 183.6 us, **1.47x the whole ordinary path**. Break-even needs
+17.4 ns per grid point all-in; the kernel alone spends 25.5. So no amount of per-point
+tuning makes the fused evaluator cheaper than the ordinary plan on a fine grid, because
+the two do different amounts of per-point work by construction: `PromRangeManipulate`
+assembles every window in one columnar pass and the vectorized kernel then runs over the
+batch, while the fused node calls a scalar kernel 7 201 times and pays Rust bookkeeping
+per call. Optimizing inside that shape moves a constant factor and cannot cross it.
+
+This also predicts the end-to-end result without further assumptions. `F` wins on `C`
+because 121 grid points make bookkeeping negligible and the four saved operators
+dominate; it loses on `G` and `W` because 7 201 points make bookkeeping dominate.
+
+**The one micro-fix this measurement justified, and its bound.** `extrapolated_rate`
+widened three millisecond differences to `i128` and narrowed them back with `as f64`, and
+each narrowing compiles to a call to the `__floattidf` builtin; a CPU profile showed it as
+self time. It now uses saturating `i64` subtraction. Even a perfect result there is
+bounded by the arithmetic above, so it is committed as a cleanup of the kernel, not as
+the fix for the regression.
+
+**Not measured, and not needed to explain the gap.** The fused node materializes all four
+tag columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans
+every grid point twice per series (`claim_label_set` then `series_to_record_batch`). Both
+are real, both are smaller than the bookkeeping/kernel split above, and neither changes
+the conclusion.
 
 ## 5. What is not shown
 

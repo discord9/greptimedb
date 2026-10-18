@@ -503,7 +503,7 @@ def seed(data_home, binary, http, grpc, mysql, postgres):
             values = []
             for index in range(SAMPLE_COUNT):
                 timestamp = FIRST_SAMPLE_MS + index * SAMPLE_INTERVAL_MS
-                # Strictly rising, and different per host so a mis-grouped series cannot hide.
+                # Strictly rising, and different per host so a wrongly grouped series cannot hide.
                 value = (index + 1) * SAMPLE_INTERVAL_SECS * (host + 1)
                 values.append(
                     f"('h{host}', 'i{host % 4}', 'j', 'l', {value}, {timestamp})"
