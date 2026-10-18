@@ -15,7 +15,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
+use common_query::prometheus::{PROMETHEUS_STALE_NAN_BITS, is_prometheus_stale_nan};
 use datafusion::arrow::array::{ArrayRef, Float64Array, TimestampMillisecondArray, UInt32Array};
 use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{DataType, Field};
@@ -1425,4 +1425,201 @@ fn rejects_a_subquery_grid_longer_than_u64() {
         subquery_grid(outer, window, 1),
         Err(DataFusionError::Plan(_))
     ));
+}
+
+/// A dense chunk: every field is a null-free float array, the shape the bulk path handles.
+fn dense_chunk(rows: &[Row], fields: usize, host: u64, is_last: bool) -> RawSeriesChunk {
+    let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
+    let time = RawTimestamps::try_new(ScalarBuffer::from(timestamps)).unwrap();
+    let samples: Vec<_> = (0..fields)
+        .map(|field| {
+            let values: Vec<f64> = rows
+                .iter()
+                .map(|(_, values)| values[field].expect("dense chunks carry every value"))
+                .collect();
+            Samples::from_float(Float64Array::from(values))
+        })
+        .collect();
+    RawSeriesChunk::try_new(
+        &raw_schema(fields),
+        Buffer::from(host.to_le_bytes().to_vec()),
+        Some(metric(host)),
+        time,
+        SeriesFields::try_from_vec(samples).unwrap(),
+        is_last,
+    )
+    .unwrap()
+}
+
+/// The bulk append produces the reference result, and it is the path that actually ran.
+///
+/// Both halves are load-bearing. Comparing against `reference`, which builds each window by
+/// scanning the rows, checks the values; asserting the bulk count checks that the comparison
+/// was not made by the per-sample loop, whose output is identical by construction.
+#[test]
+fn the_bulk_ingest_matches_the_brute_force_reference() {
+    for seed in 0..300 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let fields = rng.random_range(1..=3);
+        let (grid, window) = random_window(&mut rng);
+        // The bulk path requires no shifted timestamp, so the window keeps its range only.
+        let window = RangeWindow {
+            range_ms: window.range_ms,
+            offset_ms: 0,
+            anchor_ms: None,
+        };
+        // Every position present and no stale marker: the random generator produces a stale
+        // value in about 5% of positions, which would send nearly every generated chunk down the
+        // per-sample path and leave the bulk path untested.
+        let rows: Vec<Row> = random_rows(&mut rng, fields)
+            .into_iter()
+            .map(|(timestamp, values)| {
+                let values = values
+                    .into_iter()
+                    .map(|value| match value {
+                        Some(value) if is_prometheus_stale_nan(value) => {
+                            Some(rng.random_range(0.0..100.0))
+                        }
+                        Some(value) => Some(value),
+                        None => Some(rng.random_range(0.0..100.0)),
+                    })
+                    .collect();
+                (timestamp, values)
+            })
+            .collect();
+        assert!(
+            rows.iter().all(|(_, values)| values
+                .iter()
+                .flatten()
+                .all(|value| !is_prometheus_stale_nan(*value))),
+            "seed {seed}: the fixture must not carry a stale marker"
+        );
+
+        let mut evaluator = probe_evaluator(fields, grid.clone(), window);
+        let result = evaluator
+            .push(&dense_chunk(&rows, fields, 0, true))
+            .unwrap();
+        assert_eq!(
+            evaluator.bulk_ingest_count(),
+            1,
+            "seed {seed}: the dense chunk did not take the bulk path"
+        );
+        evaluator.finish().unwrap();
+
+        let expected = reference(&rows, &grid, window, fields, true, true);
+        assert_series_eq(result.as_ref(), &expected, &metric(0));
+    }
+}
+
+/// Every condition the bulk path requires sends the chunk back to the per-sample loop.
+#[test]
+fn the_bulk_ingest_steps_aside_for_each_shape_it_cannot_handle() {
+    let fields = 1;
+    let grid = grid(0, 1_000, 5);
+    let window = RangeWindow {
+        range_ms: 10_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    let rows: Vec<Row> = (0..5).map(|i| (i * 1_000, vec![Some(i as f64)])).collect();
+
+    // A nonzero offset shifts every sample, so the timestamps are no longer the source ones.
+    let mut evaluator = probe_evaluator(
+        fields,
+        grid.clone(),
+        RangeWindow {
+            offset_ms: 1,
+            ..window
+        },
+    );
+    evaluator
+        .push(&dense_chunk(&rows, fields, 0, true))
+        .unwrap();
+    assert_eq!(evaluator.bulk_ingest_count(), 0, "an offset must not bulk");
+    evaluator.finish().unwrap();
+
+    // A stale marker drops its row, which needs the per-row decision the loop makes.
+    let mut with_stale = rows.clone();
+    with_stale[2].1[0] = Some(stale());
+    let mut evaluator = probe_evaluator(fields, grid.clone(), window);
+    evaluator
+        .push(&dense_chunk(&with_stale, fields, 0, true))
+        .unwrap();
+    assert_eq!(
+        evaluator.bulk_ingest_count(),
+        0,
+        "a stale marker must not bulk"
+    );
+    evaluator.finish().unwrap();
+
+    // Chunked sample storage has no dense float array to copy from.
+    let mut chunked = dense_chunk(&rows, fields, 0, true);
+    let splits: Vec<_> = chunked
+        .fields
+        .iter()
+        .map(|field| {
+            Samples::try_from_chunks(vec![field.slice(0, 2).unwrap(), field.slice(2, 3).unwrap()])
+                .unwrap()
+        })
+        .collect();
+    chunked.fields = SeriesFields::try_from_vec(splits).unwrap();
+    let mut evaluator = probe_evaluator(fields, grid.clone(), window);
+    evaluator.push(&chunked).unwrap();
+    assert_eq!(
+        evaluator.bulk_ingest_count(),
+        0,
+        "chunked samples must not bulk"
+    );
+    evaluator.finish().unwrap();
+
+    // A null value has no sample, so the row must be skipped rather than copied.
+    let mut nulled = rows.clone();
+    nulled[1].1[0] = None;
+    let mut evaluator = probe_evaluator(fields, grid.clone(), window);
+    evaluator.push(&chunk(&nulled, fields, 0, true)).unwrap();
+    assert_eq!(evaluator.bulk_ingest_count(), 0, "a null must not bulk");
+    evaluator.finish().unwrap();
+}
+
+/// A counter reset inside a bulk-appended chunk is still recorded, on a fixed input.
+///
+/// The random differential test above covers this only when its generator happens to produce a
+/// reset, and an index that silently stayed empty would make `rate` and `increase` under-report
+/// by exactly the reset amounts. The probe kernel hashes the window's resets into its result, so
+/// a bulk path that skipped the scan changes the output.
+#[test]
+fn the_bulk_ingest_records_counter_resets() {
+    let fields = 1;
+    let grid = grid(0, 1_000, 6);
+    let window = RangeWindow {
+        range_ms: 10_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    // Resets between the third and fourth sample and between the fifth and sixth.
+    let values = [1.0, 5.0, 9.0, 2.0, 6.0, 3.0];
+    let rows: Vec<Row> = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as i64 * 1_000, vec![Some(*value)]))
+        .collect();
+
+    let mut evaluator = probe_evaluator(fields, grid.clone(), window);
+    let result = evaluator
+        .push(&dense_chunk(&rows, fields, 0, true))
+        .unwrap();
+    assert_eq!(
+        evaluator.bulk_ingest_count(),
+        1,
+        "the dense chunk must bulk"
+    );
+    evaluator.finish().unwrap();
+
+    let expected = reference(&rows, &grid, window, fields, true, true);
+    assert_series_eq(result.as_ref(), &expected, &metric(0));
+
+    // Guard the guard: the reference itself must see the resets, or this test would pass
+    // against an index that never held any.
+    let resets = scanned_resets(&values);
+    assert_eq!(resets.len(), 2, "the fixed input must contain two resets");
 }

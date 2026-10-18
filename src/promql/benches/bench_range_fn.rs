@@ -1494,9 +1494,108 @@ fn bench_native_vs_legacy(c: &mut Criterion) {
     group.finish();
 }
 
+/// The evaluator's per-sample work, isolated from its per-grid-point work.
+///
+/// `RangeEvaluator::push` copies every input sample into growable `Vec<i64>` / `Vec<f64>`, even
+/// though `RawSeriesChunk` hands it Arrow buffers it could keep. With a one-point grid the
+/// evaluation is a single window and the rest of the time is that copy, so this measures the
+/// cost per input sample on its own.
+///
+/// The comparison is against a path that reads the same Arrow buffer without copying it: the
+/// window times one sequential pass over the values, which is what a zero-copy evaluator would
+/// pay per sample. Both use the same input and the same grid.
+fn bench_ingest(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest");
+    const SAMPLES: usize = 200_000;
+    const SAMPLE_INTERVAL_MS: i64 = 15_000;
+
+    let schema = Arc::new(SeriesSchema {
+        fields: vec![FieldSpec {
+            name: Arc::from("value"),
+        }]
+        .into(),
+        eval_grid: None,
+    });
+    // One grid point: every sample is ingested, almost none are evaluated.
+    let grid = Arc::new(EvalGrid::try_new(GridSpec::try_new(0, 1_000, 1).unwrap()).unwrap());
+    let timestamps: Vec<i64> = (0..SAMPLES as i64)
+        .map(|k| k * SAMPLE_INTERVAL_MS)
+        .collect();
+    let values: Vec<f64> = (0..SAMPLES).map(|i| i as f64 * 15.0).collect();
+    let chunk = RawSeriesChunk::try_new(
+        &schema,
+        Buffer::from(vec![0u8]),
+        Some(MetricName::try_new(Some(Arc::from("metric")), vec![]).unwrap()),
+        RawTimestamps::try_new(timestamps.clone().into()).unwrap(),
+        SeriesFields::try_from_vec(vec![Samples::from_float(Float64Array::from(
+            values.clone(),
+        ))])
+        .unwrap(),
+        true,
+    )
+    .unwrap();
+
+    group.bench_function(BenchmarkId::new("evaluator_push", SAMPLES), |b| {
+        b.iter(|| {
+            let mut evaluator = RangeEvaluator::try_new(
+                &schema,
+                grid.clone(),
+                RangeWindow {
+                    // A window covering the whole series, so nothing is dropped early and every
+                    // sample is retained.
+                    range_ms: SAMPLE_INTERVAL_MS * SAMPLES as i64,
+                    offset_ms: 0,
+                    anchor_ms: None,
+                },
+                RangeFunction::PresentOverTime,
+            )
+            .unwrap();
+            let series = evaluator.push(&chunk).unwrap();
+            evaluator.finish().unwrap();
+            series
+        })
+    });
+
+    // The floor: what touching every sample costs when it is only read, not copied.
+    let arrow = Float64Array::from(values);
+    group.bench_function(BenchmarkId::new("read_only", SAMPLES), |b| {
+        b.iter(|| {
+            let mut sum = 0.0f64;
+            for index in 0..arrow.len() {
+                sum += arrow.value(index);
+            }
+            std::hint::black_box(sum)
+        })
+    });
+
+    // What `ingest` could cost if it kept the `Vec` representation -- which the contiguous
+    // `&[i64]` / `&[f64]` windows require -- but filled it in bulk instead of one sample at a
+    // time: two `extend_from_slice` copies plus one branchless pass rejecting stale markers
+    // before the copy. This is the achievable floor for a fast path that handles the dense,
+    // null-free, zero-offset shape and falls back to the current loop otherwise.
+    group.bench_function(BenchmarkId::new("bulk_copy", SAMPLES), |b| {
+        b.iter(|| {
+            let mut out_timestamps: Vec<i64> = Vec::with_capacity(arrow.len());
+            let mut out_values: Vec<f64> = Vec::with_capacity(arrow.len());
+            let stale = arrow
+                .values()
+                .iter()
+                .any(|value| common_query::prometheus::is_prometheus_stale_nan(*value));
+            if !stale {
+                out_timestamps.extend_from_slice(&timestamps);
+                out_values.extend_from_slice(arrow.values());
+            }
+            std::hint::black_box((out_timestamps, out_values))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_native_range_eval,
+    bench_ingest,
     bench_native_vs_legacy,
     bench_range_functions,
     bench_presence_range_functions,
