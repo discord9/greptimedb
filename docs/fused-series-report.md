@@ -21,6 +21,17 @@ calling a scalar kernel once per grid point, where the ordinary plan assembles
 every window in one columnar pass and vectorizes the kernel over the batch.
 See sections 4.4 and 4.5. `experimental_native_promql` stays off.**
 
+**This round takes that bookkeeping apart for `rate` and `increase`.** Those two
+functions now take a batch of windows per call, with the function chosen outside the
+loop, the window edges advanced as monotone cursors instead of searched per point, and
+the results appended a column at a time. On a real server the fused query's CPU drops to
+0.778 / 0.700 / 0.688 of the previous commit on `S` / `G` / `W` and stays at 1.000 on the
+coarse-step `C`, which is the shape that has few grid points and so has nothing to
+amortize; all 15 paired rounds returned identical results and both arms logged the
+expected fused selections. Wall clock moves far less than CPU (4-8% against 22-31%),
+because the query is not purely CPU-bound. Every other range function still runs one
+boxed call per grid point and gained nothing. See sections 1.4 and 4.6.
+
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
 
@@ -82,7 +93,7 @@ It runs behind the existing `experimental_native_promql` flag
 it takes effect, so an operator can tell a fused run from an ordinary one
 without reading plans.
 
-### 1.3 The counter-reset index — this round's change
+### 1.3 The counter-reset index
 
 `src/promql/src/range_eval.rs`, `src/promql/src/range_eval/function.rs`
 
@@ -136,6 +147,77 @@ Properties that keep this safe rather than merely faster:
 **This is not strict `O(1)` per window.** A window that contains resets still
 walks them in order; the improvement is that it no longer walks the samples that
 do *not* reset, which on real counters is the overwhelming majority.
+
+### 1.4 The batch path — windows, kernel and output
+
+`src/promql/src/range_eval.rs`, `src/promql/src/range_eval/function.rs`,
+`src/promql/src/grid_series.rs`
+
+The reset index removed the per-window scan of the samples but left the shape: one
+boxed call per grid point per field, each rebuilding a `FloatWindow` and appending
+one `Vec<Option<f64>>` row. At the benchmark shape that was 36.9 ns per point of
+run-time bookkeeping against 16.8 ns of arithmetic, so the bookkeeping was most of
+the path.
+
+**The kernel now takes a batch.** The function is chosen once, outside the loop,
+and the batch body is a plain loop over windows:
+
+```rust
+pub(crate) type BatchKernel =
+    Box<dyn FnMut(&WindowBatch<'_>, &mut Vec<Option<f64>>) + Send>;
+
+pub(crate) struct WindowBatch<'a> {
+    timestamps: &'a [i64],
+    values: &'a [f64],
+    resets: &'a [CounterReset],
+    windows: &'a [WindowSpan],          // WindowSpan { start, end }
+    window_resets: &'a [Range<usize>],
+    eval_ts: &'a [i64],
+    range_ms: i64,
+}
+```
+
+`WindowSpan` is an index pair into the retained arrays, not a slice: consecutive
+windows overlap almost entirely, so a window is named rather than materialized.
+That is possible because a counter function reads only a window's endpoints, its
+sample count and its resets — which is why the batch input does not need each
+window's samples to be contiguous.
+
+`RangeFunction::batch_kernel()` returns `Some` for `rate` (`<true, true>`) and
+`increase` (`<true, false>`) and `None` for everything else, which keeps every
+other function on the per-point `WindowKernel`. The two forms share the arithmetic:
+`extrapolated_rate_batch` reproduces `extrapolated_rate`'s operations in the same
+order, including the saturating `i64` subtraction, so the batch form is not a
+second implementation of the formula.
+
+**Boundaries advance instead of being searched.** Consecutive grid points have
+monotone window edges, so one forward pass per batch replaces the per-point
+searches: the left edge is the field's `head`, the right edge a cursor
+(`FieldSamples::right`) carried from the previous point, and the reset range comes
+from two more cursors (`reset_start`, `reset_end`) that move only when the window
+does. Nothing is re-searched per point; the retained-sample positions stay
+continuous across chunks because `advance` shifts all four cursors by the number of
+samples it drops.
+
+**Output is appended by column.** `GridSeriesBuilder::push_columns(index, len,
+&[&[Option<f64>]])` does the schema, length and grid-order checks once per batch and
+then writes each field's column, a dense column through `extend` plus
+`append_n_non_nulls`. The per-point `row` vector exists only on the compatibility
+path now.
+
+The batch is 512 grid points (`EVALUATION_BATCH`). It is flushed at that boundary,
+at the end of the series, and — because a batch appends contiguous rows — whenever
+the grid skips points ahead of the earliest retained sample. The real call path is
+`FusedSeriesStream::poll_evaluated` → `RangeEvaluator::push` → `evaluate` → the
+`batched` branch → `flush_batch` → `BatchKernel` → `push_columns`.
+
+**On the output side** (`src/promql/src/extension_plan/fused_series.rs`), one
+`occupancy` scan now yields both the valid-position runs that `claim_label_set`
+needs for collision detection and the take-indices that `series_to_record_batch`
+needs for construction; previously each scanned separately. A series whose only
+field is a null-free dense float array is known dense from the array's null count
+and takes a path with no per-row work at all. Tag columns are built at the kept
+length, so a `take` no longer rebuilds a constant column.
 
 ## 2. Correctness
 
@@ -224,7 +306,7 @@ The fixture is one mito table, seeded once and reused by every arm:
 A strictly rising value is deliberate: `rate` over it needs **no** counter
 correction, so any cost it shows is the fixed per-window work plus whatever the
 kernel spends looking for resets that are not there. That is exactly the cost
-this round removes, and it means a regression cannot be blamed on reset
+the reset-index round removed, and it means a regression cannot be blamed on reset
 arithmetic. The index's correctness on real resets is covered by section 2, where
 the expected values can be computed by hand.
 
@@ -263,6 +345,11 @@ so 27 timed samples per arm per case. Every individual timing, with the load
 average beside it, is in the JSON records.
 
 ### 4.2 Compute: the evaluator alone
+
+**These are the reset-index round's numbers.** The batch path of section 1.4 changed the
+evaluator again; the `native_range_eval` group has not been re-run since, so the `after`
+column below is the state before batching, not the current one. The group that *was* re-run
+is `ingest` (section 4.5), and the end-to-end effect of batching is in section 4.6.
 
 `src/promql/benches/bench_range_fn.rs`, group `native_range_eval`. One series of
 2 880 samples at 15 s on a 7 201-point 1 s grid, one value field, evaluated by
@@ -308,6 +395,9 @@ Three things this table says:
 
 ### 4.3 End to end
 
+**This table is also from the reset-index round** (L = flag off, N = flag on with the
+rescan, F = flag on with the index); section 4.6 has this round's pair.
+
 Driver: `scripts/fused_series_bench.py` (seeding and one arm per invocation),
 `scripts/fused_series_bench_crossed.sh` (the interleaved order above),
 `scripts/fused_series_bench_summarize.py` (the tables below, from the raw JSON).
@@ -330,7 +420,7 @@ Row counts were identical across arms in every case (7 084 / 28 684 / 28 684 /
 
 Where the ratios land:
 
-- **`W` is the case this round was for.** The wide-window regression went from
+- **`W` is the case the reset-index round was for.** The wide-window regression went from
   0.43x to 0.90x; between N and F it is a 2.08x improvement. That is the whole
   arithmetic half of the regression.
 - **`S` and `G` do not improve** (0.93x and 0.88x against the ordinary plan),
@@ -347,7 +437,7 @@ whole-sweep attempt (0.88x) that predates the reset work. The 1.38x came from a
 whole-arm sequential sweep whose drift is visible as the 3.4x `control` swing in
 4.1, and it is withdrawn rather than explained away. The correct reading is that
 fusion has **not** been shown to beat the ordinary plan on any of these shapes
-yet; what this round shows is that it no longer loses badly on the wide-window
+yet; what the reset-index round showed is that it no longer loses badly on the wide-window
 one.
 
 ### 4.4 What the remaining gap is — an earlier claim, retracted
@@ -471,6 +561,11 @@ So the fused evaluator splits into **bookkeeping at 1.95x the entire ordinary pa
 bookkeeping is the shape: two `partition_point` searches per point per field, a six-field
 `FloatWindow` built per point, a `dyn` call per point, then `GridSeriesBuilder::push`.
 
+That is the number section 1.4 was written against, and it named the work: the two searches
+became monotone cursors, the per-point `dyn` call became one call per 512 points, and the
+row append became a column append. The result is section 4.6's 0.700 / 0.688 CPU ratio on
+`G` / `W` — from 1.95x bookkeeping to a shape that no longer dominates.
+
 **What an earlier revision of this section claimed, and why it was wrong.** It said the
 fused evaluator "with its bookkeeping reduced to zero would still cost 1.47x the ordinary
 path, so no per-point tuning can cross that line". That number came from the pre-fix
@@ -479,34 +574,38 @@ invocation. After the `i128 -> i64` fix the kernel reads 16.77 ns/point, which i
 `legacy_full`'s 18.93. The claim is withdrawn; the conclusion it supported — that
 bookkeeping is the remaining cost — is what the table above now shows directly.
 
-**What batching would buy, as an upper bound.** Evaluating `B` consecutive grid points per
-call keeps retention at O(range + B x step) and lets one forward scan replace `B`
-independent search pairs:
+**What batching was estimated to buy, and what it then measured.** This section
+originally carried this table as an estimate, made before the work was done:
 
 | `B` | estimated | vs `legacy_full` |
 | ---: | ---: | ---: |
-| 1 (today) | 386.3 us | 2.83x |
+| 1 (then) | 386.3 us | 2.83x |
 | 8 | 154.0 us | 1.13x |
 | 16 | 137.4 us | 1.01x |
 | 32 | 129.1 us | 0.95x |
 | unbounded | 120.8 us | 0.89x |
 
-**This is an upper bound and should be read as one.** It assumes all of the bookkeeping
-amortizes, but only the window-boundary searches can: the `FloatWindow` construction, the
-`dyn` call and `GridSeriesBuilder::push` remain per point, and their share of the 36.88 ns
-is not measured. It also leaves ingest untouched, which is the cost that dominates once a
-series is large (table below). The honest statement is that batching removes the largest
-component at the benchmark shape and lands near parity there — not that it delivers 0.89x,
-and not that it helps a big series.
+The estimate assumed that all of the bookkeeping amortizes, which only the searches can.
+It has since been built (section 1.4) and measured end to end (section 4.6): the CPU of the
+fused query falls to 0.778 / 0.700 / 0.688 of its parent on `S` / `G` / `W` and stays at
+1.000 on the coarse-step `C`. The estimate and the measurement are not the same quantity --
+evaluator-only at the benchmark shape against `legacy_full` versus a whole query against the
+previous commit -- so they should not be compared row by row. What can be said is that the
+predicted direction was right, that the win is real on grid-point-heavy shapes, and that on
+a coarse-step shape it is zero, which is what removing per-point work should do.
 
-**Not measured, and not needed to explain the gap.** The fused node materializes all four
-tag columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans
-every grid point twice per series (`claim_label_set` then `series_to_record_batch`). Both
-are real, both are smaller than the bookkeeping/kernel split above, and neither changes
-the conclusion.
+**Two smaller costs, since addressed.** The fused node materializes all four tag columns
+per row while `sum by (instance)` needs one, and `occupied_offsets` scanned every grid point
+twice per series (`claim_label_set`, then `series_to_record_batch`). The double scan is gone
+(section 1.4). The tag materialization is only partly addressed: the columns are now built
+at the kept length, but the columns themselves are not trimmed, because trimming them means
+changing the planner's output schema and the column references above it rather than
+skipping a column the schema declares.
 
-**Why it calls a scalar kernel 7 201 times, and why memory is not the reason.** The
-batching form already exists in this repo: `RangeArray` (`src/promql/src/range_array.rs`)
+**Why this report described a scalar kernel called 7 201 times, and why memory was not
+the reason.** That was the shape until section 1.4; `rate` and `increase` now take a batch,
+and every other function still runs one call per point. The batching form already exists in
+this repo: `RangeArray` (`src/promql/src/range_array.rs`)
 is a dictionary array whose keys are packed `(offset, length)` pairs into one shared child
 array, so 7 201 overlapping windows cost 7 201 keys rather than 7 201 windows.
 `RangeManipulate` builds it once per batch and the UDF runs over the batch.
@@ -531,33 +630,110 @@ around:
   `Replay::EveryPoint` replay one evaluated row at many indices.
 
 Both are the simplest uniform thing for those goals, and neither is about memory. The
-price is 36.9 ns per grid point of run-time bookkeeping, measured above.
+price was 36.9 ns per grid point of run-time bookkeeping, measured above; `rate` and
+`increase` no longer pay it now that they take a batch, and the others still do.
 
 **The cost that actually dominates at scale, which this report had been missing.** The
 evaluator re-materializes every sample: `FieldSamples` holds growable `Vec<i64>` and
 `Vec<f64>`, `push` appends each sample, and `advance` slides the window by `drain`ing the
-front. Ingest is therefore O(samples in range) of per-sample Rust work — a bounds check, a
-checked add, and two `Vec` pushes — and it is paid for *every* sample even though only
-grid points produce output.
+front. Ingest is therefore O(samples in range) of copying, and it is paid for *every*
+sample even though only grid points produce output. It used to be per-sample Rust work — a
+bounds check, a checked add, two `Vec` pushes; bulk appending turned it into a memcpy
+without removing it.
 
-For the benchmark shape (2 880 samples, 7 201 grid points) that is small: about 14 us of
-ingest against 265 us of point bookkeeping. For a series whose range holds 50 M samples it
-is the other way round, by two orders of magnitude:
+The `3-8 ns/sample` this section used to quote was an estimate, and it was wrong: the
+measured rate was 15.2 ns/sample. Appending in bulk then brought it down to what copying
+costs. Criterion group `ingest`, 200 000 samples, one invocation, with an untouched control:
 
-| series content in range | ingest at 3-8 ns/sample | point bookkeeping (12 h at 1 s) |
+| case | time | ns/sample |
+| --- | ---: | ---: |
+| `evaluator_push` (the current path) | 754.7 us | 3.77 |
+| `bulk_copy` (two `memcpy`s plus a stale check) | 816.3 us | 4.08 |
+| `read_only` (read every sample, copy nothing) | 87.0 us | 0.43 |
+
+So ingest now costs a copy and nothing more, and what remains above the read-only floor is
+that copy. For a series whose range holds 50 M samples, at the measured 3.77 ns/sample:
+
+| series content in range | ingest, measured rate | point bookkeeping (12 h at 1 s) |
 | --- | ---: | ---: |
 | 2 880 samples (benchmark) | 0.01 ms | 1.6 ms |
-| 50 M samples (800 MB) | **150-400 ms** | 1.6 ms |
+| 50 M samples (800 MB) | **190 ms** | 1.6 ms |
+
+The second row is arithmetic from the measured rate, not a measurement of a 50 M-sample
+series.
 
 The ordinary plan pays neither: the scan hands over Arrow arrays it does not copy, ranges
 are index arithmetic over those arrays, and the UDF reads the shared child. So legacy is
 cheaper on **both** axes — per output row and per input sample.
 
-That is why the batching estimate below tops out at parity rather than a win: it removes
-one of the two costs. Getting a genuine advantage would also require not re-materializing
-samples, which means keeping the incoming Arrow arrays and expressing windows as
-`(offset, length)` into them, only dropping whole chunks once no later window reaches
-them. That is a redesign of `RangeEvaluator`'s storage, not of `evaluate_row`.
+That is why the batching estimate above topped out at parity rather than a win: it removes
+one of the two costs. **Not re-materializing the samples is still not done**, and it remains
+the larger half at scale. It would mean keeping the incoming Arrow arrays and expressing
+retained samples as fragments plus offsets, dropping whole fragments once no later window
+reaches them — a redesign of `RangeEvaluator`'s storage, not of the kernel.
+
+**Its ceiling has now been measured**, which is why it was not attempted in the same round.
+`evaluator_push` already costs what `bulk_copy` costs (table above), so the entire saving
+available is `bulk_copy - read_only`, about 3.6 ns/sample. Applied to the four measured
+cases that is roughly 0.8% of `S`, 1.0% of `G`, 1.5% of `W` and 2.2% of `C` — every one of
+them below the 5-9% run-to-run drift this host shows. Those percentages are arithmetic from
+the measured per-sample rate and the per-case sample counts, not measurements. Against that
+ceiling, the change would rewrite the `&[i64]` / `&[f64]` contract that the batch kernel and
+the scalar fallback both depend on, and make a window span able to cross a fragment
+boundary.
+
+### 4.6 This round: batch windows against the previous commit
+
+Run `records-20261018T073117Z`. **P** is `611917eb0b1`, the parent commit, evaluating one
+grid point per call; **F** is `d42d14df06d`, the batch path of section 1.4. Both arms are
+flag-on builds, so both fuse: this compares two kernels on the fused path, not fusion
+against the ordinary plan. Crossed order per case, 3 rounds, 2 warmup + 9 timed per arm per
+round, 27 timed samples per arm per case.
+
+The two binaries are distinct: `extrapolated_rate_batch` appears 6 times in `F` and zero
+times in `P`, `WindowSpan` 3 times and zero times.
+
+| case | wall P → F (ms) | CPU P → F (ms) | wall F/P | CPU F/P | rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `S` | 20.8 → 19.1 | 90 → 70 | 0.918 | **0.778** | 7 084 |
+| `G` | 57.9 → 55.5 | 300 → 210 | 0.958 | **0.700** | 28 684 |
+| `W` | 58.5 → 54.1 | 320 → 220 | 0.924 | **0.688** | 28 684 |
+| `C` | 25.6 → 25.7 | 50 → 50 | 1.003 | **1.000** | 480 |
+| `control` | 53.8 → 56.0 | 340 → 330 | 1.040 | 0.971 | 28 744 |
+
+Medians over all 27 timed samples per arm. `control` is `max_over_time`, which never fuses
+and which this change does not touch; its 0.971 CPU / 1.040 wall is the drift band, and the
+`S`/`G`/`W` CPU ratios sit well below it.
+
+**Correctness.** All 15 paired rounds compared identical: schema column names and types,
+every row's full label tuple, every timestamp, the row count, then every value. No round
+differed.
+
+**Fusion.** Both arms log exactly one fused selection per query on `S`/`G`/`W`/`C` and zero
+on `control`, as required, so the comparison never silently measured the ordinary plan.
+
+**`C` is the negative control this round needed.** It is the same 120-minute query as `G`
+and `W` at a 1-minute step: 120 grid points per series instead of 7 171, so 48 000 kernel
+evaluations instead of 2 868 400, against the same ~200 000 ingested samples. Its CPU ratio
+is 1.000. The gain therefore tracks grid points, which is what removing per-point work
+should look like — and it is direct evidence that the win is not an artefact of the
+comparison.
+
+**Two caveats, both material.**
+
+1. **Wall clock is not the size of the effect.** CPU falls 22-31% on the grid-heavy shapes
+   while wall falls only 4-8%: the query is not purely CPU-bound, so 90-100 ms of CPU
+   surfaces as 2-4 ms of wall. Quoting the wall figure as "the speedup" would understate
+   the change by roughly a factor of four. Wall also has real outliers here — `control`'s
+   maximum is 232.5 ms against a 48.2 ms minimum in the same arm — which is why CPU is the
+   primary statistic.
+2. **The CPU resolution is 10 ms** (`SC_CLK_TCK` = 100). `S` is 7 ticks against 9, so its
+   ratio is coarse. `G` (21 vs 30) and `W` (22 vs 32) carry the same ratio on three times
+   the ticks and are the trustworthy rows.
+
+**What this does not say.** It does not say the fused path now beats the ordinary plan:
+the arms here are both fused. Sections 4.3 and 5 still hold — no comparison in this report
+shows fusion ahead of the ordinary plan at fine steps with narrow windows.
 
 ## 5. What is not shown
 
@@ -566,19 +742,19 @@ them. That is a redesign of `RangeEvaluator`'s storage, not of `evaluate_row`.
   against the ordinary plan at fine steps with narrow windows. There is no
   evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
-- **The remaining cost is located but not fixed.** Section 4.5 shows the fused evaluator
-  costs 2.83x the ordinary plan's range-function work on identical input, that this
-  accounts for the whole end-to-end regression, and that the ratio splits into a kernel
-  already at 0.89x and per-point bookkeeping at 1.95x.
-- **The evaluator pays twice, and only the smaller half was addressed here.** It pays
-  36.9 ns per *grid point* in bookkeeping and, separately, per-sample Rust work to copy
-  every input sample into growable `Vec`s so the window can slide by `drain`ing the front.
-  At the benchmark shape the first dominates (265 us vs 14 us); for a range holding 50 M
-  samples the second does, by two orders of magnitude (150-400 ms vs 1.6 ms). The ordinary
-  plan avoids both — it copies no samples and evaluates windows as index arithmetic over
-  one shared array. So batching grid points, measured here as an upper bound of parity,
-  fixes the smaller half at scale and none of the larger one.
-- **The output path was not measured.** The node targets 4 096 rows per batch
+- **The per-point bookkeeping is gone for two functions only.** `rate` and `increase` take
+  the batch path; `delta`, `irate`, `*_over_time` and the rest still call the boxed kernel
+  once per grid point and gained nothing this round. Section 4.5's 36.9 ns-per-point figure
+  was measured on the per-point form and has not been re-measured for the others.
+- **The evaluator still pays per input sample.** Every sample is copied into growable
+  `Vec`s so that the window can slide by `drain`ing the front, at a measured 3.77 ns/sample.
+  That is now a memcpy and nothing more, but a memcpy is still O(samples in range) where the
+  ordinary plan copies nothing and does index arithmetic over one shared array. The ceiling
+  on removing it is measured (section 4.5): about 3.6 ns/sample, i.e. 0.8-2.2% on the four
+  measured cases, all inside the drift band. So unlike batching, this one is *not* expected
+  to show up end to end at these shapes, and at a range holding 50 M samples either it or
+  the copy stays in place.
+- **The output path is still not measured.** The node targets 4 096 rows per batch
   (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
   series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
   Those numbers are arithmetic from the configuration, not a measurement: no
@@ -604,6 +780,15 @@ them. That is a redesign of `RangeEvaluator`'s storage, not of `evaluate_row`.
   (including across chunk boundaries and window edges); the 1 152 000-row
   benchmark fixture has none, so no end-to-end timing includes real reset
   traffic.
+- **The batch path's own unit of work was not measured directly.** Section 4.6
+  measures whole queries before and after; there is no evaluator-only criterion number for
+  the batch form, so the per-point bookkeeping figure (36.9 ns) still describes the form
+  that `rate` and `increase` no longer use.
+- **Nothing here shows fusion beating the ordinary plan.** Every comparison in section 4.6
+  is between two fused builds. Sections 4.3 and 5's conclusion — 0.88x-0.93x against the
+  ordinary plan at fine steps with narrow windows — is unchanged, because the change that
+  would be needed to revisit it (not copying the input samples) is measured at 0.8-2.2% and
+  was therefore not done.
 
 ## 6. Reproduction
 
@@ -629,6 +814,23 @@ python3 scripts/fused_series_bench_summarize.py records
 
 The compute benchmark is a normal criterion group in the promql package:
 `cargo bench -p promql --profile nightly -- bench_main native_range_eval`.
+Section 4.5's ingest table comes from the same binary's `ingest` group.
+
+Section 4.6 compares two commits on the fused path rather than fusion against the ordinary
+plan. Both arms are `--arm on`; the pair is driven interleaved with the order rotated per
+round, and each round's two result sets are compared before the next round runs, so an arm
+that disagrees stops the sweep. `--warmup 2 --iterations 9` per arm per round.
+
+Two traps specific to that comparison:
+
+- **Both arms must have the change verified, not assumed.** A rebuild that silently reused
+  the previous binary would produce a clean "no difference". `strings <bin> | grep
+  extrapolated_rate_batch` returning nothing on the parent commit and 6 hits on this one is
+  what established that the two files differ.
+- **The summariser had the ratio inverted on first use**: it computed `arms[1]/arms[0]` over
+  a sorted arm list, i.e. P/F, while labelling the column "F / P". The numbers in section
+  4.6 come from the corrected version, which names the two arms explicitly instead of
+  relying on listing order. The raw records were unaffected either way.
 
 Traps this driver encodes, each of which produced a wrong measurement first:
 
