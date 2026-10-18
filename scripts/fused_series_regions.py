@@ -41,8 +41,8 @@ both binaries' medians side by side and the ratio `compare-bin / bin`, and the s
 rounds is the median of those per-round ratios and their range. Every ratio divides two medians
 from the same round; a ratio of a value from one round against a value from another round is the
 mistake the report's section 4.8 corrects, so none is printed. The two binaries' query results are
-also compared value by value through `fused_series_bench.compare_pair`, with `bin` as the
-baseline.
+also compared series by series and sample by sample through
+`fused_series_bench.compare_pair`, with `bin` as the baseline.
 
 `--self-test` checks the paired-ratio arithmetic with no server, for the same reason
 `fused_profile_summarize.py` carries one.
@@ -365,14 +365,17 @@ def run_compare(args, case, statement):
     print_ratio_summary(per_round, summary)
 
     # `compare_pair` stops with the first difference it finds, naming it; returning means the
-    # two binaries agree on schema, labels, timestamps, row count and every value.
-    labels, times, values = bench.compare_pair(results["bin"], results["compare-bin"])
+    # two binaries agree on schema, row count, the set of series and every sample of each one.
+    labels, times, values, same_order = bench.compare_pair(
+        results["bin"], results["compare-bin"]
+    )
     print()
     print(
-        f"same rows and values on both binaries: case {args.case}, "
+        f"same samples on both binaries: case {args.case}, "
         f"{len(results['bin']['schema'])} columns "
         f"({len(labels)} label(s), {len(times)} timestamp(s), {len(values)} value(s)), "
-        f"{results['bin']['row_count']} rows"
+        f"{results['bin']['row_count']} rows, "
+        + ("same row order" if same_order else "different cross-series row order")
     )
 
     if args.json:

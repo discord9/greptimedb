@@ -30,8 +30,8 @@ describes, and checks the three facts that distinguish them:
 
 A plan is not a result, so each arm's query is also run and every arm's complete answer
 is compared with the ordinary plan's through `fused_series_bench.compare_pair`: schema
-names and types, label tuple, timestamps, row count, then every value at a relative
-tolerance of `1e-9` with NaN and infinities handled apart.
+names and types, row count, the set of label tuples, then each series' own timestamps and
+values at a relative tolerance of `1e-9` with NaN and infinities handled apart.
 
     scripts/fused_series_partial_plan.py --data-home ~/.cache/fused-scale/data-seed \\
         --bin PATH --partial-sum-step env

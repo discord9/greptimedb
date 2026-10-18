@@ -34,11 +34,13 @@ Everything else matches `fused_series_bench.py`: same server startup, same `/v1/
 crossed arm order, same CPU accounting from `/proc/<pid>/stat`, and the same check that a
 flag-off arm logs no fused selection while a flag-on arm logs one -- and, for the `sum` arm,
 that the selection it logs is the `partial sum` one. Each arm runs one dedicated correctness
-query before its timed iterations, and every pair of arms is compared row by row and value by
-value through `fused_series_bench.compare_pair`: a case whose arms disagree on schema, labels,
-timestamps, row count or any value stops the run, because that is a correctness bug and not a
-measurement. Comparing row counts alone, as this script used to, cannot see it -- a wrong value
-in the right number of rows passes.
+query before its timed iterations, and every pair of arms is compared series by series and
+sample by sample through `fused_series_bench.compare_pair`: a case whose arms disagree on
+schema, row count, the set of series, or any timestamp or value stops the run, because that is a
+correctness bug and not a measurement. Comparing row counts alone, as this script used to,
+cannot see it -- a wrong value in the right number of rows passes. Cross-series row order is not
+compared, because a case with no aggregation above the fused node has no `Sort` in its plan and
+neither arm's order is guaranteed.
 
     scripts/fused_series_scale.py --data-home DIR --bin PATH --out records/x.json \\
         --rounds 3 --warmup 2 --iterations 9 --arms off,on,sum
@@ -359,10 +361,10 @@ def check_arms(label, statement, arms):
                 f"case {label}: the arms disagree on row count: "
                 + ", ".join(f"{counts[arm]} ({arm})" for arm in canonical)
             )
-    # Order-preserving, field by field: schema, labels, timestamps, row count, values.
-    # Flag-off is the baseline because every arm must return the ordinary plan's answer.
-    # A row count that matches says nothing about the numbers inside the rows, which is what
-    # this script used to skip: `rows["off"] != rows["on"]` and nothing else.
+    # Sample by sample, series by series: schema, row count, the set of series, then every
+    # timestamp and value of each. Flag-off is the baseline because every arm must return the
+    # ordinary plan's answer. A row count that matches says nothing about the numbers inside the
+    # rows, which is what this script used to skip: `rows["off"] != rows["on"]` and nothing else.
     for index, base in enumerate(canonical):
         for other in canonical[index + 1:]:
             bench.compare_pair(arms[base]["result"], arms[other]["result"])

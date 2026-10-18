@@ -49,8 +49,8 @@ What this script proves, and what it cannot:
   held to an explicit fused-selection count -- one on the flag-on arm for a `rate` case,
   zero on flag-off, and zero for the deliberately non-fusing `max_over_time` control -- by
   counting the `Fused series selection succeeded` lines the server logged during that query
-  alone. The two arms' correctness-pass results are then compared row by row, value by
-  value, through `fused_series_bench.compare_pair`, and a shape whose arms disagree stops
+  alone. The two arms' correctness-pass results are then compared series by series, sample
+  by sample, through `fused_series_bench.compare_pair`, and a shape whose arms disagree stops
   the run: that is a correctness bug, not a measurement. A case that returns no rows, or a
   different number of rows on the two arms, also stops the run -- an empty result has a
   valid schema and a normal-looking time and would otherwise be reported as a measurement
@@ -493,8 +493,10 @@ def check_arms(case, results):
             f"case {case['name']}: the arms disagree on row count: "
             f"{counts['off']} (off) vs {counts['on']} (on)"
         )
-    # Order-preserving, field by field: schema, labels, timestamps, row count, values.
-    # Flag-off is the baseline because both arms must return the ordinary plan's answer.
+    # Sample by sample, series by series: schema, row count, the set of series, then every
+    # timestamp and value of each. Cross-series row order is not a criterion -- see
+    # `bench.compare_pair`. Flag-off is the baseline because both arms must return the ordinary
+    # plan's answer.
     bench.compare_pair(results["off"]["result"], results["on"]["result"])
 
 

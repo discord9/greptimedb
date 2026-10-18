@@ -747,8 +747,37 @@ def first_difference(left_rows, right_rows, columns):
     return None
 
 
+def series_of(rows, labels, times, values):
+    """Rows grouped by label tuple, each group ordered by its timestamps.
+
+    The group key is the whole label tuple, so two label sets are never mixed. Ordering each
+    group by timestamp is what lets two arms whose rows are interleaved differently still be
+    compared sample by sample: the sample sequence of one series is a property of the answer,
+    while the order the series themselves arrive in is not (see `compare_pair`).
+    """
+    grouped = {}
+    for row in rows:
+        key = tuple(row[column] for column in labels)
+        grouped.setdefault(key, []).append(row)
+    for key, group in grouped.items():
+        group.sort(key=lambda row: tuple(row[column] for column in times))
+    return grouped
+
+
 def compare_pair(baseline, other):
-    """Checks `other` against `baseline`, in order, stopping at the first difference."""
+    """Checks `other` against `baseline` sample by sample, stopping at the first difference.
+
+    Compared, in this order: the schema, the row count, the set of series and how many rows each
+    one has, then every series' own timestamp/value sequence. Cross-series row order is
+    deliberately *not* a criterion. A query with no aggregation above the fused node has no
+    `Sort` in its plan -- `FilterExec -> FusedSeriesExec -> SeriesScanExec`, twenty partitions
+    merged -- so the order its series arrive in is not guaranteed to either arm, and demanding
+    it would fail two correct answers. What every PromQL answer does guarantee is which samples
+    each series holds, and that is what is checked.
+
+    Whether the full row order also matched is reported rather than required, so a difference in
+    it is recorded instead of hidden.
+    """
     case = baseline["case"]
     left, right = describe(baseline), describe(other)
 
@@ -773,49 +802,60 @@ def compare_pair(baseline, other):
             f"({[column['data_type'] for column in left_schema]}); nothing to compare"
         )
 
-    # 2. labels: the full label tuple of every row.
-    diff = first_difference(baseline["rows"], other["rows"], labels)
-    if diff:
-        index, left_cells, right_cells = diff
-        raise SystemExit(
-            f"case {case}: labels differ at row {index}: {left} has {left_cells}, "
-            f"{right} has {right_cells}"
-        )
-
-    # 3. timestamps.
-    diff = first_difference(baseline["rows"], other["rows"], times)
-    if diff:
-        index, left_cells, right_cells = diff
-        raise SystemExit(
-            f"case {case}: timestamps differ at row {index}: {left} has {left_cells}, "
-            f"{right} has {right_cells}"
-        )
-
-    # 4. row count, as its own failure rather than a truncated zip.
+    # 2. row count, as its own failure rather than a truncated comparison.
     if len(baseline["rows"]) != len(other["rows"]):
         raise SystemExit(
             f"case {case}: row count differs: {left} has {len(baseline['rows'])} rows, "
             f"{right} has {len(other['rows'])}"
         )
 
-    # 5. values.
-    for index, left_row in enumerate(baseline["rows"]):
-        right_row = other["rows"][index]
-        for column in values:
-            reason = value_mismatch(left_row[column], right_row[column])
-            if reason:
-                where = ", ".join(
-                    f"{left_schema[label]['name']}={left_row[label]!r}" for label in labels
-                )
-                stamp = ", ".join(
-                    f"{left_schema[stamp_column]['name']}={left_row[stamp_column]}"
-                    for stamp_column in times
-                )
+    # 3. the same series, each with the same number of rows. A series present on one side only,
+    #    or holding a different number of samples, is a result difference and not an ordering one.
+    left_series = series_of(baseline["rows"], labels, times, values)
+    right_series = series_of(other["rows"], labels, times, values)
+    if len(left_series) != len(right_series):
+        raise SystemExit(
+            f"case {case}: series count differs: {left} has {len(left_series)} series, "
+            f"{right} has {len(right_series)}"
+        )
+    for key in sorted(left_series, key=repr):
+        if key not in right_series:
+            raise SystemExit(
+                f"case {case}: series {key} is in {left} but not in {right}"
+            )
+        if len(left_series[key]) != len(right_series[key]):
+            raise SystemExit(
+                f"case {case}: series {key} has {len(left_series[key])} rows in {left} and "
+                f"{len(right_series[key])} in {right}"
+            )
+
+    # 4. every series' own samples: the timestamp sequence, then the values.
+    for key in sorted(left_series, key=repr):
+        left_rows, right_rows = left_series[key], right_series[key]
+        for position, (left_row, right_row) in enumerate(zip(left_rows, right_rows)):
+            left_stamp = tuple(left_row[column] for column in times)
+            right_stamp = tuple(right_row[column] for column in times)
+            if left_stamp != right_stamp:
                 raise SystemExit(
-                    f"case {case}: value differs at row {index} ({where}; {stamp}) in column "
-                    f"{left_schema[column]['name']!r}: {left} has {reason}"
+                    f"case {case}: series {key} differs at sample {position}: "
+                    f"{left} has {left_stamp}, {right} has {right_stamp}"
                 )
-    return labels, times, values
+            for column in values:
+                reason = value_mismatch(left_row[column], right_row[column])
+                if reason:
+                    raise SystemExit(
+                        f"case {case}: series {key} differs at sample {position} "
+                        f"(timestamp {left_stamp}) in column "
+                        f"{left_schema[column]['name']!r}: {left} has {reason}"
+                    )
+
+    # 5. Informational: did the rows also arrive in the same order? Not a criterion, see above.
+    same_order = all(
+        tuple(left_row[column] for column in labels + times)
+        == tuple(right_row[column] for column in labels + times)
+        for left_row, right_row in zip(baseline["rows"], other["rows"])
+    )
+    return labels, times, values, same_order
 
 
 def compare(args):
@@ -849,11 +889,12 @@ def compare(args):
     arms = ", ".join(describe(result) for result in results)
     log(f"case {cases[0]}: {len(results)} arm(s) {arms}, {len(baseline['rows'])} rows")
     for other in results[1:]:
-        labels, times, values = compare_pair(baseline, other)
+        labels, times, values, same_order = compare_pair(baseline, other)
+        order = "same row order" if same_order else "different cross-series row order"
         log(
             f"  identical to {describe(baseline)}: {len(baseline['schema'])} columns "
             f"({len(labels)} label(s), {len(times)} timestamp(s), {len(values)} value(s)), "
-            f"{len(baseline['rows'])} rows"
+            f"{len(baseline['rows'])} rows, {order}"
         )
     log(
         f"ok: case {cases[0]} is identical on {len(results)} arm(s): "
@@ -1068,6 +1109,115 @@ def run(args):
         log(f"wrote {args.out}")
 
 
+def self_test():
+    """Checks the comparator against a serverless fixture: what it must catch, and must not.
+
+    The comparator was relaxed once -- cross-series row order stopped being a criterion, because
+    a query with no aggregation above the fused node has no `Sort` in its plan. A relaxation with
+    no test is indistinguishable from a comparator that stopped comparing, so each property the
+    comparison is supposed to have is asserted here: reordering is tolerated, and a changed value,
+    a changed timestamp, a dropped sample, a dropped series and a changed label are not.
+    """
+    schema = [
+        {"name": "ts", "data_type": "Timestamp(Millisecond, None)"},
+        {"name": "value", "data_type": "Float64"},
+        {"name": "host", "data_type": "String"},
+    ]
+
+    def result(rows):
+        return {"case": "selftest", "arm": "x", "stem": "selftest-x", "schema": schema,
+                "rows": rows}
+
+    def row(stamp, value, host):
+        return [stamp, value, host]
+
+    base_rows = [
+        row(1000, 1.0, "a"), row(2000, 2.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "b"),
+    ]
+    baseline = result(base_rows)
+
+    def expect_ok(name, rows, same_order):
+        _, _, _, observed = compare_pair(baseline, result(rows))
+        if observed != same_order:
+            raise SystemExit(
+                f"selftest {name}: reported row order {observed}, expected {same_order}"
+            )
+
+    def expect_fail(name, rows, want):
+        try:
+            compare_pair(baseline, result(rows))
+        except SystemExit as failure:
+            if want not in str(failure):
+                raise SystemExit(f"selftest {name}: failed for the wrong reason: {failure}")
+            return
+        raise SystemExit(f"selftest {name}: the comparator accepted it")
+
+    # Reordering the two series, both fully interleaved and in one block, is not a difference.
+    expect_ok("interleaved", [
+        row(1000, 1.0, "a"), row(1000, 10.0, "b"), row(2000, 2.0, "a"),
+        row(2000, 20.0, "b"), row(3000, 3.0, "a"), row(3000, 30.0, "b"),
+    ], False)
+    # A series arriving last instead of first is not a difference either.
+    expect_ok("series reordered", base_rows[3:] + base_rows[:3], False)
+    # Identical input, identical order: reported as such, not as a difference.
+    expect_ok("unchanged", list(base_rows), True)
+
+    # Everything below is a real difference and must still be caught.
+    expect_fail("value changed", [
+        row(1000, 1.0, "a"), row(2000, 99.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "b"),
+    ], "differs at sample 1")
+    expect_fail("timestamp changed", [
+        row(1000, 1.0, "a"), row(2500, 2.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "b"),
+    ], "differs at sample 1")
+    # A dropped sample changes the row count, which is reported before anything else.
+    expect_fail("sample dropped", [
+        row(1000, 1.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "b"),
+    ], "row count differs")
+    # A sample moved from one series to another keeps the total, so only the per-series counts
+    # can see it.
+    expect_fail("sample moved between series", [
+        row(1000, 1.0, "a"), row(2000, 2.0, "a"), row(3000, 3.0, "a"), row(4000, 4.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"),
+    ], "has 3 rows in")
+    # Dropping a series changes the row count, which is reported before the series set.
+    expect_fail("series dropped", base_rows[:3], "row count differs")
+    # One series split in two: same row count, but a different set of series.
+    expect_fail("series split", [
+        row(1000, 1.0, "a"), row(2000, 2.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "c"),
+    ], "series count differs")
+    expect_fail("label changed", [
+        row(1000, 1.0, "a"), row(2000, 2.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "c"), row(2000, 20.0, "c"), row(3000, 30.0, "c"),
+    ], "but not in")
+    # A duplicate in place of a distinct sample: same row count, same series, still a difference.
+    expect_fail("duplicate instead of a sample", [
+        row(1000, 1.0, "a"), row(1000, 1.0, "a"), row(3000, 3.0, "a"),
+        row(1000, 10.0, "b"), row(2000, 20.0, "b"), row(3000, 30.0, "b"),
+    ], "differs at sample 1")
+    # Schema is still compared before anything else.
+    other = result(list(base_rows))
+    other["schema"] = [
+        {"name": "ts", "data_type": "Timestamp(Millisecond, None)"},
+        {"name": "value", "data_type": "Float64"},
+        {"name": "host", "data_type": "Utf8"},
+    ]
+    try:
+        compare_pair(baseline, other)
+    except SystemExit as failure:
+        if "schema differs" not in str(failure):
+            raise SystemExit(f"selftest schema: failed for the wrong reason: {failure}")
+    else:
+        raise SystemExit("selftest schema: the comparator accepted a changed schema")
+
+    print("selftest: reordering tolerated; value, timestamp, dropped sample, dropped series, "
+          "changed label, duplicate and schema differences all still caught")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1124,6 +1274,8 @@ def main():
     )
     run_parser.set_defaults(func=run)
 
+    sub.add_parser("selftest", help="check the comparator with no server")
+
     compare_parser = sub.add_parser(
         "compare", help="check saved results of one case across arms"
     )
@@ -1134,6 +1286,8 @@ def main():
     compare_parser.set_defaults(func=compare)
 
     args = parser.parse_args()
+    if args.command == "selftest":
+        return self_test()
     if args.command == "run":
         if not args.results_stem:
             args.results_stem = os.path.basename(args.out)
