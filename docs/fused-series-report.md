@@ -1020,15 +1020,15 @@ to 0.4% — the wrong instrument, and the reason it was replaced is recorded her
 in a commit message.
 
 **What this implies for a fused partial aggregate.** Take `G4`, the shape PromQL users actually
-write: the fused arm is 170 ms of CPU. Section 4.8's replicated split puts 43% of the
-grid-dependent CPU in the kernel and 29% in the aggregate's generic hash path with 1% in `emit`,
-so collapsing the intermediate rows inside the fused node could address something under a third
-of that work — the fused arm would land near 145 ms rather than the 120 ms a single un-replicated
-pass suggested. That is still a real saving on top of the 32% fusion already wins, but it is
-smaller than the kernel work it competes with for priority. The shapes where it
-would do nothing are exactly the shapes where fusion already does nothing: at 1:1 there is no
-redundancy to collapse, and `G400`'s 2.28 s is the cost of producing 2.87 M output rows that the
-user asked for. That is why the next section does not propose it as a general improvement.
+write: the fused arm is 173.0 ms of CPU, of which the aggregate's generic hash path is 38.9 ms
+(22.5%) and `emit` 1.8 ms. Collapsing the intermediate rows inside the fused node could
+therefore address at most 40.7 ms of that 173.0 — the fused arm would land near 132 ms, not the
+120 ms a single un-replicated pass implied. That is a real saving on top of the 32% fusion
+already wins, but it is a fifth of the query rather than a third, and the kernel (58.4 ms, 34%)
+is the larger target. The shapes where it would do nothing are exactly the shapes where fusion
+already does nothing: at 1:1 there is no redundancy to collapse, and `G400`'s 2.28 s is the cost
+of producing 2.87 M output rows that the user asked for. That is why this section does not
+propose it as a general improvement, only as the second item after the kernel.
 
 ## 5. What is not shown
 
