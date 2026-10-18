@@ -83,7 +83,7 @@ def executed_operators(server, case):
                 stages.append(json.loads(row[index]))
             except (TypeError, json.JSONDecodeError):
                 # A stage whose plan is not JSON (or is null) contributes no operators; the
-                # emptiness check below is what turns a fully unparseable answer into an error.
+                # emptiness check below is what turns an answer that will not parse into an error.
                 continue
     found = []
 
