@@ -35,6 +35,17 @@
 //! around the new child. Two or more candidate subtrees or candidate nodes are rejected, because
 //! phase 1 fuses exactly one.
 //!
+//! A `sum` above the fused subtree has one more swap available. DataFusion plans one logical
+//! aggregate as `Partial -> Repartition -> Final`, and the partial one groups by the evaluation
+//! timestamp plus the `by(...)` labels, so each of its groups is exactly one `(label set, grid
+//! index)` -- the unit the fused node already produces. [`partial_aggregate_above`] therefore
+//! finds that partial aggregate and [`select_partial_sum`] replaces *it*, handing the node the
+//! aggregate's own `SUM` so it accumulates per group instead of emitting every series row. It is
+//! admitted only when every gate on the aggregate and on the columns it reads holds; anything
+//! else keeps the evaluated-only fusion. The step is bench scaffolding behind
+//! `GREPTIME_FUSED_PARTIAL_SUM` (see [`partial_sum_enabled`]) and disappears once the formal
+//! planner constructs the same node configuration directly.
+//!
 //! Every gate failure returns `Ok(None)`, which means "run the ordinary plan". Nothing here may
 //! turn an unrecognized shape into a query error: the ordinary plan is always a correct answer, so
 //! an unfamiliar shape is only ever a fallback.
@@ -44,7 +55,11 @@ use std::sync::Arc;
 use api::v1::SemanticType;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::datasource::DefaultTableSource;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysicalColumn, IsNotNullExpr};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -57,7 +72,7 @@ use datafusion_expr::logical_plan::{SubqueryAlias, TableScan};
 use datafusion_expr::{Expr, Extension, LogicalPlan, Operator};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::series::time::{EvalGrid, GridSpec};
-use promql::extension_plan::fused_series::FusedSeriesExec;
+use promql::extension_plan::fused_series::{FusedSeriesExec, PartialSum};
 use promql::extension_plan::{
     RangeManipulate, RangeManipulateExec, SeriesDivide, SeriesDivideExec, SeriesNormalize,
     SeriesNormalizeExec,
@@ -85,7 +100,15 @@ pub(crate) fn try_select_fused(
     let Some((scan, scan_cooperative)) = fused_scan(&target) else {
         return Ok(None);
     };
-    let fused = match shape.build(&scan, scan_cooperative) {
+    // The partial-`SUM` arm is tried first and falls back to the evaluated-only swap, so a
+    // rejected partial shape is a smaller fusion rather than an error.
+    if partial_sum_enabled()
+        && let Some(replaced) =
+            select_partial_sum(original, &shape, &target, &scan, scan_cooperative)
+    {
+        return Ok(Some(replaced));
+    }
+    let fused = match shape.build(&scan, scan_cooperative, None) {
         Ok(fused) => fused,
         Err(reason) => {
             common_telemetry::debug!("Fused series selection fell back: {reason}");
@@ -106,6 +129,280 @@ pub(crate) fn try_select_fused(
         shape.scan.table_name
     );
     Ok(Some(replaced))
+}
+
+/// The bench switch that selects the partial-`SUM` arm, read once per selection.
+///
+/// This is scaffolding, not a user option: it disappears when the formal planner constructs the
+/// same [`PartialSum`] directly, so it is not a `QueryOptions` field, not a `SET` parameter and
+/// not in any `config/*.toml`. An absent variable, or any value other than `0`, tries the partial
+/// step; `0` keeps the evaluated-only fusion byte for byte, which is what the bench's `on` arm
+/// measures.
+const PARTIAL_SUM_ENV: &str = "GREPTIME_FUSED_PARTIAL_SUM";
+
+/// Whether the partial-`SUM` step is enabled for this query.
+fn partial_sum_enabled() -> bool {
+    partial_sum_enabled_for(std::env::var(PARTIAL_SUM_ENV).ok().as_deref())
+}
+
+/// The three-arm table [`partial_sum_enabled`] implements, as a predicate over the value read.
+fn partial_sum_enabled_for(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// One partial `SUM` above a fused subtree, with everything its swap needs.
+#[derive(Clone)]
+struct PartialAggregate {
+    /// The aggregate exactly as the plan holds it.
+    ///
+    /// Kept as the plan's own `Arc<dyn ExecutionPlan>` rather than as an `Arc<AggregateExec>`:
+    /// [`rebuild`] swaps by pointer identity, and re-wrapping the downcast value in a new `Arc`
+    /// would be a different allocation that no ancestor points at, so the swap would silently do
+    /// nothing.
+    node: Arc<dyn ExecutionPlan>,
+    /// The `SUM` the fused node takes over: the aggregate's `aggr_expr()[0]`.
+    sum: Arc<AggregateFunctionExpr>,
+    /// The sum argument's column index, which is also its position in the fused node's evaluated
+    /// output.
+    value_column: usize,
+    /// The group columns' indices, in the aggregate's own group order.
+    group_columns: Vec<usize>,
+}
+
+/// Replaces the partial aggregate above `target` with the fused node, or `None` to fall back.
+///
+/// The node is built with the aggregate's own `SUM` and schema, so the state it emits is
+/// DataFusion's and the final aggregate above it consumes it unchanged. Every rejection is a
+/// `None`: nothing here may turn an unadmitted shape into a query error.
+fn select_partial_sum(
+    original: &Arc<dyn ExecutionPlan>,
+    shape: &FusedShape,
+    target: &Arc<dyn ExecutionPlan>,
+    scan: &Arc<RegionScanExec>,
+    scan_cooperative: bool,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let Some(owner) = partial_aggregate_above(original, target) else {
+        common_telemetry::debug!(
+            "Fused series partial sum fell back: no partial aggregate above the fused subtree"
+        );
+        return None;
+    };
+    // The partial node is constructed from the aggregate's own schema and `SUM`, never rebuilt
+    // here: its output schema is the schema the final aggregate above it already reads.
+    let partial = match PartialSum::try_new(
+        owner.value_column,
+        owner.group_columns,
+        Arc::clone(&owner.sum),
+        owner.node.schema(),
+    ) {
+        Ok(partial) => partial,
+        Err(error) => {
+            common_telemetry::debug!(
+                "Fused series partial sum fell back: the fused node refused the partial sum: \
+                 {error}"
+            );
+            return None;
+        }
+    };
+    // The node's own gates cover the rest of the contract: the raw-series leaf must read exactly
+    // the one field the shape folds (a second field would let a grid point be occupied by a
+    // value the summed field does not have), and every range function the shape already matched
+    // is admitted unchanged.
+    let fused = match shape.build(scan, scan_cooperative, Some(partial)) {
+        Ok(fused) => fused,
+        Err(reason) => {
+            common_telemetry::debug!("Fused series partial sum fell back: {reason}");
+            return None;
+        }
+    };
+    // The aggregate is what is replaced: the filter, the projection and the fold below it are
+    // swallowed by the node, while the `RepartitionExec` and the `FinalPartitioned` aggregate
+    // above it are rebuilt with their own configuration.
+    let replaced = rebuild(original, &owner.node, &fused)?;
+    // A replacement that changes the caller's output is not an equivalent plan.
+    if replaced.schema() != original.schema() {
+        common_telemetry::debug!(
+            "Fused series partial sum fell back: the rebuilt plan changes the output schema"
+        );
+        return None;
+    }
+    common_telemetry::debug!(
+        "Fused series selection succeeded: partial sum of {:?} over {}",
+        shape.function,
+        shape.scan.table_name
+    );
+    Some(replaced)
+}
+
+/// Returns the one partial aggregate above `target` that the fused node can absorb.
+fn partial_aggregate_above(
+    physical: &Arc<dyn ExecutionPlan>,
+    target: &Arc<dyn ExecutionPlan>,
+) -> Option<PartialAggregate> {
+    let mut found = Vec::new();
+    collect_partial_aggregates(physical, target, &mut found);
+    // No aggregate above the subtree, or several that each look right: phase 1 replaces one.
+    let [owner] = found.as_slice() else {
+        return None;
+    };
+    Some(owner.clone())
+}
+
+/// Walks the whole plan and collects every partial aggregate that passes every gate.
+fn collect_partial_aggregates(
+    node: &Arc<dyn ExecutionPlan>,
+    target: &Arc<dyn ExecutionPlan>,
+    out: &mut Vec<PartialAggregate>,
+) {
+    if let Some(owner) = partial_aggregate(node, target) {
+        out.push(owner);
+        return;
+    }
+    for child in node.children() {
+        collect_partial_aggregates(child, target, out);
+    }
+}
+
+/// Applies the admission gates to one node above `target`.
+///
+/// The gates are numbered the way the design note numbers them. Every one of them is a rejection
+/// and never an error, because the ordinary plan is always a correct answer.
+fn partial_aggregate(
+    node: &Arc<dyn ExecutionPlan>,
+    target: &Arc<dyn ExecutionPlan>,
+) -> Option<PartialAggregate> {
+    // Gate 1: a partial aggregate. `Final`/`FinalPartitioned` consume state instead of producing
+    // it, and `Single` is not the stage that is split around a repartition.
+    let any = node.as_ref() as &dyn std::any::Any;
+    let aggregate = any.downcast_ref::<AggregateExec>()?;
+    if !matches!(aggregate.mode(), AggregateMode::Partial) {
+        return None;
+    }
+    // Gate 2: no grouping sets. `CUBE`/`ROLLUP` expand one group into several rows, which the
+    // node's fixed group columns cannot express.
+    if aggregate.group_expr().has_grouping_set() {
+        return None;
+    }
+    // Gate 3: one aggregate expression, no aggregate filter and no dynamic filter. The node takes
+    // over one `SUM` and replays neither filter.
+    //
+    // The dynamic filter is read through `ExecutionPlan::dynamic_expressions_produced`, which is
+    // the non-deprecated accessor: an aggregate that produces one is feeding it into a consumer's
+    // `with_dynamic_filter_expr`, and dropping it here would silently disable that pushdown.
+    let [sum] = aggregate.aggr_expr() else {
+        return None;
+    };
+    let [aggregate_filter] = aggregate.filter_expr() else {
+        return None;
+    };
+    if aggregate_filter.is_some() || !aggregate.dynamic_expressions_produced().is_empty() {
+        return None;
+    }
+    // Gate 4: a plain `sum(column)`. `DISTINCT`, an ordering and a computed argument all change
+    // what the accumulator sees, which the node would have to re-evaluate per group.
+    if sum.fun().name() != "sum" || sum.is_distinct() || !sum.order_bys().is_empty() {
+        return None;
+    }
+    let arguments = sum.expressions();
+    let [argument] = arguments.as_slice() else {
+        return None;
+    };
+    let value_column = physical_column(argument.as_ref())?;
+    // Gate 5: every group expression is a plain column. A computed group expression would have
+    // to be re-evaluated for every group, and the node carries no expression state.
+    let mut group_columns = Vec::with_capacity(aggregate.group_expr().expr().len());
+    for group in aggregate.group_expr().input_exprs() {
+        group_columns.push(physical_column(group.as_ref())?);
+    }
+    // Gate 6: between the aggregate and the fused subtree there is either nothing or the
+    // `<value> IS NOT NULL` filter the node already reproduces by dropping all-null rows. Any
+    // other node changes the rows the accumulator sees, and the node cannot replay it.
+    //
+    // `AggregateExec::children()` is always exactly `[input]`, so the filter is reached from the
+    // aggregate's own input rather than by reading a second child off the aggregate: a
+    // `[filter, child]` match here could never succeed, and the ordinary plan -- which always has
+    // that filter between the two -- would then never be admitted.
+    let children = node.children();
+    let [input] = children.as_slice() else {
+        return None;
+    };
+    let adjacent =
+        Arc::ptr_eq(input, target) || is_null_dropping_filter(input, target, value_column);
+    if !adjacent {
+        return None;
+    }
+    // Gate 7: the aggregate reads exactly the columns the fused node outputs. A projection or a
+    // cast between the two would mean the aggregate's column indices no longer address the node's
+    // output positions.
+    if aggregate.input_schema() != target.schema() {
+        return None;
+    }
+    // Gate 8: the sum reads the value column and every group reads the time or a label. A group
+    // column that is the value would produce groups the ordinary partial aggregate never makes.
+    // The node re-checks both against its authoritative classification when it is constructed, so
+    // a disagreement between this schema-only rule and that classification is a fallback.
+    if classify_output_column(&target.schema(), value_column) != Some(OutputKind::Value) {
+        return None;
+    }
+    if group_columns.iter().any(|index| {
+        !matches!(
+            classify_output_column(&target.schema(), *index),
+            Some(OutputKind::Time | OutputKind::Tag)
+        )
+    }) {
+        return None;
+    }
+    Some(PartialAggregate {
+        node: Arc::clone(node),
+        sum: Arc::clone(sum),
+        value_column,
+        group_columns,
+    })
+}
+
+/// Which part of the fused node's evaluated output one column is, as far as the gates need to
+/// tell them apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    /// The evaluation grid timestamp.
+    Time,
+    /// The one field the range function evaluates.
+    Value,
+    /// A declared label of the table.
+    Tag,
+}
+
+/// Classifies one output column of the fused subtree from its Arrow schema alone.
+///
+/// This is the planner-side counterpart of the node's own classification, which is private to the
+/// promql crate. It is deliberately derived from the schema: the node re-checks the authoritative
+/// classification when it is constructed and rejects a position that disagrees, so this can only
+/// ever cause a fallback. The encoding rules are the ones the node admits: a non-nullable
+/// millisecond timestamp is the time column, `Float64` is the value, and
+/// `Utf8`/`Dictionary(UInt32, Utf8)` is a label. Anything else is not a column the node emits, and
+/// returns `None`.
+fn classify_output_column(schema: &SchemaRef, index: usize) -> Option<OutputKind> {
+    let field = schema.fields().get(index)?;
+    match field.data_type() {
+        DataType::Timestamp(TimeUnit::Millisecond, None) if !field.is_nullable() => {
+            Some(OutputKind::Time)
+        }
+        DataType::Float64 => Some(OutputKind::Value),
+        DataType::Utf8 => Some(OutputKind::Tag),
+        DataType::Dictionary(key, value)
+            if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+        {
+            Some(OutputKind::Tag)
+        }
+        _ => None,
+    }
+}
+
+/// The column index of a plain physical column expression, or `None` for a computed one.
+fn physical_column(expr: &dyn PhysicalExpr) -> Option<usize> {
+    (expr as &dyn std::any::Any)
+        .downcast_ref::<PhysicalColumn>()
+        .map(PhysicalColumn::index)
 }
 
 /// One matched fused subtree, with everything the fused node needs to run it.
@@ -166,12 +463,14 @@ impl FusedShape {
 
     /// Builds the fused node over the raw series leaf of the matched `TableScan`.
     ///
-    /// The error is the name of the gate that rejected the shape; the caller falls back to the
-    /// ordinary plan, so this is never a query failure.
+    /// `partial` is the `SUM` the node accumulates instead of emitting evaluated rows; `None`
+    /// builds the evaluated-only node. The error is the name of the gate that rejected the shape;
+    /// the caller falls back to the ordinary plan, so this is never a query failure.
     fn build(
         &self,
         scan: &Arc<RegionScanExec>,
         scan_cooperative: bool,
+        partial: Option<PartialSum>,
     ) -> Result<Arc<dyn ExecutionPlan>, &'static str> {
         let Some(source) = self.scan.source.downcast_ref::<DefaultTableSource>() else {
             return Err("scan source is not a default table source");
@@ -365,6 +664,7 @@ impl FusedShape {
             self.output_schema.clone(),
             tags,
             self.time_index.clone(),
+            partial,
         )
         .map_err(|_| "FusedSeriesExec rejected the raw-series frame or the output schema")?;
         Ok(Arc::new(fused))
@@ -436,6 +736,55 @@ fn is_not_null_only(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// The physical counterpart of [`is_not_null_only`].
+///
+/// The node between a partial aggregate and the fused subtree is a `FilterExec`, whose predicate
+/// is physical, so the same predicate has to be recognised on that side too. The fused node
+/// reproduces it by never emitting a row whose value is null, which is why only this predicate is
+/// admitted and no other filter is.
+/// Whether `node` is a `FilterExec` directly over `target` that only drops null `column` values.
+///
+/// Such a filter is redundant for the partial `SUM`: the node creates a slot only for a grid point
+/// that holds a value, and `SUM` ignores a null, so dropping the filter changes no group and no
+/// sum. The column is pinned because dropping `IS NOT NULL` on a *group* column is not equivalent:
+/// the ordinary partial aggregate never produces a group whose key is null, while the fused node
+/// would report that group.
+fn is_null_dropping_filter(
+    node: &Arc<dyn ExecutionPlan>,
+    target: &Arc<dyn ExecutionPlan>,
+    column: usize,
+) -> bool {
+    let Some(filter) = (node.as_ref() as &dyn std::any::Any).downcast_ref::<FilterExec>() else {
+        return false;
+    };
+    Arc::ptr_eq(filter.input(), target) && is_not_null_only_on(filter.predicate(), column)
+}
+
+/// Whether `expr` is a conjunction of `IS NOT NULL` predicates, every one over `column`.
+///
+/// The column is pinned because only then is dropping the filter equivalent to replaying it.
+/// Dropping `IS NOT NULL` on the summed column is equivalent: `SUM` ignores a null value and the
+/// node creates a slot only for a grid point that holds one. Dropping it on a *group* column is
+/// not: the ordinary partial aggregate never produces a group whose key is null, while the fused
+/// node would keep the row and report that group -- a row the ordinary plan does not have.
+fn is_not_null_only_on(expr: &Arc<dyn PhysicalExpr>, column: usize) -> bool {
+    let any = expr.as_ref() as &dyn std::any::Any;
+    if let Some(not_null) = any.downcast_ref::<IsNotNullExpr>() {
+        let Some(argument) =
+            (not_null.arg().as_ref() as &dyn std::any::Any).downcast_ref::<PhysicalColumn>()
+        else {
+            return false;
+        };
+        return argument.index() == column;
+    }
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        return *binary.op() == Operator::And
+            && is_not_null_only_on(binary.left(), column)
+            && is_not_null_only_on(binary.right(), column);
+    }
+    false
 }
 
 /// Walks the whole plan and collects every fused subtree.
@@ -729,13 +1078,19 @@ mod e2e {
     use common_error::ext::BoxedError;
     use common_query::test_util::DummyDecoder;
     use datafusion::arrow::array::{
-        Array, ArrayRef, Float64Array, StringArray, TimestampMillisecondArray,
+        Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
     };
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::record_batch::RecordBatch as DfRecordBatch;
     use datafusion::datasource::DefaultTableSource;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, IsNotNullExpr};
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
     use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
+    use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion_expr::Operator;
     use datatypes::arrow::buffer::Buffer;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema};
@@ -1458,7 +1813,7 @@ mod e2e {
                 describe(&target)
             )
         });
-        let built = shape.build(&scan, false).unwrap_or_else(|reason| {
+        let built = shape.build(&scan, false, None).unwrap_or_else(|reason| {
             panic!(
                 "the fused node rejected the shape at gate {reason:?}; scan schema {:?}",
                 scan.schema()
@@ -1587,9 +1942,11 @@ mod e2e {
             "the partial and final aggregates must be separated by a repartition:\n{}",
             describe(&ordinary)
         );
-        assert_eq!(
-            aggregate_nodes(&ordinary),
-            aggregate_nodes(&fused),
+        // The aggregates that survive must be the ordinary plan's own, in the same order: the
+        // evaluated-only arm keeps both, and the partial-`SUM` arm keeps only the final one (see
+        // `the_partial_sum_swap_collapses_the_partial_aggregate`).
+        assert!(
+            aggregate_nodes(&ordinary).starts_with(&aggregate_nodes(&fused)),
             "the swap changed the aggregation:\n{}",
             describe(&fused)
         );
@@ -1617,22 +1974,47 @@ mod e2e {
                 .iter()
                 .map(|field| field.name().as_str())
                 .collect();
-            assert_eq!(
-                folded_names.len(),
-                2 + TAGS.len(),
-                "the folded node must emit its time column, its value column and every tag: \
-                 {folded_names:?}"
-            );
-            assert!(
-                folded_schema.column_with_name(TIME).is_some(),
-                "the folded node lost its time column: {folded_names:?}"
-            );
-            for tag in TAGS {
+            // Two shapes are legitimate and they mean different things. In the evaluated-only
+            // arm the node emits every visible column and the aggregate above it narrows the
+            // labels. In the partial arm the aggregate is *inside* the node, so the node reports
+            // the aggregate's own output: its group columns, then the state column. Which one
+            // this plan is follows from the aggregate count, not from the schema being asserted.
+            if aggregate_nodes(&fused).len() == 1 {
+                assert_eq!(
+                    folded_names,
+                    vec![INSTANCE, TIME, folded_names[2]],
+                    "the partial node must report the aggregate's group columns in the \
+                     aggregate's order: {folded_names:?}"
+                );
+                let state = folded_schema.field(2);
+                assert_eq!(
+                    state.data_type(),
+                    &DataType::Float64,
+                    "the partial state of a `sum` is one `Float64` column: {state:?}"
+                );
                 assert!(
-                    folded_schema.column_with_name(tag).is_some(),
-                    "the folded node must still carry tag `{tag}` for its parent to select from: \
+                    state.name().ends_with("[sum]"),
+                    "the partial node's third column must be the aggregate's state field: \
                      {folded_names:?}"
                 );
+            } else {
+                assert_eq!(
+                    folded_names.len(),
+                    2 + TAGS.len(),
+                    "the folded node must emit its time column, its value column and every tag: \
+                     {folded_names:?}"
+                );
+                assert!(
+                    folded_schema.column_with_name(TIME).is_some(),
+                    "the folded node lost its time column: {folded_names:?}"
+                );
+                for tag in TAGS {
+                    assert!(
+                        folded_schema.column_with_name(tag).is_some(),
+                        "the folded node must still carry tag `{tag}` for its parent to select \
+                         from: {folded_names:?}"
+                    );
+                }
             }
         }
 
@@ -1725,6 +2107,377 @@ mod e2e {
                 ordinary_row.2
             );
         }
+    }
+
+    /// `sum by (instance)` must take the partial-`SUM` swap: the partial aggregate disappears into
+    /// the fused node, the `FinalPartitioned` aggregate and its `RepartitionExec` survive, and the
+    /// answer is the ordinary plan's.
+    #[tokio::test]
+    async fn the_partial_sum_swap_collapses_the_partial_aggregate() {
+        // `GREPTIME_FUSED_PARTIAL_SUM=0` pins this process to the evaluated-only arm, so the
+        // partial assertions describe the other arm and cannot apply; that arm is covered by
+        // `a_non_sum_aggregate_keeps_the_evaluated_fusion`.
+        if !super::partial_sum_enabled() {
+            return;
+        }
+        let fixture = Arc::new(aggregate_fixture());
+        let (state, _, ordinary, on) = plan_arms(&aggregate_eval_stmt(), &fixture, true).await;
+        let (_, _, _, off) = plan_arms(&aggregate_eval_stmt(), &fixture, false).await;
+        let session = state.session_state();
+        assert!(off.is_none(), "the flag-off arm selected a fused plan");
+        assert!(
+            !contains_fused(&ordinary),
+            "the flag-off plan must not fuse:\n{}",
+            describe(&ordinary)
+        );
+        let fused = on.unwrap_or_else(|| {
+            panic!(
+                "the aggregated rate query was not fused:\n{}",
+                describe(&ordinary)
+            )
+        });
+
+        // The partial swap happened, and only once: one node replaced one aggregate.
+        assert_eq!(
+            count_fused(&fused),
+            1,
+            "the flag-on plan must hold exactly one FusedSeriesExec:\n{}",
+            describe(&fused)
+        );
+        // The ordinary plan splits one logical aggregate into a partial and a final one; the fused
+        // plan must hold exactly one fewer, so exactly one aggregate was taken over.
+        let ordinary_aggregates = aggregate_nodes(&ordinary);
+        let fused_aggregates = aggregate_nodes(&fused);
+        assert_eq!(
+            ordinary_aggregates.len(),
+            2,
+            "one logical aggregate must become a partial and a final one:\n{}",
+            describe(&ordinary)
+        );
+        assert_eq!(
+            fused_aggregates.len(),
+            ordinary_aggregates.len() - 1,
+            "the partial swap must remove exactly one aggregate:\n{}",
+            describe(&fused)
+        );
+        // The replaced one is the partial one, so the survivor is the final one, unchanged.
+        assert!(
+            fused_aggregates[0].starts_with("AggregateExec: mode=FinalPartitioned"),
+            "the surviving aggregate must be the final one, got {:?}:\n{}",
+            fused_aggregates[0],
+            describe(&fused)
+        );
+        assert_eq!(
+            fused_aggregates[0],
+            ordinary_aggregates[0],
+            "the surviving aggregate must be the ordinary plan's own final one:\n{}",
+            describe(&fused)
+        );
+        // The final aggregate is partitioned, so its `RepartitionExec` is what makes it correct:
+        // without it each partition's state would be reported as the whole answer.
+        let final_aggregate = find_node(&fused, "AggregateExec")
+            .unwrap_or_else(|| panic!("the fused plan lost its aggregate:\n{}", describe(&fused)));
+        let children: Vec<String> = final_aggregate
+            .children()
+            .iter()
+            .map(|child| child.name().to_string())
+            .collect();
+        assert_eq!(
+            children,
+            vec!["RepartitionExec".to_string()],
+            "the final aggregate must keep its repartition child:\n{}",
+            describe(&fused)
+        );
+
+        // The answer must be the ordinary plan's: same schema, then every row.
+        let ordinary_batches = datafusion::physical_plan::collect(ordinary, session.task_ctx())
+            .await
+            .unwrap();
+        let fused_batches = datafusion::physical_plan::collect(fused, session.task_ctx())
+            .await
+            .unwrap();
+        assert!(!fused_batches.is_empty(), "the fused plan produced no rows");
+        let fused_schema = fused_batches[0].schema();
+        let ordinary_schema = ordinary_batches[0].schema();
+        assert_eq!(
+            fused_schema.fields().len(),
+            ordinary_schema.fields().len(),
+            "the arms disagree on the number of result columns"
+        );
+        for (fused_field, ordinary_field) in
+            fused_schema.fields().iter().zip(ordinary_schema.fields())
+        {
+            assert_eq!(fused_field.name(), ordinary_field.name());
+            assert_eq!(fused_field.data_type(), ordinary_field.data_type());
+            assert_eq!(fused_field.is_nullable(), ordinary_field.is_nullable());
+        }
+        // The four counters rise 1, 2, 3 and 4 per second, so `x` sums to 3 and `y` to 7 at every
+        // step. Both are exact in binary, so equality is the right comparison and cannot hide a
+        // wrong value behind a tolerance.
+        let fused_rows = instance_rows(&fused_batches);
+        let ordinary_rows = instance_rows(&ordinary_batches);
+        assert_eq!(
+            fused_rows, ordinary_rows,
+            "the partial sum path and the ordinary plan disagree"
+        );
+        let expected: Vec<(String, i64, f64)> = ["x", "y"]
+            .into_iter()
+            .flat_map(|instance| {
+                [360_000i64, 420_000, 480_000, 540_000]
+                    .into_iter()
+                    .map(move |ts| {
+                        (
+                            instance.to_string(),
+                            ts,
+                            if instance == "x" { 3.0 } else { 7.0 },
+                        )
+                    })
+            })
+            .collect();
+        assert_eq!(
+            fused_rows, expected,
+            "the collapsed partial sum must report the hand-computed sums"
+        );
+    }
+
+    /// `count by (instance)` above the fused subtree must keep today's evaluated-only fusion: the
+    /// partial step takes over a `SUM`, so any other aggregate keeps both aggregates and produces
+    /// the ordinary answer.
+    #[tokio::test]
+    async fn a_non_sum_aggregate_keeps_the_evaluated_fusion() {
+        let stmt = EvalStmt {
+            expr: parser::parse(&format!("count by ({INSTANCE}) (rate({TABLE}[5m]))")).unwrap(),
+            ..eval_stmt()
+        };
+        let fixture = Arc::new(aggregate_fixture());
+        let (state, _, ordinary, on) = plan_arms(&stmt, &fixture, true).await;
+        let session = state.session_state();
+        let fused = on.unwrap_or_else(|| {
+            panic!(
+                "the aggregated rate query was not fused:\n{}",
+                describe(&ordinary)
+            )
+        });
+        assert_eq!(
+            count_fused(&fused),
+            1,
+            "the evaluated subtree must still fuse exactly once:\n{}",
+            describe(&fused)
+        );
+        // Both aggregates survive, in their ordinary configuration: nothing was collapsed.
+        assert_eq!(
+            aggregate_nodes(&fused),
+            aggregate_nodes(&ordinary),
+            "a non-`SUM` aggregate must keep the ordinary aggregation:\n{}",
+            describe(&fused)
+        );
+
+        let ordinary_batches = datafusion::physical_plan::collect(ordinary, session.task_ctx())
+            .await
+            .unwrap();
+        let fused_batches = datafusion::physical_plan::collect(fused, session.task_ctx())
+            .await
+            .unwrap();
+        // `count` reports `Int64`, not the `Float64` every other PromQL aggregate reports, so the
+        // shared `instance_rows` helper (which reads the one `Float64` column) does not apply.
+        let wrong: Vec<String> = fused_batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| {
+                field.name() == INSTANCE
+                    && field.data_type() != &datafusion::arrow::datatypes::DataType::Utf8
+            })
+            .map(|field| format!("{field:?}"))
+            .collect();
+        assert!(wrong.is_empty(), "the label column changed: {wrong:?}");
+        let counts = |batches: &[DfRecordBatch]| {
+            let mut rows: Vec<(String, i64, i64)> = Vec::new();
+            for batch in batches {
+                let labels = batch
+                    .column_by_name(INSTANCE)
+                    .expect("the result carries the grouped label")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the grouped label is a string");
+                let timestamps = batch
+                    .column_by_name(TIME)
+                    .expect("the result carries the evaluation timestamp")
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .expect("the timestamp is milliseconds");
+                let count_name = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .find(|field| {
+                        field.data_type() == &datafusion::arrow::datatypes::DataType::Int64
+                    })
+                    .expect("`count` reports exactly one `Int64` column")
+                    .name()
+                    .clone();
+                let values = batch
+                    .column_by_name(&count_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((
+                        labels.value(row).to_string(),
+                        timestamps.value(row),
+                        values.value(row),
+                    ));
+                }
+            }
+            rows.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+            rows
+        };
+        let fused_rows = counts(&fused_batches);
+        assert_eq!(
+            fused_rows,
+            counts(&ordinary_batches),
+            "the evaluated-only fusion must report the ordinary counts"
+        );
+        // Two series per instance, one grid point each: every count is 2.
+        assert_eq!(
+            fused_rows.len(),
+            8,
+            "two instances at four steps: {fused_rows:?}"
+        );
+        for (instance, timestamp, count) in &fused_rows {
+            assert_eq!(
+                *count, 2,
+                "the count at {instance}@{timestamp} must be the two series: {fused_rows:?}"
+            );
+        }
+    }
+
+    /// A filter that is not `<value> IS NOT NULL` between the partial aggregate and the fused
+    /// subtree must not be admitted: the node reproduces the `IS NOT NULL` one by dropping null
+    /// values and has no way to replay a comparison.
+    ///
+    /// This case is at the unit level because no PromQL statement plans such a filter above the
+    /// fold; the same gate rejecting a real statement's aggregate is exercised by
+    /// `a_non_sum_aggregate_keeps_the_evaluated_fusion`.
+    #[tokio::test]
+    async fn a_partial_aggregate_behind_a_foreign_filter_is_not_admitted() {
+        let fixture = Arc::new(aggregate_fixture());
+        let (_, logical, ordinary, _) = plan_arms(&aggregate_eval_stmt(), &fixture, true).await;
+        let shape = super::FusedShape::discover(&logical).expect("the aggregate shape must match");
+        let target = super::pick(&ordinary, &shape).expect("the plan holds the fused subtree");
+        let partial = find_partial_aggregate(&ordinary)
+            .unwrap_or_else(|| panic!("the ordinary plan has no partial aggregate"));
+
+        // The admitted control: the same partial aggregate straight above the projection, which is
+        // the `[]` arm of the child-chain gate.
+        let admitted = AggregateExec::try_new(
+            *partial.mode(),
+            partial.group_expr().clone(),
+            partial.aggr_expr().to_vec(),
+            partial.filter_expr().to_vec(),
+            Arc::clone(&target),
+            target.schema(),
+        )
+        .unwrap();
+        let admitted: Arc<dyn ExecutionPlan> = Arc::new(admitted);
+        assert!(
+            super::partial_aggregate_above(&admitted, &target).is_some(),
+            "a partial sum directly above the fused subtree must be admitted"
+        );
+
+        // The rejected control: one comparison between the two, which the node cannot reproduce.
+        let index = target
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.data_type() == &DataType::Float64)
+            .expect("the projection outputs one value column");
+        let name = target.schema().field(index).name().clone();
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&name, index));
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::Eq,
+            Arc::clone(&column),
+        ));
+        let filter = Arc::new(FilterExec::try_new(predicate, Arc::clone(&target)).unwrap());
+        let rejected = AggregateExec::try_new(
+            *partial.mode(),
+            partial.group_expr().clone(),
+            partial.aggr_expr().to_vec(),
+            partial.filter_expr().to_vec(),
+            filter,
+            target.schema(),
+        )
+        .unwrap();
+        let rejected: Arc<dyn ExecutionPlan> = Arc::new(rejected);
+        assert!(
+            super::partial_aggregate_above(&rejected, &target).is_none(),
+            "a filter that is not `IS NOT NULL` must keep the ordinary plan"
+        );
+
+        // `IS NOT NULL` on a *group* column must be rejected too, even though it has the admitted
+        // shape: dropping it would keep rows whose group key is null, and the ordinary partial
+        // aggregate never produces such a group.
+        let tag_index = target
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.data_type() == &DataType::Utf8)
+            .expect("the projection outputs at least one label column");
+        let tag_name = target.schema().field(tag_index).name().clone();
+        let tag: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&tag_name, tag_index));
+        let tag_filter = Arc::new(
+            FilterExec::try_new(
+                Arc::new(IsNotNullExpr::new(Arc::clone(&tag))),
+                Arc::clone(&target),
+            )
+            .unwrap(),
+        );
+        let tag_rejected = AggregateExec::try_new(
+            *partial.mode(),
+            partial.group_expr().clone(),
+            partial.aggr_expr().to_vec(),
+            partial.filter_expr().to_vec(),
+            tag_filter,
+            target.schema(),
+        )
+        .unwrap();
+        let tag_rejected: Arc<dyn ExecutionPlan> = Arc::new(tag_rejected);
+        assert!(
+            super::partial_aggregate_above(&tag_rejected, &target).is_none(),
+            "`IS NOT NULL` on a group column must keep the ordinary plan"
+        );
+    }
+
+    /// The three-arm table the bench drives: an absent variable or any value but `0` enables the
+    /// partial step, and `0` is the evaluated-only arm.
+    #[test]
+    fn the_partial_sum_switch_is_on_unless_it_is_zero() {
+        assert!(
+            super::partial_sum_enabled_for(None),
+            "an absent variable must enable the partial step"
+        );
+        assert!(super::partial_sum_enabled_for(Some("1")));
+        assert!(super::partial_sum_enabled_for(Some("")));
+        assert!(super::partial_sum_enabled_for(Some("true")));
+        assert!(
+            !super::partial_sum_enabled_for(Some("0")),
+            "`0` must keep the evaluated-only fusion"
+        );
+    }
+
+    /// The `Partial` `AggregateExec` of a plan, which is the node the partial step takes over.
+    fn find_partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+        if let Some(aggregate) =
+            (plan.as_ref() as &dyn std::any::Any).downcast_ref::<AggregateExec>()
+            && matches!(aggregate.mode(), AggregateMode::Partial)
+        {
+            return Some(aggregate);
+        }
+        plan.children()
+            .iter()
+            .find_map(|child| find_partial_aggregate(child))
     }
 
     /// Two finite values are equal to within the last bits of a float; non-finite values must
@@ -1835,7 +2588,12 @@ mod e2e {
         rows
     }
 
-    /// The configuration of every `AggregateExec`, in plan order, as its display string.
+    /// The configuration of every `AggregateExec`, **root first**, as its display string.
+    ///
+    /// PromQL splits one logical aggregate into a `FinalPartitioned` above a `Partial`, so index 0
+    /// is the final one and the last index is the partial one. Assertions about which aggregate
+    /// survived must be written against that order; `displayable(..).indent(true)` prints the plan
+    /// bottom-up, which is the opposite, so reading the order off a failure message is misleading.
     fn aggregate_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
         fn walk(node: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
             if node.name() == "AggregateExec" {
