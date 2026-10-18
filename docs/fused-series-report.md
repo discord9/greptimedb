@@ -471,6 +471,33 @@ every grid point twice per series (`claim_label_set` then `series_to_record_batc
 are real, both are smaller than the bookkeeping/kernel split above, and neither changes
 the conclusion.
 
+**Why it calls a scalar kernel 7 201 times instead of batching.** The batching form
+already exists in this repo and is what the ordinary plan uses: `RangeArray`
+(`src/promql/src/range_array.rs`) is a dictionary array whose keys are packed
+`(offset, length)` pairs into a single shared child array, so 7 201 overlapping sliding
+windows are 7 201 keys pointing into one copy of the series. `RangeManipulate` builds it
+once per batch and the UDF then runs over the whole batch.
+
+The fused evaluator does not, and the reason is memory rather than oversight: it is
+incremental. Samples arrive chunk by chunk, a grid point is evaluated as soon as its
+window is complete, and the samples no later window can still use are dropped
+(`FieldSamples::advance`). Retention is therefore O(range / sample interval), independent
+of series length.
+
+A `RangeArray` needs the whole series in one array, i.e. O(series length) retention. For
+this benchmark's series that is 45 KiB per field and, with one series in flight per
+partition, roughly 900 KiB across 20 partitions — negligible. But a raw series has no
+length bound, and a long-lived counter with 200M samples would be 3.2 GB per field held
+until that series completes. So the current shape is a defensible choice with a measured
+price.
+
+The change that would cross the structural line is a middle ground: evaluate a batch of
+`B` consecutive grid points at once, keeping retention O(range + B × step) rather than
+O(series). That keeps the memory property and still amortizes both binary searches and
+the kernel call over `B` points. It is a redesign of `evaluate_row` and of the
+`RangeFunction` dispatch (26 variants), not a patch, so it is recorded here as the next
+decision rather than applied.
+
 ## 5. What is not shown
 
 - **No general speedup.** The algorithm regression is eliminated and one shape
