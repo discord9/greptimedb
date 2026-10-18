@@ -64,11 +64,14 @@ branch of `PartialSumStream::ingest`, fails exactly three tests and no others:
 
 ```
 FAIL partial_sum_emits_absolute_grid_indices_and_nothing_for_a_missing_partition
-FAIL partial_sum_keeps_the_duplicate_label_set_rules
 FAIL partial_sum_keeps_nan_and_infinities
+FAIL partial_sum_keeps_the_duplicate_label_set_rules
+  disjoint label sets: partition 0 state must equal DataFusion's partial state
   left:  [(x, 300000), (x, 360000)]
   right: [(x, 300000), (x, 480000), (x, 540000)]
 ```
+
+Two distinct grid points collapsed onto one slot — the aliasing the absolute index prevents.
 
 The source was restored afterwards and `git diff` on that file is empty.
 

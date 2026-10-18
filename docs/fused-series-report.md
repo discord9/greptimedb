@@ -1411,16 +1411,20 @@ keyed by the *absolute* grid index (`start + offset`), because each series trims
 interval and a local row number would alias two different grid points. Changing that one
 expression to the bare row offset — in both the dense and the sparse branch — makes exactly the
 tests written for it fail: `partial_sum_emits_absolute_grid_indices_and_nothing_for_a_missing_partition`,
-`partial_sum_keeps_the_duplicate_label_set_rules` and `partial_sum_keeps_nan_and_infinities`,
-with the first reporting a state of `[(x, 300000), (x, 360000)]` where DataFusion's partial
-produced `[(x, 300000), (x, 480000), (x, 540000)]`. One deliberate wrong expression, three
+`partial_sum_keeps_nan_and_infinities` and `partial_sum_keeps_the_duplicate_label_set_rules`,
+the last reporting `[(x, 300000), (x, 360000)]` where DataFusion's partial produced
+`[(x, 300000), (x, 480000), (x, 540000)]` — two grid points collapsing onto one slot, which is
+exactly the aliasing the absolute index prevents. One deliberate wrong expression, three
 failures, no change to any other test — which is what makes the absolute-index claim a tested
 property instead of a comment.
 
 **What this does not show.** It does not resolve the partial step's magnitude on `G4`/`G1`, as
-above. It says nothing about latency: wall clock reads 0.786 / 0.849 / 0.969 / 1.016 on
-`G4`/`G1`/`n100`/`G400`, i.e. the same direction and much smaller, because the fused path
-still scans and evaluates every series. It is one fixture, one machine, one binary. And it is a
+above. It also says nothing about latency, and the gap between the two is large enough to be
+worth stating rather than eliding: wall clock for `sum/off` reads **0.722 / 0.793 / 0.940 /
+0.984** on `G4`/`G1`/`n100`/`G400`, against CPU `sum/off` of 0.406 / 0.400 / 0.818 / 0.926.
+Moving the aggregation into the scan halves the CPU in one case and removes a fifth of the wall
+time, but the query still scans, evaluates and returns the same 2.87 M points' worth of series;
+the removed work was never the majority of the elapsed time on a machine with idle cores. It is one fixture, one machine, one binary. And it is a
 bench path: the step is selected by `GREPTIME_FUSED_PARTIAL_SUM` and deleted when the formal
 planner constructs the same node configuration directly.
 
