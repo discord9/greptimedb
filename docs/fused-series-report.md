@@ -13,13 +13,13 @@ where the previous code paid 3.38x) — and at the compute level `rate[1h]` is
 and leaves the fused path 0.88x-0.93x at fine steps with narrow windows, with
 `max_over_time` as a 1% noise floor. The remaining gap is not the reset index and
 is not the raw series scan, as an earlier revision of this report claimed: on
-identical input the fused evaluator costs 3.35x the ordinary plan's range-function
-work, which accounts for the whole end-to-end CPU gap. Splitting that 3.35x shows
-why it is structural rather than a missed optimization — the fused evaluator with
-its per-point bookkeeping removed entirely would still cost 1.47x the ordinary
-plan, because it calls a scalar kernel once per grid point where the ordinary
-plan assembles every window in one columnar pass and vectorizes the kernel over
-the batch. See sections 4.4 and 4.5. `experimental_native_promql` stays off.**
+identical input the fused evaluator costs 2.83x the ordinary plan's range-function
+work, which accounts for the whole end-to-end CPU gap. Splitting that ratio in a
+single session puts the kernel at 0.89x the ordinary plan and the per-point
+bookkeeping at 1.95x: the regression is entirely the bookkeeping that comes from
+calling a scalar kernel once per grid point, where the ordinary plan assembles
+every window in one columnar pass and vectorizes the kernel over the batch.
+See sections 4.4 and 4.5. `experimental_native_promql` stays off.**
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -410,60 +410,92 @@ identical 192 000 raw samples and differ only in grid step, so 60x more output r
 grid. The extra cost tracks output rows, not the scan.
 
 **The two implementations of the range function, on identical input.** One series of
-2 880 samples at 15 s on the same 7 201-point 1 s grid, criterion, 100 samples. The
-scopes are deliberately listed because comparing the wrong pair is how this section went
-wrong twice:
+2 880 samples at 15 s on the same 7 201-point 1 s grid, criterion. The scopes are
+deliberately listed because comparing the wrong pair is how this section went wrong
+twice:
 
 | case | timed scope | 5 m window | 1 h window |
 | --- | --- | ---: | ---: |
-| `native/` | `RangeEvaluator::try_new` + `push` + `finish` | 419.4 us | 423.7 us |
-| `legacy_udf_only/` | the UDF call, input prepared outside the loop | 91.3 us | 88.8 us |
-| `legacy_full/` | build the sliding ranges, then call the UDF | 125.2 us | 115.1 us |
+| `native/` | `RangeEvaluator::try_new` + `push` + `finish` | 386.3 us | 392.7 us |
+| `legacy_udf_only/` | the UDF call, input prepared outside the loop | 93.1 us | 84.4 us |
+| `legacy_full/` | build the sliding ranges, then call the UDF | 136.3 us | 126.2 us |
 
 `native/` must be compared against `legacy_full/`, not `legacy_udf_only/`:
 `RangeEvaluator::push` both ingests raw samples and assembles every window, which in the
 ordinary plan is split between `PromRangeManipulate` and the UDF. Against the wrong
-scope the ratio reads 4.6x; against the right one it is **3.35x**.
+scope the ratio reads 4.1x; against the right one it is **2.83x**.
 
-That 3.35x accounts for the whole end-to-end gap: 400 series x (419.4 - 125.2) us =
-117.6 ms, against the 128.5 ms of CPU `G` costs `F` over `L` (360 vs 231.5 ms). So the
-remaining regression is in the evaluator, not in the scan, the output or the flush.
+That gap accounts for the whole end-to-end regression: 400 series x (386.3 - 136.3) us =
+100 ms, against the 128.5 ms of CPU `G` costs `F` over `L` (360 vs 231.5 ms), the
+remainder being the emit and scan differences on that path. So the regression is in the
+evaluator, not in the scan, the output or the flush.
 
-**Splitting the evaluator into bookkeeping and kernel.** `present_over_time`'s kernel
-returns a constant, so its time is the per-point bookkeeping and nothing else; `rate`
-adds the extrapolation arithmetic to it. Same input as the table above:
+**A caveat that applies to every number in this section.** Unchanged code drifts several
+percent between criterion invocations on this host: `legacy_full` read 125.2 us in an
+earlier invocation and 136.3 us in this one, and `present_over_time` read 244.4 us then
+265.6 us. Ratios are therefore taken from a single invocation, and where a figure is
+quoted across two, the drift is stated. An earlier revision of this section compared a
+post-fix `native/` against a pre-fix `legacy_full/` across two invocations and reported
+3.35x; that is withdrawn.
+
+**Splitting the evaluator into bookkeeping and kernel.** `present_over_time`'s kernel is
+`|_| Some(1.0)` — it never reads the window — so its time is the per-point bookkeeping and
+nothing else. `rate` adds the extrapolation arithmetic to it:
 
 | function | 5 m | 1 h | what it measures |
 | --- | ---: | ---: | --- |
-| `present_over_time` | 244.4 us | 243.7 us | bookkeeping only |
-| `max_over_time` | 354.7 us | 2 307.9 us | bookkeeping + a kernel that reads the window |
-| `rate` | 428.0 us | 427.2 us | bookkeeping + an O(1) kernel |
+| `present_over_time` | 265.6 us | 253.4 us | bookkeeping only |
+| `max_over_time` | 357.1 us | 2 321.5 us | bookkeeping + a kernel that reads the window |
+| `rate` | 386.3 us | 392.7 us | bookkeeping + an O(1) kernel |
 
-`rate` splits into **244.4 us bookkeeping (57%, 33.9 ns/point) and 183.6 us kernel (43%,
-25.5 ns/point)**, and both halves are the same at 5 m and 1 h, which is what the
+`rate` splits into **265.6 us bookkeeping (69%, 36.9 ns/point) and 120.8 us kernel (31%,
+16.8 ns/point)**, and both halves are the same at 5 m and 1 h, which is what the
 reset-index work predicted: neither the window assembly nor the kernel any longer depends
 on the window width.
 
-**Why this is structural, not a missed optimization.** Compare against `legacy_full/`,
-125.2 us for the same 7 201 points: the fused evaluator with its bookkeeping reduced to
-*zero* would still cost 183.6 us, **1.47x the whole ordinary path**. Break-even needs
-17.4 ns per grid point all-in; the kernel alone spends 25.5. So no amount of per-point
-tuning makes the fused evaluator cheaper than the ordinary plan on a fine grid, because
-the two do different amounts of per-point work by construction: `PromRangeManipulate`
-assembles every window in one columnar pass and the vectorized kernel then runs over the
-batch, while the fused node calls a scalar kernel 7 201 times and pays Rust bookkeeping
-per call. Optimizing inside that shape moves a constant factor and cannot cross it.
+**Where the 2.83x actually goes, in one session.** The three numbers below come from a
+single criterion invocation, because the same unchanged code drifts several percent
+between invocations on this host and a ratio built across two of them is not trustworthy.
+`present_over_time`'s kernel is `|_| Some(1.0)`, so its time is per-point bookkeeping and
+nothing else.
 
-This also predicts the end-to-end result without further assumptions. `F` wins on `C`
-because 121 grid points make bookkeeping negligible and the four saved operators
-dominate; it loses on `G` and `W` because 7 201 points make bookkeeping dominate.
+| quantity | time | per grid point | vs `legacy_full` |
+| --- | ---: | ---: | ---: |
+| `legacy_full/rate/5m` | 136.30 us | 18.93 ns | 1.00x |
+| `present_over_time/5m` (bookkeeping) | 265.56 us | 36.88 ns | **1.95x** |
+| `native/rate/5m` | 386.34 us | 53.65 ns | **2.83x** |
+| kernel = `native` - `present_over_time` | 120.78 us | 16.77 ns | **0.89x** |
 
-**The one micro-fix this measurement justified, and its bound.** `extrapolated_rate`
-widened three millisecond differences to `i128` and narrowed them back with `as f64`, and
-each narrowing compiles to a call to the `__floattidf` builtin; a CPU profile showed it as
-self time. It now uses saturating `i64` subtraction. Even a perfect result there is
-bounded by the arithmetic above, so it is committed as a cleanup of the kernel, not as
-the fix for the regression.
+So the fused evaluator splits into **bookkeeping at 1.95x the entire ordinary path** and a
+**kernel that is already 11% cheaper than it**. The regression is the bookkeeping, and the
+bookkeeping is the shape: two `partition_point` searches per point per field, a six-field
+`FloatWindow` built per point, a `dyn` call per point, then `GridSeriesBuilder::push`.
+
+**What an earlier revision of this section claimed, and why it was wrong.** It said the
+fused evaluator "with its bookkeeping reduced to zero would still cost 1.47x the ordinary
+path, so no per-point tuning can cross that line". That number came from the pre-fix
+kernel (183.6 us, 25.5 ns/point) compared against a `legacy_full` measured in a different
+invocation. After the `i128 -> i64` fix the kernel reads 16.77 ns/point, which is *below*
+`legacy_full`'s 18.93. The claim is withdrawn; the conclusion it supported — that
+bookkeeping is the remaining cost — is what the table above now shows directly.
+
+**What batching would buy, as an upper bound.** Evaluating `B` consecutive grid points per
+call keeps retention at O(range + B x step) and lets one forward scan replace `B`
+independent search pairs:
+
+| `B` | estimated | vs `legacy_full` |
+| ---: | ---: | ---: |
+| 1 (today) | 386.3 us | 2.83x |
+| 8 | 154.0 us | 1.13x |
+| 16 | 137.4 us | 1.01x |
+| 32 | 129.1 us | 0.95x |
+| unbounded | 120.8 us | 0.89x |
+
+**This is an upper bound and should be read as one.** It assumes all of the bookkeeping
+amortizes, but only the window-boundary searches can: the `FloatWindow` construction, the
+`dyn` call and `GridSeriesBuilder::push` remain per point, and their share of the 36.88 ns
+is not measured. The honest statement is that batching removes the largest identified
+component and the ceiling is parity-plus, not that it delivers 0.89x.
 
 **Not measured, and not needed to explain the gap.** The fused node materializes all four
 tag columns per row while `sum by (instance)` needs one, and `occupied_offsets` scans
@@ -505,11 +537,13 @@ decision rather than applied.
   against the ordinary plan at fine steps with narrow windows. There is no
   evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
-- **The remaining cost is located approximately, not fixed.** Section 4.5 shows the
-  fused evaluator costs 3.35x the ordinary plan's range-function work on identical
-  input, and that this accounts for the whole end-to-end CPU gap. Which part of the
-  evaluator is the next change is not yet determined. Making it cheaper is the
-  next change, and it is a different one.
+- **The remaining cost is located but not fixed.** Section 4.5 shows the fused evaluator
+  costs 2.83x the ordinary plan's range-function work on identical input, that this
+  accounts for the whole end-to-end regression, and that the ratio splits into a kernel
+  already at 0.89x and per-point bookkeeping at 1.95x. The bookkeeping is the next
+  change, and it is a structural one: batching consecutive grid points so one forward
+  scan replaces a search pair per point. Section 4.5 gives an upper bound on what that
+  can win and states plainly that the bound assumes more than batching delivers.
 - **The output path was not measured.** The node targets 4 096 rows per batch
   (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
   series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
