@@ -1,0 +1,35 @@
+[
+  {
+    "label": "all400",
+    "series": 400,
+    "output_rows": 2868400,
+    "output_batches": 400,
+    "evaluate_ms": 83.653326,
+    "emit_ms": 2.778534,
+    "flush_ms": 0.312757,
+    "poll_ms": 10.676128,
+    "chunks": 424
+  },
+  {
+    "label": "h100",
+    "series": 100,
+    "output_rows": 717100,
+    "output_batches": 100,
+    "evaluate_ms": 10.679893,
+    "emit_ms": 0.330851,
+    "flush_ms": 0.040567,
+    "poll_ms": 2.399496,
+    "chunks": 107
+  },
+  {
+    "label": "one",
+    "series": 1,
+    "output_rows": 7171,
+    "output_batches": 1,
+    "evaluate_ms": 0.266319,
+    "emit_ms": 0.014387,
+    "flush_ms": 0.002272,
+    "poll_ms": 0.641971,
+    "chunks": 7
+  }
+]

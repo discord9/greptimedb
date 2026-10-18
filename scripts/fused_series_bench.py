@@ -335,6 +335,13 @@ class Server:
         self.mysql = mysql
         self.postgres = postgres
         self.log_path = log_path
+        # The log filter the server runs with. `debug` is what the fused-hit count needs,
+        # because the selection lines are logged at debug. It is also expensive: at `debug`
+        # datafusion formats the whole physical plan for a log record on every planning pass,
+        # which was 4.6% of CPU samples in a profile of case W. Set this to
+        # `"info,query::datafusion::native_promql::fused=debug"` to keep the hit count and drop
+        # everything else; `level` is parsed as tracing `Targets`, so directives work.
+        self.log_level = "debug"
         self.process = None
         self.log_file = None
         # Where the log was when the query started, so hits can be counted per query.
@@ -346,7 +353,7 @@ class Server:
             handle.write(
                 'mode = "standalone"\n\n'
                 "[logging]\n"
-                'level = "debug"\n\n'
+                f'level = "{self.log_level}"\n\n'
                 "[query]\n"
                 f"experimental_native_promql = {str(self.native).lower()}\n"
             )

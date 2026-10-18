@@ -1,0 +1,18 @@
+{
+  "G_5m": {
+    "rows": 28684,
+    "cpu_ms_per_query": 211.16666666666666,
+    "wall_ms_per_query": 52.74550644680858,
+    "hits": 120,
+    "k": 120,
+    "fused_per_query": 1.0
+  },
+  "W_1h": {
+    "rows": 28684,
+    "cpu_ms_per_query": 221.33333333333334,
+    "wall_ms_per_query": 51.65299118962139,
+    "hits": 120,
+    "k": 120,
+    "fused_per_query": 1.0
+  }
+}

@@ -815,12 +815,219 @@ establish a wall-clock win: wall reads 0.90-1.00, and `C` is flat at 0.997. Nor 
 establish anything about other query shapes -- these are one table, four series, `rate` and
 `max_over_time` only (section 5).
 
+### 4.8 What the intermediate rows cost, per operator
+
+**How this section is measured, and why the first answer was wrong.** The profile in the
+previous revision of this section came from the CPU sampler
+(`POST /debug/prof/cpu`) and attributed 6.0% of the query to the evaluator, 14.2% to the
+fused node's stream and 13.7% to the aggregate. Two independent checks contradict that
+split; the raw profile and both ANALYZE plans are committed under `docs/bench-records/`:
+
+1. **The sampler does not recover the CPU it should.** pprof 0.15 samples with `ITIMER_PROF`,
+   which counts process CPU, so 215.0 s of CPU at 199 Hz should yield ~42 800 samples. Run
+   `W-on3` yielded 5 621 — 13%.
+2. **Its shares cannot cover an 81% drop.** Holding the scan, the series and the window fixed
+   and coarsening only the grid step from 1 s to 60 s cuts the intermediate rows 60x (2 868 400
+   to 48 000) and the query's CPU from 232.5 to 44.5 ms — **81% of the query's CPU disappears**.
+   Everything that shrinks must therefore have been at least 81% of the query. The sampler's
+   buckets that shrink with rows are evaluator 6.0, stream 14.2, aggregate 13.7, sort 7.3,
+   shuffle 4.9 and http 10.8: **56.9% even counting all of them**, against 81% required. A
+   missing 13% of samples cannot be the explanation either, since a uniformly sparse sample
+   keeps its proportions; the shares themselves must be wrong.
+
+**The two instruments also disagree directly, on one region.** The same pass measured the
+process at 232.5 ms of CPU per query and the batch kernel's block timer at 65.45 ms, i.e. the
+kernel is 28.2% of the query's CPU. The sampler attributed 6.0% to `promql::range_eval`. Both
+numbers claim to be the same quantity for the same code, and they differ by 4.7x. The timer is
+the one that survives the checks below.
+
+So this section uses the operators' **own block timers** instead, and treats
+`elapsed_compute` as unavailable for the reason it always was: nested operators count their
+children and a partitioned plan counts once per partition, so it cannot be summed. The block
+timers (`fused_evaluate_time`, `fused_emit_time`, `fused_flush_time`) wrap one statement in the
+stream's poll loop, one partition at a time, so their sum over 20 partitions is that block's
+wall time. Turning that into CPU needs one assumption: that the blocks are not waiting. Two
+measurements support it here — `fused_input_poll_time`, which times exactly the wait for the
+child, is 8.88 ms against `fused_evaluate_time`'s 65.45 ms, and the query as a whole runs at
+232.5 ms CPU over 56.6 ms wall, 4.1 cores busy. So the sum is read as CPU, with the assumption
+stated rather than hidden, and it is checked below against an independent `/proc` counter and
+never by being added to another operator's time.
+
+**Case `G`, `sum by (instance) (rate(vmbench[5m]))`, 120 min at a 1 s step, 400 series, on
+`a2d345cc76c` fused.** The fused node's own counters:
+
+| counter | value | per intermediate row |
+| --- | ---: | ---: |
+| `fused_series_completed` / `emitted` | 400 / 400 | — |
+| `output_batches` | 400 | 1 batch per series |
+| `output_rows` | 2 868 400 | — |
+| `fused_evaluate_time` (the batch kernel) | 65.45 ms | **22.8 ns** |
+| `fused_input_poll_time` (waiting on the scan) | 8.88 ms | 3.1 ns |
+| `fused_emit_time` (`occupancy` + build columns) | 2.13 ms | 0.7 ns |
+| `fused_flush_time` (`concat_batches`) | 0.24 ms | 0.1 ns |
+
+and the two aggregates above it: the partial `sum` (below the repartition) 49.93 ms and the
+final merge 4.47 ms.
+
+**The window width was checked, and it is not what moves these numbers.** A first pair of
+`ANALYZE` runs, taken in different passes, had the evaluator at 65.45 ms for a 5 m window and
+95.83 ms for 1 h, which would contradict section 4.5's claim that the batch kernel is
+window-independent. Taking both in one call, alternating, four times, resolves it: the 1 h arm
+read 143.4 / 53.2 / 71.8 / 60.6 ms and the 5 m arm 50.7 / 56.9 / 76.0 / 49.3 ms. The first 1 h
+reading is an outlier in which *every* operator of the plan is about 2.5x its later value —
+143.4 against ~54 for the evaluator, 94.3 against ~40 for the aggregate, 4.7 against ~1.7 for
+`emit` — which is a property of that pass, not of the query. Without it the two ranges overlap:
+53.2-71.8 against 49.3-76.0. What separates drift from a window effect is that the
+partial aggregate **cannot see the window**: it sums one value per row and never looks at the
+sample range. Its ratio to the evaluator is 0.657, 0.701, 0.688, 0.642, 0.616, 0.673, 0.671
+across the seven runs after the first — flat, and the first of those seven is the 2.5x outlier
+itself, whose ratio (0.657) is in the same band as the rest. Its correlation with the evaluator
+is **+0.997** (`emit`: +1.000). A window effect would raise the evaluator and leave the
+aggregate where it is, so that ratio would fall; instead it survives a 2.5x change in the
+evaluator untouched. The variation is therefore a multiplicative drift that moves every per-row
+operator together, and section 4.5's window independence survives this check.
+
+**400 output batches for 400 series.** `MAX_ROWS_PER_BATCH` is 4 096 and each series emits
+7 171 rows, so the 4 096-row buffer is always filled by a single series and flushed before the
+next one completes: the buffering never coalesces two series in this shape. At a 60 s step each
+series emits 120 rows and 20 batches carry all 400 series, which is the coalescing the buffer
+exists for.
+
+**The marginal test, which is what makes the split checkable.** `G` and `C` scan the same
+192 000 raw samples with the same window and differ only in grid step, so the only quantity
+that changes is the number of intermediate rows — 2 868 400 against 48 000. Differencing two
+runs of the same operator therefore gives that operator's cost per *added* row, with the scan,
+the series and the per-batch overhead held constant:
+
+| operator | `G` (1 s) | `C` (60 s) | delta | per added row |
+| --- | ---: | ---: | ---: | ---: |
+| `fused_evaluate_time` | 65.45 ms | 2.99 ms | 62.46 ms | **22.1 ns** |
+| `fused_emit_time` | 2.13 ms | 0.71 ms | 1.42 ms | 0.5 ns |
+| `fused_flush_time` | 0.24 ms | 0.42 ms | -0.18 ms | 0 (below resolution) |
+| `agg` partial `aggregation_time` | 49.93 ms | 0.81 ms | 49.12 ms | **17.4 ns** |
+| `agg` final `aggregation_time` | 4.47 ms | 0.18 ms | 4.30 ms | 1.5 ns |
+| sum of the five | | | 117.11 ms | 41.5 ns |
+
+The same pass measured the process's CPU at 232.5 ms per query at a 1 s step and 44.5 ms at
+60 s, a delta of **188.0 ms**. The five operators account for 117.1 ms of it, 62%. That is the
+consistency check the sampler failed: a subset cannot exceed its total, and 62% is a subset.
+The remaining 38% is outside these five — the scan's own per-batch work, the sort, the response,
+planning — none of which is claimed here.
+
+**So the answer to "where does the remaining cost go"** is two operators, and they are not the
+ones the profile named:
+
+- **The batch kernel is the largest single item: 22.1 ns per intermediate row, 62.5 ms per
+  query, 33% of the CPU that a finer grid adds.** It is not output-build overhead and it is not
+  `concat_batches`: `emit` is 0.5 ns/row and `flush` is unmeasurable at this resolution. The
+  cost is the per-point arithmetic itself — 400 series x 7 171 points = 2.87 M evaluations of
+  `extrapolated_rate_batch`, including its saturating `i64` subtraction and extrapolation.
+  Section 4.5 measured that kernel at 16.8 ns per point with criterion on one series; 22.1 ns
+  end to end, including the window cursors and `push_columns`, is the same order.
+- **The partial aggregate's generic hash table is second: 17.4 ns per intermediate row, 49.1 ms
+  per query, 26% of that CPU.** The fused node hands downstream one batch per series and the
+  aggregate hashes every row against `(instance, ts)`.
+
+**Two measurement artifacts this round had to remove.** Both would have inflated the fused
+node's apparent cost:
+
+1. **Profiling the wrong statement.** `fused_series_bench.py`'s `CASES[i]["expr"]` is the inner
+   `rate(...)`; only `bench.tql(case)` wraps it in `sum by (instance)`. Profiling the raw
+   expression returns all 2 868 400 rows and measures JSON serialisation of them: median 3 841.8
+   ms, with `serde_json` and `HttpRecordsOutput::try_new` at the top. The same mistake was in
+   `fused_series_profile.py`'s `ANALYZE` path, which built its statement from `case["expr"]`
+   too; it now derives the analysed statement from `bench.tql` so the plan is the measured
+   query's.
+2. **A `debug` log filter.** The driver configures `level = "debug"` because the fused-selection
+   line is logged at debug, and at that level datafusion formats the entire physical plan for a
+   log record on every planning pass: 4.6% of samples in the first run, and the median query
+   read 53.8 ms against 42.7 ms with the filter narrowed to
+   `info,query::datafusion::native_promql::fused=debug`.
+
+**What a fused partial aggregate could remove, at this measurement.** Of the 188 ms that a
+finer grid adds, the aggregate's generic hash work (49.1 ms) and the emit/flush (1.2 ms) are the
+transport it would collapse: 50.3 ms, 27% of the delta. That is a **ceiling, not a prediction** —
+a fused accumulator still adds every value into its group, which is tens of times cheaper than
+the hash-table path but not free, and it is only available when the group cardinality is known
+or bounded, which is what `sum by` over a finite label set gives but a general aggregate does
+not. The `FilterExec` between the two nodes is also pure transport (`selectivity = 0`, every row
+passes), but its contribution is not added to the 50.3 ms because no `C`-side measurement of it
+was taken. And the kernel's 62.5 ms stays whatever happens to the aggregation: `rate` is per
+series, so every `(series, point)` value must be computed wherever it is summed. **The kernel,
+not the aggregation, is the larger of the two remaining costs.**
+
+### 4.9 Varying series count and group count
+
+Section 4.7's cases all use one table shape: 400 series into 4 groups. Both axes move inside
+the query, over the same fixture and without re-seeding: a label matcher selects the input
+series, and the aggregation picks the group count.
+
+`scripts/fused_series_scale.py`, 120 min at a 1 s step, one binary (`a2d345cc76c`), the native
+flag as the only variable, 3 rounds with the arm order rotated, 2 warmup + 9 timed per arm per
+round, and the same per-query fused-hit check as section 4.7. CPU is the median of the timed
+iterations; the ratio is the median over rounds.
+
+| case | intermediate rows | output rows | ratio | CPU off | CPU on | CPU on/off | per-round | wall on/off |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| `G1` `sum by (job)` | 2 868 400 | 7 171 | 400:1 | 220 ms | 160 ms | **0.682** | 0.68 / 0.66 / 0.73 | 0.917 |
+| `G4` `sum by (instance)` | 2 868 400 | 28 684 | 100:1 | 280 ms | 170 ms | **0.682** | 0.71 / 0.68 / 0.57 | 0.853 |
+| `n100` (100 series, `sum by (instance)`) | 717 100 | 7 171 | 100:1 | 110 ms | 90 ms | 0.818 | 0.91 / 0.82 / 0.82 | 0.929 |
+| `G400` `sum by (host)` | 2 868 400 | 2 868 400 | 1:1 | 2 340 ms | 2 280 ms | 0.970 | 0.97 / 0.97 / 0.97 | 1.005 |
+| `raw` (no aggregation) | 2 868 400 | 2 868 400 | 1:1 | 1 230 ms | 1 190 ms | 0.967 | 0.97 / 0.97 / 0.95 | 1.026 |
+| `n1` (1 series, `sum by (instance)`) | 7 171 | 7 171 | 1:1 | 30 ms | 30 ms | 1.000 | 1.00 / 1.00 / 1.00 | 0.854 |
+| `control` (`max_over_time`, never fuses) | 2 868 400 | 28 744 | — | 430 ms | 440 ms | 1.023 | 0.83 / 1.13 / 1.02 | 0.889 |
+
+**The gain tracks the reduction ratio, and vanishes at 1:1.** Where an aggregation collapses
+100:1 or 400:1 the fused path costs 0.68 of the ordinary plan; where nothing is collapsed
+(`G400`, `raw`) it costs 0.97, and with a single series it is 1.000. The three 1:1 cases are
+also the most repeatable in the table — `G400` reads 0.97 in all three rounds, `n1` 1.00 in all
+three, `raw` 0.97/0.97/0.95 — while the two high-ratio cases carry the most spread
+(`G4` 0.71/0.68/0.57). That is the direction one wants: the effect is largest where the noise
+is, and absent where the noise is not.
+
+**Why the ratio matters more than the series count.** `n100` has the same 100:1 ratio as `G4`
+but a quarter of the series, and reads 0.818 rather than 0.682. Both arms shrink with the series
+count, but not equally: the fused arm's remaining cost is per-series fixed overhead plus
+per-intermediate-row work, and at 100 series the fixed part is a larger share of a smaller
+total. `n1` is the limit of that progression: one series, no aggregation to speak of, ratio
+exactly 1.000.
+
+**The gate on this pass.** The script's gate compares each case's per-round ratios and this pass
+reported **not quiet**: `n100` spread 11% against a 10% gate (0.91 / 0.82 / 0.82), and
+`control` spread 10% (0.83 / 1.13 / 1.02). Both are reported rather than gated away. The
+conclusion above rests on `G1`, `G4`, `G400`, `raw` and `n1`, whose spreads are 6.7%, 4.8%,
+0.4%, 0.0% and 0.0%; `n100`'s 0.818 should be read with its three rounds in view, not as a
+point estimate.
+
+**`control` is a poor gate and is kept only as a diagnostic.** It is `max_over_time`, which does
+not fuse, so both arms run the ordinary plan and the ratio must be 1.00 — it reads 1.023, which
+is fine. But its spread is 10% because the ordinary plan's `PromRangeManipulateExec`
+materialises the whole range matrix per query: `TQL ANALYZE` on `control`'s own statement reports
+its `output_bytes` as **176 MB**, against 7 MB for the `SeriesScan` beneath it and 81 MB for the
+`ProjectionExec` above it. That figure is identical for `max_over_time[5m]`, `rate[5m]` and
+`rate[1h]` — 176 MB and 2 874 400 rows in all three — so it scales with the grid, not with the
+window. A query allocating and freeing that every call measures jemalloc's variance, not the
+machine's quietness, so the gate was moved to the repeatability of each case's own ratio. An earlier version of the script gated
+on `control` and rejected a pass whose 2.3 s cases were steady to 11% — the wrong instrument,
+and the reason it was replaced is recorded here rather than in a commit message.
+
+**What this implies for a fused partial aggregate.** Take `G4`, the shape PromQL users actually
+write: the fused arm is 170 ms of CPU, and section 4.8 puts 49.9 ms of that in the aggregate's
+generic hash path and 2.1 ms in `emit`. Collapsing the intermediate rows inside the fused node
+would remove most of that ~52 ms, i.e. the fused arm would go from 170 ms to roughly 120 ms —
+another 30% off the fused path, on top of the 32% fusion already wins. The shapes where it
+would do nothing are exactly the shapes where fusion already does nothing: at 1:1 there is no
+redundancy to collapse, and `G400`'s 2.28 s is the cost of producing 2.87 M output rows that the
+user asked for. That is why the next section does not propose it as a general improvement.
+
 ## 5. What is not shown
 
-- **No general speedup.** The algorithm regression is eliminated and one shape
-  (`W`) improved 2.08x between N and F, but the fused path is still 0.88x-0.93x
-  against the ordinary plan at fine steps with narrow windows. There is no
-  evidence here to justify enabling `experimental_native_promql` by default; it
+- **No general speedup.** On CPU the fused path now beats the ordinary plan on every `rate`
+  shape measured (section 4.7: 0.625-0.783, all 12 paired rounds below 1.00) and ties it where
+  there is nothing to collapse (section 4.9: 1:1 grouping and the un-aggregated statement).
+  Wall clock moves far less (0.904-0.997): the fused path uses less CPU, not fewer round trips,
+  and on a machine with idle cores the wall time was already dominated by other work. There is
+  still no evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
 - **The per-point bookkeeping is gone for two functions only.** `rate` and `increase` take
   the batch path; `delta`, `irate`, `*_over_time` and the rest still call the boxed kernel
@@ -835,18 +1042,23 @@ establish anything about other query shapes -- these are one table, four series,
   band, so removing it is not expected to show up end to end at these shapes. That estimate
   omits many-chunk retention, capacity growth and reset work, so it is a reason for the
   ordering this round chose, not a bound on the real change.
-- **The output path is still not measured.** The node targets 4 096 rows per batch
-  (`MAX_ROWS_PER_BATCH`); with 400 series over a 20-partition scan that is ~20
-  series × 7 201 rows per partition ≈ 144 k rows ≈ 35 batches per partition.
-  Those numbers are arithmetic from the configuration, not a measurement: no
-  batch count, rows-per-batch, or emit/flush cost was collected, and no threshold
-  was changed on the strength of them.
+- **The output path is measured only at these shapes.** Section 4.8 has the counters: case `G`
+  emits 400 batches for 400 series (`MAX_ROWS_PER_BATCH` = 4 096 against 7 171 rows per
+  series, so the buffer never coalesces two series), `emit` costs 0.5 ns per row and `flush`
+  is below the resolution of its own timer. Case `C`, at 120 rows per series, coalesces: 20
+  batches carry all 400 series. What is not measured is a shape where the batch budget is
+  *small* relative to a series — a series emitting fewer rows than the budget but many series
+  arriving interleaved — so no threshold was changed on the strength of these numbers.
 - **No large-window ceiling measured.** `W` is the widest window measured (1 h
   against a 2 h span). Nothing here says whether a still-wider window would now
   become *faster* than the ordinary plan rather than merely equal.
-- **No CPU sampling profile.** Section 4.4 is operator-level `elapsed_compute`
-  from `TQL ANALYZE VERBOSE`, not a sampled stack profile, so it attributes cost
-  to operators rather than to functions within the scan.
+- **No CPU sampling profile that can allocate CPU.** A profile was taken this round and is in
+  the record, but this build's sampler does not recover the CPU it should: 5 621 samples
+  against the ~42 800 that 215.0 s of CPU at 199 Hz implies, and its shares do not move with an
+  18x change in the work they claim to describe. Section 4.8 therefore attributes cost with the
+  operators' own block timers, corroborated by `/proc` CPU. The consequence is a real gap:
+  nothing here splits the **scan's** 22% (as the profile called it) into region read, memtable
+  and merge, because the only instrument that could is the one that does not allocate.
 - **No `EXPLAIN` visibility from the frontend.** In standalone, TQL is planned as
   a `MergeScan` pushed to the datanode, and fusion happens when the datanode
   builds its physical plan. `TQL EXPLAIN` at the frontend therefore never shows
@@ -928,6 +1140,28 @@ recomputed rather than taken on trust:
 ```bash
 python3 scripts/fused_series_bench_pair_summarize.py docs/bench-records/20261018T073117Z
 ```
+
+Sections 4.8 and 4.9 come from a third set of scripts, all of which take the same
+`--data-home`/`--bin` and write JSON:
+
+```bash
+# 4.9: every case, both arms, three rounds with the arm order rotated.
+python3 scripts/fused_series_scale.py --data-home <dir> --bin <greptime> \
+    --rounds 3 --warmup 2 --iterations 9 --out scale.json
+
+# 4.8: the same statement at two grid densities, one ANALYZE each, then the per-operator
+# budget. The two steps scan the same samples, so the difference is cost per added row.
+python3 scripts/fused_series_profile.py --data-home <dir> --bin <greptime> --case G \
+    --arm on --analyze-only --analyze-out analyze-G.json
+python3 scripts/fused_series_profile.py --data-home <dir> --bin <greptime> --case C \
+    --arm on --analyze-only --analyze-out analyze-C.json
+python3 scripts/fused_plan_budget.py analyze-G.json --json budget-G.json
+```
+
+`fused_plan_budget.py` prints each operator's *own* counters and refuses to sum them across the
+tree, which is the mistake section 4.4 also documents. The CPU profile that section 4.8 rejects,
+and the summary that attributes its stacks, are
+`scripts/fused_series_profile.py --seconds 60` and `scripts/fused_profile_summarize.py`.
 
 The correctness *results* of that run are ~300 KB each and are not committed;
 `docs/bench-records/20261018T073117Z/RESULTS.md` lists each one's row count and sha256 so a
