@@ -24,14 +24,19 @@ See sections 4.4 and 4.5. `experimental_native_promql` stays off.**
 **This round takes that bookkeeping apart for `rate` and `increase`.** Those two
 functions now take a batch of windows per call, with the function chosen outside the
 loop, the window edges advanced as monotone cursors instead of searched per point, and
-the results appended a column at a time. On a real server the fused query's CPU drops to
-0.778 / 0.700 / 0.688 of the previous commit on `S` / `G` / `W` and stays at 1.000 on the
-coarse-step `C`, which is the shape that has few grid points and so has nothing to
-amortize; all 15 paired rounds returned identical results and both arms logged the
-expected fused selections. Wall clock moves 4-8% where CPU moves 22-31%; those measure
-different things, and section 4.6 says what each one does and does not support. Every other
-range function still runs one boxed call per grid point and gained nothing. See sections 1.4
-and 4.6.
+the results appended a column at a time. Against the previous commit the fused query's CPU
+drops to 0.778 / 0.700 / 0.688 on `S` / `G` / `W` and stays at 1.000 on the coarse-step `C`,
+which has few grid points and so has nothing to amortize; all 15 paired rounds returned
+identical results and both arms logged the expected fused selections (section 4.6). Wall
+clock moves 4-8% where CPU moves 22-31%; those measure different things and section 4.6 says
+what each supports. Every other range function still runs one boxed call per grid point and
+gained nothing.
+
+**And that closes the gap with the ordinary plan.** On this build, one binary, flag off
+against flag on, the fused arm costs **0.750 / 0.708 / 0.783 / 0.625** of the ordinary plan's
+CPU on `S` / `G` / `W` / `C`, with all 12 paired rounds below 1.00 and a never-fused control
+at 1.029 as the noise floor. Before this round it *cost* 8-14% more. Wall clock is 0.90-1.00,
+so this is a CPU result, not yet a latency one. See section 4.7.
 
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
@@ -761,6 +766,55 @@ ratio on three times the ticks and are the trustworthy rows.
 the arms here are both fused. Sections 4.3 and 5 still hold — no comparison in this report
 shows fusion ahead of the ordinary plan at fine steps with narrow windows.
 
+### 4.7 This round against the ordinary plan
+
+Section 4.3's comparison with the ordinary plan predates the batch path and can no longer
+describe this build. This is that comparison, run on the current build with one binary:
+`a2d345cc76c` with `experimental_native_promql = false` (the ordinary plan) against the same
+binary with it `true` (fused). Run `records-20261018T091334Z`, crossed order, 3 rounds, 2
+warmup + 9 timed per arm per round, 27 timed samples per arm per case.
+
+| case | off CPU | on CPU | CPU on/off | wall on/off | per-round CPU on/off |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `S` | 80 ms | 60 ms | **0.750** | 0.954 | 0.875 / 0.875 / 0.750 |
+| `G` | 240 ms | 170 ms | **0.708** | 0.970 | 0.783 / 0.708 / 0.708 |
+| `W` | 230 ms | 180 ms | **0.783** | 0.904 | 0.783 / 0.708 / 0.783 |
+| `C` | 80 ms | 50 ms | **0.625** | 0.997 | 0.714 / 0.625 / 0.625 |
+| `control` | 340 ms | 350 ms | 1.029 | 0.976 | 1.000 / 1.029 / 1.000 |
+
+All 12 paired rounds on the four `rate` cases are below 1.00. The flag-off arms logged zero
+fused selections and the flag-on arms exactly one, so neither arm measured the other's path.
+Every paired round compared identical within the driver's tolerance.
+
+**The control case is the noise ruler, and it says this comparison is sound.** `control` is
+`max_over_time`: it never fuses, so both arms run the ordinary plan and the ratio must be 1.00.
+It reads 1.029 on 34-against-35 ticks and 0.976 wall. That is the whole noise budget of the
+run, and the four `rate` margins are far outside it.
+
+**This inverts the pre-batch result.** Section 4.3 had the fused arm at `L/F = 0.88-0.93`
+(`S` 0.93, `G` 0.88, `W` 0.90), i.e. *costing* 8-14% more than the ordinary plan. It now costs
+25-37% less on CPU. Part of the difference is not the evaluator: the fused node also skips
+`ProjectionExec`, `PromSeriesDivideExec` and `PromSeriesNormalizeExec`, which section 4.5
+measured as the reason the fused arm was already cheaper on the coarse-step `C`. What this
+round adds to that is that the grid-heavy shapes joined it.
+
+**A second run of the same comparison, and why it is here.** It was first run while a
+`cargo build --profile nightly` of the whole server was in progress
+(`records-20261018T091013Z`). Load average was 26-37, wall clock inflated ~4x
+(`S` read 89.0 ms where the clean run reads 21.9), and CPU inflated on both arms: `G` read 350
+ticks for the ordinary plan against 240 on the clean run. The ratios came out compressed --
+`G` 0.943 there against 0.708 here -- because contention does not inflate the two arms equally.
+Both runs agree in direction and both have a control at 1.00-1.04, but only the clean run's
+magnitudes should be quoted. This is the same trap as section 4.5's caveat, in a new form: it is
+not enough for a ratio to come from one invocation if that invocation has a compiler fighting
+it.
+
+**What this establishes, and what it does not.** Fused is now cheaper than the ordinary plan on
+CPU on all four measured shapes, and the coarse-step case is the largest margin. It does not
+establish a wall-clock win: wall reads 0.90-1.00, and `C` is flat at 0.997. Nor does it
+establish anything about other query shapes -- these are one table, four series, `rate` and
+`max_over_time` only (section 5).
+
 ## 5. What is not shown
 
 - **No general speedup.** The algorithm regression is eliminated and one shape
@@ -811,15 +865,14 @@ shows fusion ahead of the ordinary plan at fine steps with narrow windows.
   measures whole queries before and after; there is no evaluator-only criterion number for
   the batch form, so the per-point bookkeeping figure (36.9 ns) still describes the form
   that `rate` and `increase` no longer use.
-- **Whether the current build beats the ordinary plan is not known.** Every comparison in
-  section 4.6 is between two *fused* builds. The 0.88x-0.93x in section 4.3 was measured
-  before the batch path existed, so it describes the previous build and says nothing about
-  this one: the query's cost has changed by 22-31% of CPU since, which is larger than the
-  gap that figure described. A same-session comparison of this build with
-  `experimental_native_promql` off has not been run. Neither a claim that fusion still
-  loses nor one that it now wins follows from what is measured here, and multiplying the
-  two rounds' ratios to bridge the gap would be exactly the cross-invocation error this
-  report withdrew twice.
+- **No wall-clock win.** Section 4.7 has the fused arm at 0.90-1.00 of the ordinary plan's
+  wall time while its CPU is 0.63-0.78: the query is not CPU-bound, so a third of the CPU
+  shows up as, at most, a tenth of the latency. Anyone who needs a latency result needs a
+  different measurement.
+- **No general speedup.** Section 4.7 covers one table, four series, `rate` and
+  `max_over_time`, on one machine. Every range function other than `rate` and `increase`
+  still evaluates one boxed call per grid point, so the margins in 4.7 do not carry over to
+  `delta`, `irate`, `*_over_time` or the predict functions without being measured.
 
 ## 6. Reproduction
 
@@ -855,6 +908,18 @@ BIN_F=<this binary>  COMMIT_F=<this sha> \
 # not from their position in a sorted list.
 python3 scripts/fused_series_bench_pair_summarize.py <run directory>
 ```
+
+Section 4.7 is the same driver with both arms pointing at one binary and the native flag as
+the variable:
+
+```bash
+BIN_P=<binary> BIN_F=<same binary> \
+COMMIT_P=<sha>-off COMMIT_F=<sha>-on ARM_P=off ARM_F=on \
+  bash scripts/fused_series_bench_pair.sh
+```
+
+The driver refuses a flag-off arm that logs a fused selection, so an arm cannot silently
+measure the other's path; that check is what makes this comparison safe.
 
 The timing records of the run quoted in section 4.6 are committed under
 `docs/bench-records/20261018T073117Z/`, so those medians and per-round ratios can be
