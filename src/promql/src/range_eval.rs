@@ -14,6 +14,7 @@
 
 //! Range-vector window evaluation of raw series onto an evaluation grid.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use common_query::prometheus::is_prometheus_stale_nan;
@@ -60,6 +61,57 @@ pub(crate) struct FloatWindow<'a> {
     pub range_ms: i64,
 }
 
+/// The retained samples one window reads, as a half-open range into the field's arrays.
+///
+/// Windows are ranges rather than copies: consecutive windows overlap almost entirely, so
+/// materializing each one would copy the same samples once per grid point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl WindowSpan {
+    pub(crate) fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+/// A batch of windows over one field, for the range functions that have a batch form.
+///
+/// The samples stay where the field retains them and the windows name them by index, so a
+/// function that needs only a window's endpoints, sample count and resets -- which is every
+/// counter function -- reads them without any per-window slice being built. The evaluator fills
+/// the boundary arrays for a whole batch with two forward passes, so nothing here is a search.
+pub(crate) struct WindowBatch<'a> {
+    /// The retained samples, in time order.
+    pub timestamps: &'a [i64],
+    pub values: &'a [f64],
+    /// Counter resets over the retained samples, ascending by position.
+    pub resets: &'a [CounterReset],
+    /// The retained-sample range of each window, ascending.
+    pub windows: &'a [WindowSpan],
+    /// For each window, the resets it contains as a range into `resets`.
+    pub window_resets: &'a [Range<usize>],
+    /// The evaluation timestamp of each window.
+    pub eval_ts: &'a [i64],
+    pub range_ms: i64,
+}
+
+impl WindowBatch<'_> {
+    /// The resets inside window `index`.
+    pub(crate) fn resets_of(&self, index: usize) -> &[CounterReset] {
+        &self.resets[self.window_resets[index].clone()]
+    }
+}
+
+/// Computes one range function over a batch of windows of one field.
+///
+/// One call covers a whole batch, so the dispatch is per batch rather than per grid point and the
+/// function body is a loop the compiler can optimize across windows. Results are appended in
+/// window order; `None` is a window with no result.
+pub(crate) type BatchKernel = Box<dyn FnMut(&WindowBatch<'_>, &mut Vec<Option<f64>>) + Send>;
+
 /// Computes one window result; `None` means the window has no result.
 pub(crate) type WindowKernel = Box<dyn FnMut(FloatWindow<'_>) -> Option<f64> + Send>;
 
@@ -90,7 +142,79 @@ pub struct RangeEvaluator {
     /// only that the output is right, which the per-sample path would also produce.
     #[cfg(test)]
     bulk_ingests: usize,
+    /// The batch form of the function, when it has one.
+    ///
+    /// Present for the counter functions. Absent for the rest, which therefore run the per-window
+    /// kernel one grid point at a time.
+    batch: Option<BatchKernel>,
+    /// Batch calls made so far. Test-only: both paths produce the same output, so a test that
+    /// compared only output could not tell which one ran.
+    #[cfg(test)]
+    batch_calls: usize,
+    /// Windows accumulated for the next batch call.
+    pending: PendingBatch,
 }
+
+/// Grid points accumulated for the next batch call.
+///
+/// The evaluator still decides one grid point at a time, because whether a window is complete and
+/// whether it is empty are per-point questions; what is deferred to the batch is the function
+/// call and the output append, which then cover the whole batch at once.
+#[derive(Default)]
+struct PendingBatch {
+    /// Grid index of each accumulated point, ascending and contiguous.
+    indices: Vec<usize>,
+    /// Evaluation timestamp of each accumulated point.
+    eval_ts: Vec<i64>,
+    /// The retained-sample span of each point's window, one list per field.
+    spans: Vec<Vec<WindowSpan>>,
+    /// The resets inside each point's window, as ranges into the field's reset index.
+    window_resets: Vec<Vec<Range<usize>>>,
+    /// One output column per field, written by the batch kernel.
+    values: Vec<Vec<Option<f64>>>,
+}
+
+impl PendingBatch {
+    /// Sizes the per-field lists for `fields` fields.
+    fn with_fields(fields: usize) -> Self {
+        Self {
+            indices: Vec::new(),
+            eval_ts: Vec::new(),
+            spans: vec![Vec::new(); fields],
+            window_resets: vec![Vec::new(); fields],
+            values: vec![Vec::new(); fields],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// Drops the accumulated points, keeping the allocations.
+    fn clear_points(&mut self) {
+        self.indices.clear();
+        self.eval_ts.clear();
+        for spans in &mut self.spans {
+            spans.clear();
+        }
+        for resets in &mut self.window_resets {
+            resets.clear();
+        }
+        for values in &mut self.values {
+            values.clear();
+        }
+    }
+}
+
+/// How many grid points one batch call covers.
+///
+/// Large enough that the per-call cost is negligible, small enough that the boundary arrays stay
+/// in cache and a partially ready chunk still evaluates most of what it can.
+const EVALUATION_BATCH: usize = 512;
 
 /// Prometheus `schema.IsMetadataLabel`: the labels removed with the metric name.
 const METADATA_LABELS: [&str; 3] = ["__name__", "__type__", "__unit__"];
@@ -124,6 +248,18 @@ struct FieldSamples {
     values: Vec<f64>,
     /// Samples before `head` are behind every remaining window.
     head: usize,
+    /// One past the last sample the most recent window read.
+    ///
+    /// Windows end at a later time as the grid advances, so this only moves forward and the next
+    /// window continues from it instead of searching the array again from `head`.
+    right: usize,
+    /// Index into `resets` of the first reset at or behind the window start.
+    ///
+    /// Both window edges only move forward, so the reset range advances monotonically too and is
+    /// never searched from the beginning again. Adjusted by the same drops `advance` makes.
+    reset_start: usize,
+    /// Index into `resets` one past the last reset inside the window end.
+    reset_end: usize,
     /// Sequence number of `values[0]`. Absolute and monotonic, so a reset keeps its position
     /// when `head` samples are dropped instead of every index being renumbered.
     base: u64,
@@ -206,11 +342,39 @@ impl FieldSamples {
         self.base += head as u64;
         self.timestamps.drain(..head);
         self.values.drain(..head);
+        self.right = self.right.saturating_sub(head);
         // A reset at `base` would add back the last dropped sample, so it goes with it.
         let dropped = self
             .resets
             .partition_point(|reset| reset.position <= self.base);
         self.resets.drain(..dropped);
+        self.reset_start = self.reset_start.saturating_sub(dropped);
+        self.reset_end = self.reset_end.saturating_sub(dropped).max(self.reset_start);
+    }
+
+    /// Advances the reset cursors to cover the window `[start, end)` of retained samples.
+    ///
+    /// Returns the range into `resets`. Both window edges move forward as the grid advances, so
+    /// each cursor is a forward scan that costs one step per reset it passes, instead of two
+    /// binary searches per grid point per field.
+    fn advance_resets(&mut self, start: usize, end: usize) -> Range<usize> {
+        if !self.index_resets {
+            return 0..0;
+        }
+        // Left-open: a reset at `base + start` would add back a sample behind the window.
+        let lower = self.base + start as u64;
+        while self.reset_start < self.resets.len()
+            && self.resets[self.reset_start].position <= lower
+        {
+            self.reset_start += 1;
+        }
+        let upper = self.base + end as u64;
+        let right = self.reset_end.max(self.reset_start);
+        self.reset_end = right;
+        while self.reset_end < self.resets.len() && self.resets[self.reset_end].position < upper {
+            self.reset_end += 1;
+        }
+        self.reset_start..self.reset_end
     }
 
     /// The resets inside the window holding `len` samples from `head`.
@@ -227,6 +391,9 @@ impl FieldSamples {
         self.timestamps.clear();
         self.values.clear();
         self.head = 0;
+        self.right = 0;
+        self.reset_start = 0;
+        self.reset_end = 0;
         self.base = 0;
         self.resets.clear();
     }
@@ -274,6 +441,7 @@ impl RangeEvaluator {
         )?;
         evaluator.drops_metric_name = function.drops_metric_name();
         evaluator.window_error = window_error;
+        evaluator.batch = function.batch_kernel();
         Ok(evaluator)
     }
 
@@ -323,7 +491,23 @@ impl RangeEvaluator {
             window_error: None,
             #[cfg(test)]
             bulk_ingests: 0,
+            batch: None,
+            #[cfg(test)]
+            batch_calls: 0,
+            pending: PendingBatch::with_fields(input.fields.len()),
         })
+    }
+
+    /// Whether the evaluator dispatches the function once per batch instead of once per point.
+    #[cfg(test)]
+    pub(crate) fn evaluates_in_batches(&self) -> bool {
+        self.batch.is_some() && self.replay == Replay::PerPoint
+    }
+
+    /// Batch kernel calls made so far.
+    #[cfg(test)]
+    pub(crate) fn batch_call_count(&self) -> usize {
+        self.batch_calls
     }
 
     /// Chunks appended without the per-sample loop. Test-only: the output of both paths is
@@ -575,19 +759,31 @@ impl RangeEvaluator {
     /// when `ready` is `None`.
     fn evaluate(&mut self, ready: Option<i128>) -> Result<()> {
         let points_read = self.points_read();
+        // An anchored selector replays one evaluated row at many points, which a batch ordered by
+        // grid index cannot express, so those keep the per-point path.
+        let batched = self.batch.is_some() && self.replay == Replay::PerPoint;
+        let range_ms = self.window.range_ms;
         let state = self.series.as_mut().expect("checked by check_chunk");
         let spec = self.grid.spec();
         let grid = self.grid.timestamps();
-        let range = i128::from(self.window.range_ms);
+        let range = i128::from(range_ms);
         while state.cursor < points_read {
             let eval_ts = grid[state.cursor];
             let lower = i128::from(eval_ts) - range;
             let mut earliest = None;
             // Later windows start no earlier, so samples behind this one go even when the point
             // itself is not ready yet.
+            //
+            // `lower` grows with the grid, so the left edge only ever moves forward and a forward
+            // scan replaces the binary search that re-derived the same position every point. Over
+            // a series the scan costs one step per discarded sample -- the same samples `advance`
+            // would drop -- so it is O(1) amortized per grid point rather than O(log n).
             for field in &mut self.fields {
-                field.head += field.timestamps[field.head..]
-                    .partition_point(|&timestamp| i128::from(timestamp) <= lower);
+                while field.head < field.timestamps.len()
+                    && i128::from(field.timestamps[field.head]) <= lower
+                {
+                    field.head += 1;
+                }
                 if let Some(&timestamp) = field.timestamps.get(field.head) {
                     earliest = Some(earliest.map_or(timestamp, |min: i64| min.min(timestamp)));
                 }
@@ -600,6 +796,19 @@ impl RangeEvaluator {
                 break;
             };
             if earliest > eval_ts {
+                // The skipped points break the run of grid indices, and a batch appends
+                // contiguous rows, so what is accumulated has to go out first.
+                if batched {
+                    flush_batch(
+                        self.batch.as_mut().expect("checked above"),
+                        &mut self.pending,
+                        &self.fields,
+                        range_ms,
+                        &mut self.output,
+                        #[cfg(test)]
+                        &mut self.batch_calls,
+                    )?;
+                }
                 // Skip the points whose windows end before the earliest sample.
                 let step = i128::from(spec.step_ms);
                 let steps = (i128::from(earliest) - i128::from(spec.start_ms) + step - 1) / step;
@@ -610,12 +819,44 @@ impl RangeEvaluator {
                 return Err(DataFusionError::Execution(error.clone()));
             }
 
+            if batched {
+                // Record this point's window instead of evaluating it: one forward step of the
+                // right edge per field, one range of the reset index per field, and the point
+                // joins the batch.
+                let cursor = state.cursor;
+                self.pending.indices.push(cursor);
+                self.pending.eval_ts.push(eval_ts);
+                for (field_index, field) in self.fields.iter_mut().enumerate() {
+                    let start = field.head;
+                    let mut right = field.right.max(start);
+                    while right < field.timestamps.len() && field.timestamps[right] <= eval_ts {
+                        right += 1;
+                    }
+                    field.right = right;
+                    let resets = field.advance_resets(start, right);
+                    self.pending.spans[field_index].push(WindowSpan { start, end: right });
+                    self.pending.window_resets[field_index].push(resets);
+                }
+                if self.pending.len() == EVALUATION_BATCH {
+                    flush_batch(
+                        self.batch.as_mut().expect("checked above"),
+                        &mut self.pending,
+                        &self.fields,
+                        range_ms,
+                        &mut self.output,
+                        #[cfg(test)]
+                        &mut self.batch_calls,
+                    )?;
+                }
+                state.cursor += 1;
+                continue;
+            }
             match self.replay {
                 Replay::PerPoint => {
                     evaluate_row(
                         &self.fields,
                         &mut self.kernel,
-                        self.window.range_ms,
+                        range_ms,
                         eval_ts,
                         eval_ts,
                         &mut self.row,
@@ -651,6 +892,19 @@ impl RangeEvaluator {
             }
             state.cursor += 1;
         }
+        if batched {
+            // The tail below advances every field, which renumbers the reset index the batch
+            // ranges point into, so the rest of the batch has to be evaluated first.
+            flush_batch(
+                self.batch.as_mut().expect("checked above"),
+                &mut self.pending,
+                &self.fields,
+                range_ms,
+                &mut self.output,
+                #[cfg(test)]
+                &mut self.batch_calls,
+            )?;
+        }
         for field in &mut self.fields {
             // After the last window, samples are still ingested so that the overflow and
             // histogram checks do not depend on how the series is chunked, but none are kept.
@@ -670,6 +924,56 @@ impl RangeEvaluator {
             Replay::Once | Replay::EveryPoint => 1,
         }
     }
+}
+
+/// Runs the batch kernel over the accumulated points and appends their rows to `output`.
+///
+/// One call per batch per field, instead of one call per grid point per field. The kernel writes a
+/// whole column, and `push_columns` appends the columns together, so neither the row `Vec` nor the
+/// per-point output append exists on this path.
+fn flush_batch(
+    kernel: &mut BatchKernel,
+    pending: &mut PendingBatch,
+    fields: &[FieldSamples],
+    range_ms: i64,
+    output: &mut GridSeriesBuilder,
+    #[cfg(test)] batch_calls: &mut usize,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // Counted here rather than at the call sites, so the number a test reads is by construction
+    // the number of kernel calls that happened.
+    #[cfg(test)]
+    {
+        *batch_calls += 1;
+    }
+    let rows = pending.len();
+    {
+        let PendingBatch {
+            indices,
+            eval_ts,
+            spans,
+            window_resets,
+            values,
+        } = pending;
+        for (field_index, field) in fields.iter().enumerate() {
+            let batch = WindowBatch {
+                timestamps: &field.timestamps,
+                values: &field.values,
+                resets: &field.resets,
+                windows: &spans[field_index],
+                window_resets: &window_resets[field_index],
+                eval_ts,
+                range_ms,
+            };
+            kernel(&batch, &mut values[field_index]);
+        }
+        let columns: Vec<&[Option<f64>]> = values.iter().map(Vec::as_slice).collect();
+        output.push_columns(indices[0], rows, &columns)?;
+    }
+    pending.clear_points();
+    Ok(())
 }
 
 /// Fills `row` with the kernel results over each field's window ending at `window_end`,

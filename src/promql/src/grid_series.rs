@@ -115,6 +115,92 @@ impl GridSeriesBuilder {
         Ok(())
     }
 
+    /// Appends `len` consecutive grid rows starting at absolute `index`, by column.
+    ///
+    /// `fields[f][r]` is field `f`'s value at row `r`, `None` when missing. This is the columnar
+    /// form of calling [`push`](Self::push) `len` times: a row whose values are all `None` holds
+    /// no sample and becomes a gap, exactly as `push` treats it, but the appends are bulk instead
+    /// of one `Vec::push` per field per row.
+    pub fn push_columns(
+        &mut self,
+        index: usize,
+        len: usize,
+        fields: &[&[Option<f64>]],
+    ) -> Result<()> {
+        if fields.len() != self.schema.fields.len() {
+            return Err(DataFusionError::Execution(format!(
+                "grid series column set has {} fields, schema has {}",
+                fields.len(),
+                self.schema.fields.len()
+            )));
+        }
+        if fields.iter().any(|column| column.len() != len) {
+            return Err(DataFusionError::Execution(
+                "grid series columns differ in length".into(),
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let grid_len = self.grid.timestamps().len();
+        if index < self.next || index + len > grid_len {
+            return Err(DataFusionError::Execution(format!(
+                "grid series batch [{index}, {}) is not increasing or exceeds grid length {grid_len}",
+                index + len
+            )));
+        }
+        self.next = index + len;
+
+        // The first and last rows holding a value bound what is appended; all-`None` rows ahead
+        // of the first or behind the last become a gap, and interior ones become nulls.
+        let holds_value = |row: usize| fields.iter().any(|column| column[row].is_some());
+        let Some(first) = (0..len).find(|row| holds_value(*row)) else {
+            return Ok(());
+        };
+        let last = (0..len)
+            .rev()
+            .find(|row| holds_value(*row))
+            .expect("a first implies a last");
+
+        if self.start.is_none() {
+            self.start = Some(index + first);
+            self.fields = (0..fields.len())
+                .map(|_| FieldBuilder {
+                    values: Vec::new(),
+                    nulls: NullBufferBuilder::new(0),
+                })
+                .collect();
+        } else {
+            let gap = index + first - self.valid_end;
+            for field in &mut self.fields {
+                field.values.resize(field.values.len() + gap, 0.0);
+                field.nulls.append_n_nulls(gap);
+            }
+        }
+        let rows = last - first + 1;
+        for (field, column) in self.fields.iter_mut().zip(fields) {
+            let column = &column[first..=last];
+            // Dense first: an all-valid column is one `extend_from_slice` plus one bulk append,
+            // with no per-value branch and no substitution for the missing ones.
+            if column.iter().all(Option::is_some) {
+                field.values.extend(
+                    column
+                        .iter()
+                        .map(|value| value.expect("checked by the test above")),
+                );
+                field.nulls.append_n_non_nulls(rows);
+                continue;
+            }
+            field.values.reserve(rows);
+            for value in column {
+                field.values.push(value.unwrap_or_default());
+                field.nulls.append(value.is_some());
+            }
+        }
+        self.valid_end = index + last + 1;
+        Ok(())
+    }
+
     /// Finishes the current series and resets the builder for the next one.
     ///
     /// Returns `None` when no pushed row had a valid value.

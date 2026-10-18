@@ -574,6 +574,7 @@ fn series_to_record_batch(
     tags: &[String],
     output_schema: &SchemaRef,
     series: &Series,
+    occupancy: &Occupancy,
 ) -> Result<Option<RecordBatch>> {
     let TimeAxis::Grid(range) = &series.time else {
         return Err(DataFusionError::Execution(
@@ -581,21 +582,14 @@ fn series_to_record_batch(
         ));
     };
     let rows = range.len();
-    let occupied = occupied_offsets(series)?;
-    if occupied.is_empty() {
+    if occupancy.offsets.is_empty() && !occupancy.dense {
         return Ok(None);
     }
     // Every grid point holds a value in the common case, so the copy below is skipped entirely.
-    let indices: Option<ArrayRef> = (occupied.len() != rows).then(|| {
-        Arc::new(UInt32Array::from(
-            occupied
-                .iter()
-                .map(|offset| *offset as u32)
-                .collect::<Vec<_>>(),
-        )) as ArrayRef
-    });
+    let indices = occupancy.indices();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(classification.len());
     for (position, column) in classification.iter().enumerate() {
+        let column_is_tag = matches!(column, OutputColumn::Tag(_, _));
         let values: ArrayRef = match column {
             OutputColumn::Time => {
                 Arc::new(TimestampMillisecondArray::new(range.timestamps(), None))
@@ -615,12 +609,21 @@ fn series_to_record_batch(
                 field_column(samples)?
             }
             OutputColumn::Tag(index, encoding) => {
-                tag_column(series, tags, *index, *encoding, rows, position)?
+                // A series' tag is the same on every row, so a `take` would only rebuild the same
+                // constant at the shorter length. Building it once at the kept length skips both
+                // the full-length allocation and the gather.
+                let tag_rows = match &indices {
+                    Some(indices) => indices.len(),
+                    None => rows,
+                };
+                tag_column(series, tags, *index, *encoding, tag_rows, position)?
             }
         };
-        columns.push(match &indices {
-            Some(indices) => take(values.as_ref(), indices.as_ref(), None)?,
-            None => values,
+        columns.push(match (&indices, column_is_tag) {
+            // Tags were already built at the kept length.
+            (Some(_), true) => values,
+            (Some(indices), false) => take(values.as_ref(), indices.as_ref(), None)?,
+            (None, _) => values,
         });
     }
     Ok(Some(RecordBatch::try_new(output_schema.clone(), columns)?))
@@ -825,47 +828,90 @@ fn render_labels(metric: &MetricName) -> String {
     format!("{{{}}}", parts.join(", "))
 }
 
-/// The offsets of the trimmed interval at which at least one field holds a value.
+/// Everything one output pass needs to know about which rows hold a value.
 ///
-/// A row whose every field is missing is not a point of the series: Prometheus has no sample
-/// there, so it is neither emitted nor able to collide with another series.
-fn occupied_offsets(series: &Series) -> Result<Vec<usize>> {
+/// Computed once per series and shared by the label-set collision check and the batch
+/// construction. Previously each scanned the series separately, so a series with values at every
+/// grid point was walked twice per output.
+struct Occupancy {
+    /// The grid offsets that hold a value, in order.
+    offsets: Vec<usize>,
+    /// The same positions as merged runs of absolute grid indices.
+    runs: Vec<(usize, usize)>,
+    /// Whether every row holds a value. When set, no `take` is needed and `offsets` is the
+    /// identity, so callers skip building it.
+    dense: bool,
+}
+
+impl Occupancy {
+    /// The `take` indices, or `None` when every row is kept.
+    fn indices(&self) -> Option<ArrayRef> {
+        (!self.dense).then(|| {
+            Arc::new(UInt32Array::from(
+                self.offsets
+                    .iter()
+                    .map(|offset| *offset as u32)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef
+        })
+    }
+}
+
+/// Scans the trimmed range once and reports its occupied offsets and runs.
+///
+/// A single dense, null-free float field makes every row occupied without touching them: the
+/// array's own null count answers the question, so the common case does no per-row work at all.
+/// Otherwise one pass over the rows computes the union of the fields' validity.
+fn occupancy(series: &Series) -> Result<Occupancy> {
     let TimeAxis::Grid(range) = &series.time else {
         return Err(DataFusionError::Execution(
             "FusedSeriesExec requires evaluated series on a time grid".into(),
         ));
     };
+    let rows = range.len();
+    let start = range.start();
+    if rows == 0 {
+        return Ok(Occupancy {
+            offsets: Vec::new(),
+            runs: Vec::new(),
+            dense: false,
+        });
+    }
+    // The fast path: one dense float field with no nulls covers every row.
+    let dense = series.fields.len() == 1
+        && matches!(
+            series.fields.iter().next().and_then(Samples::dense),
+            Some(DenseSamplesRef::Float(values)) if values.null_count() == 0
+        );
+    if dense {
+        return Ok(Occupancy {
+            offsets: Vec::new(),
+            runs: vec![(start, start + rows)],
+            dense: true,
+        });
+    }
+
     let mut offsets = Vec::new();
-    for offset in 0..range.len() {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for offset in 0..rows {
         if series
             .fields
             .iter()
             .any(|samples| has_value(samples, offset))
         {
             offsets.push(offset);
+            let absolute = start + offset;
+            match runs.last_mut() {
+                Some(run) if run.1 == absolute => run.1 = absolute + 1,
+                _ => runs.push((absolute, absolute + 1)),
+            }
         }
     }
-    Ok(offsets)
-}
-
-/// The grid indices of the trimmed interval that hold a value, as merged runs.
-///
-/// Each run is `(start, end_exclusive)` over absolute grid indices.
-fn occupied_runs(series: &Series) -> Result<Vec<(usize, usize)>> {
-    let TimeAxis::Grid(range) = &series.time else {
-        return Err(DataFusionError::Execution(
-            "FusedSeriesExec requires evaluated series on a time grid".into(),
-        ));
-    };
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for offset in occupied_offsets(series)? {
-        let index = range.start() + offset;
-        match runs.last_mut() {
-            Some((_, end)) if *end == index => *end += 1,
-            _ => runs.push((index, index + 1)),
-        }
-    }
-    Ok(runs)
+    Ok(Occupancy {
+        offsets,
+        runs,
+        dense: false,
+    })
 }
 
 /// Whether one field holds a value, rather than a missing position, at `index`.
@@ -1035,8 +1081,8 @@ impl FusedSeriesStream {
     /// timestamp, which is Prometheus' range-query rule. Series with disjoint points are legal:
     /// Prometheus merges them into one output series, while this node emits them as separate rows
     /// and defers that merge to matrix assembly, so every sample survives.
-    fn claim_label_set(&mut self, series: &Series) -> Result<()> {
-        let runs = occupied_runs(series)?;
+    fn claim_label_set(&mut self, series: &Series, runs: &[(usize, usize)]) -> Result<()> {
+        let runs = runs.to_vec();
         let key = LabelsKey::new(&series.metric);
         match self.seen.entry(key) {
             Entry::Occupied(mut entry) => {
@@ -1063,12 +1109,16 @@ impl FusedSeriesStream {
     /// `None` means the series holds no value at all, so it has no output row.
     fn emit(&mut self, series: &Series) -> Result<Option<RecordBatch>> {
         let started = Instant::now();
-        self.claim_label_set(series)?;
+        // One scan serves both consumers: the collision check needs the runs, the batch needs the
+        // offsets, and they are two views of the same validity.
+        let occupancy = occupancy(series)?;
+        self.claim_label_set(series, &occupancy.runs)?;
         let batch = series_to_record_batch(
             &self.classification,
             &self.tags,
             &self.output_schema,
             series,
+            &occupancy,
         )?;
         self.timers.emit.add_elapsed(started);
         Ok(batch)

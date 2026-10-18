@@ -44,7 +44,7 @@ use crate::functions::{
 };
 use crate::grid_series::GridSeriesBuilder;
 use crate::grid_series::reference::{
-    Dense, assert_series_eq, assert_series_eq_any_nan, random_dense, special_value,
+    Dense, assert_series_eq, assert_series_eq_any_nan, expand, random_dense, special_value,
 };
 use crate::range_array::RangeArray;
 
@@ -1622,4 +1622,309 @@ fn the_bulk_ingest_records_counter_resets() {
     // against an index that never held any.
     let resets = scanned_resets(&values);
     assert_eq!(resets.len(), 2, "the fixed input must contain two resets");
+}
+
+/// Builds a per-point evaluator running the same kernel `function` the batch path would.
+///
+/// `try_new` attaches the batch kernel; `with_kernel` takes a window kernel directly and never
+/// gets one, so the two evaluators differ only in which dispatch shape they use.
+fn per_point_counter_evaluator(
+    function: RangeFunction,
+    grid: Arc<EvalGrid>,
+    window: RangeWindow,
+    index_resets: bool,
+) -> RangeEvaluator {
+    RangeEvaluator::with_kernel(
+        &raw_schema(1),
+        grid,
+        window,
+        function.kernel(0),
+        true,
+        index_resets,
+    )
+    .unwrap()
+}
+
+/// The batch dispatch produces exactly what the per-point dispatch produces.
+///
+/// Bit-for-bit, not approximately: both run the same arithmetic in the same order, so any
+/// divergence is a batch-assembly bug -- a wrong window span, a reset range off by one, or a
+/// batch that assumed contiguous indices it did not have.
+///
+/// The batch count assertion is what makes this a test of the batch path. Without it the
+/// comparison could pass while the evaluator quietly took the per-point path.
+#[test]
+fn the_batch_dispatch_matches_the_per_point_dispatch() {
+    let mut produced = 0usize;
+    for function in [RangeFunction::Rate, RangeFunction::Increase] {
+        for seed in 0..120 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let fields = 1;
+            let (grid, base) = random_window(&mut rng);
+            // No offset: the per-point comparison is about the dispatch, not about shifting.
+            let window = RangeWindow {
+                range_ms: base.range_ms,
+                offset_ms: 0,
+                anchor_ms: None,
+            };
+            // The fixture has to guarantee that points actually evaluate. `random_window` can draw
+            // a one-millisecond range, and a sample placed after the first grid point then falls
+            // outside its window, every point takes the "nothing retained yet" branch, and the
+            // batch never fills -- a case that looks green while testing nothing. So one sample is
+            // pinned at the first evaluation timestamp, which is inside its own window for any
+            // positive range, and the series is extended past the last grid point.
+            let spec = grid.spec();
+            let step = spec.step_ms.max(1);
+            let span = step * (spec.len as i64 - 1);
+            // A counter with resets, so the reset ranges matter.
+            let mut total = 7.0f64;
+            let mut timestamp = spec.start_ms;
+            let mut rows: Vec<Row> = vec![(timestamp, vec![Some(total)])];
+            while timestamp < spec.start_ms + span {
+                total = if rng.random_bool(0.15) {
+                    rng.random_range(0.0..5.0)
+                } else {
+                    total + rng.random_range(0.0..50.0)
+                };
+                timestamp += rng.random_range(1..=step);
+                rows.push((timestamp, vec![Some(total)]));
+            }
+
+            let mut batched =
+                RangeEvaluator::try_new(&raw_schema(fields), grid.clone(), window, function)
+                    .unwrap();
+            assert!(
+                batched.evaluates_in_batches(),
+                "seed {seed}: {function:?} has no batch dispatch"
+            );
+            let mut per_point = per_point_counter_evaluator(function, grid.clone(), window, true);
+
+            let chunk = dense_chunk(&rows, fields, 0, true);
+            let from_batch = batched.push(&chunk).unwrap();
+            let from_points = per_point.push(&chunk).unwrap();
+            // `finish` consumes the evaluator, so read the counts first.
+            let batch_calls = batched.batch_call_count();
+            let point_calls = per_point.batch_call_count();
+            batched.finish().unwrap();
+            per_point.finish().unwrap();
+
+            assert!(
+                batch_calls > 0,
+                "seed {seed}: {function:?} did not call the batch kernel"
+            );
+            assert_eq!(
+                point_calls, 0,
+                "seed {seed}: the per-point evaluator must not batch"
+            );
+
+            // A range can be as short as one millisecond, and then no window holds the two samples
+            // `rate` needs, so both paths correctly produce no series at all. "Nothing" equals
+            // "nothing": the property under test is that the two dispatches agree, not that a
+            // value exists.
+            match (&from_batch, &from_points) {
+                (None, None) => {}
+                (Some(from_batch), Some(from_points)) => {
+                    produced += 1;
+                    let (batch_dense, point_dense) = (expand(from_batch), &expand(from_points));
+                    assert_eq!(
+                        batch_dense.len(),
+                        point_dense.len(),
+                        "seed {seed}: row count"
+                    );
+                    for (row, (batch_row, point_row)) in
+                        batch_dense.iter().zip(point_dense).enumerate()
+                    {
+                        for (field, (batch_value, point_value)) in
+                            batch_row.iter().zip(point_row).enumerate()
+                        {
+                            // Exact: the same code over the same numbers cannot differ in a bit.
+                            let same = match (batch_value, point_value) {
+                                (None, None) => true,
+                                (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
+                                _ => false,
+                            };
+                            assert!(
+                                same,
+                                "seed {seed}: row {row} field {field}: batch {batch_value:?} vs point {point_value:?}"
+                            );
+                        }
+                    }
+                }
+                (batch, points) => panic!(
+                    "seed {seed}: {function:?} produced a series on one dispatch only: batch {batch:?}, points {points:?}"
+                ),
+            }
+        }
+    }
+    // The seeds above must not all fall into the "nothing to compare" case above, or this test
+    // would pass while exercising no values at all.
+    assert!(
+        produced > 0,
+        "no seed produced a series, so nothing was compared"
+    );
+}
+
+/// A batch larger than one call still lands on contiguous grid indices.
+///
+/// `EVALUATION_BATCH` points flush in the middle of a series, so this proves the accumulator
+/// carries a batch across the flush boundary without losing or duplicating a row.
+#[test]
+fn the_batch_flushes_in_the_middle_of_a_long_series() {
+    let fields = 1;
+    // More grid points than one batch, with a one-minute step.
+    let grid_len = 1_300;
+    let grid = grid(0, 60_000, grid_len);
+    let window = RangeWindow {
+        range_ms: 300_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    // A sample every 60 s, so every window holds several.
+    let rows: Vec<Row> = (0..grid_len as i64 * 2)
+        .map(|index| (index * 60_000, vec![Some(index as f64)]))
+        .collect();
+
+    let mut batched = RangeEvaluator::try_new(
+        &raw_schema(fields),
+        grid.clone(),
+        window,
+        RangeFunction::Rate,
+    )
+    .unwrap();
+    let mut per_point =
+        per_point_counter_evaluator(RangeFunction::Rate, grid.clone(), window, true);
+
+    let chunk = dense_chunk(&rows, fields, 0, true);
+    let from_batch = batched.push(&chunk).unwrap();
+    let from_points = per_point.push(&chunk).unwrap();
+    let batch_calls = batched.batch_call_count();
+    batched.finish().unwrap();
+    per_point.finish().unwrap();
+
+    // 1300 points at 512 per batch: two full batches and a tail of 276.
+    assert_eq!(batch_calls, 3, "two full batches plus the tail");
+    let from_batch = from_batch.expect("a series");
+    let from_points = from_points.expect("a series");
+    assert_eq!(expand(&from_batch), expand(&from_points));
+}
+
+/// A window spanning chunks evaluates the same as the same samples arriving whole.
+///
+/// The batch path reads window spans out of the retained arrays, which `ingest` fills from
+/// several chunks and `advance` trims between them. A window whose samples straddle a chunk
+/// boundary is the case where a span could point at the wrong samples, so it is compared against
+/// the per-point path over identical data delivered as one chunk.
+#[test]
+fn the_batch_path_matches_across_chunk_boundaries() {
+    let fields = 1;
+    let grid = grid(0, 60_000, 40);
+    let window = RangeWindow {
+        range_ms: 300_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    // A sample every 60 s over the whole grid, so each 5 min window holds six samples.
+    let rows: Vec<Row> = (0..45)
+        .map(|index| (index * 60_000, vec![Some(index as f64 * 3.0)]))
+        .collect();
+
+    let whole = dense_chunk(&rows, fields, 0, true);
+    let mut one_chunk = RangeEvaluator::try_new(
+        &raw_schema(fields),
+        grid.clone(),
+        window,
+        RangeFunction::Rate,
+    )
+    .unwrap();
+    let expected = one_chunk.push(&whole).unwrap();
+    assert!(one_chunk.batch_call_count() > 0, "the batch path must run");
+    one_chunk.finish().unwrap();
+
+    // The same rows split at points that do not align with the window edges, so every cross-chunk
+    // boundary is interior to some window.
+    for splits in [vec![7_usize, 19, 31], vec![1, 2, 3], vec![39]] {
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        let mut boundaries = splits.clone();
+        boundaries.push(rows.len());
+        for end in boundaries {
+            if end <= start {
+                continue;
+            }
+            pieces.push(dense_chunk(&rows[start..end], fields, 0, end == rows.len()));
+            start = end;
+        }
+        let mut chunked = RangeEvaluator::try_new(
+            &raw_schema(fields),
+            grid.clone(),
+            window,
+            RangeFunction::Rate,
+        )
+        .unwrap();
+        let mut got = None;
+        for piece in &pieces {
+            got = chunked.push(piece).unwrap();
+        }
+        assert!(chunked.batch_call_count() > 0, "the batch path must run");
+        chunked.finish().unwrap();
+
+        match (got.as_ref(), expected.as_ref()) {
+            (None, None) => {}
+            (Some(got), Some(expected)) => {
+                assert_eq!(
+                    expand(got),
+                    expand(expected),
+                    "splits {splits:?}: chunked delivery differs"
+                );
+            }
+            (got, expected) => panic!(
+                "splits {splits:?}: chunking changed whether a series exists: {got:?} vs {expected:?}"
+            ),
+        }
+    }
+}
+
+/// A batch boundary in the middle of a series flushes without losing or duplicating a row.
+///
+/// The tail flush and the mid-sweep flush must agree on which grid indices they cover; an
+/// off-by-one at either edge would drop a row or repeat one, which the per-point comparison
+/// catches because that path has no batch boundary at all.
+#[test]
+fn the_batch_boundary_loses_no_rows() {
+    let fields = 1;
+    // Two full batches and a partial one.
+    let grid_len = 1_100;
+    let grid = grid(0, 60_000, grid_len);
+    let window = RangeWindow {
+        range_ms: 300_000,
+        offset_ms: 0,
+        anchor_ms: None,
+    };
+    let rows: Vec<Row> = (0..grid_len as i64 + 5)
+        .map(|index| (index * 60_000, vec![Some(index as f64)]))
+        .collect();
+
+    let mut batched = RangeEvaluator::try_new(
+        &raw_schema(fields),
+        grid.clone(),
+        window,
+        RangeFunction::Rate,
+    )
+    .unwrap();
+    let mut per_point =
+        per_point_counter_evaluator(RangeFunction::Rate, grid.clone(), window, true);
+    let chunk = dense_chunk(&rows, fields, 0, true);
+    let from_batch = batched.push(&chunk).unwrap();
+    let from_points = per_point.push(&chunk).unwrap();
+    let calls = batched.batch_call_count();
+    batched.finish().unwrap();
+    per_point.finish().unwrap();
+
+    assert!(
+        calls >= 3,
+        "expected more than one batch and a tail, got {calls}"
+    );
+    let from_batch = from_batch.expect("a series");
+    let from_points = from_points.expect("a series");
+    assert_eq!(expand(&from_batch), expand(&from_points));
 }

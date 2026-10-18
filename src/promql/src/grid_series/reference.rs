@@ -29,7 +29,7 @@ use crate::grid_series::GridSeriesBuilder;
 pub(crate) type Dense = Vec<Vec<Option<f64>>>;
 
 /// Expands a grid series to a dense matrix over its whole grid.
-fn expand(series: &Series) -> Dense {
+pub(crate) fn expand(series: &Series) -> Dense {
     let TimeAxis::Grid(range) = &series.time else {
         panic!("expected a grid series, got {:?}", series.time);
     };

@@ -18,7 +18,7 @@
 //! operation order. Arithmetic that GreptimeDB's range UDFs compute the same way is shared with
 //! them.
 
-use super::{FloatWindow, WindowKernel};
+use super::{BatchKernel, FloatWindow, WindowBatch, WindowKernel};
 use crate::functions::{EdgeKind, count_edges, extremum, instant_delta};
 
 /// A PromQL range-vector function over float samples.
@@ -74,6 +74,19 @@ impl RangeFunction {
     /// correction, so a new counter function has to be added here as well.
     pub(crate) fn indexes_counter_resets(self) -> bool {
         matches!(self, Self::Rate | Self::Increase)
+    }
+
+    /// The batch form of this function, when it has one.
+    ///
+    /// Only the counter functions have one so far. The rest keep the per-window form, which the
+    /// evaluator falls back to for the whole call, so adding a function here is what changes
+    /// which shape its evaluation takes.
+    pub(crate) fn batch_kernel(self) -> Option<BatchKernel> {
+        match self {
+            Self::Rate => Some(Box::new(extrapolated_rate_batch::<true, true>)),
+            Self::Increase => Some(Box::new(extrapolated_rate_batch::<true, false>)),
+            _ => None,
+        }
     }
 
     /// Returns the kernel computing this function over windows read with `offset_ms`.
@@ -302,6 +315,69 @@ fn extrapolated_rate<const IS_COUNTER: bool, const IS_RATE: bool>(
         factor /= range_ms as f64 / 1000.0;
     }
     Some(result * factor)
+}
+
+/// The batch form of [`extrapolated_rate`], over a whole batch of windows at once.
+///
+/// This computes exactly what calling the per-window form once per point computes -- same
+/// arithmetic, same order -- but reads each window's endpoints straight out of the field's
+/// arrays. A rate needs only the first and last sample, the sample count and the resets, so no
+/// per-window slice is built and no window struct is passed to a boxed call per grid point.
+pub(crate) fn extrapolated_rate_batch<const IS_COUNTER: bool, const IS_RATE: bool>(
+    batch: &WindowBatch<'_>,
+    out: &mut Vec<Option<f64>>,
+) {
+    out.clear();
+    out.reserve(batch.windows.len());
+    let range_ms = batch.range_ms;
+    for (index, span) in batch.windows.iter().enumerate() {
+        let samples_minus_one = span.len().checked_sub(1).filter(|n| *n > 0);
+        let Some(samples_minus_one) = samples_minus_one else {
+            out.push(None);
+            continue;
+        };
+        let (start, last) = (span.start, span.end - 1);
+        let (first_t, last_t) = (batch.timestamps[start], batch.timestamps[last]);
+        let first = batch.values[start];
+        let mut result = batch.values[last] - first;
+        if IS_COUNTER {
+            // The same additions in the same order as the per-window form, reached through the
+            // evaluator's per-field reset index.
+            result = batch
+                .resets_of(index)
+                .iter()
+                .fold(result, |result, reset| result + reset.previous_value);
+        }
+        let range_start = batch.eval_ts[index].saturating_sub(range_ms);
+        let mut duration_to_start = first_t.saturating_sub(range_start) as f64 / 1000.0;
+        let mut duration_to_end = batch.eval_ts[index].saturating_sub(last_t) as f64 / 1000.0;
+        let sampled_interval = last_t.saturating_sub(first_t) as f64 / 1000.0;
+        let average_interval = sampled_interval / samples_minus_one as f64;
+        let threshold = average_interval * 1.1;
+        if duration_to_start >= threshold {
+            duration_to_start = average_interval / 2.0;
+        }
+        if IS_COUNTER {
+            let mut duration_to_zero = duration_to_start;
+            if result > 0.0 && first >= 0.0 {
+                duration_to_zero = sampled_interval * (first / result);
+            }
+            if duration_to_zero < duration_to_start {
+                duration_to_start = duration_to_zero;
+            }
+        }
+        if duration_to_end >= threshold {
+            duration_to_end = average_interval / 2.0;
+        }
+        let mut factor = 1.0;
+        if sampled_interval != 0.0 {
+            factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
+        }
+        if IS_RATE {
+            factor /= range_ms as f64 / 1000.0;
+        }
+        out.push(Some(result * factor));
+    }
 }
 
 fn last_two<const IS_RATE: bool>(window: FloatWindow<'_>) -> Option<f64> {

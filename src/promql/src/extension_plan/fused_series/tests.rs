@@ -57,7 +57,7 @@ use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use super::{
     FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_EMIT, METRIC_EVALUATE,
     METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_SERIES_COMPLETED,
-    METRIC_SERIES_EMITTED, apply_maps, classify_output, series_to_record_batch,
+    METRIC_SERIES_EMITTED, apply_maps, classify_output, occupancy, series_to_record_batch,
 };
 use crate::map::MathOp;
 use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
@@ -393,9 +393,17 @@ impl Case {
                 continue;
             };
             let series = apply_maps(&evaluator, &self.maps, series).unwrap();
-            let batch =
-                series_to_record_batch(&classification, &self.tags, &self.output_schema, &series)
-                    .unwrap();
+            let batch = {
+                let occupancy = occupancy(&series).unwrap();
+                series_to_record_batch(
+                    &classification,
+                    &self.tags,
+                    &self.output_schema,
+                    &series,
+                    &occupancy,
+                )
+            }
+            .unwrap();
             // A series without a value emits no batch, so it has no reference row either.
             if let Some(batch) = batch {
                 out.push((series, batch));
@@ -743,8 +751,9 @@ async fn the_input_timer_does_not_count_a_pending_poll() {
         RangeFunction::Rate,
         vec![],
     );
-    // A child that answers `Pending` on every other poll: each `Pending` is a wakeup the timer
-    // must not charge, and each `Ready` is a chunk it must.
+    // A child that answers `Pending` on every other poll and spends `PENDING_DELAY` doing it:
+    // each `Pending` is time the timer must not charge, and each `Ready` is a chunk it must.
+    const PENDING_DELAY: std::time::Duration = std::time::Duration::from_millis(8);
     let batches = chunks
         .iter()
         .flat_map(|chunk| frame_batches(std::slice::from_ref(chunk)))
@@ -754,9 +763,11 @@ async fn the_input_timer_does_not_count_a_pending_poll() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicBool::new(false)),
     )
-    .pending_every_other();
+    .pending_after(PENDING_DELAY);
     let exec = case.fused(Arc::new(child)).unwrap();
+    let started = std::time::Instant::now();
     let batches = collect(run_partition(&exec, 0).await);
+    let wall = started.elapsed();
     assert!(!batches.is_empty());
 
     let metrics = exec.metrics().expect("the node must report metrics");
@@ -767,11 +778,18 @@ async fn the_input_timer_does_not_count_a_pending_poll() {
         "every chunk must still be consumed"
     );
     let polled = metrics.sum_by_name(METRIC_INPUT_POLL).unwrap().as_usize();
-    // Two nanos per chunk is the floor `Time` guarantees (one per recorded block), so a value
-    // far above it would mean the pending polls were charged as well.
+    // The comparison is against the wall time the run actually took, not a fixed budget: the
+    // probe's pending polls account for a known share of that wall time, so a timer that
+    // charged them reads a comparable fraction of it while a correct one reads a rounding
+    // error. An absolute threshold would fail on a loaded machine for a reason that has nothing
+    // to do with the property under test, which is how this test came to be flaky.
     assert!(
-        polled < 1_000_000,
-        "the input timer must not accumulate wait time, got {polled} ns"
+        wall > PENDING_DELAY * 2,
+        "the run must span several pending polls, took {wall:?}"
+    );
+    assert!(
+        (polled as f64) < wall.as_nanos() as f64 / 4.0,
+        "the input timer must not accumulate wait time: {polled} ns charged out of {wall:?} wall"
     );
 }
 
@@ -1622,6 +1640,9 @@ struct ProbeExec {
     yields: Arc<AtomicUsize>,
     /// Answer `Pending` on every other poll, the way a child waiting on I/O would.
     pending_every_other: bool,
+    /// Wall time each `Pending` poll takes, so the test can tell "charged the wait" from
+    /// "did not" by the size of the difference instead of by machine speed.
+    pending_delay: Option<std::time::Duration>,
 }
 
 impl ProbeExec {
@@ -1645,6 +1666,7 @@ impl ProbeExec {
             dropped,
             yields: Arc::new(AtomicUsize::new(0)),
             pending_every_other: false,
+            pending_delay: None,
         }
     }
 
@@ -1652,8 +1674,15 @@ impl ProbeExec {
     ///
     /// The fused node must not charge that wait time to any of its block timers, which is the
     /// difference between reporting work and reporting latency.
-    fn pending_every_other(mut self) -> Self {
+    /// Makes every `Pending` poll take `delay` of wall time.
+    ///
+    /// Without this the probe returns `Pending` immediately, so a timer that wrongly spans the
+    /// pending poll still reads near zero and the test can only fail when the machine happens to
+    /// be slow -- the wrong reason. Charging the delay makes the two behaviours differ by the
+    /// injected total, which no amount of load can hide.
+    fn pending_after(mut self, delay: std::time::Duration) -> Self {
         self.pending_every_other = true;
+        self.pending_delay = Some(delay);
         self
     }
 }
@@ -1709,6 +1738,7 @@ impl ExecutionPlan for ProbeExec {
             dropped: Arc::clone(&self.dropped),
             yields: Arc::clone(&self.yields),
             pending_every_other: self.pending_every_other,
+            pending_delay: self.pending_delay,
             polls: 0,
         }))
     }
@@ -1720,6 +1750,7 @@ struct ProbeStream {
     dropped: Arc<AtomicBool>,
     yields: Arc<AtomicUsize>,
     pending_every_other: bool,
+    pending_delay: Option<std::time::Duration>,
     polls: usize,
 }
 
@@ -1735,6 +1766,9 @@ impl Stream for ProbeStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.polls += 1;
         if self.pending_every_other && self.polls % 2 == 1 {
+            if let Some(delay) = self.pending_delay {
+                std::thread::sleep(delay);
+            }
             // A real child wakes itself when the work completes; doing that here keeps the
             // stream progressing instead of stalling the test on a pending poll.
             cx.waker().wake_by_ref();
@@ -1949,7 +1983,14 @@ async fn an_all_null_series_emits_no_batch() {
     let output_schema = output_schema(&["host"]);
     let tags = ["host".to_string()];
     let classification = classify_output(&output_schema, &schema, &tags, TIME).unwrap();
-    let batch = series_to_record_batch(&classification, &tags, &output_schema, &series).unwrap();
+    let batch = series_to_record_batch(
+        &classification,
+        &tags,
+        &output_schema,
+        &series,
+        &occupancy(&series).unwrap(),
+    )
+    .unwrap();
     assert!(
         batch.is_none(),
         "a series without a value must not emit a batch, got {batch:?}"
@@ -1971,9 +2012,15 @@ async fn an_all_null_series_emits_no_batch() {
         fields,
     )
     .unwrap();
-    let batch = series_to_record_batch(&classification, &tags, &output_schema, &series)
-        .unwrap()
-        .expect("a series with values must emit a batch");
+    let batch = series_to_record_batch(
+        &classification,
+        &tags,
+        &output_schema,
+        &series,
+        &occupancy(&series).unwrap(),
+    )
+    .unwrap()
+    .expect("a series with values must emit a batch");
     assert_eq!(batch.num_rows(), 2, "only the non-null rows are emitted");
 }
 
