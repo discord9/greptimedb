@@ -1068,8 +1068,8 @@ user asked for. That is why the next section does not propose it as a general im
   become *faster* than the ordinary plan rather than merely equal.
 - **No CPU sampling profile that can allocate CPU.** A profile was taken this round and is in
   the record, but this build's sampler does not recover the CPU it should: 5 621 samples
-  against the ~42 800 that 215.0 s of CPU at 199 Hz implies, and its shares do not move with an
-  18x change in the work they claim to describe. Section 4.8 therefore attributes cost with the
+  against the ~42 800 that 215.0 s of CPU at 199 Hz implies, and its row-dependent shares add
+  up to 56.9% where the grid step alone accounts for 81% of the query's CPU. Section 4.8 therefore attributes cost with the
   operators' own block timers, corroborated by `/proc` CPU. The consequence is a real gap:
   nothing here splits the **scan's** 22% (as the profile called it) into region read, memtable
   and merge, because the only instrument that could is the one that does not allocate.
@@ -1082,23 +1082,28 @@ user asked for. That is why the next section does not propose it as a general im
   deliberately not invented here.
 - **No `PartialAggregate`, vector matching, or planner-level fusion.** Out of
   scope by design.
-- **Nothing here covers a counter that resets inside every window at scale.**
-  The unit and integration tests prove the index is correct with resets
-  (including across chunk boundaries and window edges); the 1 152 000-row
-  benchmark fixture has none, so no end-to-end timing includes real reset
-  traffic.
+- **Resets are now covered for correctness, not for timing.** Section 2's sixth layer adds
+  three shapes through real storage: a counter resetting every 48 samples (so 24 resets per
+  series, at 5 m and 1 h windows), one with gaps and a 30 min outage, and fragmented chunks.
+  All agree across arms, and `vfrag`/`vmreset` — identical values, different fragmentation —
+  return bit-identical results on the fused path. What is still missing is a **timed**
+  measurement at that shape: these tables carry 40 series and each query costs 70-160 ms of
+  CPU on a 10 ms tick, so their ratios do not resolve, and no end-to-end *timing* here includes
+  reset traffic. The 400-series fixture has no resets at all.
 - **The batch path's own unit of work was not measured directly.** Section 4.6
   measures whole queries before and after; there is no evaluator-only criterion number for
   the batch form, so the per-point bookkeeping figure (36.9 ns) still describes the form
   that `rate` and `increase` no longer use.
-- **No wall-clock win.** Section 4.7 has the fused arm at 0.90-1.00 of the ordinary plan's
-  wall time while its CPU is 0.63-0.78: the query is not CPU-bound, so a third of the CPU
-  shows up as, at most, a tenth of the latency. Anyone who needs a latency result needs a
-  different measurement.
-- **No general speedup.** Section 4.7 covers one table, four series, `rate` and
-  `max_over_time`, on one machine. Every range function other than `rate` and `increase`
-  still evaluates one boxed call per grid point, so the margins in 4.7 do not carry over to
-  `delta`, `irate`, `*_over_time` or the predict functions without being measured.
+- **No wall-clock win worth quoting.** Section 4.7 has the fused arm at 0.904-0.997 of the
+  ordinary plan's wall time while its CPU is 0.625-0.783; section 4.9 reads 0.853-1.026 on
+  wall against 0.682-1.000 on CPU, including two cases above 1.00. The query is not
+  CPU-bound, so a third of the CPU buys at most a tenth of the latency, and at `raw` and
+  `G400` it buys nothing measurable (1.026 and 1.005). Anyone who needs a latency result
+  needs a different measurement.
+- **The margins do not carry to other functions.** Sections 4.7 and 4.9 cover `rate` (and
+  `max_over_time` as a control) on one machine. Every range function other than `rate` and
+  `increase` still evaluates one boxed call per grid point, so nothing here says what `delta`,
+  `irate`, `*_over_time` or the predict functions would do.
 
 ## 6. Reproduction
 
