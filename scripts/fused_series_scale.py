@@ -436,7 +436,6 @@ def main():
     parser.add_argument("--bin", required=True)
     parser.add_argument("--commit", default="unknown")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--results", default=None)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=9)
     parser.add_argument("--http", type=int, default=15140)

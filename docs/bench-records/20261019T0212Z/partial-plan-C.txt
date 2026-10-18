@@ -1,0 +1,15 @@
+C off  fused=0 aggregates=FinalPartitioned,Partial partial=0 selections=0/0
+          AggregateExec: mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]
+          RepartitionExec: partitioning=Hash([instance@0, ts@1], 20), input_partitions=20
+          AggregateExec: mode=Partial, gby=[instance@2 as instance, ts@0 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]
+C on   fused=1 aggregates=FinalPartitioned,Partial partial=0 selections=1/0
+          AggregateExec: mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]
+          RepartitionExec: partitioning=Hash([instance@0, ts@1], 20), input_partitions=20
+          AggregateExec: mode=Partial, gby=[instance@2 as instance, ts@0 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]
+          FusedSeriesExec: eval=rate, range=300000ms, offset=0ms, maps=[]
+C sum  fused=1 aggregates=FinalPartitioned       partial=1 selections=1/1
+          AggregateExec: mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]
+          RepartitionExec: partitioning=Hash([instance@0, ts@1], 20), input_partitions=20
+          FusedSeriesExec: eval=rate, range=300000ms, offset=0ms, maps=[], partial=sum
+
+C: 480 rows, the 3 arms agree on schema, labels, timestamps and every value

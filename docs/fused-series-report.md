@@ -38,6 +38,23 @@ CPU on `S` / `G` / `W` / `C`, with all 12 paired rounds below 1.00 and a never-f
 at 1.029 as the noise floor. Before this round it *cost* 8-14% more. Wall clock is 0.90-1.00,
 so this is a CPU result, not yet a latency one. See section 4.7.
 
+**And this round makes the fused node compute the partial aggregate itself.** For
+`sum by (instance) (rate(metric[5m]))` the node now folds every evaluated series into the
+replaced partial aggregate's own `GroupsAccumulator` and emits DataFusion's state directly, so
+the 2 868 400 intermediate rows that aggregate used to consume are never materialised; the
+`FinalPartitioned` aggregate and the repartition above it stay exactly as they were. Verified on
+real mito storage through the real query entry point, and correct on seven shapes: all three arms
+return the same answer, series by series and value by value, including the two 2 868 400-row
+cases (section 4.11). The direction is unambiguous — `sum/on` is below 1.00 in **9 of 9 rounds**
+of the three collapsing cases, and the partial arm is also the *most repeatable* of the three,
+reading 130-150 ms across all six of its `G4`/`G1` rounds while the arm it is compared against
+swings 170-270 ms. The **magnitude is not resolved** on the 100:1 shape a user writes (`G4`
+0.70 / 0.48 / 0.88): the noise is in the denominator, and the gate reports the pass not quiet.
+Where both arms repeat, it reads **0.900** on `n100` (three identical rounds) and **0.957** on
+`G400`. Section 4.9's 40.7 ms bound is neither confirmed nor refuted — the rounds straddle it.
+This is bench scaffolding behind an environment variable, and `experimental_native_promql` still
+stays off.
+
 Everything below was produced in this worktree on a 20-core machine with the
 `nightly` Cargo profile (`lto = "thin"`, `strip = "debuginfo"`).
 
@@ -71,10 +88,24 @@ What this node adds on top of those is:
 - Output coalescing to `MAX_ROWS_PER_BATCH = 4_096` rows per batch per stream
   (`src/promql/src/extension_plan/fused_series.rs`), so a query over *n* series
   does not hand downstream *n* tiny batches.
+- **Partial mode** (`PartialSum`, section 4.11): instead of converting each completed
+  evaluated series into one output row per grid point, fold its points into the replaced
+  partial aggregate's *own* `GroupsAccumulator` and emit that accumulator's `state()`
+  once per partition. The state is DataFusion's, produced by DataFusion's accumulator, so
+  the `FinalPartitioned` aggregate above consumes exactly what a `Partial` one would have
+  written; the node reuses the aggregate rather than re-implementing `SUM`. Slots are keyed
+  by `(label group, absolute grid index)` — `GridRange::start()` plus the row offset, never
+  a local row number — because each series trims its own interval and a local index would
+  alias two grid points. It is admitted only for a single-field shape: the occupancy set is
+  the union over the series' fields, so with two fields a grid point can be occupied while
+  the summed field is null, and the node would report a group the ordinary partial
+  aggregate never makes.
 
 Construction-time rejections (never a silent fallback): zero partitions, an
 evaluation-grid input schema, `Interleaved` ordering, an illegal window or
-function, an illegal frame schema, an illegal output schema.
+function, an illegal frame schema, an illegal output schema, and — in partial
+mode — a state layout that is not one `Float64` per group, a summed column that is
+not the node's one series field, or a group column that is that field.
 
 ### 1.2 Planner wiring — deliberate throwaway
 
@@ -92,6 +123,31 @@ node **by schema and content** rather than by a logical child-index path, and
 swaps it in place with `transform_up`. Any shape it cannot prove returns
 `Ok(None)` and the ordinary plan runs. The node and its output contract are what
 survive a planner replacement; the matcher is not.
+
+A `sum` above the fused subtree has a second, optional step (section 4.11).
+DataFusion plans one logical aggregate as `Partial → Repartition → Final`, and the
+partial one groups by the evaluation timestamp as well as the `by(...)` labels — PromQL
+puts the evaluation timestamp in the grouping key — so each of its groups is exactly one
+`(label set, grid index)`, which is the unit the node already produces. The hook finds
+that partial aggregate and replaces *it*, handing the node the aggregate's own `SUM`.
+The `RepartitionExec` and the `FinalPartitioned` aggregate above are rebuilt with their
+own configuration and stay in place; this is a swap of the partial stage, not a
+replacement of the aggregation.
+
+It is admitted only when every gate holds, and each gate is a rejection rather than a
+query error, because the ordinary plan is always a correct answer:
+
+| what it requires | why the swap is not equivalent without it |
+| --- | --- |
+| the aggregate is `Partial`, has no grouping sets, exactly one `SUM` with no `DISTINCT`/ordering/filter | the node takes over one accumulator and replays no filter or rollup |
+| the `SUM` argument and every group expression is a plain column | the node carries no expression state to re-evaluate |
+| between them, either nothing or `<summed column> IS NOT NULL` | the node reproduces that filter by never emitting an all-null point; **only on the summed column** — dropping `IS NOT NULL` on a group column is *not* equivalent, because the ordinary partial aggregate never produces a null group key while the fused node would report that group |
+| the aggregate's `input_schema()` is the node's output schema | otherwise its column indices no longer address the node's output positions |
+| exactly one such aggregate above the subtree | phase 1 replaces one |
+
+The step reads `GREPTIME_FUSED_PARTIAL_SUM`, which is bench scaffolding and not a user
+option: it is not a `QueryOptions` field, not a `SET` parameter, not in any `config/*.toml`.
+`0` keeps the evaluated-only fusion byte for byte, which is what the `on` arm measures.
 
 It runs behind the existing `experimental_native_promql` flag
 (`src/query/src/datafusion.rs`), and logs
@@ -1156,7 +1212,10 @@ same.
 That is the comparison the next round should make: a fused partial aggregate is worth at most
 40.7 ms of a 173.0 ms query and is well understood, while the evaluator's 60.7 ms is spread over
 2.87 M points at a fixed cost each, on top of 137.7 MB of cumulative per-point window-metadata
-writes that exceed the 22.95 MB of values the query returns. The shapes where a partial aggregate
+writes that exceed the 22.95 MB of values the query returns. **Section 4.11 makes that
+comparison.** Its `G4` rounds straddle the 40.7 ms bound — 0.70 / 0.48 / 0.88 against a
+predicted floor of 0.765 — so the bound is neither confirmed nor refuted there, and the saving it
+did not account for is the intermediate rows this estimate never charged to anything. The shapes where a partial aggregate
 would do nothing are exactly the shapes where fusion already does nothing: at 1:1 there is no
 redundancy to collapse, and `G400`'s 2.28 s is the cost of producing 2.87 M output rows that the
 user asked for.
@@ -1236,6 +1295,135 @@ the computation semantics unchanged.
 `PendingBatch` says so in its own comment — so its `indices` is load-bearing and cannot become a
 counter until that changes.
 
+### 4.11 A partial `SUM` inside the fused node
+
+Section 4.9 ends with a prediction: collapsing the intermediate rows could address "at most
+40.7 ms" of `G4`'s 173.0 ms, "and is well understood". This section is the controlled test of
+that, on the query PromQL users actually write — `sum by (instance) (rate(metric[5m]))`.
+
+**What changed.** For that shape DataFusion plans `Aggregate(FinalPartitioned) →
+Repartition → Aggregate(Partial) → Filter → Projection → RangeManipulate`, and because PromQL
+puts the *evaluation timestamp* in the grouping key, each of the partial aggregate's groups is
+exactly one `(label set, grid index)` — the unit the fused node already produces. The hook
+therefore replaces the partial `AggregateExec` with the fused node carrying
+`partial=sum` (`PartialSum`), which folds every evaluated series into the aggregate's own
+`GroupsAccumulator` and emits that accumulator's `state()` once per partition. The state is
+DataFusion's, so the `FinalPartitioned` aggregate and the `RepartitionExec` above it are
+unchanged and consume it as they would have consumed the partial aggregate's own output.
+
+Three arms, one binary, the environment variable as the only difference (`off`, `on`, `sum`),
+120 min at a 1 s step on the 400-series fixture, 3 rounds with the arm order rotated,
+2 warmup + 9 timed per arm per round. Binary built from `83e366b33bd`.
+
+**The path is the intended one, on real storage.** `TQL ANALYZE VERBOSE FORMAT JSON` (not
+`EXPLAIN`: in standalone it prints `CooperativeExec → MergeScanExec` and never expands the
+remote plan, so an EXPLAIN-based check here would certify nothing) reports, for
+`sum by (instance) (rate(vmbench[5m]))` at 20 partitions:
+
+```
+AggregateExec: mode=FinalPartitioned, gby=[instance@0, ts@1], aggr=[sum(prom_rate(...))]
+  RepartitionExec: partitioning=Hash([instance@0, ts@1], 20), input_partitions=20
+    FusedSeriesExec: eval=rate, range=300000ms, offset=0ms, maps=[], partial=sum
+      SeriesScanExec: source=primary_key, fields=1, partitions=20
+```
+
+One aggregate, `FinalPartitioned`; the partial one is gone; the repartition is preserved.
+Each arm logs what it should and only what it should: `off` 0 fused, `on` 1 fused with no
+partial marker, `sum` 1 fused with `partial=sum`, and the never-fusing `control` 0 on all
+three.
+
+**Correctness: three arms, seven shapes, the same answer.** Every arm runs one dedicated
+correctness query per case — its own execution, never a timed one — and every pair is compared
+series by series and sample by sample: schema, row count, the set of label tuples with each
+one's row count, then each series' own timestamp sequence and every value. All seven cases
+agree, including the two 2 868 400-row ones.
+
+| case | rows | fused / partial hits (off / on / sum) |
+| --- | ---: | --- |
+| `G4` `sum by (instance)` | 28 684 | 0/0, 1/0, **1/1** |
+| `G400` `sum by (host)` | 2 868 400 | 0/0, 1/0, **1/1** |
+| `G1` `sum by (job)` | 7 171 | 0/0, 1/0, **1/1** |
+| `n100`, `n1` | 7 171 | 0/0, 1/0, **1/1** |
+| `raw` (no aggregation) | 2 868 400 | 0/0, 1/0, **1/0** — nothing to push into |
+| `control` (`max_over_time`) | 28 744 | 0/0, 0/0, 0/0 |
+
+`raw`'s `1/0` is the load-bearing negative control *inside this build*: with no aggregation
+above the fused node there is no partial aggregate to absorb, so the `sum` arm runs the
+identical plan to `on` and its ratio is the harness's own floor.
+
+**The result.**
+
+| case | CPU off | CPU on | CPU sum | `sum/on` | per round | `sum/off` |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| `G4` `sum by (instance)` | 340 ms | 200 ms | 140 ms | **0.700** | 0.70 / 0.48 / 0.88 | 0.406 |
+| `G1` `sum by (job)` | 300 ms | 180 ms | 140 ms | **0.667** | 0.87 / 0.61 / 0.67 | 0.400 |
+| `n100` (100 series) | 110 ms | 100 ms | 90 ms | **0.900** | 0.90 / 0.90 / 0.90 | 0.818 |
+| `G400` `sum by (host)` | 2 450 ms | 2 350 ms | 2 250 ms | **0.957** | 0.95 / 0.98 / 0.96 | 0.926 |
+| `raw` (no aggregation) | 1 410 ms | 1 350 ms | 1 350 ms | 0.993 | 0.99 / 0.99 / 1.04 | 0.957 |
+| `n1` (1 series) | 30 ms | 30 ms | 30 ms | 1.000 | 1.33 / 1.00 / 1.00 | 1.000 |
+| `control` (`max_over_time`) | 470 ms | 470 ms | 500 ms | 1.298 | 1.30 / 0.70 / 1.39 | 1.064 |
+
+**The direction is unambiguous; the magnitude is not, on the cases that matter most.** On the
+three cases with something to collapse, `sum/on` is below 1.00 in **9 of 9 rounds** — `G4`
+0.70/0.48/0.88, `G1` 0.87/0.61/0.67, `n100` 0.90/0.90/0.90. No round of any of them is above
+the `on` arm. The magnitude is only resolvable where *both* arms repeat, and the gate reports
+this pass **not quiet**: `G4`'s `on/off` deviates 60% and its `sum/on` 31%, `G1`'s 42% and 31%.
+Those two ratios are therefore quoted with their per-round values and no single number is
+claimed from them.
+
+**Where the swing comes from, and it is not the partial arm.** Per arm, per round:
+
+| case | `off` spread | `on` spread | `sum` spread |
+| --- | ---: | ---: | ---: |
+| `G4` | 18% | **50%** | **14%** |
+| `G1` | 53% | **39%** | **14%** |
+| `n100` | 9% | 0% | 0% |
+| `G400` | 2% | 1% | 1% |
+| `raw` | 1% | 4% | 1% |
+
+The `sum` arm is the most repeatable of the three on every fusing case — it reads 130-150 ms
+across all six `G4`/`G1` rounds — while the `on` arm swings 170-270 ms on `G4` alone. That is
+consistent with what the two do: `on` materialises 2 868 400 intermediate rows per query and
+pushes them through a generic `AggregateExec` hash table, `sum` never materialises them. So the
+`sum/on` ratio's instability is inherited from its *denominator*, and the partial arm's cheapness
+and its repeatability are the same property.
+
+**Against section 4.9's bound.** 4.9 predicted `G4` would land "near 132 ms", i.e. `sum/on` no
+lower than about **0.765**, from the aggregate's 38.9 ms share of a 173.0 ms fused arm. This run
+reads 0.70 / 0.48 / 0.88: one round above that bound, two below. The bound falls inside the
+observed spread, so this pass neither confirms nor refutes it, and no new bound is derived from
+it. Two things also make the comparison inexact: the builds differ, and this machine was
+noisier — `G4`'s `on` arm reads 200 ms here against 173.0 ms archived, so the fusion gain
+itself moved from 0.682 to 0.526. The 4.9 accounting counted the aggregate's own hash path;
+the partial step additionally avoids materialising the intermediate rows the aggregate
+consumed, which that accounting did not charge to anything. That is a reason to expect the true
+saving to exceed the bound, not evidence that it does.
+
+**One small correction to 4.9's "nothing to collapse at 1:1".** `G400` is `sum by (host)`, 1:1,
+and 4.9 predicted a partial aggregate would do nothing there. It reads 0.957 with all three
+arms stable to 1-2% and all three rounds below 1.00, so the saving is small but real: at 1:1 the
+output row count is unchanged, but the ordinary plan still builds a hash table over 2 868 400
+rows and copies group columns, where the fused node writes the state directly. 4.3% is above
+this shape's own floor (1-2%) and near `raw`'s (1-4% on a shorter query).
+
+**The slot key is load-bearing, and that is verified rather than asserted.** A slot must be
+keyed by the *absolute* grid index (`start + offset`), because each series trims its own
+interval and a local row number would alias two different grid points. Changing that one
+expression to the bare row offset — in both the dense and the sparse branch — makes exactly the
+tests written for it fail: `partial_sum_emits_absolute_grid_indices_and_nothing_for_a_missing_partition`,
+`partial_sum_keeps_the_duplicate_label_set_rules` and `partial_sum_keeps_nan_and_infinities`,
+with the first reporting a state of `[(x, 300000), (x, 360000)]` where DataFusion's partial
+produced `[(x, 300000), (x, 480000), (x, 540000)]`. One deliberate wrong expression, three
+failures, no change to any other test — which is what makes the absolute-index claim a tested
+property instead of a comment.
+
+**What this does not show.** It does not resolve the partial step's magnitude on `G4`/`G1`, as
+above. It says nothing about latency: wall clock reads 0.786 / 0.849 / 0.969 / 1.016 on
+`G4`/`G1`/`n100`/`G400`, i.e. the same direction and much smaller, because the fused path
+still scans and evaluates every series. It is one fixture, one machine, one binary. And it is a
+bench path: the step is selected by `GREPTIME_FUSED_PARTIAL_SUM` and deleted when the formal
+planner constructs the same node configuration directly.
+
 ## 5. What is not shown
 
 - **No general speedup.** On CPU the fused path now beats the ordinary plan on every `rate`
@@ -1245,6 +1433,13 @@ counter until that changes.
   and on a machine with idle cores the wall time was already dominated by other work. There is
   still no evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
+- **The partial `SUM` (section 4.11) is not resolved on the shape it exists for.** Its direction
+  is: `sum/on` is below 1.00 in all nine rounds of the three collapsing cases. Its magnitude is
+  not: `G4` reads 0.70 / 0.48 / 0.88 and `G1` 0.87 / 0.61 / 0.67, and the gate reports the pass
+  not quiet, mostly through the `on` arm's own 50% / 39% round-to-round spread. Only `n100`
+  (0.900, three identical rounds) and `G400` (0.957, all arms within 2%) give a magnitude this
+  run can support, and neither is the 100:1 shape a PromQL user writes. Section 4.9's 40.7 ms
+  bound is neither confirmed nor refuted — the rounds straddle it.
 - **The per-point bookkeeping is gone for two functions only.** `rate` and `increase` take
   the batch path; `delta`, `irate`, `*_over_time` and the rest still call the boxed kernel
   once per grid point and gained nothing this round. Section 4.5's 36.9 ns-per-point figure
@@ -1404,6 +1599,26 @@ python3 $ARCH/analyse.py $ARCH/W-8r.json $ARCH/W-self8.json \
     $ARCH/G-8r.json $ARCH/G-self8.json
 ```
 
+Section 4.11 adds a third arm to the 4.9 driver, so it is the same command with
+`--arms off,on,sum`; the three arms are one binary and one environment variable
+(`GREPTIME_FUSED_PARTIAL_SUM`), which is what makes `sum/on` isolate the partial step alone:
+
+```bash
+python3 scripts/fused_series_scale.py --data-home <dir> --bin <greptime> \
+    --commit <sha> --arms off,on,sum --rounds 3 --warmup 2 --iterations 9 \
+    --out docs/bench-records/20261019T0212Z/scale-3arm.json
+
+# The plan each arm actually runs, and that all three return the same answer. Needs
+# TQL ANALYZE: in standalone TQL EXPLAIN reports only `CooperativeExec -> MergeScanExec`
+# and never expands the remote plan, so it cannot show which operators ran.
+python3 scripts/fused_series_partial_plan.py --data-home <dir> --bin <greptime> --case C \
+    | tee docs/bench-records/20261019T0212Z/partial-plan-C.txt
+
+# The comparator that run relies on, with no server: reordering tolerated, and a changed
+# value, timestamp, dropped sample, dropped series, changed label or schema still caught.
+python3 scripts/fused_series_bench.py selftest
+```
+
 The three data shapes of section 2 are seeded and measured by
 `scripts/fused_series_shapes.py --data-home <dir> --bin <greptime> --out shapes.json`, which
 refuses to seed into a directory already holding a different shape and refuses to report a case
@@ -1413,6 +1628,12 @@ that returned no rows.
 tree, which is the mistake section 4.4 also documents. The CPU profile that section 4.8 rejects,
 and the summary that attributes its stacks, are
 `scripts/fused_series_profile.py --seconds 60` and `scripts/fused_profile_summarize.py`.
+
+Section 4.11's three-arm pass is in `docs/bench-records/20261019T0212Z/`, with the per-iteration
+samples behind every median. It writes no per-arm result files: the three arms are compared
+in-process by `check_arms` on every case, and a disagreement stops the run before it records
+anything, so a saved copy would only restate a check that already passed — and at 2 868 400 rows
+per arm it would not be archivable anyway.
 
 Sections 4.8 and 4.9's numbers are in `docs/bench-records/20261018T122000Z/`, with the
 per-iteration samples behind every median; section 2's three data shapes and the
