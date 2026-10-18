@@ -237,7 +237,7 @@ reused: when every row is occupied it has already produced a single run covering
 
 ## 2. Correctness
 
-Five independent layers, all currently green.
+Six independent layers, all currently green.
 
 1. **Node unit tests** — `src/promql/src/extension_plan/fused_series/tests.rs`
 2. **Evaluator differential tests** — `src/promql/src/range_eval/tests.rs`. The
@@ -255,6 +255,20 @@ Five independent layers, all currently green.
 4. **Real storage scan** — `tests-integration/.../nested_merge_scan_capability_test.rs`,
    `test_fused_series_exec_over_real_storage_scan`.
 5. **Real PromQL query through the planner** — see section 3.
+6. **Three data shapes the fixture cannot express**, through real storage and the real planner:
+   a counter that resets every 48 samples (`vmreset`, 5 m and 1 h windows), a counter with
+   periodic gaps plus a 30 min outage (`vgaps`, 52 008 of 57 600 samples present), and the same
+   data as `vmreset` written in 5 760 ten-sample statements instead of 40 whole-series ones
+   (`vfrag`). `scripts/fused_series_shapes.py` seeds all three, checks the hit count per
+   execution, and compares the arms row for row: all five cases matched on both arms, the fused
+   arm logging exactly one selection per query and the unfused arm none.
+
+   The sharpest of those is `vfrag` against `vmreset`: **identical values at identical
+   timestamps, different on-disk fragmentation**, so the two must return identical numbers. They
+   do — `differing cells = 0`, largest absolute difference `0.0` on the fused path — while the
+   ordinary path differs from itself by `1.4e-14` on the same comparison. That is the shape a
+   lost-at-batch-boundary accumulator bug would fail, and an arm-versus-arm comparison could not
+   catch it (both arms would be wrong in the same way).
 
 `cargo nextest run -p promql` → 457 passed.
 `cargo nextest run -p query` → 885 passed, 2 skipped.
@@ -1157,6 +1171,11 @@ python3 scripts/fused_series_profile.py --data-home <dir> --bin <greptime> --cas
     --arm on --analyze-only --analyze-out analyze-C.json
 python3 scripts/fused_plan_budget.py analyze-G.json --json budget-G.json
 ```
+
+The three data shapes of section 2 are seeded and measured by
+`scripts/fused_series_shapes.py --data-home <dir> --bin <greptime> --out shapes.json`, which
+refuses to seed into a directory already holding a different shape and refuses to report a case
+that returned no rows.
 
 `fused_plan_budget.py` prints each operator's *own* counters and refuses to sum them across the
 tree, which is the mistake section 4.4 also documents. The CPU profile that section 4.8 rejects,
