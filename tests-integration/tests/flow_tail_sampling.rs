@@ -63,6 +63,14 @@ struct RoundOutcome {
     affected_trace_ids: BTreeSet<String>,
     high: HashMap<u64, u64>,
     submitted_rows: usize,
+    /// Wall time of the sequence-delta query, in milliseconds.
+    q1_ms: u128,
+    /// Wall time of the time-movement query, in milliseconds.
+    q2_ms: u128,
+    /// Wall time of the restricted recomputation and its writes, in milliseconds.
+    q3_ms: u128,
+    /// Wall time of the whole round, in milliseconds.
+    total_ms: u128,
 }
 
 fn sql_string(value: &str) -> String {
@@ -470,6 +478,7 @@ async fn discover_watermark(db: &Database, t: DateTime<Utc>) -> HashMap<u64, u64
 /// only recompute the affected traces. Progress advances only after every step
 /// succeeded, so a failed round is simply retried with the previous state.
 async fn run_round(db: &Database, state: &mut PocState, t: DateTime<Utc>) -> RoundOutcome {
+    let round_started = std::time::Instant::now();
     let mut outcome = RoundOutcome::default();
 
     if !state.is_initialized() {
@@ -485,10 +494,13 @@ async fn run_round(db: &Database, state: &mut PocState, t: DateTime<Utc>) -> Rou
 
         state.after_seqs = outcome.high.clone();
         state.previous_eval_time = Some(t);
+        outcome.total_ms = round_started.elapsed().as_millis();
         return outcome;
     }
 
+    let q1_started = std::time::Instant::now();
     let (new_traces, high) = query_new_traces(db, &state.after_seqs, t).await;
+    outcome.q1_ms = q1_started.elapsed().as_millis();
     outcome.new_trace_ids = new_traces;
     outcome.high = high;
 
@@ -497,7 +509,9 @@ async fn run_round(db: &Database, state: &mut PocState, t: DateTime<Utc>) -> Rou
     let previous = state
         .previous_eval_time
         .expect("an initialized round must have a previous evaluation time");
+    let q2_started = std::time::Instant::now();
     let time_traces = query_time_traces(db, previous, t, &outcome.high).await;
+    outcome.q2_ms = q2_started.elapsed().as_millis();
     outcome.time_trace_ids = time_traces;
 
     let affected = outcome
@@ -507,8 +521,11 @@ async fn run_round(db: &Database, state: &mut PocState, t: DateTime<Utc>) -> Rou
         .collect::<BTreeSet<_>>();
     outcome.affected_trace_ids = affected;
 
+    let q3_started = std::time::Instant::now();
     outcome.submitted_rows =
         write_poc_sink(db, &outcome.affected_trace_ids, t, &outcome.high).await;
+    outcome.q3_ms = q3_started.elapsed().as_millis();
+    outcome.total_ms = round_started.elapsed().as_millis();
 
     state.after_seqs = outcome.high.clone();
     state.previous_eval_time = Some(t);
@@ -592,13 +609,71 @@ async fn insert_spans(db: &Database, t: DateTime<Utc>, spans: &[(&str, &str, i64
     api_affected_rows(db, &sql, t).await;
 }
 
+/// Inserts many spans, splitting the statement so a large dataset does not build
+/// one oversized request.
+async fn insert_spans_chunked(db: &Database, t: DateTime<Utc>, spans: &[BenchSpan]) -> usize {
+    // A large chunk keeps the insert count low: each statement rebuilds memtable
+    // state, and with 60k spans a 500-row chunk means 120 expensive round trips.
+    const CHUNK: usize = 5_000;
+    let mut written = 0;
+    for chunk in spans.chunks(CHUNK) {
+        let values = chunk
+            .iter()
+            .map(|span| {
+                format!(
+                    "({}, {}, {}, {}, {}, 'svc', {}, 'SPAN_KIND_SERVER', {}, 'poc')",
+                    sql_timestamp(t + ChronoDuration::milliseconds(span.start_ms)),
+                    sql_timestamp(t + ChronoDuration::milliseconds(span.end_ms)),
+                    (span.end_ms - span.start_ms) * 1_000_000,
+                    sql_string(&span.trace),
+                    sql_string(&span.span),
+                    sql_string(&span.span),
+                    sql_string(span.status),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO raw_spans (`timestamp`, timestamp_end, duration_nano, trace_id, span_id, \
+             service_name, span_name, span_kind, span_status_code, `span_attributes.poc.case`) \
+             VALUES {values}"
+        );
+        written += api_affected_rows(db, &sql, t).await;
+    }
+    written
+}
+
 /// The PoC decision must match the full-query decision after every round.
 async fn assert_sinks_agree(db: &Database, label: &str) {
     let difference = sink_difference(db, POC_SINK, BASELINE_SINK).await;
-    assert_eq!(
-        difference, 0,
-        "after {label}: the PoC sink must match the baseline sink exactly"
-    );
+    if difference == 0 {
+        return;
+    }
+    // Report the offending rows, not just the count: a bare number does not say
+    // which side is wrong or which column drifted.
+    let columns = format!("{SPAN_COLUMNS}, sample_reason");
+    let mut report = format!("after {label}: sinks differ by {difference} rows");
+    for (side, sql) in [
+        (
+            "only in poc",
+            format!(
+                "SELECT {columns} FROM {POC_SINK} EXCEPT SELECT {columns} FROM {BASELINE_SINK}"
+            ),
+        ),
+        (
+            "only in baseline",
+            format!(
+                "SELECT {columns} FROM {BASELINE_SINK} EXCEPT SELECT {columns} FROM {POC_SINK}"
+            ),
+        ),
+    ] {
+        let rows = fetch_row_set(db, &sql, &[]).await;
+        report.push_str(&format!("\n{side} ({} rows):", rows.len()));
+        for row in rows.iter().take(8) {
+            report.push_str(&format!("\n  {row:?}"));
+        }
+    }
+    panic!("{report}");
 }
 
 fn poc_eval_time() -> DateTime<Utc> {
@@ -1126,6 +1201,298 @@ async fn test_local_result_equals_full_scoped_to_affected() {
             "the restricted query returned an unrequested trace: {row:?}"
         );
     }
+
+    let _ = grpc_server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Cost comparison (plan section 8)
+// ---------------------------------------------------------------------------
+
+/// One generated span, with offsets relative to the measurement start time.
+struct BenchSpan {
+    trace: String,
+    span: String,
+    start_ms: i64,
+    end_ms: i64,
+    status: &'static str,
+}
+
+/// Deterministic pseudo-random source, so a rerun produces the same dataset
+/// without depending on an external random number generator.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+}
+
+/// Builds the background dataset: `trace_count` traces with three spans each,
+/// one percent of them carrying an ERROR span and a disjoint one percent slow.
+///
+/// Every span sits between eight and two minutes before the measurement start,
+/// so they are all past the thirty second wait and none of them crosses the ten
+/// minute lookback boundary during a minute of ticks. That is what makes the
+/// static scenario produce an empty delta.
+fn gen_bench_dataset(trace_count: usize) -> Vec<BenchSpan> {
+    const EARLIEST_MS: i64 = -480_000;
+    const LATEST_MS: i64 = -120_000;
+    let span_ms = LATEST_MS - EARLIEST_MS;
+    let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+    let mut spans = Vec::with_capacity(trace_count * 3);
+
+    for trace_index in 0..trace_count {
+        // Spread the bases so they are not all aligned to the same millisecond.
+        let jitter = (rng.next() % 1000) as i64;
+        let base = EARLIEST_MS + (trace_index as i64 * span_ms / trace_count as i64) + jitter;
+        let trace = format!("bench_trace_{trace_index:06}");
+        let is_error = trace_index % 100 == 0;
+        let is_slow = trace_index % 100 == 50;
+
+        for span_index in 0..3i64 {
+            let start = base + span_index * 100;
+            let mut end = start;
+            let mut status = "STATUS_CODE_OK";
+            if is_error && span_index == 1 {
+                status = "STATUS_CODE_ERROR";
+            }
+            if is_slow && span_index == 2 {
+                // 1.5s extent, above the one second threshold.
+                end = start + 1_500;
+            }
+            spans.push(BenchSpan {
+                trace: trace.clone(),
+                span: format!("s{span_index}"),
+                start_ms: start,
+                end_ms: end,
+                status,
+            });
+        }
+    }
+    spans
+}
+
+/// Spans appended by one scenario tick: the traces chosen for this tick append a
+/// single normal span, and every fifth of those appends an ERROR span so the
+/// reason of an already sampled trace has to be recomputed.
+fn gen_tick_appends(scenario: &str, trace_count: usize, tick: usize) -> Vec<BenchSpan> {
+    let selector: usize = match scenario {
+        // One percent of the traces change per tick.
+        "sparse" => 100,
+        // Half of the traces change per tick: the degraded case.
+        "active" => 2,
+        _ => return Vec::new(),
+    };
+    let mut spans = Vec::new();
+    for trace_index in 0..trace_count {
+        if (trace_index + tick) % selector != 0 {
+            continue;
+        }
+        let trace = format!("bench_trace_{trace_index:06}");
+        // Sixty seconds old, so the appended span is immediately eligible and the
+        // recomputation has a real chance to change the decision.
+        let start = tick as i64 * 5_000 - 60_000;
+        let status = if (trace_index + tick) % (selector * 5) == 0 {
+            "STATUS_CODE_ERROR"
+        } else {
+            "STATUS_CODE_OK"
+        };
+        spans.push(BenchSpan {
+            trace: trace.clone(),
+            span: format!("t{tick}"),
+            start_ms: start,
+            end_ms: start,
+            status,
+        });
+    }
+    spans
+}
+
+async fn reset_tables(db: &Database) {
+    for table in ["raw_spans", POC_SINK, BASELINE_SINK] {
+        let _ = db.sql(&format!("DROP TABLE IF EXISTS {table}")).await;
+    }
+    create_tables(db).await;
+}
+
+async fn sink_rows(db: &Database, table: &str) -> BTreeSet<Vec<String>> {
+    fetch_row_set(
+        db,
+        &format!("SELECT {SPAN_COLUMNS}, sample_reason FROM {table}"),
+        &[],
+    )
+    .await
+}
+
+/// Compares the two strategies on the same generated input and writes one CSV row
+/// per measured round.
+///
+/// The per-round timings come from the round helper itself, so the extra work of
+/// keeping the full-query sink in sync for the correctness check is not counted
+/// against the incremental path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cost_comparison() {
+    let trace_count: usize = std::env::var("POC_TRACE_COUNT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000);
+    let csv_path = std::env::var("POC_RESULTS_CSV")
+        .unwrap_or_else(|_| "/tmp/flow-tail-sampling-results.csv".to_string());
+
+    let (db, grpc_server) = test_db("test_cost_comparison").await;
+    let dataset = gen_bench_dataset(trace_count);
+    println!("dataset: {trace_count} traces, {} spans", dataset.len());
+
+    let mut csv = vec![
+        "mode,scenario,tick,eval_time,new_trace_ids,time_trace_ids,\
+affected_trace_ids,q1_ms,q2_ms,q3_ms,total_ms,sink_submitted_rows,sink_visible_rows"
+            .to_string(),
+    ];
+
+    let t0 = poc_eval_time();
+    let tick_time = |tick: usize| t0 + ChronoDuration::seconds(tick as i64 * 5);
+
+    let only: Vec<String> = std::env::var("POC_SCENARIOS")
+        .unwrap_or_else(|_| "static,sparse,active".to_string())
+        .split(',')
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    for scenario in ["static", "sparse", "active"]
+        .into_iter()
+        .filter(|name| only.iter().any(|wanted| wanted == name))
+    {
+        let ticks: usize = match std::env::var("POC_TICKS").ok().and_then(|v| v.parse().ok()) {
+            Some(explicit) => explicit,
+            None if scenario == "static" => 12,
+            None => 6,
+        };
+
+        // Incremental mode: measure the rounds, and keep the baseline sink in
+        // sync so the final contents can be compared.
+        reset_tables(&db).await;
+        let inserted = insert_spans_chunked(&db, t0, &dataset).await;
+        assert_eq!(inserted, dataset.len());
+        // Move the dataset into SSTs. The `trace_id` skipping index only prunes
+        // row groups in SSTs, so without this flush the trace-restricted query
+        // would have to scan every row of the memtable.
+        db.sql("admin flush_table('raw_spans')").await.unwrap();
+        // Capture one plan for the full query and one for a trace-restricted
+        // query, so the report can state where the trace predicate lands
+        // instead of guessing. GreptimeDB exposes no scan-row counter, so the
+        // plan is the only available evidence.
+        if scenario == "static" {
+            let probe: BTreeSet<String> = dataset
+                .iter()
+                .take(200)
+                .map(|span| span.trace.clone())
+                .collect();
+            for (label, sql) in [
+                ("full", sampling_select(None)),
+                ("restricted", sampling_select(Some(&probe))),
+            ] {
+                let plan = format!("EXPLAIN {sql}");
+                let lines = fetch_string_column(&db, &plan, &[]).await;
+                println!("--- EXPLAIN {label} ---");
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+        }
+        let mut state = PocState::default();
+        for tick in 0..=ticks {
+            let now = tick_time(tick);
+            let appends = gen_tick_appends(scenario, trace_count, tick);
+            if !appends.is_empty() {
+                insert_spans_chunked(&db, t0, &appends).await;
+            }
+            run_baseline(&db, now).await;
+            let outcome = run_round(&db, &mut state, now).await;
+
+            if scenario == "static" && tick > 0 {
+                assert!(
+                    outcome.affected_trace_ids.is_empty(),
+                    "static scenario must produce an empty delta at tick {tick}: {:?}",
+                    outcome.affected_trace_ids
+                );
+                assert_eq!(
+                    outcome.submitted_rows, 0,
+                    "static scenario must submit nothing at tick {tick}"
+                );
+            }
+
+            let visible = count_rows(&db, &format!("SELECT COUNT(*) FROM {POC_SINK}")).await;
+            // Thirteen fields, in header order; the full-query-only columns stay
+            // empty here and the per-query timings stay empty there.
+            csv.push(
+                [
+                    "poc".to_string(),
+                    scenario.to_string(),
+                    tick.to_string(),
+                    now.timestamp_millis().to_string(),
+                    outcome.new_trace_ids.len().to_string(),
+                    outcome.time_trace_ids.len().to_string(),
+                    outcome.affected_trace_ids.len().to_string(),
+                    outcome.q1_ms.to_string(),
+                    outcome.q2_ms.to_string(),
+                    outcome.q3_ms.to_string(),
+                    outcome.total_ms.to_string(),
+                    outcome.submitted_rows.to_string(),
+                    visible.to_string(),
+                ]
+                .join(","),
+            );
+        }
+        let poc_rows = sink_rows(&db, POC_SINK).await;
+        let reference = sink_rows(&db, BASELINE_SINK).await;
+        assert_eq!(
+            poc_rows, reference,
+            "scenario {scenario}: the incremental sink must match the full-query sink"
+        );
+
+        // Full-query mode on the same input, so the comparison uses one data set.
+        reset_tables(&db).await;
+        insert_spans_chunked(&db, t0, &dataset).await;
+        db.sql("admin flush_table('raw_spans')").await.unwrap();
+        for tick in 0..=ticks {
+            let now = tick_time(tick);
+            let appends = gen_tick_appends(scenario, trace_count, tick);
+            if !appends.is_empty() {
+                insert_spans_chunked(&db, t0, &appends).await;
+            }
+            let started = std::time::Instant::now();
+            let submitted = run_baseline(&db, now).await;
+            let elapsed = started.elapsed().as_millis();
+            let visible = count_rows(&db, &format!("SELECT COUNT(*) FROM {BASELINE_SINK}")).await;
+            csv.push(
+                [
+                    "baseline".to_string(),
+                    scenario.to_string(),
+                    tick.to_string(),
+                    now.timestamp_millis().to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    elapsed.to_string(),
+                    submitted.to_string(),
+                    visible.to_string(),
+                ]
+                .join(","),
+            );
+        }
+    }
+
+    std::fs::write(&csv_path, csv.join("\n") + "\n").expect("writing the results csv");
+    println!("results written to {csv_path} ({} rows)", csv.len() - 1);
 
     let _ = grpc_server.shutdown().await;
 }

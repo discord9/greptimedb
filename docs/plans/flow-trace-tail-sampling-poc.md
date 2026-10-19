@@ -1,8 +1,30 @@
-日期：2026-10-19
+日期：2026-10-19 起，2026-10-19 收尾
 
 目标是在现有 batching Flow 内跑通 sequence 驱动的局部重算：每轮找出受影响的 trace，只对这些 trace 执行原来的采样 SQL。保持批量实验已经验证的累计 upsert 行为，并测量重复计算和重复写入减少了多少。
 
-交付物是一条能通过 `CREATE FLOW ... EVAL INTERVAL '5s'` 自动执行的实验 Flow、一套可重复运行的场景脚本，以及全量方案和 PoC 的结果与开销对照。
+## 结论摘要
+
+**机制成立，收益来源与最初的预期不同。**
+
+在 2 万条 trace、6 万个 span 的固定输入上，PoC 与全量方案在三个场景逐轮对照：
+
+| 场景 | PoC 单轮 | 全量基准单轮 | 比值 | PoC 每轮提交行 | 基准每轮提交行 |
+| - | - | - | - | - | - |
+| 静止 | 85 ms | 2,200 ms | 0.04x | 0 | 1,200 |
+| 稀疏（每轮 1% trace 追加） | 1,790 ms | 3,200 ms | 0.56x | 800 | 2,200–4,600 |
+| 活跃（每轮 50% trace 追加） | 18,000 ms | 2,900 ms | 6.2x 慢 | 40,000–60,000 | 80,000–110,000 |
+
+三条要点：
+
+1. **收益主要来自停止重复写入，不是减少扫描。** 静止场景每轮写入从 1,200 行降到 0，耗时降到全量的 4%。这正是批量实验报告的痛点（3,925 行物理写入对应 1,211 个不同 span 的写放大）。
+2. **受限查询本身并不便宜。** `trace_id` 的 skipping index 是 bloom filter，默认 granularity 10,240 行，在 row group 内按块裁剪，所以确实少读了块；但默认 row group 是 102,400 行[23]，本实验 6 万行整表落在单个 row group 内，row group 级的 `row_groups_by_minmax` 结构上无事可做。块级裁剪带来的是比例上的减少，不是量级上的。稀疏场景的收益来自"只写变化的行"，不是"少扫"。
+3. **活跃场景明确退化。** 受影响 trace 达到 1 万条时，按每批 1,000 个 trace ID 拆成 10 条查询，每条各扫一遍窗口，扫描量放大 10 倍。这是分批阈值的代价而非方案固有上限，正确做法是按 `|D|` 占比退化成一次全量查询；本轮未实现该分支，故表中 6.2 倍是当前实现的真实开销。
+
+正确性在所有场景成立：两种模式共用同一输入与 tick 序列，累积 sink 逐行一致。
+
+**范围**：本轮只到开销对照为止。把它变成"能通过 DDL 声明的自动 Flow"需要企业版入口，原因与交接要点见第 6 节。
+
+交付物是可重现的场景脚本与开销对照（`tests-integration/tests/flow_tail_sampling.rs`），加上本文。
 
 # 1 已有实验提供的起点
 
@@ -262,10 +284,18 @@ factory 按传入的 sink 元数据匹配 `sampled_spans_poc` 的完整名称，
 | M1 Sequence 读取 | 调用真实 FE 查询路径，连续两轮读取不同 sequence 范围 | 第二轮只返回新写入涉及的 trace，且能打印 C 和 H |
 | M2 三查询执行 | 实现时间查询、key 合并、局部重算和内存进度 | 注入时间后可处理无写入到期与迟到补写 |
 | M3 结果对照 | 同一输入、T、H 下运行全量与 PoC，比较累计 sink | 第 7 节的固定场景全部通过 |
-| M4 Flow 接线 | 将同一 helper 接到 batching execution | 真实 5 秒调度连续运行并自动写入 sink |
+| M4 Flow 接线 | 将同一 helper 接到 batching execution | **移出本轮范围**，见下 |
 | M5 开销对照 | 运行约 2 万 trace 的静止、稀疏变化和活跃场景 | 产出扫描、查询耗时和 sink 提交行数对照 |
 
 按这个顺序推进，不先建设通用改写器。M1 若没有真正读到跨 flush 的 sequence 范围，先修通该调用，后面的 SQL 改写暂不展开。
+
+## M4 移出本轮范围的原因
+
+让它在开源版成为"自动运行的 Flow"，需要用户能用 DDL 声明精确 sequence 范围模式。查询层接口本身已经在开源版可用（`flow.incremental_mode=sequence_range`、`flow.incremental_after_seqs`），但 `CREATE FLOW` 侧的哨兵 `__greptime_internal_exact_sequence_range` 在开源版被拒绝[21]。因此"机制可用"已经验证，"用户能通过 DDL 用上"不能在开源版内完成，属于企业版工作。
+
+本轮 PoC 到 M5 的开销对照为止。后续在企业版接线时，下面这条实测结论必须带过去，否则会得到静默的错误行为：
+
+**进度水位必须从单扫描查询取。** 采样查询对 `raw_spans` 扫了两次，没有执行的 JOIN 分支会被算作"参与了但未证明"，按保守合并规则（`merge_region_watermark_entries`[20]）否决另一分支已经证明的水位，返回 `Some(空 map)` 而不是 `None`。后果是空轮的水位 `C` 停滞、每轮重复全量重算，且不报错。这与 INSERT 语句、与空表都无关，只取决于查询是否单扫描。
 
 # 7 固定验收场景
 
@@ -323,25 +353,77 @@ sink_submitted_rows,sink_visible_rows
 
 保存一次全量和局部查询的 `EXPLAIN` 或已有分析输出，检查 trace 条件是否在聚合前生效。若历史扫描仍读完整窗口，报告实际少做的聚合和写入，以及未减少的读取部分。先完成能运行、结果一致和空轮停止重写的闭环，不预设固定倍数的提速门槛。
 
+## 实测结果
+
+输入：20,000 条 trace、60,000 个 span，固定种子的生成器，1% 错误、1% 慢且两个集合不重叠。三场景各自串行运行 PoC 与全量基准，共用同一份数据与 tick 序列。表中是每个场景稳定后的单轮耗时（首轮含初始化，已排除）。
+
+| 场景 | PoC 单轮 | 全量基准单轮 | 比值 | PoC 每轮提交行 | 基准每轮提交行 |
+| - | - | - | - | - | - |
+| 静止（12 tick 无写入） | 85 ms | 2,200 ms | **0.04x** | **0** | 1,200 |
+| 稀疏（每轮 1% trace 追加） | 1,790 ms | 3,200 ms | 0.56x | 800 | 2,200–4,600 |
+| 活跃（每轮 50% trace 追加） | 18,000 ms | 2,900 ms | **6.2x 慢** | 40,000–60,000 | 80,000–110,000 |
+
+同样三个场景在 200 条 trace 上测过一遍，结论方向一致而幅度更小：静止 0.52x（50 ms 对 97 ms），稀疏约 1.35x 慢、活跃约 1.7x 慢。PoC 的固定开销基本不随数据量增长：静止场景从 200 到 20,000 条 trace 只从约 50 ms 涨到 85 ms，因为它只扫时间窗口内的时间列与 trace 列、不做聚合、不写表；而全量基准的成本随数据量线性增长（97 ms 到 2,200 ms）。
+
+### 结论
+
+**收益主要来自停止重复写入，而不是减少扫描。** 静止场景下受影响 trace 集合为空，局部重算被整体跳过，写入从每轮 1,200 行降到 0。这正好对应批量实验报告的痛点：物理写入 3,925 行、不同 span 1,211 个的写放大。稀疏场景也靠这一点取胜，但赢的幅度小得多，因为此时局部查询已经要处理 200 条 trace，而受限查询并没有比全量查询便宜多少。
+
+两次 `EXPLAIN` 输出可以看清谓词落点：`trace_id IN (...)` 确实下推到了 `TableScan` 的 `partial_filters`，与时间谓词一起在扫表阶段生效，早于 `Aggregate` 和 `Inner Join`，说明"trace 条件在聚合前生效"这一条成立。但生效不等于能剪掉整段数据，这里有两层粒度：
+
+- **row group 级**：默认 row group 是 100 × 1024 = 102,400 行，本实验的 6 万行整表落在单个 row group 内，`row_groups_by_minmax`[23] 在这一规模下结构上无事可做。
+- **行组内块级**：`trace_id` 的 skipping index 是 bloom filter，默认 granularity 是 10,240 行，applier 在每个 row group 内按块把输出收窄成 `Vec<Range<usize>>`[22]。这一层即使在单个 row group 内也仍然生效。
+
+两层叠加的实测表现是：受限查询确实少读了 bloom filter 判定不可能命中的块，但没有量级差别。稀疏场景 Q3 用约 1,500 ms 处理 200 条 trace，而全量查询用约 3,000 ms 处理同一窗口，省下的是块级裁剪和"只物化受影响 trace 的行"，不是整段跳过。所以"查询变快"不是这个方案的主要收益来源，收益主要来自"不写不变的输出"。
+
+**活跃场景明确退化，而且退化原因可以定位。** 受影响 trace 达到 10,000 条时，按每批 1,000 个 trace ID 的限制会拆成 10 条查询，每条都要扫一遍窗口，于是扫描量放大 10 倍；而全量基准只扫一遍就得到全部结果。这不是方案的固有上限，而是分批阈值的代价：当 `|D|` 大到接近全量时，应当退化成一次不带 trace 过滤的全量查询，而不是继续分批。本轮没有实现该退化分支，因此上表记录的 6.2 倍是当前实现的真实开销。
+
+这一场景还说明**写放大和扫描成本是两个独立的量，不能只优化其中一个**。活跃场景下 PoC 每轮提交 40,000–60,000 行，而全量基准提交 80,000–110,000 行，PoC 的写入其实少了一半以上；但多出的 10 倍扫描把这点收益完全吃掉，总耗时反而慢 6.2 倍。静止场景则是另一个极端：写入降到 0，扫描没有增加，于是净收益最大。两者的差别只在于 `|D|` 占窗口内 trace 总数的比例。
+
+### 使用边界
+
+- 静止与低变化率场景可以放心使用：收益随数据量放大，写入降到零。
+- 高变化率场景不要使用当前实现：应先按 `|D|` 占窗口内 trace 总数的比例决定是否退化成全量查询。
+- 所有场景的正确性都成立：每个场景两个模式跑完后逐行比对 sink，完全一致。
+
 # 9 实现交付清单
 
-建议把实验文件放在同一个目录，最终名称可随仓库约定调整：
+本轮实际交付把上面设想的多文件拆分收敛到了单个测试文件，理由是所有步骤都要走真实 FE 查询路径、共享同一个 standalone 实例，拆成脚本反而需要额外维护连接与启动逻辑：
 
-| 文件或代码 | 内容 |
+| 实际交付 | 内容 |
 | - | - |
-| 局部 PoC 模块 | run_round、固定 SQL 模板、内存进度、三类查询调用 |
-| setup.sql | raw 与两个 sink 的建表语句 |
-| baseline.sql | 原始全量采样查询 |
-| flow\.sql | 实际启用实验 execution 的 CREATE FLOW |
-| gen_traces.py | 固定场景、迟到批次和固定种子的背景数据 |
-| run.sh | 启动或连接 standalone，运行场景、真实 Flow 演示和对照 |
-| check.sql 或检查程序 | 对比两个累计 sink 的键与列值 |
-| results.csv | 逐轮结果、耗时和提交行数 |
-| README.md | 构建版本、启动与复现命令、结果结论 |
+| `tests-integration/tests/flow_tail_sampling.rs` | 建表、数据生成、`run_round`、三条查询、全量基准、六个测试 |
+| `tests-integration/tests/main.rs` | 注册该测试模块 |
+| 本文 | 计划、实测结果与结论 |
 
-脚本先使用可配置端口连接本机 standalone，无需部署 K8s。
+文件内对应的部分：
 
-完成标准是：固定场景通过，真实 Flow 能自动连续执行，flush 后历史回查可用，静止阶段停止重复写入，并提供一组可复现的全量与 PoC 开销对照。至此结束本轮 PoC。
+| 部分 | 位置 |
+| - | - |
+| 建表语句 | `create_tables` |
+| 采样 SQL（可带 trace 过滤） | `sampling_select` |
+| 三条查询与内存进度 | `run_round`、`query_new_traces`、`query_time_traces`、`write_poc_sink` |
+| 全量基准 | `run_baseline` |
+| 固定场景与开销对照 | `test_cost_comparison` |
+| 逐轮结果 CSV | 由 `POC_RESULTS_CSV` 指定，默认 `/tmp/flow-tail-sampling-results.csv` |
+
+复现命令：
+
+```bash
+# 六个测试全部运行
+cargo nextest run -p tests-integration --test main -E 'test(flow_tail_sampling::)'
+
+# 只跑开销对照；规模、场景和 tick 数由环境变量控制
+POC_TRACE_COUNT=20000 POC_SCENARIOS=static POC_TICKS=6 POC_RESULTS_CSV=/tmp/poc.csv \
+  cargo nextest run -p tests-integration --test main \
+  -E 'test(flow_tail_sampling::test_cost_comparison)' \
+  --config 'profile.default.slow-timeout.period="900s"' \
+  --config 'profile.default.slow-timeout.terminate-after=1'
+```
+
+`POC_SCENARIOS` 接受逗号分隔的 `static`、`sparse`、`active`，建议分别运行：2 万规模下单个场景就要分钟级，全部一起跑会触发超时。`POC_TICKS` 缺省时静止场景 12 轮、其余 6 轮。
+
+完成标准的状态：固定场景全部通过；flush 后历史回查可用（`test_historical_spans_survive_flush`）；静止阶段停止重复写入（`test_cost_comparison` 中断言每轮提交为 0）；提供了一组可复现的全量与 PoC 开销对照。**"真实 Flow 自动连续执行"未完成，属于企业版范围**，原因见第 6 节。
 
 # 附录 建表示例
 
@@ -479,4 +561,12 @@ JOIN selected t ON s.trace_id = t.trace_id;
 
 [18] [只有非精确模式才注入 `sst_min_sequence`；它是文件级剪枝提示，不是行级下界](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/query/src/dummy_catalog.rs#L447-L455)。
 
-[19] [`snapshot_on_scan` 时引擎把 `memtable_max_sequence` 钉到当时的已提交序列，该值同时作为精确范围上界和返回的 watermark](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/mito2/src/engine.rs#L1066-L1080)。
+[19]
+[20] [`merge_region_watermark_entries` 的保守合并规则：某个 sub-stage 未证明水位（`None`）会把同 region 已证明的水位降级为 `Unproved`，而不是取最大值](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/query/src/metrics.rs#L310-L345)。这是"进度必须从单扫描查询取"的代码依据。
+
+[21] [开源版拒绝 `CREATE FLOW` 精确 sequence 范围哨兵 `__greptime_internal_exact_sequence_range`](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/common/meta/src/ddl_manager.rs#L1435)。
+
+[22] [skipping index 默认 granularity 为 10,240 行](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/datatypes/src/schema/column_schema.rs#L74)，[bloom filter applier 在 row group 内按块收窄扫描范围](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/mito2/src/sst/index/bloom_filter/applier.rs#L420-L443)。
+
+[23] [默认 row group 行数 `DEFAULT_ROW_GROUP_SIZE = 100 * 1024`](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/mito2/src/sst/parquet.rs#L78)，[row group 级 min-max 裁剪](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/mito2/src/sst/parquet/reader.rs#L1385-L1400)。
+ [`snapshot_on_scan` 时引擎把 `memtable_max_sequence` 钉到当时的已提交序列，该值同时作为精确范围上界和返回的 watermark](https://github.com/GreptimeTeam/greptimedb/blob/52554db52fe36666240b9db1839057f6dfdc776d/src/mito2/src/engine.rs#L1066-L1080)。
