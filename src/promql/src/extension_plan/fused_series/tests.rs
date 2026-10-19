@@ -37,6 +37,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::TaskContext;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion::physical_expr::expressions::Column;
@@ -61,12 +63,13 @@ use store_api::region_engine::RawLabelSource;
 
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 
+use super::PartialSumStream;
 use super::{
     FusedSeriesExec, MAX_CHUNKS_PER_POLL, MAX_ROWS_PER_BATCH, METRIC_COLUMNS, METRIC_EMIT,
     METRIC_EVALUATE, METRIC_FLUSH, METRIC_INPUT_CHUNKS, METRIC_INPUT_POLL, METRIC_KERNEL,
     METRIC_PARTIAL_POINTS, METRIC_PARTIAL_SLOTS, METRIC_PARTIAL_STATE_ROWS, METRIC_PARTIAL_UPDATES,
-    METRIC_SERIES_COMPLETED, METRIC_SERIES_EMITTED, METRIC_WINDOW_PREP, PartialSum, apply_maps,
-    classify_output, occupancy, series_to_record_batch,
+    METRIC_SERIES_COMPLETED, METRIC_SERIES_EMITTED, METRIC_WINDOW_PREP, PartialSum, SlotColumn,
+    apply_maps, classify_output, occupancy, series_to_record_batch,
 };
 use crate::map::MathOp;
 use crate::range_eval::{RangeEvaluator, RangeFunction, RangeWindow};
@@ -383,6 +386,8 @@ impl Case {
         }
     }
 
+    /// The same configuration over another evaluation grid, for the shapes whose point is the
+    /// grid's size or where the data sits in it.
     fn with_grid(&self, grid: Arc<EvalGrid>) -> Self {
         Self {
             grid,
@@ -3247,4 +3252,355 @@ async fn construction_rejects_out_of_scope_partial_bindings() {
     let error = PartialSum::try_new(0, vec![1, 2], counted, Arc::new(Schema::new(fields)))
         .expect_err("a non-float state must be rejected");
     assert!(error.to_string().contains("Float64 state"), "{error}");
+}
+
+/// A `TaskContext` whose memory pool accepts at most `limit` bytes, plus the pool itself.
+///
+/// The pool is what makes the sparse cases testable: a slot column that grew with the absolute
+/// grid index would ask for far more than a series actually occupies, and this pool refuses it.
+fn context_with_pool(limit: usize) -> (TaskContext, Arc<dyn MemoryPool>) {
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build()
+        .unwrap();
+    (TaskContext::default().with_runtime(Arc::new(runtime)), pool)
+}
+
+/// A group whose first point is deep in the grid must not allocate the indices before it.
+#[test]
+fn slot_column_never_allocates_the_prefix_before_its_first_point() {
+    // The shape this exists for: 100 000 grid points, one point at the very end.
+    let mut column = SlotColumn::default();
+    column.reserve(99_999);
+    column.set(99_999, 7);
+
+    assert_eq!(column.get(99_999), Some(7));
+    assert_eq!(
+        column.get(0),
+        None,
+        "no prefix means no slot before the base"
+    );
+    assert_eq!(column.get(99_998), None);
+    assert_eq!(column.base, 99_999);
+    // One step of slack, not one entry per grid point: 256 bytes instead of 400 KB.
+    assert_eq!(
+        column.ids.len(),
+        64,
+        "a single tail point must allocate one step, not the grid"
+    );
+    assert!(
+        column.ids.capacity() * size_of::<u32>() < 400_000 / 100,
+        "the prefix must not be allocated: {} bytes for one point",
+        column.ids.capacity() * size_of::<u32>()
+    );
+}
+
+/// A later series covering an earlier interval extends the span downwards without moving slots.
+#[test]
+fn slot_column_extends_downwards_without_moving_its_slots() {
+    let mut column = SlotColumn::default();
+    column.reserve(1_000);
+    column.set(1_000, 1);
+    column.reserve(1_100);
+    column.set(1_100, 2);
+
+    // Out-of-order arrival: this group's second series covers an earlier interval.
+    column.reserve(990);
+    column.set(990, 3);
+
+    assert_eq!(column.base, 990);
+    assert_eq!(column.get(990), Some(3));
+    assert_eq!(column.get(1_000), Some(1), "existing slots keep their ids");
+    assert_eq!(column.get(1_100), Some(2));
+    assert_eq!(
+        column.get(989),
+        None,
+        "nothing below the new base is allocated"
+    );
+}
+
+/// A 100 000-point grid whose groups only cover its last ten minutes.
+///
+/// The slot columns must stay proportional to what the groups cover. Each of the 200 series has
+/// its own `zone`, so there are 200 label groups; a column indexed by the absolute grid index
+/// would ask for 200 x 100 000 x 4 bytes = 80 MB, which the 8 MB pool below refuses.
+#[tokio::test]
+async fn partial_sum_over_the_tail_of_a_large_grid_holds_no_prefix() {
+    const GRID_POINTS: u64 = 100_000;
+    const TAIL: i64 = 10;
+    const SERIES: usize = 200;
+
+    let grid = Arc::new(
+        EvalGrid::try_new(GridSpec::try_new(GRID_START, GRID_STEP, GRID_POINTS).unwrap()).unwrap(),
+    );
+    let tail_start = GRID_START + (GRID_POINTS as i64 - TAIL) * GRID_STEP;
+    let chunks = (0..SERIES)
+        .map(|index| {
+            // Rising `60 * (index + 1)` per grid point, so every group has a distinct sum and a
+            // regrouped or aliased slot cannot pass by coincidence.
+            let rows = (0..TAIL)
+                .map(|step| {
+                    (
+                        tail_start + step * GRID_STEP,
+                        Some((step + 1) as f64 * 60.0 * (index + 1) as f64),
+                    )
+                })
+                .collect::<Vec<Row>>();
+            // Each of these is a whole series and ends with its own chunk: a series whose last
+            // chunk never arrives is an invalid frame, not a longer series.
+            chunk_with(
+                index as u8,
+                two_label_metric(&format!("h{index:03}"), &format!("z{index:03}")),
+                &rows,
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let case = Case::new(
+        &["host", "zone"],
+        five_minutes(),
+        RangeFunction::Rate,
+        vec![],
+    )
+    .with_output_schema(output_schema_of(&[VALUE], &["host", "zone"]))
+    .with_tags(&["host", "zone"])
+    .with_grid(grid);
+    // Grouped by `zone` only: one group per series, and the timestamp as the other key half.
+    let partial_case = PartialCase::new(&case, 0, vec![3, 2]);
+
+    // The reference comparison: every series' tail, the same state DataFusion's partial writes,
+    // and the final aggregate over it.
+    let states = assert_partial_matches_datafusion(
+        &case,
+        &partial_case,
+        std::slice::from_ref(&&chunks[..]),
+        "tail",
+    )
+    .await;
+    assert_eq!(states.len(), 1, "one partition");
+    let rows = sum_rows(&states[0][0], &partial_case.state_name());
+    // `rate` needs two samples in the window, so the first grid point -- whose window holds only
+    // the series' first sample -- produces nothing, and the remaining nine do.
+    assert_eq!(
+        rows.len(),
+        (TAIL as usize - 1) * SERIES,
+        "only the grid points with two samples in their window produce a slot, for every group"
+    );
+
+    // The same query under a pool far smaller than the prefix it must not allocate.
+    let exec = partial_case
+        .fused(&case, partitioned_child(&[&chunks]))
+        .unwrap();
+    let (context, pool) = context_with_pool(8 << 20);
+    let mut stream = exec.execute(0, Arc::new(context)).unwrap();
+    let mut batches = Vec::new();
+    while let Some(item) = stream.next().await {
+        batches.push(item.expect("the tail query must fit the pool"));
+    }
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        rows.len(),
+        "the pool must not have changed the answer"
+    );
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "the reservation must be back at zero once the state batch is in hand"
+    );
+}
+
+/// The reservation is returned when the last batch is emitted, not when the stream is dropped.
+#[tokio::test]
+async fn partial_sum_returns_its_reservation_before_the_stream_is_dropped() {
+    let chunks = vec![
+        chunk(1, "a", &counter_rows(60.0), true),
+        chunk(2, "b", &counter_rows(120.0), true),
+    ];
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let exec = partial_case
+        .fused(&case, partitioned_child(&[&chunks]))
+        .unwrap();
+
+    let (context, pool) = context_with_pool(64 << 20);
+    let mut stream = exec.execute(0, Arc::new(context)).unwrap();
+    let mut rows = 0;
+    while let Some(item) = stream.next().await {
+        rows += item.expect("the fused stream must not fail").num_rows();
+    }
+    assert!(rows > 0, "the case must emit state");
+    // `stream` is still alive: the state and the label table were dropped and the bytes returned
+    // when the batch was emitted, not deferred to `Drop`.
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "a stream held by its caller must not keep the pool's bytes"
+    );
+    drop(stream);
+    assert_eq!(pool.reserved(), 0);
+}
+
+/// Dropping the stream part-way through returns everything it had reserved.
+#[tokio::test]
+async fn partial_sum_releases_its_reservation_when_the_stream_is_dropped_early() {
+    // Enough chunks that one poll cannot reach the end: the stream is then part-way through,
+    // holding the label table and whatever slots it allocated.
+    let chunks = (0..300_u16)
+        .map(|index| {
+            chunk(
+                index as u8,
+                &format!("h{index:03}"),
+                &counter_rows(60.0 + index as f64),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let exec = partial_case
+        .fused(&case, partitioned_child(&[&chunks]))
+        .unwrap();
+
+    let (context, pool) = context_with_pool(64 << 20);
+    let mut stream = exec.execute(0, Arc::new(context)).unwrap();
+    // A single poll, not `next().await`: the stream wakes itself when its chunk budget runs out,
+    // so awaiting would keep re-polling until the child ended and there would be no half-finished
+    // state to drop. One poll consumes a budget of chunks and returns pending, holding the label
+    // table for the series it has seen.
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let polled = stream.as_mut().poll_next(&mut cx);
+    assert!(
+        matches!(polled, Poll::Pending),
+        "one poll must not finish the stream: {polled:?}"
+    );
+    assert!(
+        pool.reserved() > 0,
+        "the half-finished stream must be holding something, else the drop below proves nothing"
+    );
+    drop(stream);
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "dropping a half-finished stream must return its reservation"
+    );
+}
+
+/// An error part-way through returns the reservation too, and ends the stream.
+#[tokio::test]
+async fn partial_sum_releases_its_reservation_after_an_error() {
+    // Two raw series that reach the same final label set with overlapping grid points: the
+    // duplicate-label-set rule rejects them, which is an error *inside* the stream.
+    let chunks = vec![
+        named_chunk("a", 1, "same", &counter_rows(60.0), true),
+        named_chunk("a", 2, "same", &counter_rows(120.0), true),
+    ];
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let exec = partial_case
+        .fused(&case, partitioned_child(&[&chunks]))
+        .unwrap();
+
+    let (context, pool) = context_with_pool(64 << 20);
+    let mut stream = exec.execute(0, Arc::new(context)).unwrap();
+    let mut error = None;
+    while let Some(item) = stream.next().await {
+        if let Err(failure) = item {
+            error = Some(failure);
+            break;
+        }
+    }
+    let error = error.expect("the duplicate label set must fail the stream");
+    assert!(
+        error.to_string().contains("same labelset"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "the failed stream must have returned its reservation"
+    );
+}
+
+/// The reservation tracks what the containers hold, not a count of the insertions made.
+///
+/// The previous accounting charged increments by hand -- a step per `keys` push, `ids.len()` per
+/// slot growth -- and drifted from the allocator in three ways: `Vec::resize` reserves more
+/// capacity than it initialises, `Vec::push` grows on its own schedule, and the label map's
+/// buckets and `Option<String>` values were only partly counted. Measuring capacity instead is
+/// only an improvement if it is actually measured, so this asserts the figure against the
+/// containers' own capacities and against what the pool is charged.
+#[test]
+fn partial_sum_reservation_matches_the_capacity_it_holds() {
+    let case = Case::new(&["host"], five_minutes(), RangeFunction::Rate, vec![]);
+    let partial_case = PartialCase::new(&case, 0, vec![1, 2]);
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+    let mut stream = PartialSumStream::try_new(
+        partial_case.partial.clone(),
+        partial_case.aggregate.create_groups_accumulator().unwrap(),
+        &classify_output(&case.output_schema, &case.schema, &case.tags, TIME).unwrap(),
+        case.tags.clone().into(),
+        case.grid.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        stream.held_bytes(),
+        0,
+        "an empty binding holds no table bytes"
+    );
+
+    // Grow the tables the way `ingest` does: one label group, one slot column with one point.
+    stream.labels.insert(vec![1, 2, 3], 0);
+    stream.slots.push(SlotColumn::default());
+    stream.slots[0].reserve(1_000);
+    stream.slots[0].set(1_000, 0);
+    stream.label_values.push(vec![Some("a".to_string())]);
+    stream.keys.push((0, 1_000));
+
+    let held = stream.held_bytes();
+    // Every term is a capacity the containers actually hold, so the sum cannot be below the
+    // elements themselves.
+    let minimum = size_of::<u32>() * 64          // the slot column's one step of ids
+        + 3                                      // the map key's own buffer
+        + size_of::<Option<String>>()            // the label value array
+        + "a".len()                              // that value's own buffer
+        + size_of::<(u32, u32)>(); // the keys array, at least one entry
+    assert!(
+        held >= minimum,
+        "held {held} must cover the contents it counts ({minimum})"
+    );
+    assert_eq!(
+        held,
+        stream.slots.capacity() * size_of::<SlotColumn>()
+            + stream.labels.capacity() * (size_of::<(Vec<u8>, usize)>() + 1)
+            + stream.label_values.capacity() * size_of::<Vec<Option<String>>>()
+            + stream.keys.capacity() * size_of::<(u32, u32)>()
+            + stream.slots[0].ids.capacity() * size_of::<u32>()
+            + stream
+                .labels
+                .keys()
+                .map(|key| key.capacity())
+                .sum::<usize>()
+            + stream.label_values[0].capacity() * size_of::<Option<String>>()
+            + stream.label_values[0]
+                .iter()
+                .map(|value| value.as_ref().map_or(0, String::capacity))
+                .sum::<usize>(),
+        "held_bytes must be the containers' capacities, term for term"
+    );
+
+    // And it is what the pool is charged, once.
+    let mut reservation = MemoryConsumer::new("test").register(&pool);
+    stream.sync_persistent(&mut reservation).unwrap();
+    assert_eq!(reservation.size(), held, "the pool is charged what is held");
+    stream.sync_persistent(&mut reservation).unwrap();
+    assert_eq!(
+        reservation.size(),
+        held,
+        "a second sync with nothing changed must charge nothing more"
+    );
+    reservation.free();
+    assert_eq!(pool.reserved(), 0);
 }

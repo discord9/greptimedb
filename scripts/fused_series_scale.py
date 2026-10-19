@@ -101,23 +101,40 @@ import fused_series_bench as bench
 SPAN_MINUTES = 120
 STEP = "1s"
 
-# `(label, inner expression, aggregation, fuses)`. `{table}` is substituted. Each is wrapped
-# in the case's own aggregation, so the label states both axes.
+# `(label, inner expression, aggregation, fuses, input series, SQL predicate)`. `{table}` is
+# substituted in the expression. Each is wrapped in the case's own aggregation, so the label
+# states both axes. The SQL predicate restates the expression's own label selector, and is what
+# the pre-flight counts; it is written out rather than translated from PromQL, because a
+# translator that is wrong in the same way as the selector would agree with itself.
+#
+# `input series` is the number of distinct `host` values the inner expression's selector must
+# match, and the driver counts them before it measures anything. Without that check a selector
+# that matches nothing -- a padding or spelling difference from what `fused_series_bench.py`
+# actually wrote -- returns an empty result with a valid schema, which reads as an
+# unmeasurably fast query rather than as a broken one.
 CASES = [
     # group count at a fixed input size: 400 series -> 4 / 400 / 1 groups
-    ("G4", "rate({table}[5m])", "sum by (instance)", True),
-    ("G400", "rate({table}[5m])", "sum by (host)", True),
-    ("G1", "rate({table}[5m])", "sum by (job)", True),
-    # input series count at a fixed group count: 100 / 1 series -> 4 / 1 groups.
-    # The fixture's host values are zero-padded to four digits (`h0000`..`h0399`), which is what
-    # is actually stored; matching `h7` selects nothing and silently yields zero rows.
-    ("n100", 'rate({table}{{host=~"h00[0-9][0-9]"}}[5m])', "sum by (instance)", True),
-    ("n1", 'rate({table}{{host="h0007"}}[5m])', "sum by (instance)", True),
+    ("G4", "rate({table}[5m])", "sum by (instance)", True, 400, ""),
+    ("G400", "rate({table}[5m])", "sum by (host)", True, 400, ""),
+    ("G1", "rate({table}[5m])", "sum by (job)", True, 400, ""),
+    # input series count: 100 / 1 series. The fixture stores `h0000`..`h0399` with
+    # `instance = i{host % 4}`, so the first hundred hosts are all `i0` and `n100` collapses
+    # 100:1 -- the same ratio as `G4` -- over a quarter of the input.
+    (
+        "n100",
+        'rate({table}{{host=~"h00[0-9][0-9]"}}[5m])',
+        "sum by (instance)",
+        True,
+        100,
+        " WHERE host ~ '^h00[0-9][0-9]$'",
+    ),
+    ("n1", 'rate({table}{{host="h0007"}}[5m])', "sum by (instance)", True, 1,
+     " WHERE host = 'h0007'"),
     # no aggregation at all: the fused node's full output, nothing removed above it
-    ("raw", "rate({table}[5m])", None, True),
+    ("raw", "rate({table}[5m])", None, True, 400, ""),
     # Unchanged work in both arms: the same rows flow through the same plan either way, so the
     # ratio for this case is the drift of the whole call, not a measurement of anything.
-    ("control", "max_over_time({table}[5m])", "sum by (instance)", False),
+    ("control", "max_over_time({table}[5m])", "sum by (instance)", False, 400, ""),
 ]
 
 # The ratios reported per case, most important first: `sum / on` is what a round that adds the
@@ -336,6 +353,10 @@ def run_arm(server, label, arm, statement, warmup, iterations, expect_rows=True)
         "correctness_hits": correctness_hits,
         "correctness_partial_hits": correctness_partial_hits,
         "timed": results,
+        # `VmHWM` of the server process, which the kernel maintains as a high-water mark. A peak,
+        # not an allocation total, and of the whole process rather than this query: it is only
+        # comparable between arms measured the same way. `None` when the process is gone.
+        "peak_rss_bytes": server.peak_memory_bytes(),
     }
 
 
@@ -370,6 +391,23 @@ def check_arms(label, statement, arms):
             bench.compare_pair(arms[base]["result"], arms[other]["result"])
 
 
+def median_vs_aggregate(median_ratio, aggregate_ratio):
+    """How far the two statistics are from each other, relative to the per-iteration median."""
+    if not median_ratio:
+        return 0.0
+    return abs(aggregate_ratio - median_ratio) / median_ratio
+
+
+def statistics_disagree(median_ratio, aggregate_ratio):
+    """Whether the two statistics point at different answers, one below 1.00 and one above.
+
+    Both are ratios of the same two arms over the same rounds, so one below 1.00 and one above
+    means the pass supports neither a saving nor a regression from that pair alone -- which is
+    exactly the case a single quoted number used to hide.
+    """
+    return (median_ratio - 1.0) * (aggregate_ratio - 1.0) < 0
+
+
 def worst_gated_ratio(row, gated):
     """The gated ratio of `row` that sits furthest from its own median, with how far.
 
@@ -389,12 +427,21 @@ def worst_gated_ratio(row, gated):
     worst = None
     for name in names:
         summary = row["ratios"][name]
-        if worst is None or summary["deviation_over_median"] > worst["deviation"]:
+        # A ratio whose two statistics straddle 1.00 is not quiet however stable each one is:
+        # the pass cannot say whether the arm is faster or slower. Reported as an infinite
+        # deviation so it outranks any finite one, with the round it would have named.
+        if statistics_disagree(summary["median"], summary["aggregate_median"]):
+            deviation = float("inf")
+        else:
+            deviation = summary["deviation_over_median"]
+        if worst is None or deviation > worst["deviation"]:
             worst = {
                 "ratio": name,
-                "deviation": summary["deviation_over_median"],
+                "deviation": deviation,
                 "round": summary["worst_round"],
                 "side": summary["worst_side"],
+                "median": summary["median"],
+                "aggregate_median": summary["aggregate_median"],
             }
     return worst
 
@@ -508,12 +555,43 @@ def main():
         "rounds": [],
         "cases": [],
     }
-    per_case_rounds = {label: [] for label, _, _, _ in CASES}
+    per_case_rounds = {label: [] for label, _, _, _, _, _ in CASES}
+
+    # The fixture's shape, checked once before anything is timed. A selector that matches a
+    # different number of series than the case is named for measures a different query, and one
+    # that matches none returns a valid empty result the timing loop would otherwise report.
+    with bench.Server(
+        args.bin,
+        args.data_home,
+        args.http,
+        args.grpc,
+        args.mysql,
+        args.postgres,
+        False,
+        args.log,
+    ) as server:
+        total = server.rows(f'SELECT count(*) FROM "{bench.TABLE}"')[0][0]
+        if total != bench.ROW_COUNT:
+            raise SystemExit(
+                f"the fixture holds {total} rows, not the {bench.ROW_COUNT} the selectors were "
+                "written for; seed a fresh directory with fused_series_bench.py seed"
+            )
+        for label, _, _, _, input_series, predicate in CASES:
+            found = server.rows(
+                f'SELECT count(DISTINCT "host") FROM "{bench.TABLE}"{predicate}'
+            )[0][0]
+            if found != input_series:
+                raise SystemExit(
+                    f"case {label} expects {input_series} input series but its predicate "
+                    f"{predicate or '(none)'} matches {found} hosts in the fixture"
+                )
+            print(f"fixture: case {label:7} selects {found} series", flush=True)
+
     for round_index in range(args.rounds):
         # Rotate which arm goes first, so a drift across the round cannot favour one of them and
         # no arm is always the one that follows another arm's server shutdown.
         order = arm_order(arms, round_index)
-        for label, inner, aggregation, fuses in CASES:
+        for label, inner, aggregation, fuses, input_series, predicate in CASES:
             statement = tql(inner, aggregation)
             measured = {}
             for arm in order:
@@ -572,6 +650,7 @@ def main():
                 "cpu_median_ms": cpu_median,
                 "cpu_aggregate_ms": cpu_total,
                 "wall_median_ms": wall,
+                "peak_rss_bytes": {a: measured[a]["peak_rss_bytes"] for a in arms},
             }
             # Per-round ratios, under keys of the shape `cpu_on_over_off` that the archived
             # records already use, one family per reported ratio.
@@ -603,7 +682,7 @@ def main():
     # One summary row per case. The reported ratio is the median over rounds, and the gate is
     # whether the rounds agree with each other: repeating the quantity being reported is a more
     # direct test of its repeatability than any proxy query.
-    for label, inner, aggregation, fuses in CASES:
+    for label, inner, aggregation, fuses, input_series, predicate in CASES:
         entries = per_case_rounds[label]
         ratio_rows = {}
         for name in ratio_names:
@@ -611,6 +690,7 @@ def main():
             aggregate_per_round = [e["cpu_aggregate_" + name] for e in entries]
             wall_per_round = [e["wall_" + name] for e in entries]
             deviation, worst_round, worst_side = ratio_deviation(per_round)
+            aggregate_deviation, _, _ = ratio_deviation(aggregate_per_round)
             ratio_rows[name] = {
                 "label": RATIO_LABELS[name],
                 "per_round": per_round,
@@ -622,6 +702,15 @@ def main():
                 "deviation_over_median": deviation,
                 "worst_round": worst_round,
                 "worst_side": worst_side,
+                # The second statistic and its own repeatability. Both are reported for every
+                # gated ratio because they can disagree, and when they do neither is the answer:
+                # a per-iteration median resolves one iteration, a per-round total amortises the
+                # 10 ms tick over nine of them. `statistics_disagree` is what makes a reader look
+                # before quoting one of them.
+                "aggregate_deviation_over_median": aggregate_deviation,
+                "median_vs_aggregate": median_vs_aggregate(
+                    statistics.median(per_round), statistics.median(aggregate_per_round)
+                ),
                 "gated": name in gated,
             }
         row = {
@@ -645,6 +734,15 @@ def main():
             },
             "wall_median_ms": {
                 a: statistics.median([e["wall_median_ms"][a] for e in entries]) for a in arms
+            },
+            # Per arm: the largest peak any round saw, since a peak that happened is what the
+            # query needed, and rounds with a smaller peak cannot lower it.
+            "peak_rss_bytes": {
+                a: max(
+                    (e["peak_rss_bytes"][a] for e in entries if e["peak_rss_bytes"][a]),
+                    default=None,
+                )
+                for a in arms
             },
         }
         if "on_over_off" in ratio_rows:
@@ -680,6 +778,7 @@ def main():
     header += [f"{'dev':>5}", f"{'worst round':>{worst_width}}"]
     if "sum_over_off" in ratio_names:
         header += [f"{'sum/off':>8}"]
+    header += [f"{'C/B agg':>8}", f"{'conflict':>9}"]
     if "on_over_off" in ratio_names:
         header += [f"{'wall':>7}"]
     print()
@@ -701,6 +800,14 @@ def main():
         cells += [f"{100 * worst_ratio['deviation']:>4.0f}%", f"{worst:>{worst_width}}"]
         if "sum_over_off" in row["ratios"]:
             cells += [f"{row['ratios']['sum_over_off']['median']:>8.3f}"]
+        # The same ratio from the other statistic, and whether the two disagree about which arm
+        # is faster. A case reading `0.900` by median and `1.034` by round total is neither a
+        # saving nor a regression, and the `conflict` column is what says so.
+        graded = row["ratios"].get("sum_over_on") or row["ratios"].get("on_over_off")
+        cells += [f"{graded['aggregate_median']:>8.3f}"]
+        cells += [
+            "  YES" if statistics_disagree(graded["median"], graded["aggregate_median"]) else "   no"
+        ]
         if "on_over_off" in row["ratios"]:
             cells += [f"{row['ratios']['on_over_off']['wall_median']:>7.3f}"]
         print(" ".join(cells), flush=True)
@@ -720,6 +827,28 @@ def main():
         f"{RATIO_LABELS.get(verdict['worst_ratio'], '-')}, round {verdict['worst_round']} "
         f"{verdict['worst_side']} the median), gate {100 * args.max_ratio_spread:.0f}%"
     )
+    # Cases whose two statistics straddle 1.00, listed regardless of the verdict: this is the
+    # condition under which no ratio for that case should be quoted alone.
+    conflicts = [
+        (row["label"], name, row["ratios"][name])
+        for row in record["cases"]
+        for name in gated
+        if name in row["ratios"]
+        and statistics_disagree(
+            row["ratios"][name]["median"], row["ratios"][name]["aggregate_median"]
+        )
+    ]
+    if conflicts:
+        print(
+            "  the two CPU statistics disagree on the direction of: "
+            + ", ".join(f"{label} ({RATIO_LABELS[name]})" for label, name, _ in conflicts)
+        )
+        for label, name, summary in conflicts:
+            print(
+                f"    {label:8} {RATIO_LABELS[name]:7} per-iteration median "
+                f"{summary['median']:.3f}, per-round total {summary['aggregate_median']:.3f}"
+                f"  ({' '.join(f'{v:.3f}' for v in summary['aggregate_per_round'])})"
+            )
     if verdict["quiet"]:
         print("  quiet: the rounds agree, so each case's median ratio is repeatable.")
     else:

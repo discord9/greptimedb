@@ -873,11 +873,13 @@ fn tag_column(
 ) -> Result<ArrayRef> {
     let value = tag_value(series, tags, index, encoding, position)?;
     if !encoding.dictionary {
+        // `Option<&str>` is `Copy`, so this repeats the reference: one allocation for the column,
+        // none per row.
         return Ok(Arc::new(StringArray::from(
             std::iter::repeat_n(value, rows).collect::<Vec<_>>(),
         )));
     }
-    let dictionary: ArrayRef = Arc::new(StringArray::from(vec![value.clone().unwrap_or_default()]));
+    let dictionary: ArrayRef = Arc::new(StringArray::from(vec![value.unwrap_or_default()]));
     let keys = match value {
         Some(_) => UInt32Array::from(vec![0_u32; rows]),
         None => UInt32Array::from(vec![None::<u32>; rows]),
@@ -889,24 +891,28 @@ fn tag_column(
 
 /// The single value one series' tag column carries, before it is repeated over the rows.
 ///
+/// Borrowed from the series' own labels: an evaluated tag column repeats this value once per row,
+/// so returning an owned `String` would make every row of every series allocate for a value that
+/// never changes across them. Only a new label group in partial mode has to keep a copy.
+///
 /// Both the evaluated rows and the partial state's group columns print the same value, so this is
 /// the one place the absent-label rule lives: a NULL where the column allows one, and the empty
 /// label value where it does not, which is how Prometheus reads a label the series does not carry.
-fn tag_value(
-    series: &Series,
+fn tag_value<'a>(
+    series: &'a Series,
     tags: &[String],
     index: usize,
     encoding: TagEncoding,
     position: usize,
-) -> Result<Option<String>> {
+) -> Result<Option<&'a str>> {
     let name = tags.get(index).ok_or_else(|| {
         DataFusionError::Execution(format!(
             "output column {position} declares unavailable tag {index}"
         ))
     })?;
     Ok(match (series.metric.get(name), encoding.nullable) {
-        (value, true) => value.map(str::to_string),
-        (value, false) => Some(value.unwrap_or_default().to_string()),
+        (value, true) => value,
+        (value, false) => Some(value.unwrap_or_default()),
     })
 }
 
@@ -1257,8 +1263,11 @@ struct PartialSumStream {
     label_values: Vec<Vec<Option<String>>>,
     /// Slot -> `(label group, absolute grid index)`, in slot order: the order `state()` returns.
     keys: Vec<(u32, u32)>,
-    /// Entries of `keys` already reserved on the pool, so each step is charged exactly once.
-    keys_reserved: usize,
+    /// Bytes of the persistent tables -- `slots` with their columns, `labels`, `label_values` and
+    /// `keys` -- already charged on the pool. Measured from the containers' capacities (see
+    /// [`Self::held_bytes`]) rather than by counting insertions, so a growth step the allocator
+    /// took is charged even when no insertion announced it.
+    persistent_bytes: usize,
     /// The accumulator's own `size()` at the last reservation, so only its growth is reserved.
     accumulator_bytes: usize,
 }
@@ -1278,44 +1287,70 @@ enum GroupColumn {
     },
 }
 
-/// The slot ids of one label group, indexed by absolute grid index.
+/// The slot ids of one label group, over the interval of the grid that group actually covers.
 ///
-/// The column grows with the highest absolute index the group has occupied so far instead of with
-/// the grid, so a group that only covers the tail of the grid does not allocate the whole of it.
-/// A shape in which every group spans the whole grid still costs one `u32` per grid point per
-/// group; those bytes are reserved on the stream's memory pool as they are taken.
+/// `ids[offset]` is the slot for absolute grid index `base + offset`, so the column spans
+/// `[base, base + ids.len())` and **nothing below `base` is ever initialized**. That is what keeps
+/// a group whose series only cover the tail of a large grid cheap: a column indexed by the
+/// absolute index would cost one `u32` per grid point per group whether or not the group has a
+/// point there, so a 100 000-point grid with 1 000 groups holding one point each would pay about
+/// 400 MB to represent 1 000 aggregating positions.
+///
+/// The span is a flat array rather than a chunked map because [`PartialSumStream::slot`] runs once
+/// per grid point per series and must stay an array index. The price is that a group with points at
+/// both ends of the grid pays for the span in between; that is the same shape the ordinary partial
+/// aggregate pays for, since it holds a slot per group either way. These bytes are reserved on the
+/// stream's memory pool together with the other persistent tables, by capacity.
 #[derive(Default)]
 struct SlotColumn {
+    /// Absolute grid index of `ids[0]`, meaningless while `ids` is empty.
+    base: usize,
     ids: Vec<u32>,
 }
 
 impl SlotColumn {
     /// The slot of `abs`, or `None` when this group has no point there yet.
     fn get(&self, abs: usize) -> Option<u32> {
-        match self.ids.get(abs) {
+        let offset = abs.checked_sub(self.base)?;
+        match self.ids.get(offset) {
             Some(&slot) if slot != NO_SLOT => Some(slot),
             _ => None,
         }
     }
 
-    /// Extends the column to hold `abs`, reserving the new indices on the pool first.
+    /// Makes `abs` addressable, initializing only the indices this adds.
     ///
-    /// Grows in steps, so a dense group pays one reservation per step instead of one per point,
-    /// and never initializes past the step that covers `abs`.
-    fn reserve(&mut self, abs: usize, reservation: &mut MemoryReservation) -> Result<()> {
+    /// Grows in steps, so a dense group pays one growth per step rather than one per point. A point
+    /// below the current base means a later series covered an earlier interval: the existing ids
+    /// shift up inside the same `Vec`, and only the gap down to the new lowest point is added.
+    fn reserve(&mut self, abs: usize) {
         // Indices a single step adds: 256 bytes per group and step, at most one step of slack.
         const STEP: usize = 64;
-        if self.ids.len() > abs {
-            return Ok(());
+        if self.ids.is_empty() {
+            // The first point this group occupies defines the base, so a query over the tail of a
+            // large grid never allocates the wasted prefix.
+            self.base = abs;
+            self.ids.resize(STEP, NO_SLOT);
+            return;
         }
-        let target = abs + STEP;
-        reservation.try_grow((target - self.ids.len()) * size_of::<u32>())?;
-        self.ids.resize(target, NO_SLOT);
-        Ok(())
+        if abs < self.base {
+            let added = self.base - abs;
+            let len = self.ids.len() + added;
+            // The new indices land at the end, then rotate to the front: the old ids keep their
+            // slots and end up at their new offsets, which are exactly `added` higher.
+            self.ids.resize(len, NO_SLOT);
+            self.ids.rotate_right(added);
+            self.base = abs;
+            return;
+        }
+        let offset = abs - self.base;
+        if offset >= self.ids.len() {
+            self.ids.resize(offset + STEP, NO_SLOT);
+        }
     }
 
     fn set(&mut self, abs: usize, slot: u32) {
-        self.ids[abs] = slot;
+        self.ids[abs - self.base] = slot;
     }
 }
 
@@ -1372,9 +1407,54 @@ impl PartialSumStream {
             labels: HashMap::new(),
             label_values: Vec::new(),
             keys: Vec::new(),
-            keys_reserved: 0,
+            persistent_bytes: 0,
             accumulator_bytes: 0,
         })
+    }
+
+    /// The bytes the persistent tables of this stream actually hold.
+    ///
+    /// Measured from each container's own `capacity()` and each stored `String`'s `capacity()`,
+    /// not from the number of insertions that were made: a `Vec` that has grown to 128 slots holds
+    /// them whether or not all are filled, and `Vec::push`/`HashMap::insert` pick their own growth
+    /// steps, so a count-based figure drifts from what the allocator holds. The label map is
+    /// charged its bucket count times the item size plus hashbrown's control byte.
+    fn held_bytes(&self) -> usize {
+        let mut bytes = self.slots.capacity() * size_of::<SlotColumn>()
+            + self.labels.capacity() * (size_of::<(Vec<u8>, usize)>() + 1)
+            + self.label_values.capacity() * size_of::<Vec<Option<String>>>()
+            + self.keys.capacity() * size_of::<(u32, u32)>();
+        for column in &self.slots {
+            bytes += column.ids.capacity() * size_of::<u32>();
+        }
+        for key in self.labels.keys() {
+            bytes += key.capacity();
+        }
+        for values in &self.label_values {
+            // The `Option<String>` array, then each value's own buffer: the group columns are
+            // printed once per emitted state row, so these values live as long as the stream.
+            bytes += values.capacity() * size_of::<Option<String>>();
+            for value in values {
+                bytes += value.as_ref().map_or(0, String::capacity);
+            }
+        }
+        bytes
+    }
+
+    /// Charges the growth of the persistent tables, and gives back what they released.
+    ///
+    /// Called once per ingested series rather than per point: a single series can add at most its
+    /// own number of slots and at most one label group, so what is uncharged between two syncs is
+    /// bounded by one series' coverage, while the per-point path stays an array index.
+    fn sync_persistent(&mut self, reservation: &mut MemoryReservation) -> Result<()> {
+        let held = self.held_bytes();
+        if held > self.persistent_bytes {
+            reservation.try_grow(held - self.persistent_bytes)?;
+        } else if held < self.persistent_bytes {
+            reservation.shrink(self.persistent_bytes - held);
+        }
+        self.persistent_bytes = held;
+        Ok(())
     }
 
     /// Folds one completed evaluated series into the accumulator and reports the points it fed.
@@ -1419,18 +1499,18 @@ impl PartialSumStream {
                 values.push(tag_value(series, &self.tags, *tag, *encoding, *position)?);
             }
         }
-        let group = self.label_group(&values, reservation)?;
+        let group = self.label_group(&values);
 
         // One `group_indices` entry per row of the value array below. A row with no value carries
         // an in-range index: SUM skips nulls, so it never contributes to that slot.
         let mut indices = vec![0usize; rows];
         if occupancy.dense {
             for (offset, index) in indices.iter_mut().enumerate() {
-                *index = self.slot(group, start + offset, reservation)? as usize;
+                *index = self.slot(group, start + offset)? as usize;
             }
         } else {
             for offset in &occupancy.offsets {
-                indices[*offset] = self.slot(group, start + offset, reservation)? as usize;
+                indices[*offset] = self.slot(group, start + offset)? as usize;
             }
         }
 
@@ -1457,6 +1537,9 @@ impl PartialSumStream {
         // handed out contiguously, so the accumulator can size itself once per batch.
         self.accumulator
             .update_batch(&[values], &indices, None, self.keys.len())?;
+        // The series' slots and label group exist now, so charge the tables they grew. This runs
+        // before the accumulator's own size is charged, so the pool sees the whole step at once.
+        self.sync_persistent(reservation)?;
         let size = self.accumulator.size();
         if size > self.accumulator_bytes {
             reservation.try_grow(size - self.accumulator_bytes)?;
@@ -1466,11 +1549,10 @@ impl PartialSumStream {
     }
 
     /// The label group of the given tag values, registering a new one on first use.
-    fn label_group(
-        &mut self,
-        values: &[Option<String>],
-        reservation: &mut MemoryReservation,
-    ) -> Result<usize> {
+    ///
+    /// The values are borrowed from the series, so a series that joins an existing group copies
+    /// nothing; only a new group keeps its own copy, because it outlives the series.
+    fn label_group(&mut self, values: &[Option<&str>]) -> usize {
         let mut key = Vec::new();
         for value in values {
             match value {
@@ -1484,30 +1566,26 @@ impl PartialSumStream {
             }
         }
         if let Some(group) = self.labels.get(&key) {
-            return Ok(*group);
+            return *group;
         }
         let group = self.slots.len();
-        let bytes = key.len()
-            + size_of::<usize>()
-            + size_of::<Vec<Option<String>>>()
-            + values
-                .iter()
-                .map(|value| value.as_ref().map_or(0, String::len))
-                .sum::<usize>();
-        reservation.try_grow(bytes)?;
         self.labels.insert(key, group);
         self.slots.push(SlotColumn::default());
-        self.label_values.push(values.to_vec());
-        Ok(group)
+        self.label_values.push(
+            values
+                .iter()
+                .map(|value| value.map(str::to_string))
+                .collect(),
+        );
+        group
     }
 
     /// The slot of `(group, abs)`, allocated on first use.
-    fn slot(
-        &mut self,
-        group: usize,
-        abs: usize,
-        reservation: &mut MemoryReservation,
-    ) -> Result<u32> {
+    ///
+    /// Nothing is reserved here: a series can add at most its own number of slots and at most one
+    /// label group, so the growth is charged once per series by [`Self::sync_persistent`] instead
+    /// of on the per-point path.
+    fn slot(&mut self, group: usize, abs: usize) -> Result<u32> {
         if let Some(slot) = self.slots[group].get(abs) {
             return Ok(slot);
         }
@@ -1516,14 +1594,7 @@ impl PartialSumStream {
                 "FusedSeriesExec partial sum exceeds the supported number of groups".into(),
             )
         })?;
-        // Charge the slot table in steps, so a long run of new slots costs one reservation per
-        // step rather than one per point.
-        if self.keys.len() == self.keys_reserved {
-            const STEP: usize = 64;
-            reservation.try_grow(STEP * size_of::<(u32, u32)>())?;
-            self.keys_reserved += STEP;
-        }
-        self.slots[group].reserve(abs, reservation)?;
+        self.slots[group].reserve(abs);
         self.slots[group].set(abs, slot);
         self.keys.push((
             u32::try_from(group).map_err(|_| {
@@ -1770,14 +1841,24 @@ impl FusedSeriesStream {
         if let Some(evaluator) = self.evaluator.take() {
             self.timers.record_batch_regions(evaluator.batch_timers());
         }
+        self.release_partition_state();
+        self.reservation.free();
+    }
+
+    /// Drops every structure charged on `reservation`.
+    ///
+    /// Both terminal paths call this *before* returning the bytes: `seen`, `pending` and the
+    /// partial state are charged on the same reservation, so freeing it while they are still
+    /// allocated would put bytes back that the allocator still holds, and the pool could hand them
+    /// to another consumer. Used by the success path too, because a stream that has emitted its
+    /// last batch is not necessarily dropped yet -- the caller keeps it until it polls `None` and
+    /// may hold it longer.
+    fn release_partition_state(&mut self) {
         self.seen = HashMap::new();
         self.pending = Vec::new();
         self.pending_rows = 0;
         self.pending_bytes = 0;
-        // The accumulator, the slot columns and the label group table go with it; the whole
-        // reservation built up by `seen`, `pending` and the partial state is freed in one call.
         self.partial = None;
-        self.reservation.free();
     }
 
     /// Claims the occupied grid positions of one finished series for its final label set.
@@ -1943,11 +2024,13 @@ impl FusedSeriesStream {
                     this.finished = true;
                     return match emitted {
                         Ok(batch) => {
-                            // Drop the slot columns and the accumulator *first*: releasing their
-                            // reservation while they are still allocated would let the pool hand
-                            // the same bytes to another consumer. They are dead weight from here
-                            // on, so they go now instead of waiting for the stream's drop.
-                            this.partial = None;
+                            // Every structure charged on this reservation is dead weight from
+                            // here on: the state batch is built, and the label-set table that
+                            // guards the duplicate-label-set rule has already seen every series.
+                            // Drop them *first* -- releasing a reservation while what it paid for
+                            // is still allocated would let the pool hand those bytes to another
+                            // consumer.
+                            this.release_partition_state();
                             this.reservation.free();
                             match batch {
                                 Some(batch) => Poll::Ready(Some(Ok(batch))),

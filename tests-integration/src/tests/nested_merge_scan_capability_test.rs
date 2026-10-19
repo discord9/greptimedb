@@ -2242,6 +2242,9 @@ async fn test_fused_series_exec_over_real_storage_scan() {
         output_schema,
         vec!["host".to_string()],
         "ts".to_string(),
+        // The evaluated-only node: this test exercises the real storage scan and the range
+        // evaluation, not the partial `SUM` binding.
+        None,
     )
     .unwrap();
     let mut stream = fused

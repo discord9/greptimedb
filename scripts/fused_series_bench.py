@@ -320,6 +320,16 @@ def check_ranges():
             )
 
 
+def host_label(host):
+    """How a host's value is stored: four digits, `h0000`..`h0399`.
+
+    Defined once because the seed and the selectors have to agree exactly. A matcher over the
+    stored text (`host=~"h00[0-9][0-9]"`) silently selects nothing when the padding differs, and
+    the failure looks like a fast query rather than an empty one.
+    """
+    return f"h{host:04d}"
+
+
 def check_fixture(where, count, first_ts, last_ts):
     """Fails unless the server's own count/min/max equal the fixture constants."""
     if count != ROW_COUNT:
@@ -421,13 +431,14 @@ class Server:
         self.mysql = mysql
         self.postgres = postgres
         self.log_path = log_path
-        # The log filter the server runs with. `debug` is what the fused-hit count needs,
-        # because the selection lines are logged at debug. It is also expensive: at `debug`
-        # datafusion formats the whole physical plan for a log record on every planning pass,
-        # which was 4.6% of CPU samples in a profile of case W. Set this to
-        # `"info,query::datafusion::native_promql::fused=debug"` to keep the hit count and drop
-        # everything else; `level` is parsed as tracing `Targets`, so directives work.
-        self.log_level = "debug"
+        # The log filter the server runs with. The fused-hit count needs the selection lines,
+        # which are logged at `debug` by `query::datafusion::native_promql::fused`; a blanket
+        # `debug` also makes datafusion format the whole physical plan for a log record on every
+        # planning pass, which was 4.6% of CPU samples in a profile of case W. The targeted
+        # directive keeps the count and drops the rest, so the arms are not competing with the
+        # instrumentation. `level` is parsed as tracing `Targets`, so a directive works; pass a
+        # plain `debug` only when investigating why a selection did not happen.
+        self.log_level = "info,query::datafusion::native_promql::fused=debug"
         self.process = None
         self.log_file = None
         # Where the log was when the query started, so hits can be counted per query.
@@ -525,6 +536,24 @@ class Server:
         ticks = fields[11:13]  # utime, stime
         return sum(int(tick) for tick in ticks) / os.sysconf("SC_CLK_TCK")
 
+    def peak_memory_bytes(self):
+        """The largest resident set this process has had, from `/proc/<pid>/status`.
+
+        `VmHWM` is a high-water mark maintained by the kernel, so it survives a peak that has
+        since been freed -- which is the point: the interesting figure is what the query needed at
+        its worst, not what is resident when it finishes. It is a *peak* of the whole process,
+        not an allocation total and not this query's own footprint: the server holds the storage
+        engine, caches and every other per-query structure, so only a difference between two arms
+        measured the same way says anything about the arms.
+        """
+        if self.process is None:
+            return None
+        with open(f"/proc/{self.process.pid}/status") as handle:
+            for line in handle:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+        return None
+
     def begin_query(self):
         """Records where the log ends, so the next query's hits can be counted alone."""
         self.log_offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
@@ -618,6 +647,14 @@ def seed(data_home, binary, http, grpc, mysql, postgres):
         log(f"seeding {ROW_COUNT} rows into {data_home}")
         # One INSERT per host keeps each statement small enough for the HTTP endpoint while
         # writing every sample of that series in a single batch.
+        #
+        # `host` is zero-padded to four digits and `instance` is `i{host % 4}`, so the fixture has
+        # 400 hosts spread over four instances, 100 each. Both facts are load-bearing for the
+        # selectors in `fused_series_scale.py`: `host=~"h00[0-9][0-9]"` selects exactly the first
+        # hundred hosts, which are all `i0` and therefore collapse into a single group. Writing
+        # `h{host}` unpadded produced `h0`..`h399`, which that matcher selects *nothing* from, so
+        # the case measured an empty scan -- the check against `ROW_COUNT` below cannot see it,
+        # because the table as a whole is still correct.
         for host in range(HOSTS):
             started = time.time()
             values = []
@@ -626,7 +663,7 @@ def seed(data_home, binary, http, grpc, mysql, postgres):
                 # Strictly rising, and different per host so a wrongly grouped series cannot hide.
                 value = (index + 1) * SAMPLE_INTERVAL_SECS * (host + 1)
                 values.append(
-                    f"('h{host}', 'i{host % 4}', 'j', 'l', {value}, {timestamp})"
+                    f"('{host_label(host)}', 'i{host % 4}', 'j', 'l', {value}, {timestamp})"
                 )
             server.sql(
                 f'INSERT INTO "{TABLE}" '
