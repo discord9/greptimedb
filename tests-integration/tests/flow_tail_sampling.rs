@@ -473,9 +473,10 @@ async fn run_round(db: &Database, state: &mut PocState, t: DateTime<Utc>) -> Rou
 
     if !state.is_initialized() {
         // Learn the source region and its watermark with a plain read. The
-        // write below cannot be used for this: an `INSERT ... SELECT` returns
-        // affected rows rather than the scanned batches, so it carries no
-        // terminal region watermark on this path.
+        // sampling query itself cannot provide it: it scans `raw_spans` twice
+        // and a JOIN branch that reads no rows still counts as participating
+        // without proving a watermark, which vetoes the other branch's proof.
+        // A single-scan query proves its watermark even on an empty table.
         outcome.high = discover_watermark(db, t).await;
 
         let sql = format!("INSERT INTO {POC_SINK} {}", sampling_select(None));
