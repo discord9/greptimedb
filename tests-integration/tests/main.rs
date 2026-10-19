@@ -23,6 +23,7 @@ mod grpc;
 #[macro_use]
 mod http;
 mod flow_ddl_event;
+mod flow_tail_sampling;
 mod gc_event;
 mod json2;
 mod jsonbench;

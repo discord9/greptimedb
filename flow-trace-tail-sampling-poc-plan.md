@@ -94,6 +94,8 @@ struct TailSamplingPocState {
 
 初始化允许全量计算。后续轮次才使用下面的增量路径。进程重启时允许重新初始化，本轮不实现进度持久化。
 
+初始化里的"写初始快照"和"取 watermark"必须分成两条语句，不能指望一条 `INSERT ... SELECT` 同时完成。实测这条写入路径返回的是 affected rows，扫描批次不流向客户端，因此 terminal metrics 里没有 region 水位；用普通 `SELECT` 读取同一范围才能拿到。所以顺序是：先纯读取得 region 与 C，再执行初始快照写入。M4 若要复用现有执行路径，需要先确认带 `flow.sink_table_id` 的写入是否也受影响。
+
 ## 查询一 找新增 span 涉及的 trace
 
 ```sql
