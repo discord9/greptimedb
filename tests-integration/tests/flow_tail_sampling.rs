@@ -21,12 +21,13 @@
 //! compared directly.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use api::v1::QueryRequest;
 use api::v1::query_request::Query;
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use client::{Client, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, Database, OutputData};
-use datatypes::arrow::array::{Array, StringArray};
+use datatypes::arrow::array::{Array, ArrayRef, StringArray};
 use futures_util::StreamExt;
 use servers::server::Server;
 use tests_integration::test_util::{StorageType, setup_grpc_server};
@@ -751,6 +752,380 @@ async fn test_incremental_tail_sampling_rounds() {
         before_expiry, after_expiry,
         "an expired trace must not remove long-term rows"
     );
+
+    let _ = grpc_server.shutdown().await;
+}
+
+/// Fetches every row as a vector of rendered cells.
+///
+/// Cells are rendered positionally so whole rows can be compared as sets. The
+/// fallback renders the sliced array, which is deterministic for a given value,
+/// so equality comparisons stay meaningful for types without an explicit arm.
+async fn fetch_row_set(
+    db: &Database,
+    sql: &str,
+    extensions: &[(&str, &str)],
+) -> BTreeSet<Vec<String>> {
+    let result = db
+        .flight_request()
+        .with_flow_extensions(extensions)
+        .query_with_terminal_metrics(QueryRequest {
+            query: Some(Query::Sql(sql.to_string())),
+        })
+        .await
+        .unwrap_or_else(|err| panic!("query failed: {err:?}\n{sql}"));
+    let OutputData::Stream(mut stream) = result.output.data else {
+        panic!("expected a stream for: {sql}");
+    };
+
+    let mut rows = BTreeSet::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        for row in 0..batch.num_rows() {
+            let mut cells = Vec::with_capacity(batch.num_columns());
+            for column_index in 0..batch.num_columns() {
+                let column = batch.column(column_index);
+                cells.push(if column.is_null(row) {
+                    "NULL".to_string()
+                } else {
+                    render_cell(column, row)
+                });
+            }
+            rows.insert(cells);
+        }
+    }
+    rows
+}
+
+fn render_cell(column: &ArrayRef, row: usize) -> String {
+    use datatypes::arrow::array::{
+        Int64Array, LargeStringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, UInt64Array,
+    };
+    let any = column.as_any();
+    if let Some(array) = any.downcast_ref::<StringArray>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<LargeStringArray>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<UInt64Array>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<Int64Array>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<TimestampMillisecondArray>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<TimestampMicrosecondArray>() {
+        return array.value(row).to_string();
+    }
+    if let Some(array) = any.downcast_ref::<TimestampNanosecondArray>() {
+        return array.value(row).to_string();
+    }
+    format!("{:?}", column.slice(row, 1))
+}
+
+/// Bootstraps an empty source and returns the starting time and state.
+async fn bootstrap(db: &Database, name: &str) -> (DateTime<Utc>, PocState) {
+    let _ = name;
+    create_tables(db).await;
+    let t0 = poc_eval_time();
+    let mut state = PocState::default();
+    run_baseline(db, t0).await;
+    run_round(db, &mut state, t0).await;
+    assert!(state.is_initialized(), "bootstrap must discover the source");
+    (t0, state)
+}
+
+async fn test_db(name: &str) -> (Database, Arc<servers::grpc::GrpcServer>) {
+    common_telemetry::init_default_ut_logging();
+    let (_db, grpc_server) = setup_grpc_server(StorageType::File, name).await;
+    let addr = grpc_server.bind_addr().unwrap().to_string();
+    let db = Database::new(
+        DEFAULT_CATALOG_NAME,
+        DEFAULT_SCHEMA_NAME,
+        Client::with_urls(vec![addr]),
+    );
+    (db, grpc_server)
+}
+
+/// A trace keeps its ERROR reason while the ERROR span is inside the lookback
+/// window, and must drift to `slow` once that span leaves it while a normal span
+/// stays.
+///
+/// This is the one case that the second interval of the time query exists for: the
+/// span that leaves the window was written long before the checkpoint, so only an
+/// explicit lookback comparison can find the trace. Without it the PoC sink would
+/// keep reporting `error` forever while the full query reports `slow`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reason_drift_when_error_leaves_window() {
+    let (db, grpc_server) = test_db("test_reason_drift_when_error_leaves_window").await;
+    let (t0, mut state) = bootstrap(&db, "drift").await;
+
+    // The ERROR span leaves the lookback at round 3. With `tick(n) = t0 + 5n` the
+    // lookback lower bound is `t0 + 5n - 600s`, so the interval that just left the
+    // window is `[t0 + 5n - 600s, t0 + 5(n-1) - 600s)`. A span at `t0 - 587s` falls
+    // in that interval only when it is round 3: `[t0 - 590s, t0 - 585s)`.
+    insert_spans(
+        &db,
+        t0,
+        &[
+            ("drift", "d_err", -587_000, -587_000, "STATUS_CODE_ERROR"),
+            ("drift", "d_ok", -60_000, -58_500, "STATUS_CODE_OK"),
+        ],
+    )
+    .await;
+
+    run_baseline(&db, t0 + ChronoDuration::seconds(5)).await;
+    run_round(&db, &mut state, t0 + ChronoDuration::seconds(5)).await;
+    assert_sinks_agree(&db, "round 1").await;
+
+    // Round 2 is quiet on purpose: the lookback lower bound is still `t0 - 590s`
+    // and the ERROR span sits at `t0 - 587s`, so nothing has moved for this trace
+    // yet. Recomputing it here would be wasted work.
+    run_baseline(&db, t0 + ChronoDuration::seconds(10)).await;
+    let round2 = run_round(&db, &mut state, t0 + ChronoDuration::seconds(10)).await;
+    assert!(
+        round2.affected_trace_ids.is_empty(),
+        "nothing changed for this trace at round 2, so it must not be recomputed: {:?}",
+        round2.affected_trace_ids
+    );
+    assert_sinks_agree(&db, "round 2").await;
+    let reason_at_round2 = fetch_string_column(
+        &db,
+        &format!("SELECT DISTINCT sample_reason FROM {POC_SINK} WHERE trace_id = 'drift'"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        reason_at_round2,
+        vec!["error".to_string()],
+        "the ERROR span is still inside the lookback, so the reason must stay `error`"
+    );
+
+    // Round 3 is the drift: no writes at all, only time moves.
+    run_baseline(&db, t0 + ChronoDuration::seconds(15)).await;
+    let round3 = run_round(&db, &mut state, t0 + ChronoDuration::seconds(15)).await;
+    assert!(
+        round3.new_trace_ids.is_empty(),
+        "no rows were written, so the sequence delta must be empty: {:?}",
+        round3.new_trace_ids
+    );
+    assert!(
+        round3.time_trace_ids.contains("drift"),
+        "the trace whose ERROR span left the window must be re-selected by the \
+         time query: {:?}",
+        round3.time_trace_ids
+    );
+    assert_sinks_agree(&db, "round 3").await;
+
+    // The span that is still inside the window must now report `slow`, while the
+    // expired ERROR row stays in the long-term table with its old reason.
+    let normal_reason = fetch_string_column(
+        &db,
+        &format!(
+            "SELECT sample_reason FROM {POC_SINK} WHERE trace_id = 'drift' AND span_id = 'd_ok'"
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        normal_reason,
+        vec!["slow".to_string()],
+        "after the ERROR span leaves the window the remaining span must drift to `slow`"
+    );
+    let expired_reason = fetch_string_column(
+        &db,
+        &format!(
+            "SELECT sample_reason FROM {POC_SINK} WHERE trace_id = 'drift' AND span_id = 'd_err'"
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        expired_reason,
+        vec!["error".to_string()],
+        "an expired span must keep the reason it was written with"
+    );
+
+    let _ = grpc_server.shutdown().await;
+}
+
+/// A round whose new rows all fall outside the lookback still advances progress.
+///
+/// Such rows can never be discovered by the sequence query, so the checkpoint has
+/// to move past them. If it did not, every round would rescan the same sequence
+/// range forever, which looks like normal operation but keeps redoing work.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_empty_result_still_advances_progress() {
+    let (db, grpc_server) = test_db("test_empty_result_still_advances_progress").await;
+    let (t0, mut state) = bootstrap(&db, "empty-advance").await;
+
+    let before = state.after_seqs.clone();
+
+    // Twenty minutes back: far outside the ten minute lookback.
+    insert_spans(
+        &db,
+        t0,
+        &[("stale", "s1", -1_200_000, -1_200_000, "STATUS_CODE_ERROR")],
+    )
+    .await;
+
+    run_baseline(&db, t0 + ChronoDuration::seconds(5)).await;
+    let round = run_round(&db, &mut state, t0 + ChronoDuration::seconds(5)).await;
+
+    assert!(
+        round.new_trace_ids.is_empty(),
+        "a row outside the lookback must not be reported as an affected trace"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|(region, seq)| state.after_seqs[region] > *seq),
+        "progress must advance even when the query returns no trace: before={before:?} after={:?}",
+        state.after_seqs
+    );
+
+    // The next round must not rediscover anything: the checkpoint is past those
+    // rows, and they are unreachable by the sequence query by construction.
+    run_baseline(&db, t0 + ChronoDuration::seconds(10)).await;
+    let next = run_round(&db, &mut state, t0 + ChronoDuration::seconds(10)).await;
+    assert!(
+        next.new_trace_ids.is_empty(),
+        "rows the checkpoint already passed must not be rediscovered: {:?}",
+        next.new_trace_ids
+    );
+    assert_sinks_agree(&db, "after advancement").await;
+
+    let _ = grpc_server.shutdown().await;
+}
+
+/// Historical spans stay readable through the exact range after a flush.
+///
+/// The decision for a trace needs spans written in earlier rounds, which by then
+/// live in SSTs. Both the time query and the recomputation read `(0, H]` rather
+/// than `(C, H]` for exactly this reason, so this checks that a flush does not
+/// hide the rows that decide the trace.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_historical_spans_survive_flush() {
+    let (db, grpc_server) = test_db("test_historical_spans_survive_flush").await;
+    let (t0, mut state) = bootstrap(&db, "flush").await;
+
+    // A slow trace whose deciding spans are written, flushed, and only sampled
+    // once the wait elapses.
+    insert_spans(
+        &db,
+        t0,
+        &[
+            // Ages are `5n + 20` seconds at round n: 25s at round 1 (inside the
+            // wait) and exactly 30s at round 2 (released, since the rule is `<=`).
+            ("flushed", "f1", -20_000, -20_000, "STATUS_CODE_OK"),
+            ("flushed", "f2", -19_000, -18_500, "STATUS_CODE_OK"),
+        ],
+    )
+    .await;
+    // `admin flush_table` reports a result set rather than affected rows.
+    db.sql("admin flush_table('raw_spans')").await.unwrap();
+
+    run_baseline(&db, t0 + ChronoDuration::seconds(5)).await;
+    let early = run_round(&db, &mut state, t0 + ChronoDuration::seconds(5)).await;
+    assert_eq!(
+        early.new_trace_ids,
+        BTreeSet::from(["flushed".to_string()]),
+        "the sequence query must find the flushed trace"
+    );
+    assert_eq!(
+        early.submitted_rows, 0,
+        "the trace is younger than the wait, so nothing may be sampled yet"
+    );
+    assert_sinks_agree(&db, "before the wait elapses").await;
+
+    // Advance past the wait with no writes. Both deciding spans are now in an
+    // SST, and the round must still see them.
+    for round in [2, 3] {
+        run_baseline(&db, t0 + ChronoDuration::seconds(round * 5)).await;
+        let outcome = run_round(&db, &mut state, t0 + ChronoDuration::seconds(round * 5)).await;
+        assert!(
+            outcome.new_trace_ids.is_empty(),
+            "no writes, so the sequence delta must stay empty"
+        );
+        assert_sinks_agree(&db, &format!("round {round}")).await;
+    }
+
+    let sampled = fetch_string_column(
+        &db,
+        &format!("SELECT sample_reason FROM {POC_SINK} WHERE trace_id = 'flushed'"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        sampled.iter().filter(|reason| *reason == "slow").count(),
+        2,
+        "both flushed spans must be sampled once the wait elapses, got {sampled:?}"
+    );
+
+    let _ = grpc_server.shutdown().await;
+}
+
+/// The trace-restricted query must return exactly the full query's rows for those
+/// traces, and nothing more.
+///
+/// This is the invariant behind recomputing only affected traces: restricting the
+/// sampling SQL by trace id may not change any selected row, drop a span of a
+/// selected trace, or pull in a trace that was not affected. Comparing the two
+/// forms directly also catches a restriction applied to only one of the two
+/// source scans.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_local_result_equals_full_scoped_to_affected() {
+    let (db, grpc_server) = test_db("test_local_result_equals_full_scoped_to_affected").await;
+    let (t0, _state) = bootstrap(&db, "scope").await;
+
+    insert_spans(
+        &db,
+        t0,
+        &[
+            ("kept_error", "k1", -200_000, -200_000, "STATUS_CODE_OK"),
+            ("kept_error", "k2", -199_000, -199_000, "STATUS_CODE_ERROR"),
+            ("kept_slow", "s1", -300_000, -300_000, "STATUS_CODE_OK"),
+            ("kept_slow", "s2", -299_000, -298_500, "STATUS_CODE_OK"),
+            ("dropped", "x1", -120_000, -120_000, "STATUS_CODE_OK"),
+            ("young", "y1", -10_000, -10_000, "STATUS_CODE_ERROR"),
+        ],
+    )
+    .await;
+
+    let t = t0 + ChronoDuration::seconds(60);
+    let scheduled = t.timestamp_millis().to_string();
+    let extensions = [("flow.scheduled_time_millis", scheduled.as_str())];
+
+    let full = fetch_row_set(&db, &sampling_select(None), &extensions).await;
+    let affected = BTreeSet::from(["kept_error".to_string(), "kept_slow".to_string()]);
+    let local = fetch_row_set(&db, &sampling_select(Some(&affected)), &extensions).await;
+
+    let expected = full
+        .iter()
+        .filter(|row| affected.contains(&row[3]))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert!(
+        !expected.is_empty(),
+        "the fixture must select at least one trace, otherwise this proves nothing"
+    );
+    assert_eq!(
+        local, expected,
+        "the trace-restricted query must equal the full query's rows for those traces"
+    );
+
+    // The restricted result must not contain a trace that was not requested.
+    for row in &local {
+        assert!(
+            affected.contains(&row[3]),
+            "the restricted query returned an unrequested trace: {row:?}"
+        );
+    }
 
     let _ = grpc_server.shutdown().await;
 }
