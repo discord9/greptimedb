@@ -45,13 +45,32 @@ the 2 868 400 intermediate rows that aggregate used to consume are never materia
 `FinalPartitioned` aggregate and the repartition above it stay exactly as they were. Verified on
 real mito storage through the real query entry point, and correct on seven shapes: all three arms
 return the same answer, series by series and value by value, including the two 2 868 400-row
-cases (section 4.11). The direction is unambiguous — `sum/on` is below 1.00 in **9 of 9 rounds**
-of the three collapsing cases, and the partial arm is also the *most repeatable* of the three,
-reading 130-150 ms across all six of its `G4`/`G1` rounds while the arm it is compared against
-swings 170-270 ms. The **magnitude is not resolved** on the 100:1 shape a user writes (`G4`
-0.70 / 0.48 / 0.88): the noise is in the denominator, and the gate reports the pass not quiet.
-Where both arms repeat, it reads **0.900** on `n100` (three identical rounds) and **0.957** on
-`G400`. Section 4.9's 40.7 ms bound is neither confirmed nor refuted — the rounds straddle it.
+cases (section 4.11).
+
+**What the partial step is worth: the structural part is settled, the number is not.** On the
+fixed tree the `sum` arm returns **28 684 rows with an identical key set and zero value
+differences** against the flag-off arm, the inner `AggregateExec` disappears entirely — the
+172.0 ms its own counter attributes to reducing 2.87 M points to 566 509 partial rows — and
+peak RSS *falls* (390.1 → 376.1 MiB), so the state the node holds is cheaper than the rows the
+plan it replaces was holding. That much does not depend on a stopwatch. What does, does not
+settle: across three passes `G4`'s `sum/on` reads 0.69-0.73, 0.60 / 1.11 / 0.30 and
+1.14 / 0.77 / 0.69, `G1` 0.73-0.77, 1.18 / 0.85 / 0.88 and 0.82 / 1.50 / 1.35, and only the
+first pass had a never-fusing control that held flat (420-440 ms across all nine arm-rounds).
+The reason is not the clock: `fused_partial_slots` for one unchanged statement varied **4×** —
+20, 78, 80, 20 keys per grid step in four consecutive executions in one process — because the
+scan's partitioning decides how many of the four label groups each partition sees, and that is
+how much folding the partial step is asked to do. Repetition cannot average that out, so the
+gate reports **`NOT QUIET` on every pass** and no magnitude is claimed. Section 4.9's 40.7 ms
+bound is consistent with the direction and remains unmeasured.
+
+**Two earlier claims are retracted here.** `n100`'s "stable 10%" — 90 vs 100 ms is one 10 ms
+tick, and its per-round totals straddle 1.00. And the statement that this report had verified
+the fixture as `instance = i{host % 4}` — the archived fixture actually stores
+`instance = i{host // 100}`, so `n100`'s one group came from the fixture on disk, not from the
+seed script; `n100` is now `sum by (job)`, which is one group under either assignment. Section
+4.12 has both, plus the reason `G400`'s null result (0.996 / 1.000 / 1.007) is the one ratio
+here that is stable.
+
 This is bench scaffolding behind an environment variable, and `experimental_native_promql` still
 stays off.
 
@@ -1315,6 +1334,25 @@ Three arms, one binary, the environment variable as the only difference (`off`, 
 120 min at a 1 s step on the 400-series fixture, 3 rounds with the arm order rotated,
 2 warmup + 9 timed per arm per round. Binary built from `83e366b33bd`.
 
+**The fixture, verified rather than assumed.** The table is `vmbench`: 400 series
+(`host = h0000..h0399`) × 2 880 samples at 15 s = 1 152 000 rows, with `job = j`, `l1 = l`, and
+`instance` assigned by the seed script. The driver counts each case's selected series against the
+number the case is named for before it times anything, so `n100` is 100 series into 1 group — a
+100:1 reduction, the same ratio as `G4` (400 series into 4 groups) over a quarter of the input.
+
+**The `instance` assignment is not what an earlier revision of this section said it was, and the
+difference is measured.** That revision stated `instance = i{host % 4}` and called it verified.
+Querying the archived `data-seed` directly reports `h0000 → i0`, `h0099 → i0`, `h0100 → i1`,
+`h0399 → i3`: the archived fixture writes `instance = i{host // 100}`, contiguous hundred-host
+blocks. The current seed script writes `i{host % 4}`, which interleaves. Both give 100 hosts per
+instance and 288 000 rows per instance, so the aggregate shape is identical — but a selector for
+`h00NN` spans one instance under the archived assignment and all four under the current one.
+`n100`'s `sum by (instance)` therefore produced the one group it is named for *only* on the
+fixture these runs used; re-seeding an empty directory with the current script turns the same
+case into four groups, 25:1. Section 4.12 changes `n100` to `sum by (job)`, which is one group
+under either assignment because `job` is constant. The measurements in this section are
+unaffected: their `n100` really was 100 series into one group, on the fixture that was on disk.
+
 **The path is the intended one, on real storage.** `TQL ANALYZE VERBOSE FORMAT JSON` (not
 `EXPLAIN`: in standalone it prints `CooperativeExec → MergeScanExec` and never expands the
 remote plan, so an EXPLAIN-based check here would certify nothing) reports, for
@@ -1343,7 +1381,7 @@ agree, including the two 2 868 400-row ones.
 | `G4` `sum by (instance)` | 28 684 | 0/0, 1/0, **1/1** |
 | `G400` `sum by (host)` | 2 868 400 | 0/0, 1/0, **1/1** |
 | `G1` `sum by (job)` | 7 171 | 0/0, 1/0, **1/1** |
-| `n100`, `n1` | 7 171 | 0/0, 1/0, **1/1** |
+| `n100` (100 series → 1 group), `n1` | 7 171 | 0/0, 1/0, **1/1** |
 | `raw` (no aggregation) | 2 868 400 | 0/0, 1/0, **1/0** — nothing to push into |
 | `control` (`max_over_time`) | 28 744 | 0/0, 0/0, 0/0 |
 
@@ -1357,19 +1395,38 @@ identical plan to `on` and its ratio is the harness's own floor.
 | --- | ---: | ---: | ---: | ---: | --- | ---: |
 | `G4` `sum by (instance)` | 340 ms | 200 ms | 140 ms | **0.700** | 0.70 / 0.48 / 0.88 | 0.406 |
 | `G1` `sum by (job)` | 300 ms | 180 ms | 140 ms | **0.667** | 0.87 / 0.61 / 0.67 | 0.400 |
-| `n100` (100 series) | 110 ms | 100 ms | 90 ms | **0.900** | 0.90 / 0.90 / 0.90 | 0.818 |
+| `n100` (100 series → 1 group) | 110 ms | 100 ms | 90 ms | 0.900 † | 0.90 / 0.90 / 0.90 | 0.818 |
 | `G400` `sum by (host)` | 2 450 ms | 2 350 ms | 2 250 ms | **0.957** | 0.95 / 0.98 / 0.96 | 0.926 |
 | `raw` (no aggregation) | 1 410 ms | 1 350 ms | 1 350 ms | 0.993 | 0.99 / 0.99 / 1.04 | 0.957 |
 | `n1` (1 series) | 30 ms | 30 ms | 30 ms | 1.000 | 1.33 / 1.00 / 1.00 | 1.000 |
 | `control` (`max_over_time`) | 470 ms | 470 ms | 500 ms | 1.298 | 1.30 / 0.70 / 1.39 | 1.064 |
 
-**The direction is unambiguous; the magnitude is not, on the cases that matter most.** On the
-three cases with something to collapse, `sum/on` is below 1.00 in **9 of 9 rounds** — `G4`
-0.70/0.48/0.88, `G1` 0.87/0.61/0.67, `n100` 0.90/0.90/0.90. No round of any of them is above
-the `on` arm. The magnitude is only resolvable where *both* arms repeat, and the gate reports
-this pass **not quiet**: `G4`'s `on/off` deviates 60% and its `sum/on` 31%, `G1`'s 42% and 31%.
-Those two ratios are therefore quoted with their per-round values and no single number is
-claimed from them.
+† one 10 ms tick of 100 ms; see the two-statistic table below. Not claimed as a saving.
+
+**The direction is supported where both statistics agree; the magnitude is not established
+anywhere.** The driver reports every ratio two ways — the median of the per-iteration CPU
+readings, and the per-round total divided by the iteration count — and they do not always agree:
+
+| `sum/on`, by statistic | round 1 | round 2 | round 3 |
+| --- | ---: | ---: | ---: |
+| `G4` per-iteration median | 0.700 | 0.481 | 0.882 |
+| `G4` per-round total | 0.775 | 0.531 | 0.927 |
+| `G1` per-iteration median | 0.875 | 0.609 | 0.667 |
+| `G1` per-round total | 0.696 | 0.558 | 0.756 |
+| `n100` per-iteration median | 0.900 | 0.900 | 0.900 |
+| `n100` per-round total | **1.034** | **0.784** | **1.011** |
+
+`G4` and `G1` improve under both statistics in all three rounds, so the direction is supported
+there and their magnitudes are not: the gate reports the pass not quiet, `G4`'s `on/off`
+deviating 60% and its `sum/on` 31%. **`n100`'s "stable 10% saving" is retracted.** Its three
+identical 0.900 readings are 90 ms against 100 ms, a difference of exactly one 10 ms
+`/proc/<pid>/stat` tick; its per-round totals read 1.034 / 0.784 / 1.011, straddling 1.00. A
+result that moves by one tick and reverses sign under the other statistic is neither a saving
+nor a regression, and it is no longer quoted as either.
+
+`G400` reads 0.953 / 0.979 / 0.957 by median against 0.962 / 0.975 / 0.965 by round total: a
+small CPU improvement observed in all three rounds under both statistics, on a 1:1 shape, still
+to be re-checked on a quieter machine before any number is attached to it.
 
 **Where the swing comes from, and it is not the partial arm.** Per arm, per round:
 
@@ -1381,12 +1438,20 @@ claimed from them.
 | `G400` | 2% | 1% | 1% |
 | `raw` | 1% | 4% | 1% |
 
-The `sum` arm is the most repeatable of the three on every fusing case — it reads 130-150 ms
-across all six `G4`/`G1` rounds — while the `on` arm swings 170-270 ms on `G4` alone. That is
-consistent with what the two do: `on` materialises 2 868 400 intermediate rows per query and
-pushes them through a generic `AggregateExec` hash table, `sum` never materialises them. So the
-`sum/on` ratio's instability is inherited from its *denominator*, and the partial arm's cheapness
-and its repeatability are the same property.
+The `sum` arm is the most repeatable of the three on every fusing case in *this run* — it reads
+120-150 ms across all six `G4`/`G1` rounds — while the `on` arm swings 170-270 ms on `G4` alone.
+That is consistent with what the two do: `on` materialises 2 868 400 intermediate rows per query
+and pushes them through a generic `AggregateExec` hash table, `sum` never materialises them. So in
+this run the `sum/on` ratio's instability is inherited from its *denominator*, and the partial
+arm's cheapness and its repeatability are the same property.
+
+**"Most repeatable" is a property of this run, not of the arm, and section 4.12 shows why.** On
+the fixed tree the `sum` arm's own cost varies with how the scan partitions the series: its
+state volume read 20, 78, 80 and 20 keys per grid step in four consecutive executions of one
+unchanged statement, a 4× difference in the folding it is asked to do. So the narrow 14% spread
+above is not a guarantee that repeats; it is one draw from a quantity that can be several times
+larger. The conclusion that survives is the one that does not depend on it: the arm does less
+work and holds less memory, and its ratio's numerator is not a constant.
 
 **Against section 4.9's bound.** 4.9 predicted `G4` would land "near 132 ms", i.e. `sum/on` no
 lower than about **0.765**, from the aggregate's 38.9 ms share of a 173.0 ms fused arm. This run
@@ -1405,6 +1470,33 @@ arms stable to 1-2% and all three rounds below 1.00, so the saving is small but 
 output row count is unchanged, but the ordinary plan still builds a hash table over 2 868 400
 rows and copies group columns, where the fused node writes the state directly. 4.3% is above
 this shape's own floor (1-2%) and near `raw`'s (1-4% on a shorter query).
+
+**What the review of this round changed, and why the numbers above predate it.** The three-arm
+pass was run on `83e366b33bd`. Review then found four defects, all fixed afterwards, none of which
+the pass measured:
+
+1. `tests-integration` did not compile: the real-storage test still called
+   `FusedSeriesExec::try_new` without the new `partial` argument. The release benchmark could not
+   have caught it, because it does not build that target.
+2. The slot columns grew from grid index zero. A group whose series only cover the tail of a large
+   grid initialized everything below it: 100 000 grid points with 1 000 groups holding one point
+   each would have allocated about 400 MB to represent 1 000 aggregating positions. `SlotColumn`
+   is now a base-relative span whose ids start at the group's lowest occupied index, and its
+   bytes are charged by capacity.
+3. The memory reservation was charged by counting insertions, so it drifted from what the
+   allocator held — `Vec::resize`'s capacity, `Vec::push`'s own growth steps, the label map's
+   buckets and the `Option<String>` values were each only partly counted. It is now measured from
+   the containers' capacities and synced once per ingested series.
+4. On success, the reservation was returned while the label-set table it had paid for was still
+   allocated; and `tag_value` returned an owned `String`, so each row of every `Utf8`-encoded tag
+   column cloned its label. Both are fixed, and the second is a real regression on the plain
+   `Utf8` path — ordinary mito/metric queries usually carry dictionary-encoded labels, so this
+   does **not** invalidate the benchmark above, which ran the dictionary path.
+
+None of these makes the ratios above wrong, and none is claimed to improve them: their effect is
+on memory held, on the `Utf8` path, and on whether the integration target builds. The re-run on
+the fixed tree is section 4.12; the numbers here stay as measured, and are labelled as predating
+the fixes.
 
 **The slot key is load-bearing, and that is verified rather than asserted.** A slot must be
 keyed by the *absolute* grid index (`start + offset`), because each series trims its own
@@ -1428,6 +1520,133 @@ the removed work was never the majority of the elapsed time on a machine with id
 bench path: the step is selected by `GREPTIME_FUSED_PARTIAL_SUM` and deleted when the formal
 planner constructs the same node configuration directly.
 
+### 4.12 Rerun after the fixes: three passes, and a variable the CPU counter cannot see
+
+Section 4.11 ends by naming four defects its numbers predate. All four are fixed in
+`38b6ad368e2`, and this section is the rerun on that binary — one fixture written into an empty
+directory, three arms, the environment variable again the only difference. It also retracts one
+fixture claim made above, and reports a property of the node that makes `G4`'s CPU ratio
+ungateable for a reason that is not measurement noise.
+
+**Correctness first, on the fixed tree, before any timing.** The first question about a rewrite
+of an aggregation is whether it still aggregates. `sum by (instance) (rate(vmbench[5m]))` run
+against the `off` and `sum` arms returns **28 684 rows in both, with an identical
+`(instance, timestamp)` key set and zero value differences** at 1e-6. The slot rework, the
+reservation rework and the early-release change are therefore not silent semantic changes: the
+state the node emits still sums to what DataPlan's own partial aggregate produced.
+
+**Three passes, and why only one of them can arbitrate.** Every pass below is on `38b6ad368e2`
+with the same fixture, and each is disqualified from a different direction:
+
+| record | `control` `sum/on`, three rounds | why it is not quoted for a magnitude |
+| --- | --- | --- |
+| `20261019T1100Z` | 0.97 / 1.03 / 0.98 | `n100` still used `sum by (instance)`; on the re-seeded fixture that is 4 groups, not 1, so **its `n100` column measures a different query** (28 684 rows, not 7 171) and is void |
+| `20261019T1130Z` | 1.18 / 1.03 / 1.12 | `control`'s raw CPU rose from 430 ms to 640 ms and oscillated; the machine was ~45% slower than the pass before |
+| `20261019T1140Z` | 1.04 / 1.08 / 1.03 | `control`'s `off` arm read 560 / 520 / 660 ms against 430 / 430 / 440 in `1100Z`, so the pass is not comparable to it even though nothing else was running |
+
+`control` is the case that never fuses and does identical work in all three arms, so it is the
+pass's own noise floor. Its ratio is not the right test on its own, because one round is slow for
+all three arms at once and the ratio then stays near 1.00 while the pass is unusable. Its absolute
+CPU is: `1100Z` holds all nine arm-rounds inside **420-440 ms**, against **420-740 ms** in
+`1130Z` and **520-780 ms** in `1140Z`. `1140Z` is the trap this exposes — its `control` ratio
+repeats to 3%, tighter than `1100Z`'s 5%, purely because the arms inflated together. So the pass
+quoted below is chosen by the flatness of the work, not by the stability of the ratio it produces,
+and not by which pass flatters the change.
+
+**In the pass whose control held to 420-440 ms, the direction is consistent.** `sum/on` by
+per-round cumulative CPU: `G4` **0.72 / 0.69 / 0.73**, `G1` **0.75 / 0.77 / 0.73**, `G400`
+1.00 / 0.99 / 1.01, `raw` 1.16 / 1.01 / 1.00. The per-iteration medians agree on direction
+(`G4` 0.75 / 0.65 / 0.75, `G1` 0.78 / 0.78 / 0.70). The two later passes put `G4` at
+0.60 / 1.11 / 0.30 and 1.14 / 0.77 / 0.69 and `G1` at 1.18 / 0.85 / 0.88 and 0.82 / 1.50 / 1.35;
+they neither confirm nor refute, and the `1.35` in particular is a reading this report will not
+average away.
+
+**What the counters say, which owes nothing to the CPU clock.** One `TQL ANALYZE VERBOSE FORMAT
+JSON` per arm on `G4`, `20261019T1140Z/operator-metrics.json`:
+
+| operator | `off` | `on` | `sum` |
+| --- | --- | --- | --- |
+| `SeriesScanExec` | not in this plan | 342.7 ms | 257.2 ms |
+| `FusedSeriesExec` rows out | — | 2 868 400 | 559 338 |
+| `FusedSeriesExec` bytes out | — | 60 398 400 | 11 607 792 |
+| `FilterExec` elapsed | 5.4 ms | 0.8 ms | **gone** |
+| inner `AggregateExec` `elapsed_compute` | 163.0 ms (573 680 rows out) | **172.0 ms** (566 509 rows out) | **gone** |
+| — of which `aggregation_time` | 159.8 ms | 167.3 ms | — |
+| final `AggregateExec` `elapsed_compute` | 10.6 ms | 12.0 ms | 9.6 ms |
+| process peak RSS (`VmHWM`) | 390.1 MiB | 382.7 MiB | 376.1 MiB |
+
+The `off` arm has no `SeriesScanExec` node at all: it plans the ordinary `RangeManipulate` over a
+table scan, so its scan time is not comparable and its row is left as such rather than filled
+with the `on` arm's number. Between `on` and `sum` the plans differ by exactly one step, which is
+what makes that pair the measurement.
+
+The `sum` arm does not make the final aggregate faster — it *deletes the inner one*, the
+172.0 ms `elapsed_compute` that existed only to reduce 2.87 M evaluated points to 566 509 partial
+rows. The `off` arm has the same operator at 163.0 ms; the two differ because they ran at different
+times, not because the fused node changed it.
+
+That reduction is now done inside the scan, and the node's own accounting prices it: `evaluate`
+108.5 → 117.0 ms, `partial fold` 34.1 ms, `partial state` 15.8 ms, so the node's block time rises
+by about 59 ms to remove about 172 ms. Peak RSS does not rise either — 376.1 MiB for `sum` is the
+lowest of the three, against 382.7 for `on` and 390.1 for `off` — so the state the node holds is
+cheaper than the plan it replaces holding the same partition's rows. These figures are single executions and move
+with the variable below, but their signs do not: fewer rows leave the node, the inner aggregate
+disappears, and memory does not grow.
+
+**A variable the CPU counter cannot see: the partial state volume depends on how the scan splits
+the series.** `fused_partial_slots` counts the `(label group, absolute grid index)` keys the node
+allocated — one per state row it emits. A perfectly folded partition set would allocate
+`4 groups × 7 171 steps = 28 684`. What was measured for the *same* statement, four times in a
+row, in one process:
+
+| run | `fused_partial_slots` | / step | `G400` slots | / step |
+| --- | --- | --- | --- | --- |
+| 0 | 143 420 | 20 | 2 868 400 | 400 |
+| 1 | 559 338 | 78 | 2 868 400 | 400 |
+| 2 | 573 680 | 80 | 2 868 400 | 400 |
+| 3 | 143 420 | 20 | 2 868 400 | 400 |
+
+Twenty output batches in every run, so the partition *count* is stable at 20; what changes is how
+many of the four label groups each partition sees. At 20 each group landed in exactly one
+partition; at 80 every partition saw all four, which is the whole cross product. Earlier runs
+record 24, 46 and 73. Both arrangements are correct — the final aggregate sums the partials
+either way, which is why the result comparison above still passed — but they differ by **4×** in
+the work the partial fold and the state emission do, which is exactly the `sum` arm's added cost.
+So `G4`'s `sum/on` is not a constant with noise around it; it is a ratio over a numerator whose
+own work varies 4× between identical executions.
+
+**`G400` is the control for that explanation, and it behaves as the explanation predicts.** With
+400 groups, one slot per group per step is already the irreducible minimum: 2 868 400, every run,
+`k = 400` — nothing to fold, and no variance in what the fold is asked to do. Its `sum/on` reads
+0.996 / 1.000 / 1.007 across the three passes, with all nine per-round values between 0.994 and
+1.015. That is the correct answer for a shape with no reduction, and it is stable precisely
+because the variable above is absent. Its `on/off` is also the most stable number in the whole
+figure set: 0.966 / 0.978 / 0.968 by per-round cumulative CPU across the three passes, so the
+fused node alone is 2-3% cheaper than the ordinary plan at 400 groups, in every pass, before and
+after the fixes.
+
+**What this rerun settles and what it does not.** It settles that the four fixes did not change
+results (identical 28 684 rows and values), did not increase peak memory (376.1 vs 390.1 MiB), and
+did not remove the effect they were not supposed to touch (the inner `AggregateExec` is still
+gone, 172.0 ms of `elapsed_compute`, 167.3 ms of it `aggregation_time`). It settles the direction
+on `G4` and `G1` only in the one pass whose control held flat: 0.69-0.73 and 0.73-0.77,
+consistent with 4.9's 40.7 ms bound being roughly the size of the effect. It does **not** give a magnitude for either, because the
+numerator varies 4× by partition composition, and no amount of repetition of the same pass
+addresses that — the variance is in the workload, not in the clock. The gate reports every pass
+`NOT QUIET`, which is the correct verdict and is printed as such.
+
+**Two harness defects were found while doing this, and both are fixed in the driver.** `n100`
+used `sum by (instance)` with a selector for the first hundred hosts; that is one group under the
+archived fixture's `instance = i{host // 100}` and four under the current `i{host % 4}`, so it is
+now `sum by (job)`, which is one group under either. And the resolution test compared each CPU
+reading against a fixed count of 10 ms counter ticks, which is too weak a test at the small end:
+`n1` costs ~10 ms, so its per-round total spans 14-21 ticks and passed the test, yet its ratio
+varied 19%, 32% and 75% between rounds in three consecutive passes — scheduling and page-fault
+jitter, not quantization. The cumulative statistic now also has to clear 400 ms of CPU, which is
+the midpoint of a bracket this harness measured at both ends: `control` repeats to a few percent
+at 420-440 ms, `n1` does not repeat at all at 140-210 ms. `n1` is still reported, and excluded
+from the verdict. Neither change touches any number quoted above.
+
 ## 5. What is not shown
 
 - **No general speedup.** On CPU the fused path now beats the ordinary plan on every `rate`
@@ -1437,13 +1656,19 @@ planner constructs the same node configuration directly.
   and on a machine with idle cores the wall time was already dominated by other work. There is
   still no evidence here to justify enabling `experimental_native_promql` by default; it
   remains off.
-- **The partial `SUM` (section 4.11) is not resolved on the shape it exists for.** Its direction
-  is: `sum/on` is below 1.00 in all nine rounds of the three collapsing cases. Its magnitude is
-  not: `G4` reads 0.70 / 0.48 / 0.88 and `G1` 0.87 / 0.61 / 0.67, and the gate reports the pass
-  not quiet, mostly through the `on` arm's own 50% / 39% round-to-round spread. Only `n100`
-  (0.900, three identical rounds) and `G400` (0.957, all arms within 2%) give a magnitude this
-  run can support, and neither is the 100:1 shape a PromQL user writes. Section 4.9's 40.7 ms
-  bound is neither confirmed nor refuted — the rounds straddle it.
+- **The partial `SUM` has no magnitude, and the reason is in the workload rather than the
+  clock.** What is established: the result is unchanged (section 4.12: identical 28 684 rows and
+  values against the `off` arm), the inner 167.3 ms `AggregateExec` is gone and 5.1× fewer rows
+  leave the node (2 868 400 → 559 338), and peak RSS falls rather than rises (390.1 → 376.1 MiB).
+  What is not: `G4` and `G1` read 0.69-0.73 and 0.73-0.77 by per-round cumulative CPU in the one
+  pass whose never-fusing control held flat at 420-440 ms, but the same case in the other two
+  passes reads as low as 0.30 and as high as 1.50, and the partial state volume itself varies 4×
+  between identical consecutive executions (20 to 80 keys per grid step) with the scan's
+  partitioning. Repetition cannot average that out, so no magnitude is claimed and every pass
+  reports the gate `NOT QUIET`. `G400` is the exception and is a null result by construction:
+  400 groups, nothing to fold, `sum/on` 0.996 / 1.000 / 1.007 — the right answer, and stable
+  because the varying quantity is absent. `n1` is excluded as unresolvable (section 4.12).
+  Section 4.9's 40.7 ms bound is consistent with the direction and is not a measured value.
 - **The per-point bookkeeping is gone for two functions only.** `rate` and `increase` take
   the batch path; `delta`, `irate`, `*_over_time` and the rest still call the boxed kernel
   once per grid point and gained nothing this round. Section 4.5's 36.9 ns-per-point figure
@@ -1621,7 +1846,47 @@ python3 scripts/fused_series_partial_plan.py --data-home <dir> --bin <greptime> 
 # The comparator that run relies on, with no server: reordering tolerated, and a changed
 # value, timestamp, dropped sample, dropped series, changed label or schema still caught.
 python3 scripts/fused_series_bench.py selftest
+
+# What the partial step costs and produces, from the operators' own counters: input chunks,
+# completed series, points folded, slots and state rows, the two block-scoped timers, and the
+# process peak. `output_bytes` is cumulative, not a peak, and both are labelled.
+python3 scripts/fused_partial_metrics.py --data-home <dir> --bin <greptime> \
+    --arms off,on,sum --case G4 --json docs/bench-records/<dir>/metrics-G4.json
 ```
+
+Section 4.12 re-runs all of the above on a **freshly seeded** directory, because the archived
+fixture was written by an older seed script and cannot be re-derived from the current one
+(section 4.11). Seeding into an empty directory and checking the row count is what verifies the
+seed itself:
+
+```bash
+# Empty directory in, 1 152 000 rows out. `seed` refuses to add to a directory of another shape,
+# so this is the only way to reproduce section 4.12's fixture from nothing.
+mkdir -p ~/.cache/fused-scale/data-fresh
+python3 scripts/fused_series_bench.py seed \
+    --data-home ~/.cache/fused-scale/data-fresh --bin <greptime>
+python3 scripts/fused_series_bench.py selftest
+
+# The three passes of section 4.12. Only the first is quoted for a magnitude; the archive keeps
+# the other two because their disqualification is the evidence for how the gate is read.
+for tag in 20261019T1100Z 20261019T1130Z 20261019T1140Z; do
+  python3 scripts/fused_series_scale.py \
+      --data-home ~/.cache/fused-scale/data-fresh --bin <greptime> \
+      --commit <sha> --arms off,on,sum --rounds 3 --warmup 2 --iterations 9 \
+      --out docs/bench-records/$tag/scale-3arm.json
+done
+
+# The operator decomposition of section 4.12, including peak RSS per arm.
+python3 scripts/fused_partial_metrics.py \
+    --data-home ~/.cache/fused-scale/data-fresh --bin <greptime> \
+    --arms off,on,sum --case G4 \
+    --json docs/bench-records/20261019T1140Z/operator-metrics.json
+```
+
+The driver refuses a case whose selector matches a different number of distinct hosts than the
+case is named for, which is the check that caught `n100` measuring four groups instead of one;
+the host form itself is written by `fused_series_bench.py`'s `host_label` and read by the
+selectors, so the two cannot drift apart.
 
 The three data shapes of section 2 are seeded and measured by
 `scripts/fused_series_shapes.py --data-home <dir> --bin <greptime> --out shapes.json`, which

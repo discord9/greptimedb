@@ -1,0 +1,564 @@
+{
+  "case": "G4",
+  "statement": "TQL EVAL (1700000000, 1700007200, '1s') sum by (instance) (rate(vmbench[5m]))",
+  "arms": {
+    "off": {
+      "fused_selections": 0,
+      "partial_selections": 0,
+      "peak_rss_bytes": 409022464,
+      "operators": [],
+      "stages": [
+        {
+          "name": "CooperativeExec",
+          "param": "",
+          "output_rows": 0,
+          "elapsed_compute": 0,
+          "metrics": {},
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "MergeScanExec",
+              "param": "peers=[4398046511104(1024, 0), ], metrics={\"partition_0\":{\"regions\":1,\"total_poll_duration\":\"23.85075ms\",\"total_do_get_cost\":\"4.650307ms\",\"ready_time\":\"4.666012ms\",\"first_consume_time\":\"28.514339ms\",\"finish_time\":\"28.833358ms\",\"region_metrics\":[{\"region_id\":\"4398046511104(1024, 0)\",\"poll_duration\":\"23.85075ms\",\"do_get_cost\":\"4.650307ms\",\"total_cost\":\"28.797604ms\"}]}}",
+              "output_rows": 28684,
+              "elapsed_compute": 0,
+              "metrics": {
+                "first_consume_time": 28514363,
+                "greptime_exec_read_cost": 0,
+                "finish_time": 28839676,
+                "ready_time": 4666054
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "name": "SortPreservingMergeExec",
+          "param": "[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST]",
+          "output_rows": 28684,
+          "elapsed_compute": 2399179,
+          "metrics": {
+            "output_bytes": 575616,
+            "output_batches": 4
+          },
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "SortExec",
+              "param": "expr=[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST], preserve_partitioning=[true]",
+              "output_rows": 28684,
+              "elapsed_compute": 39501,
+              "metrics": {
+                "spilled_bytes": 0,
+                "spill_count": 0,
+                "output_batches": 20,
+                "output_bytes": 738160,
+                "spilled_rows": 0
+              },
+              "children": [
+                {
+                  "name": "AggregateExec",
+                  "param": "mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]",
+                  "output_rows": 28684,
+                  "elapsed_compute": 10621985,
+                  "metrics": {
+                    "output_bytes": 836368,
+                    "time_calculating_group_ids": 67618,
+                    "spilled_bytes": 0,
+                    "aggregate_arguments_time": 27227,
+                    "aggregation_time": 10115287,
+                    "output_batches": 20,
+                    "spilled_rows": 0,
+                    "emitting_time": 230552,
+                    "spill_count": 0
+                  },
+                  "children": [
+                    {
+                      "name": "RepartitionExec",
+                      "param": "partitioning=Hash([instance@0, ts@1], 20), input_partitions=20",
+                      "output_rows": 573680,
+                      "elapsed_compute": 88130,
+                      "metrics": {
+                        "fetch_time": 359940380,
+                        "spill_count": 0,
+                        "output_bytes": 12828928,
+                        "repartition_time": 8163556,
+                        "spilled_rows": 0,
+                        "output_batches": 80,
+                        "spilled_bytes": 0,
+                        "send_time": 21648707
+                      },
+                      "children": [
+                        {
+                          "name": "AggregateExec",
+                          "param": "mode=Partial, gby=[instance@2 as instance, ts@0 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]",
+                          "output_rows": 573680,
+                          "elapsed_compute": 163010513,
+                          "metrics": {
+                            "aggregation_time": 159761368,
+                            "output_bytes": 49166080,
+                            "aggregate_arguments_time": 123467,
+                            "spill_count": 0,
+                            "output_batches": 80,
+                            "skipped_aggregation_rows": 0,
+                            "emitting_time": 1900470,
+                            "time_calculating_group_ids": 408087,
+                            "spilled_bytes": 0,
+                            "reduction_factor": 0,
+                            "spilled_rows": 0
+                          },
+                          "children": [
+                            {
+                              "name": "FilterExec",
+                              "param": "prom_rate(ts_range,metric_value,ts,Int64(300000))@1 IS NOT NULL",
+                              "output_rows": 2868400,
+                              "elapsed_compute": 5357360,
+                              "metrics": {
+                                "output_batches": 400,
+                                "selectivity": 0,
+                                "output_bytes": 57780800
+                              },
+                              "children": [
+                                {
+                                  "name": "ProjectionExec",
+                                  "param": "expr=[ts@5 as ts, prom_rate(ts_range@6, metric_value@4, ts@5, 300000) as prom_rate(ts_range,metric_value,ts,Int64(300000)), instance@1 as instance]",
+                                  "output_rows": 2874400,
+                                  "elapsed_compute": 62614728,
+                                  "metrics": {
+                                    "output_bytes": 58284800,
+                                    "output_batches": 400,
+                                    "expr_0_eval_time": 74487,
+                                    "expr_2_eval_time": 61833,
+                                    "expr_1_eval_time": 62111209
+                                  },
+                                  "children": [
+                                    {
+                                      "name": "PromRangeManipulateExec",
+                                      "param": "req range=[1700000000000..1700007200000], interval=[1000], eval range=[300000], time index=[ts]",
+                                      "output_rows": 2874400,
+                                      "elapsed_compute": 61933745,
+                                      "metrics": {
+                                        "output_bytes": 119699200,
+                                        "num_series": 400,
+                                        "output_batches": 400
+                                      },
+                                      "children": [
+                                        {
+                                          "name": "PromSeriesNormalizeExec",
+                                          "param": "offset=[0], time index=[ts], filter NaN: [true]",
+                                          "output_rows": 192000,
+                                          "elapsed_compute": 1842093,
+                                          "metrics": {
+                                            "output_batches": 400,
+                                            "num_series": 400,
+                                            "output_bytes": 7795200
+                                          },
+                                          "children": [
+                                            {
+                                              "name": "PromSeriesDivideExec",
+                                              "param": "tags=[\"host\", \"instance\", \"job\", \"l1\"]",
+                                              "output_rows": 192000,
+                                              "elapsed_compute": 5963932,
+                                              "metrics": {
+                                                "output_bytes": 60089600,
+                                                "output_batches": 800,
+                                                "num_series": 400
+                                              },
+                                              "children": [
+                                                {
+                                                  "name": "SeriesScan",
+                                                  "param": "region=4398046511104(1024, 0), {\"partition_count\":{\"count\":2, \"mem_ranges\":20, \"files\":0, \"file_ranges\":0}, \"distribution\":\"PerSeries\", \"projection\": [\"host\", \"instance\", \"job\", \"l1\", \"metric_value\", \"ts\"], \"filters\": [\"ts >= TimestampMillisecond(1699999700001, None)\", \"ts <= TimestampMillisecond(1700007200000, None)\"], \"flat_format\": true, \"mode\":\"legacy\", \"metrics_per_partition\": [{\"partition\":0, \"metrics\":{\"prepare_scan_cost\":\"2.486215ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.032145ms\", \"yield_cost\":\"14.993502ms\", \"total_cost\":\"20.566825ms\", \"num_rows\":11040, \"num_batches\":46, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.536591ms\", \"convert_cost\":\"76.535\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":1, \"metrics\":{\"prepare_scan_cost\":\"2.599119ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.132253ms\", \"yield_cost\":\"14.974617ms\", \"total_cost\":\"20.64818ms\", \"num_rows\":11040, \"num_batches\":46, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.538969ms\", \"convert_cost\":\"78.142\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":2, \"metrics\":{\"prepare_scan_cost\":\"2.639117ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"3.742917ms\", \"yield_cost\":\"13.029487ms\", \"total_cost\":\"20.317817ms\", \"num_rows\":8160, \"num_batches\":34, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.541029ms\", \"convert_cost\":\"56.268\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":3, \"metrics\":{\"prepare_scan_cost\":\"2.680126ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.77219ms\", \"yield_cost\":\"15.329587ms\", \"total_cost\":\"20.647367ms\", \"num_rows\":10560, \"num_batches\":44, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.542619ms\", \"convert_cost\":\"58.013\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":4, \"metrics\":{\"prepare_scan_cost\":\"2.727615ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.131282ms\", \"yield_cost\":\"15.206067ms\", \"total_cost\":\"20.884089ms\", \"num_rows\":7680, \"num_batches\":32, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.544628ms\", \"convert_cost\":\"75.914\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":5, \"metrics\":{\"prepare_scan_cost\":\"2.765508ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.649042ms\", \"yield_cost\":\"15.439821ms\", \"total_cost\":\"20.637187ms\", \"num_rows\":8160, \"num_batches\":34, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.546149ms\", \"convert_cost\":\"66.786\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":6, \"metrics\":{\"prepare_scan_cost\":\"2.802987ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.528312ms\", \"yield_cost\":\"15.656725ms\", \"total_cost\":\"20.720733ms\", \"num_rows\":10080, \"num_batches\":42, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.531559ms\", \"convert_cost\":\"73.992\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":7, \"metrics\":{\"prepare_scan_cost\":\"2.847996ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.636303ms\", \"yield_cost\":\"15.61134ms\", \"total_cost\":\"20.787095ms\", \"num_rows\":10080, \"num_batches\":42, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.536725ms\", \"convert_cost\":\"67.927\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":8, \"metrics\":{\"prepare_scan_cost\":\"2.885014ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.135544ms\", \"yield_cost\":\"14.980785ms\", \"total_cost\":\"20.65996ms\", \"num_rows\":7200, \"num_batches\":30, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.540987ms\", \"convert_cost\":\"44.331\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":9, \"metrics\":{\"prepare_scan_cost\":\"2.923736ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.665236ms\", \"yield_cost\":\"15.623349ms\", \"total_cost\":\"20.833129ms\", \"num_rows\":10560, \"num_batches\":44, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.54241ms\", \"convert_cost\":\"81.596\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":10, \"metrics\":{\"prepare_scan_cost\":\"2.973359ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.01218ms\", \"yield_cost\":\"15.254774ms\", \"total_cost\":\"20.81718ms\", \"num_rows\":10080, \"num_batches\":42, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.544322ms\", \"convert_cost\":\"76.881\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":11, \"metrics\":{\"prepare_scan_cost\":\"3.014528ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.809115ms\", \"yield_cost\":\"14.126151ms\", \"total_cost\":\"20.484846ms\", \"num_rows\":9600, \"num_batches\":40, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.547009ms\", \"convert_cost\":\"69.39\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":12, \"metrics\":{\"prepare_scan_cost\":\"3.060573ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.135499ms\", \"yield_cost\":\"15.478757ms\", \"total_cost\":\"21.169017ms\", \"num_rows\":10560, \"num_batches\":44, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.551358ms\", \"convert_cost\":\"100.809\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":13, \"metrics\":{\"prepare_scan_cost\":\"3.099588ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.699952ms\", \"yield_cost\":\"15.105395ms\", \"total_cost\":\"20.361548ms\", \"num_rows\":9120, \"num_batches\":38, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.55301ms\", \"convert_cost\":\"108.038\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":14, \"metrics\":{\"prepare_scan_cost\":\"3.141347ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.810808ms\", \"yield_cost\":\"14.053639ms\", \"total_cost\":\"20.422647ms\", \"num_rows\":10560, \"num_batches\":44, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.555004ms\", \"convert_cost\":\"54.499\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":15, \"metrics\":{\"prepare_scan_cost\":\"3.177751ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.866162ms\", \"yield_cost\":\"14.011056ms\", \"total_cost\":\"20.431333ms\", \"num_rows\":9600, \"num_batches\":40, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.548482ms\", \"convert_cost\":\"56.307\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":16, \"metrics\":{\"prepare_scan_cost\":\"3.218915ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"1.747813ms\", \"yield_cost\":\"14.9804ms\", \"total_cost\":\"20.281178ms\", \"num_rows\":9120, \"num_batches\":38, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.550515ms\", \"convert_cost\":\"87.472\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":17, \"metrics\":{\"prepare_scan_cost\":\"3.262543ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.259451ms\", \"yield_cost\":\"14.670736ms\", \"total_cost\":\"20.486003ms\", \"num_rows\":10560, \"num_batches\":44, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.5526ms\", \"convert_cost\":\"64.723\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":18, \"metrics\":{\"prepare_scan_cost\":\"3.303947ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.151259ms\", \"yield_cost\":\"14.958468ms\", \"total_cost\":\"20.667434ms\", \"num_rows\":9120, \"num_batches\":38, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.554622ms\", \"convert_cost\":\"70.374\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":19, \"metrics\":{\"prepare_scan_cost\":\"3.342429ms\", \"build_reader_cost\":\"0ns\", \"scan_cost\":\"2.523869ms\", \"yield_cost\":\"14.999011ms\", \"total_cost\":\"21.082785ms\", \"num_rows\":9120, \"num_batches\":38, \"num_mem_ranges\":0, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.556337ms\", \"convert_cost\":\"50.248\u00b5s\", \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}, {\"partition\":20, \"metrics\":{\"prepare_scan_cost\":\"3.453889ms\", \"build_reader_cost\":\"314.893\u00b5s\", \"scan_cost\":\"0ns\", \"yield_cost\":\"0ns\", \"total_cost\":\"19.725269ms\", \"num_rows\":0, \"num_batches\":0, \"num_mem_ranges\":20, \"num_file_ranges\":0, \"build_parts_cost\":\"0ns\", \"sst_scan_cost\":\"0ns\", \"rg_total\":0, \"rows_before_filter\":0, \"num_sst_record_batches\":0, \"num_sst_batches\":0, \"num_sst_rows\":0, \"first_poll\":\"3.454944ms\", \"convert_cost\":\"0ns\", \"num_series_send_full\":113, \"num_distributor_rows\":192000, \"num_distributor_batches\":800, \"distributor_scan_cost\":\"14.066872ms\", \"distributor_yield_cost\":\"2.045486ms\", \"distributor_divider_cost\":\"98.622\u00b5s\", \"mem_rows\":192000, \"mem_batches\":440, \"mem_series\":110, \"mem_scan_cost\":\"6.459736ms\", \"merge_metrics\":{\"scan_cost\":\"25.404727ms\", \"init_cost\":\"354.976\u00b5s\", \"num_fetch_by_batches\":1600, \"fetch_cost\":\"21.952784ms\"}, \"dedup_metrics\":{\"dedup_cost\":\"1.26508ms\"}, \"build_ranges_peak_mem_size\":0, \"num_peak_range_builders\":0, \"stream_eof\":true}}]}",
+                                                  "output_rows": 192000,
+                                                  "elapsed_compute": 343343245,
+                                                  "metrics": {
+                                                    "build_reader_cost": 314913,
+                                                    "scan_cost": 43441333,
+                                                    "yield_cost": 298483668,
+                                                    "build_parts_cost": 21,
+                                                    "dynamic_filter_cost": 20,
+                                                    "output_bytes": 6266800,
+                                                    "convert_cost": 1418246,
+                                                    "elapsed_poll": 5419587,
+                                                    "elapsed_await": 48436883
+                                                  },
+                                                  "children": []
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "on": {
+      "fused_selections": 1,
+      "partial_selections": 0,
+      "peak_rss_bytes": 401244160,
+      "operators": [
+        {
+          "name": "FusedSeriesExec",
+          "param": "eval=rate, range=300000ms, offset=0ms, maps=[]",
+          "metrics": {
+            "fused_flush_time": 495385,
+            "fused_emit_time": 4450663,
+            "output_bytes": 60398400,
+            "fused_kernel_time": 53168645,
+            "fused_input_poll_time": 33256856,
+            "fused_series_emitted": 400,
+            "fused_columns_time": 10908770,
+            "output_batches": 400,
+            "fused_window_prep_time": 41670920,
+            "fused_evaluate_time": 108541182,
+            "fused_series_completed": 400,
+            "fused_input_chunks": 800
+          }
+        }
+      ],
+      "stages": [
+        {
+          "name": "CooperativeExec",
+          "param": "",
+          "output_rows": 0,
+          "elapsed_compute": 0,
+          "metrics": {},
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "MergeScanExec",
+              "param": "peers=[4398046511104(1024, 0), ], metrics={\"partition_0\":{\"regions\":1,\"total_poll_duration\":\"24.791115ms\",\"total_do_get_cost\":\"6.374827ms\",\"ready_time\":\"6.405891ms\",\"first_consume_time\":\"31.194382ms\",\"finish_time\":\"31.529223ms\",\"region_metrics\":[{\"region_id\":\"4398046511104(1024, 0)\",\"poll_duration\":\"24.791115ms\",\"do_get_cost\":\"6.374827ms\",\"total_cost\":\"31.494376ms\"}]}}",
+              "output_rows": 28684,
+              "elapsed_compute": 0,
+              "metrics": {
+                "finish_time": 31535436,
+                "first_consume_time": 31194488,
+                "ready_time": 6406088,
+                "greptime_exec_read_cost": 0
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "name": "SortPreservingMergeExec",
+          "param": "[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST]",
+          "output_rows": 28684,
+          "elapsed_compute": 2475922,
+          "metrics": {
+            "output_bytes": 575616,
+            "output_batches": 4
+          },
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "SortExec",
+              "param": "expr=[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST], preserve_partitioning=[true]",
+              "output_rows": 28684,
+              "elapsed_compute": 44366,
+              "metrics": {
+                "spilled_bytes": 0,
+                "output_bytes": 738160,
+                "output_batches": 20,
+                "spilled_rows": 0,
+                "spill_count": 0
+              },
+              "children": [
+                {
+                  "name": "AggregateExec",
+                  "param": "mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]",
+                  "output_rows": 28684,
+                  "elapsed_compute": 12024725,
+                  "metrics": {
+                    "spilled_rows": 0,
+                    "emitting_time": 226504,
+                    "output_bytes": 836368,
+                    "output_batches": 20,
+                    "spilled_bytes": 0,
+                    "spill_count": 0,
+                    "aggregation_time": 11487576,
+                    "aggregate_arguments_time": 32284,
+                    "time_calculating_group_ids": 74013
+                  },
+                  "children": [
+                    {
+                      "name": "RepartitionExec",
+                      "param": "partitioning=Hash([instance@0, ts@1], 20), input_partitions=20",
+                      "output_rows": 566509,
+                      "elapsed_compute": 92026,
+                      "metrics": {
+                        "repartition_time": 8253554,
+                        "output_bytes": 12801920,
+                        "spilled_rows": 0,
+                        "spilled_bytes": 0,
+                        "send_time": 32060474,
+                        "output_batches": 80,
+                        "spill_count": 0,
+                        "fetch_time": 365265374
+                      },
+                      "children": [
+                        {
+                          "name": "AggregateExec",
+                          "param": "mode=Partial, gby=[instance@2 as instance, ts@0 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]",
+                          "output_rows": 566509,
+                          "elapsed_compute": 172032880,
+                          "metrics": {
+                            "aggregate_arguments_time": 139250,
+                            "output_bytes": 48465404,
+                            "spilled_bytes": 0,
+                            "spill_count": 0,
+                            "output_batches": 79,
+                            "skipped_aggregation_rows": 0,
+                            "emitting_time": 1771311,
+                            "aggregation_time": 167265744,
+                            "time_calculating_group_ids": 479581,
+                            "reduction_factor": 0,
+                            "spilled_rows": 0
+                          },
+                          "children": [
+                            {
+                              "name": "FilterExec",
+                              "param": "prom_rate(ts_range,metric_value,ts,Int64(300000))@1 IS NOT NULL",
+                              "output_rows": 2868400,
+                              "elapsed_compute": 808699,
+                              "metrics": {
+                                "selectivity": 0,
+                                "output_batches": 400,
+                                "output_bytes": 60398400
+                              },
+                              "children": [
+                                {
+                                  "name": "FusedSeriesExec",
+                                  "param": "eval=rate, range=300000ms, offset=0ms, maps=[]",
+                                  "output_rows": 2868400,
+                                  "elapsed_compute": 20,
+                                  "metrics": {
+                                    "fused_flush_time": 495385,
+                                    "fused_emit_time": 4450663,
+                                    "output_bytes": 60398400,
+                                    "fused_kernel_time": 53168645,
+                                    "fused_input_poll_time": 33256856,
+                                    "fused_series_emitted": 400,
+                                    "fused_columns_time": 10908770,
+                                    "output_batches": 400,
+                                    "fused_window_prep_time": 41670920,
+                                    "fused_evaluate_time": 108541182,
+                                    "fused_series_completed": 400,
+                                    "fused_input_chunks": 800
+                                  },
+                                  "children": [
+                                    {
+                                      "name": "SeriesScanExec",
+                                      "param": "source=primary_key, fields=1, partitions=20",
+                                      "output_rows": 800,
+                                      "elapsed_compute": 342723930,
+                                      "metrics": {
+                                        "build_parts_cost": 21,
+                                        "output_bytes": 3142100,
+                                        "elapsed_poll": 25801451,
+                                        "yield_cost": 12883860,
+                                        "convert_cost": 1172923,
+                                        "dynamic_filter_cost": 20,
+                                        "build_reader_cost": 350344,
+                                        "scan_cost": 328667149,
+                                        "elapsed_await": 66644778
+                                      },
+                                      "children": []
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "sum": {
+      "fused_selections": 1,
+      "partial_selections": 1,
+      "peak_rss_bytes": 394412032,
+      "operators": [
+        {
+          "name": "FusedSeriesExec",
+          "param": "eval=rate, range=300000ms, offset=0ms, maps=[], partial=sum",
+          "metrics": {
+            "fused_kernel_time": 53784501,
+            "fused_partial_points": 2868400,
+            "fused_partial_slots": 559338,
+            "fused_emit_time": 34834470,
+            "fused_evaluate_time": 117048794,
+            "fused_partial_state_rows": 559338,
+            "output_batches": 20,
+            "fused_partial_state_time": 15839491,
+            "fused_series_completed": 400,
+            "fused_flush_time": 20,
+            "fused_window_prep_time": 50997768,
+            "output_bytes": 11607792,
+            "fused_partial_update_time": 34125485,
+            "fused_input_poll_time": 37843192,
+            "fused_columns_time": 9328845,
+            "fused_partial_updates": 400,
+            "fused_input_chunks": 800,
+            "fused_series_emitted": 400
+          }
+        }
+      ],
+      "stages": [
+        {
+          "name": "CooperativeExec",
+          "param": "",
+          "output_rows": 0,
+          "elapsed_compute": 0,
+          "metrics": {},
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "MergeScanExec",
+              "param": "peers=[4398046511104(1024, 0), ], metrics={\"partition_0\":{\"regions\":1,\"total_poll_duration\":\"20.103602ms\",\"total_do_get_cost\":\"3.994857ms\",\"ready_time\":\"4.009574ms\",\"first_consume_time\":\"24.100189ms\",\"finish_time\":\"24.464896ms\",\"region_metrics\":[{\"region_id\":\"4398046511104(1024, 0)\",\"poll_duration\":\"20.103602ms\",\"do_get_cost\":\"3.994857ms\",\"total_cost\":\"24.432919ms\"}]}}",
+              "output_rows": 28684,
+              "elapsed_compute": 0,
+              "metrics": {
+                "greptime_exec_read_cost": 0,
+                "finish_time": 24470850,
+                "first_consume_time": 24100194,
+                "ready_time": 4009621
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "name": "SortPreservingMergeExec",
+          "param": "[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST]",
+          "output_rows": 28684,
+          "elapsed_compute": 2175814,
+          "metrics": {
+            "output_bytes": 575616,
+            "output_batches": 4
+          },
+          "memory_usage": 0,
+          "children": [
+            {
+              "name": "SortExec",
+              "param": "expr=[instance@0 ASC NULLS LAST, ts@1 ASC NULLS LAST], preserve_partitioning=[true]",
+              "output_rows": 28684,
+              "elapsed_compute": 50087,
+              "metrics": {
+                "spill_count": 0,
+                "output_bytes": 738160,
+                "output_batches": 20,
+                "spilled_bytes": 0,
+                "spilled_rows": 0
+              },
+              "children": [
+                {
+                  "name": "AggregateExec",
+                  "param": "mode=FinalPartitioned, gby=[instance@0 as instance, ts@1 as ts], aggr=[sum(prom_rate(ts_range,metric_value,ts,Int64(300000)))]",
+                  "output_rows": 28684,
+                  "elapsed_compute": 9621909,
+                  "metrics": {
+                    "output_bytes": 836368,
+                    "spill_count": 0,
+                    "aggregate_arguments_time": 31349,
+                    "aggregation_time": 8992628,
+                    "time_calculating_group_ids": 81552,
+                    "output_batches": 20,
+                    "spilled_bytes": 0,
+                    "spilled_rows": 0,
+                    "emitting_time": 255287
+                  },
+                  "children": [
+                    {
+                      "name": "RepartitionExec",
+                      "param": "partitioning=Hash([instance@0, ts@1], 20), input_partitions=20",
+                      "output_rows": 559338,
+                      "elapsed_compute": 102952,
+                      "metrics": {
+                        "repartition_time": 18115654,
+                        "spilled_rows": 0,
+                        "fetch_time": 282714652,
+                        "spill_count": 0,
+                        "spilled_bytes": 0,
+                        "output_bytes": 12738048,
+                        "send_time": 13305532,
+                        "output_batches": 80
+                      },
+                      "children": [
+                        {
+                          "name": "FusedSeriesExec",
+                          "param": "eval=rate, range=300000ms, offset=0ms, maps=[], partial=sum",
+                          "output_rows": 559338,
+                          "elapsed_compute": 20,
+                          "metrics": {
+                            "fused_kernel_time": 53784501,
+                            "fused_partial_points": 2868400,
+                            "fused_partial_slots": 559338,
+                            "fused_emit_time": 34834470,
+                            "fused_evaluate_time": 117048794,
+                            "fused_partial_state_rows": 559338,
+                            "output_batches": 20,
+                            "fused_partial_state_time": 15839491,
+                            "fused_series_completed": 400,
+                            "fused_flush_time": 20,
+                            "fused_window_prep_time": 50997768,
+                            "output_bytes": 11607792,
+                            "fused_partial_update_time": 34125485,
+                            "fused_input_poll_time": 37843192,
+                            "fused_columns_time": 9328845,
+                            "fused_partial_updates": 400,
+                            "fused_input_chunks": 800,
+                            "fused_series_emitted": 400
+                          },
+                          "children": [
+                            {
+                              "name": "SeriesScanExec",
+                              "param": "source=primary_key, fields=1, partitions=20",
+                              "output_rows": 800,
+                              "elapsed_compute": 257210973,
+                              "metrics": {
+                                "convert_cost": 1308859,
+                                "scan_cost": 240269687,
+                                "dynamic_filter_cost": 20,
+                                "build_parts_cost": 21,
+                                "build_reader_cost": 294728,
+                                "elapsed_await": 104548571,
+                                "yield_cost": 15632429,
+                                "elapsed_poll": 30367298,
+                                "output_bytes": 3144050
+                              },
+                              "children": []
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

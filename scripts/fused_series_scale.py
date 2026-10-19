@@ -117,17 +117,25 @@ CASES = [
     ("G4", "rate({table}[5m])", "sum by (instance)", True, 400, ""),
     ("G400", "rate({table}[5m])", "sum by (host)", True, 400, ""),
     ("G1", "rate({table}[5m])", "sum by (job)", True, 400, ""),
-    # input series count: 100 / 1 series. The fixture stores `h0000`..`h0399` with
-    # `instance = i{host % 4}`, so the first hundred hosts are all `i0` and `n100` collapses
-    # 100:1 -- the same ratio as `G4` -- over a quarter of the input.
+    # Input series count at a fixed group count: 100 / 1 series, both into ONE group.
+    #
+    # The grouping column matters. The seed writes `instance = i{host % 4}`, so the first hundred
+    # hosts span all four instances and `sum by (instance)` would give four groups, not one --
+    # 25:1, not 100:1. `job` is constant (`j`) for every series, so `sum by (job)` is one group
+    # over any input, which is the axis this case is for. (An earlier revision of this file used
+    # `sum by (instance)` and got one group only because the archived fixture had been seeded by
+    # an older script that wrote `instance = i{host // 100}`.)
     (
         "n100",
         'rate({table}{{host=~"h00[0-9][0-9]"}}[5m])',
-        "sum by (instance)",
+        "sum by (job)",
         True,
         100,
         " WHERE host ~ '^h00[0-9][0-9]$'",
     ),
+    # One series, one group. At ~10 ms a query this case sits at the resolution of the CPU
+    # counter (one 10 ms tick), which is why the driver refuses to gate a ratio whose denominator
+    # is a couple of ticks -- see `below_resolution`.
     ("n1", 'rate({table}{{host="h0007"}}[5m])', "sum by (instance)", True, 1,
      " WHERE host = 'h0007'"),
     # no aggregation at all: the fused node's full output, nothing removed above it
@@ -231,6 +239,40 @@ def aggregate_cpu(timed):
     by more than a few percent, that pass is not reportable and the `run_arm` caller sees it.
     """
     return sum(sample["cpu_ms"] for sample in timed) / len(timed) if timed else 0.0
+
+
+# One `/proc/<pid>/stat` CPU tick, in milliseconds. `SC_CLK_TCK` is 100 on this host, but the
+# constant is read rather than assumed: a ratio over one or two ticks cannot resolve anything,
+# and how many milliseconds that is depends on the kernel's HZ.
+TICK_MS = 1000.0 / os.sysconf("SC_CLK_TCK")
+
+# How many ticks a reading must span before a ratio formed from it means anything. Eight ticks
+# (80 ms here) is where a one-tick quantization error is 12% rather than 100%.
+#
+# The two statistics do not have the same resolution, and that is the point of keeping both. The
+# per-iteration median is one reading: a 10 ms difference on a 120 ms query is one tick on twelve.
+# The per-round total sums `iterations` readings, so one tick is `iterations` times smaller
+# relative to it -- at nine iterations a 10 ms error on a 1080 ms total is under 1%.
+MIN_TICKS = 8
+
+# The same test is not enough for the cumulative statistic, because tick quantization is not the
+# only noise at small sizes. `n1` costs about 10 ms a query, so its total over nine iterations is
+# ~140-210 ms -- fourteen to twenty-one ticks, above `MIN_TICKS` -- and its ratio still varied
+# 19%, 32% and 75% between rounds in three consecutive passes. That is scheduling and page-fault
+# jitter on a trivial query, not quantization, and no number of ticks in the reading makes it go
+# away.
+#
+# The floor is bracketed by this harness's own measurements at the two ends. `control` never
+# fuses and does identical work in every arm, and it repeats to a few percent at 420-440 ms of
+# CPU; `n1` does not repeat at all at 140-210 ms. 400 ms therefore sits between the smallest
+# window shown to repeat and the largest shown not to, and a case under it is reported rather
+# than gated. Both sides of that bracket come from the records, not from a preference.
+MIN_AGGREGATE_WINDOW_MS = 400.0
+
+
+def below_resolution(cpu_ms):
+    """Whether a CPU reading spans too few counter ticks to form a ratio from."""
+    return cpu_ms < MIN_TICKS * TICK_MS
 
 
 def ratio_deviation(ratios):
@@ -418,8 +460,28 @@ def worst_gated_ratio(row, gated):
     combination that reports no gated ratio, so reaching this with nothing to check means the
     ratio names and the rows have gone out of step.
     """
-    names = [name for name in gated if name in row["ratios"]]
+    # Only ratios whose denominator spans enough CPU ticks: a case that costs a couple of ticks
+    # cannot produce a repeatable ratio, and gating it would report quantization as noise.
+    names = [
+        name
+        for name in gated
+        if name in row["ratios"] and row["ratios"][name]["gated"]
+    ]
     if not names:
+        unresolvable = [
+            name for name in gated if name in row["ratios"]
+        ]
+        if unresolvable:
+            # Reported, not gated: the case's own cost is below the counter's resolution.
+            return {
+                "ratio": unresolvable[0],
+                "deviation": 0.0,
+                "round": 1,
+                "side": "at",
+                "median": row["ratios"][unresolvable[0]]["median"],
+                "aggregate_median": row["ratios"][unresolvable[0]]["aggregate_median"],
+                "below_resolution": True,
+            }
         raise SystemExit(
             f"case {row['label']} reports no gated ratio "
             f"({', '.join(row['ratios'])}), so its quietness cannot be decided"
@@ -427,13 +489,23 @@ def worst_gated_ratio(row, gated):
     worst = None
     for name in names:
         summary = row["ratios"][name]
+        # Every statistic that has the resolution to speak decides: a ratio is quiet only if
+        # *each* of them repeats. The per-iteration median is the tighter attribution but the
+        # shorter window, so on a fast case it drops out and the per-round total carries the
+        # decision -- which is what makes a 10 ms query measurable at all.
+        deviations = []
+        if summary["median_resolvable"]:
+            deviations.append(summary["deviation_over_median"])
+        if summary["aggregate_resolvable"]:
+            deviations.append(summary["aggregate_deviation_over_median"])
+        if not deviations:
+            continue
+        deviation = max(deviations)
         # A ratio whose two statistics straddle 1.00 is not quiet however stable each one is:
         # the pass cannot say whether the arm is faster or slower. Reported as an infinite
         # deviation so it outranks any finite one, with the round it would have named.
         if statistics_disagree(summary["median"], summary["aggregate_median"]):
             deviation = float("inf")
-        else:
-            deviation = summary["deviation_over_median"]
         if worst is None or deviation > worst["deviation"]:
             worst = {
                 "ratio": name,
@@ -458,12 +530,20 @@ def quietness_gate(cases, gate):
     while `on / off` does not is not a quiet pass either, because the two are quoted together.
     """
     worst = {"case": None, "ratio": None, "deviation": 0.0, "round": None, "side": None}
+    # `below_resolution` is reported per case and excluded here: its cost is smaller than the
+    # counter's own tick, so no number of rounds makes its ratio repeatable.
+    below = []
     for row in cases:
         if row["label"] == "control":
             continue
         candidate = worst_gated_ratio(row, GATED_RATIOS)
-        # The first case is taken whatever it reads, so an all-zero pass still names the case and
-        # ratio it read, instead of reporting `None` for a deviation of 0.
+        if candidate.get("below_resolution"):
+            # Excluded from the verdict and reported separately: its cost is a couple of counter
+            # ticks, so its ratio is quantization rather than measurement.
+            below.append(row["label"])
+            continue
+        # The first resolvable case is taken whatever it reads, so an all-zero pass still names
+        # the case and ratio it read, instead of reporting `None` for a deviation of 0.
         if worst["case"] is None or candidate["deviation"] > worst["deviation"]:
             worst = {"case": row["label"], **candidate}
     return {
@@ -474,6 +554,7 @@ def quietness_gate(cases, gate):
         "worst_side": worst["side"],
         "gate": gate,
         "quiet": worst["deviation"] <= gate,
+        "below_resolution_cases": below,
     }
 
 
@@ -688,9 +769,35 @@ def main():
         for name in ratio_names:
             per_round = [e["cpu_" + name] for e in entries]
             aggregate_per_round = [e["cpu_aggregate_" + name] for e in entries]
+            # `cpu_aggregate_*` is already the ratio of the two totals (see `aggregate_cpu`),
+            # so the ratio and the window are both the cumulative view.
             wall_per_round = [e["wall_" + name] for e in entries]
             deviation, worst_round, worst_side = ratio_deviation(per_round)
             aggregate_deviation, _, _ = ratio_deviation(aggregate_per_round)
+            # Whether this ratio is resolvable at all: the denominator's per-iteration CPU is a
+            # count of 10 ms ticks, so a case that costs a couple of ticks cannot produce a
+            # ratio regardless of how many rounds it is repeated over.
+            denominator = RATIOS_BY_NAME[name][1]
+            # Both statistics' windows, in milliseconds and in counter ticks. The aggregate covers
+            # `iterations` executions, so its window is that much longer and it is the one that
+            # can resolve a small effect on a short query.
+            median_window_ms = statistics.median(
+                [e["cpu_median_ms"][denominator] for e in entries]
+            )
+            # The total, not the mean: `cpu_aggregate_ms` is `sum / iterations`, and the whole
+            # point of the longer window is that the *sum* spans `iterations` times the ticks a
+            # single reading does. Reading the mean back would give the short window again.
+            aggregate_window_ms = statistics.median(
+                [
+                    sum(sample["cpu_ms"] for sample in e[denominator])
+                    for e in entries
+                ]
+            )
+            median_resolvable = not below_resolution(median_window_ms)
+            aggregate_resolvable = not below_resolution(
+                aggregate_window_ms
+            ) and aggregate_window_ms >= MIN_AGGREGATE_WINDOW_MS
+            resolvable = median_resolvable or aggregate_resolvable
             ratio_rows[name] = {
                 "label": RATIO_LABELS[name],
                 "per_round": per_round,
@@ -708,10 +815,17 @@ def main():
                 # 10 ms tick over nine of them. `statistics_disagree` is what makes a reader look
                 # before quoting one of them.
                 "aggregate_deviation_over_median": aggregate_deviation,
+                "median_window_ms": median_window_ms,
+                "median_window_ticks": median_window_ms / TICK_MS,
+                "aggregate_window_ms": aggregate_window_ms,
+                "aggregate_window_ticks": aggregate_window_ms / TICK_MS,
+                "median_resolvable": median_resolvable,
+                "aggregate_resolvable": aggregate_resolvable,
+                "resolvable": resolvable,
                 "median_vs_aggregate": median_vs_aggregate(
                     statistics.median(per_round), statistics.median(aggregate_per_round)
                 ),
-                "gated": name in gated,
+                "gated": name in gated and resolvable,
             }
         row = {
             "label": label,
@@ -849,6 +963,13 @@ def main():
                 f"{summary['median']:.3f}, per-round total {summary['aggregate_median']:.3f}"
                 f"  ({' '.join(f'{v:.3f}' for v in summary['aggregate_per_round'])})"
             )
+    if verdict["below_resolution_cases"]:
+        print(
+            "  below the CPU counter's resolution, reported but not gated: "
+            + ", ".join(verdict["below_resolution_cases"])
+            + f" (no statistic clears {MIN_TICKS} ticks of {TICK_MS:.0f} ms and "
+            f"{MIN_AGGREGATE_WINDOW_MS:.0f} ms of CPU)"
+        )
     if verdict["quiet"]:
         print("  quiet: the rounds agree, so each case's median ratio is repeatable.")
     else:
