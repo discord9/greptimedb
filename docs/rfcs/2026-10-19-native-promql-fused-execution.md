@@ -16,7 +16,7 @@ Author: "@discord9"
 本轮确定以下要求：
 
 1. PromPlan 表达查询语义；物理编译生成已绑定输入、字段、网格和 kernel 的执行树。
-2. Fused 内部直接传递 native 批次；普通行转换只发生在明确的对外边界。
+2. Fused 内部节点通过函数调用直接传递 Rust struct；结构中复用 native 批次和 Arrow 缓冲，普通行转换只发生在明确的对外边界。
 3. 窗口和即时选点支持分块输入、批量求值及分批输出。三项能力分别实现和验证。
 4. 聚合是可组合节点。完整聚合结果可以继续进入 map、窗口或其他合法节点。
 5. 运行态接入现有查询内存池，并继续使用现有存储扫描配额。
@@ -55,7 +55,6 @@ Fused 内部的执行单位称为**计算节点（`NativeNode`）**。`kernel` �
 
 ```rust
 struct NativeNode {
-    id: NodeId,
     expr: NativeExpr,
     output: NativeType,
 }
@@ -75,7 +74,9 @@ enum NativeExpr {
 }
 ```
 
-每个节点有稳定的计划内 `node_id`、明确的输入和输出类型，以及已绑定的运算。`FusedSeriesExec` 持有这棵树、物理输入和出口绑定，不再持有唯一的 `window`、`maps` 或 `partial_agg` 槽位。
+每个节点有明确的输入和输出类型，以及已绑定的运算。`FusedSeriesExec` 持有这棵树、物理输入和出口绑定，不再持有唯一的 `window`、`maps` 或 `partial_agg` 槽位。
+
+树的结构直接表达依赖，求值不需要额外的 `NodeId`。每个运行态直接持有自己的 `NodeMetrics`；EXPLAIN 和指标导出所需的定位由最终执行树的位置派生，见第 8 节，不进入 AST 的语义字段或批次数据。
 
 一棵树即可表达本轮需要的组合。二元节点有两个子树；公共子表达式是否共享执行属于以后独立的优化。加入一个已支持运算的合法组合，应只改变编译出的树，不能要求增加一个完整形状的 matcher。
 
@@ -113,7 +114,11 @@ enum NativeExpr {
 
 第一期允许合法节点阻塞式收集必要输入，例如在分区结束时完成聚合。可组合性不要求每个节点都立即产出结果；这些保留状态必须受内存池管理，计划也必须标明其输出时机。
 
-## 3. Native 批次协议
+## 3. 节点间的 Rust 数据结构
+
+同一 Fused 内部通过函数调用、返回值或借用直接交接 Rust struct。按输入类型复用 `RawSeriesChunk`、`Series`，并补充 evaluated 分片和聚合状态所需的结构；不把每条内部连接包装成 DataFusion stream、frame 或序列化消息。
+
+结构中的 Arrow 数组、buffer 和共享 schema 直接复用。同步消费可以借用；需要跨 poll 保留时持有结构或共享引用，并遵守第 7 节的内存责任。数据结构只包含计算需要的数据与批次边界，不携带节点定位信息。
 
 ### 3.1 Raw 输入与来源归并
 
@@ -150,7 +155,7 @@ null、computed stale 值、float/histogram 混合窗口以及标签删除的语
 
 ### 3.3 聚合状态与 Scalar
 
-聚合中间状态具有单独的已绑定类型和 state schema，不伪装成普通求值值。状态批可以复用 Arrow `RecordBatch` 承载，字段包含分组、求值时间和对应 accumulator state；列布局由编译器绑定。
+聚合中间状态通过已绑定类型的 Rust struct 直接传递，包含分组、求值时间和对应 accumulator state，不伪装成普通求值值。结构内部可复用 Arrow state 数组；列布局和 state schema 由编译器绑定。需要交给 DataFusion aggregate 或实际交换边界时，再适配为该边界要求的 `RecordBatch`。
 
 常数 Scalar 可保留为一个值并在 kernel 中广播。随网格变化的 Scalar 明确携带相应网格和有效性。两者都不要求为了连接下一个 native 节点而先展开成普通结果行。
 
@@ -220,13 +225,13 @@ Complete 和 Final 输出的结果可以继续进入 Map、Window、Binary 或�
 
 ## 6. Native 连接与 DataFusion 出口
 
-Fused 内部节点不必分别实现 DataFusion `ExecutionPlan`，也不在每条内部边上 pack/unpack frame。它们通过第 3 节的 native 批次直接连接。
+Fused 内部节点不必分别实现 DataFusion `ExecutionPlan`，也不在每条内部边上 pack/unpack frame。它们通过第 3 节的 Rust struct 直接连接，交接发生在普通的函数调用和状态树推进中。
 
 `FusedSeriesExec` 的外壳负责 DataFusion 输入、执行上下文、metrics 以及输出协议。出口适配器可以是外壳的已绑定配置，也可以是明确的适配节点：
 
 | 消费方 | 交付方式 |
 | --- | --- |
-| 同一 Fused 内的 native 节点 | 原生数据及状态直接传递 |
+| 同一 Fused 内的 native 节点 | Rust struct 直接传递，复用其中的原生数据及状态 |
 | 普通 Projection / Aggregate / 查询结果出口 | 显式转换为所需的普通行或 aggregate state schema |
 | 必须跨物理节点或传输边界的 native 数据 | 使用该边界明确支持的 carrier 与兼容性契约 |
 
@@ -281,7 +286,7 @@ Fused 每次执行的运行态通过 `MemoryConsumer` / `MemoryReservation` 注�
 普通 `EXPLAIN` 展示：
 
 - Fused 的物理输入、执行位置、partition 分布和出口模式。
-- 带 `node_id` 的内部树、节点运算和依赖。
+- 内部树、节点运算和依赖，以及与节点指标一致的树位置。
 - Window 的输入/输出网格、range、offset、anchor，以及字段绑定。
 - 聚合阶段、分组时间维度和完整性依据；二元 matching 的关键规则。
 - 源 ordering、完成信号的来源，以及普通路径的具体降级理由。
@@ -294,11 +299,15 @@ Fused 每次执行的运行态通过 `MemoryConsumer` / `MemoryReservation` 注�
 
 ### 8.2 节点指标与现有采集接口
 
-每个 `NativeNode` 的执行状态持有独立的 `NodeMetrics`。复用 DataFusion `ExecutionPlanMetricsSet` / `MetricBuilder`，并通过 Fused 的 `metrics()` 暴露查询局部指标。每个内部节点、输入适配和出口适配均能关联到计划中的 ID。两个同为 `rate` 的节点分别统计，便于比较它们的输入规模、窗口成本与内存行为。
+每个 `NativeNode` 的执行状态持有独立的 `NodeMetrics`。复用 DataFusion `ExecutionPlanMetricsSet` / `MetricBuilder`，并通过 Fused 的 `metrics()` 暴露查询局部指标。节点计算直接更新自己持有的指标句柄，不按 ID 或字符串查找指标。两个同为 `rate` 的节点分别统计，便于比较它们的输入规模、窗口成本与内存行为。
 
-第一版使用带节点 ID 的查询局部指标名，例如 `native.n3.self_compute_time_ns`、`native.n3.output_values`。不能只把 ID 放在 metric label 中，因为现有 [MetricCollector](../../src/common/recordbatch/src/adapter.rs) 会先执行 `aggregate_by_name()`，同名指标的节点身份会丢失。
+展示和指标注册使用最终执行树的结构位置：根为 `root`，一元输入为 `.input`，二元输入为 `.left` / `.right`，例如 `native.root.left.self_compute_time_ns` 和 `native.root.right.output_values`。输入与出口适配使用独立的保留前缀。这些名字在创建运行态、注册指标时生成，热路径只更新句柄。
 
-`DisplayAs` 输出带相同 ID 的 native 树，TEXT/JSON 的现有 metrics 字段保存节点指标。JSON 的 `param` 包含树描述，metrics 字典用 ID 关联；现有 `children` 继续只表示真实物理 child。本轮不要求先扩展一个新的结构化诊断协议，也不让 common-recordbatch 反向依赖 promql。
+树位置只是当前 Fused 计划内的观测定位，不要求跨查询、跨计划改写或跨版本稳定，也不需要 ID 分配器或节点注册表。`NativeNode` 不额外保存路径字符串；`DisplayAs` 与运行态构造在遍历同一最终树时临时携带位置，使用同一遍历规则。计划改写完成后才生成指标名字，不从子节点实际产出数据的先后顺序推导位置。
+
+需要区分节点的原因是现有 [MetricCollector](../../src/common/recordbatch/src/adapter.rs) 会先执行 `aggregate_by_name()`。只使用 `rate.self_compute_time_ns` 或仅加 metric label，会把不同节点的同名指标合并。因此保留树位置前缀，但不据此要求执行模型具有 `NodeId`。
+
+`DisplayAs` 输出带相同树位置的 native 树，TEXT/JSON 的现有 metrics 字段保存节点指标。JSON 的 `param` 包含树描述，metrics 字典通过树位置关联；现有 `children` 继续只表示真实物理 child。本轮不要求先扩展一个新的结构化诊断协议，也不让 common-recordbatch 反向依赖 promql。
 
 | 指标 | 口径 |
 | --- | --- |
@@ -320,13 +329,13 @@ Fused 标准 `elapsed_compute` 只计一次整个执行区域自身的工作，�
 
 这些 block timer 测量同步工作区间的经过时间，不直接宣称为进程 CPU 时间。并行 partition 的 compute 总量、查询 wall time、存储等待和远端时间分别展示；父子、远端阶段与本地等待不能重复累计。
 
-Fused peak 按执行分区报告，使用该分区同一时刻的区域保留量，不能相加各节点分别发生的 peak。各 partition 的 peak 也不能相加后标作整个 Fused 的同时峰值。峰值指标名称必须保留 partition 身份，例如 `native.p2.n3.peak_reserved_bytes`；Fused 分区高水位同样区分 partition。查询内存池原有指标继续沿用，节点诊断不再制造一份池额度。
+Fused peak 按执行分区报告，使用该分区同一时刻的区域保留量，不能相加各节点分别发生的 peak。各 partition 的 peak 也不能相加后标作整个 Fused 的同时峰值。峰值指标名称必须保留 partition 身份，例如 `native.p2.root.left.peak_reserved_bytes`；Fused 分区高水位同样区分 partition。查询内存池原有指标继续沿用，节点诊断不再制造一份池额度。
 
 ### 8.4 远端 ANALYZE
 
 复用现有链路：datanode 的实际 ExecutionPlan 指标经 `MetricCollector → RecordBatchMetrics → Flight metrics` 返回，`MergeScanExec` 保存 sub-stage metrics，前端 [DistAnalyzeExec](../../src/query/src/analyze.rs) 展示 TEXT/JSON。
 
-新增 native 树描述和带 ID 的指标必须经过同一条链路。保留 stage、远端节点、物理节点及查询局部 native ID 的上下文，不能把不同远端实例的 `n3` 混为同一个节点。
+新增 native 树描述和带树位置的指标必须经过同一条链路。保留 stage、远端节点、物理节点及 Fused 内部树位置的上下文，不能把不同远端实例的 `root.left` 混为同一个节点。远端实际执行树按它自己的结构位置关联，不以另一次前端编译的位置替代。
 
 默认可按既有方式汇总各 partition 的 count、累计 self time 和有明确时刻口径的 current 值，peak 始终保留 partition 身份。`VERBOSE` 展示分布等细节；其他逐 partition 明细的身份也必须在序列化和按名聚合后保留。指标数随计划与执行分区规模增长，不把 series 标签、primary key 或时间点作为全局 Prometheus label。
 
@@ -368,7 +377,7 @@ Fused peak 按执行分区报告，使用该分区同一时刻的区域保留量
 | 聚合与 matching | accumulator/state 语义、native binary kernels | 时间维度、Complete/Partial/Final、批次连接及受限状态 |
 | 输出 | Arrow、Series/GridRange、已有 raw frame | 已绑定出口适配，不在内部连接反复行列转换 |
 | 内存 | TaskContext pool、MemoryConsumer/Reservation、既有扫描框架 | 所有长期保留状态的容量和增长接入、取消释放 |
-| 计划与诊断 | DisplayAs、metrics、RecordBatchMetrics、Flight、DistAnalyzeExec | native ID 与树描述、节点指标、远端只准备的计划可见性 |
+| 计划与诊断 | DisplayAs、metrics、RecordBatchMetrics、Flight、DistAnalyzeExec | 树描述与位置前缀、节点指标、远端只准备的计划可见性 |
 
 先定编译树与批次接口，并一起定义内存和 metrics 的运行上下文。随后接入各类节点和出口，再完成实际 planner、远端展示与端到端验收。内存、EXPLAIN 和 ANALYZE 不作为功能上线后的补充项。
 
