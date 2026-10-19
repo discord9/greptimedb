@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use api::v1::alter_table_expr::Kind;
@@ -19,12 +20,13 @@ use api::v1::greptime_database_client::GreptimeDatabaseClient;
 use api::v1::greptime_request::Request as RequestBody;
 use api::v1::greptime_response::Response as ResponseBody;
 use api::v1::promql_request::Promql;
+use api::v1::query_request::Query;
 use api::v1::value::ValueData;
 use api::v1::{
     AddColumn, AddColumns, AlterTableExpr, Basic, Column, ColumnDataType, ColumnDef, ColumnSchema,
     CreateTableExpr, GreptimeRequest, InsertRequest, InsertRequests, PromInstantQuery,
-    PromRangeQuery, PromqlRequest, RequestHeader, Row, RowInsertRequest, RowInsertRequests, Rows,
-    SemanticType, Value, column,
+    PromRangeQuery, PromqlRequest, QueryRequest, RequestHeader, Row, RowInsertRequest,
+    RowInsertRequests, Rows, SemanticType, Value, column,
 };
 use auth::user_provider_from_option;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
@@ -48,6 +50,7 @@ use datatypes::arrow::array::{
 use datatypes::arrow::datatypes::{DataType, Field};
 use datatypes::arrow::ipc::writer::StreamWriter;
 use datatypes::arrow::record_batch::RecordBatch as ArrowRecordBatch;
+use futures_util::StreamExt;
 use otel_arrow_rust::otlp::metrics::MetricType as ArrowMetricType;
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::arrow_metrics_service_client::ArrowMetricsServiceClient;
 use otel_arrow_rust::proto::opentelemetry::arrow::v1::{
@@ -127,6 +130,7 @@ macro_rules! grpc_tests {
                 test_grpc_timezone,
                 test_grpc_tls_config,
                 test_grpc_memory_limit,
+                test_flow_exact_sequence_rounds,
             );
         )*
     };
@@ -2257,6 +2261,165 @@ pub async fn test_grpc_memory_limit(store_type: StorageType) {
         err_msg.contains("Memory limit exceeded"),
         "Expected 'Memory limit exceeded' error, got: {}",
         err_msg
+    );
+
+    let _ = fe_grpc_server.shutdown().await;
+}
+
+/// Query used by the exact-sequence probe below. The time predicate is
+/// deliberate: it exercises the timestamp filter and the row-level `(C, H]`
+/// sequence range in the same scan, which is what incremental trace tail
+/// sampling relies on.
+const PROBE_TRACE_IDS_SQL: &str = "SELECT DISTINCT trace_id FROM raw_spans \
+     WHERE `timestamp` >= '2023-11-14 00:00:00' AND `timestamp` < '2023-11-15 00:00:00'";
+
+fn probe_after_seqs_json(seqs: &HashMap<u64, u64>) -> String {
+    let entries = seqs
+        .iter()
+        .map(|(region, seq)| format!("\"{region}\":{seq}"))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", entries.join(","))
+}
+
+/// Runs the probe query through the real frontend with the given sequence
+/// bounds. `after` selects the exact `(C, H]` incremental mode; `snapshot`
+/// supplies an explicit upper bound. Returns the distinct trace ids and the
+/// terminal per-region watermark.
+async fn probe_query_trace_ids(
+    db: &Database,
+    after: Option<&HashMap<u64, u64>>,
+    snapshot: Option<&HashMap<u64, u64>>,
+) -> Result<(BTreeSet<String>, HashMap<u64, u64>), String> {
+    let mut extensions = vec![("flow.return_region_seq", "true")];
+    let after_json = after.map(probe_after_seqs_json);
+    if let Some(json) = after_json.as_deref() {
+        extensions.push(("flow.incremental_mode", "sequence_range"));
+        extensions.push(("flow.incremental_after_seqs", json));
+    }
+
+    let mut flight = db.flight_request().with_flow_extensions(&extensions);
+    if let Some(snapshot) = snapshot {
+        flight = flight.with_snapshot_seqs(snapshot);
+    }
+    let result = flight
+        .query_with_terminal_metrics(QueryRequest {
+            query: Some(Query::Sql(PROBE_TRACE_IDS_SQL.to_string())),
+        })
+        .await
+        .map_err(|err| format!("{err:?}"))?;
+
+    // Take the terminal-metrics handle before moving the stream out of the
+    // output; the handle stays live and becomes ready once the stream drains.
+    let metrics = result.metrics.clone();
+    let OutputData::Stream(mut stream) = result.output.data else {
+        return Err("expected a record batch stream".to_string());
+    };
+    let mut traces = BTreeSet::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|err| format!("{err:?}"))?;
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| "trace_id must be a utf8 column".to_string())?;
+        for index in 0..column.len() {
+            if column.is_valid(index) {
+                traces.insert(column.value(index).to_string());
+            }
+        }
+    }
+
+    let watermarks = metrics
+        .region_watermark_map()
+        .ok_or_else(|| "terminal metrics did not become ready".to_string())?;
+    Ok((traces, watermarks))
+}
+
+/// Incremental trace tail sampling, M1 probe.
+///
+/// Proves through the real frontend path that:
+/// 1. a round without an incremental lower bound discovers the region id and
+///    the first watermark `C`;
+/// 2. the next round reads an exact `(C, H]` range and does not re-emit rows
+///    that were already consumed, even after those rows were flushed into an
+///    SST;
+/// 3. an idle round returns an empty delta and leaves the watermark unchanged,
+///    so a checkpoint can advance to `H`;
+/// 4. a stale upper bound without the exact range fails closed instead of
+///    silently reading rows beyond it.
+pub async fn test_flow_exact_sequence_rounds(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (_db, fe_grpc_server) =
+        setup_grpc_server(store_type, "test_flow_exact_sequence_rounds").await;
+    let addr = fe_grpc_server.bind_addr().unwrap().to_string();
+    let db = Database::new(
+        DEFAULT_CATALOG_NAME,
+        DEFAULT_SCHEMA_NAME,
+        Client::with_urls(vec![addr]),
+    );
+
+    // No TTL here: the probe pins timestamps to a fixed past instant, and the
+    // production TTL of one hour would expire them before the second round.
+    db.sql(
+        r#"CREATE TABLE raw_spans (
+            `timestamp` TIMESTAMP(9) NOT NULL,
+            trace_id STRING NULL,
+            span_id STRING NULL,
+            TIME INDEX (`timestamp`),
+            PRIMARY KEY (trace_id, span_id)
+        ) WITH ('append_mode' = 'true', 'preserve_row_sequence' = 'true')"#,
+    )
+    .await
+    .unwrap();
+
+    // Round 1: trace `a`, flushed so its rows live in an SST.
+    db.sql(
+        "INSERT INTO raw_spans VALUES \
+         ('2023-11-14 22:13:20', 'a', 'a1'), ('2023-11-14 22:13:21', 'a', 'a2')",
+    )
+    .await
+    .unwrap();
+    db.sql("admin flush_table('raw_spans')").await.unwrap();
+
+    let (round1, c) = probe_query_trace_ids(&db, None, None).await.unwrap();
+    assert_eq!(round1, BTreeSet::from(["a".to_string()]));
+    assert!(!c.is_empty(), "round 1 must report a source watermark");
+
+    // Round 2: trace `b`, flushed again, so `a`'s rows sit in an older SST that
+    // only a row-level lower bound can exclude.
+    db.sql("INSERT INTO raw_spans VALUES ('2023-11-14 22:13:22', 'b', 'b1')")
+        .await
+        .unwrap();
+    db.sql("admin flush_table('raw_spans')").await.unwrap();
+
+    let (round2, h) = probe_query_trace_ids(&db, Some(&c), None).await.unwrap();
+    assert_eq!(
+        round2,
+        BTreeSet::from(["b".to_string()]),
+        "exact (C, H] must not re-emit the already-consumed flushed trace `a`"
+    );
+    assert_eq!(
+        h.keys().collect::<BTreeSet<_>>(),
+        c.keys().collect::<BTreeSet<_>>(),
+        "the region set must stay stable across rounds"
+    );
+    assert!(
+        c.iter().all(|(region, seq)| h[region] > *seq),
+        "the watermark must advance after new writes: c={c:?} h={h:?}"
+    );
+
+    // Round 3: no writes. The delta is empty and H stops moving.
+    let (round3, h3) = probe_query_trace_ids(&db, Some(&h), None).await.unwrap();
+    assert!(round3.is_empty(), "an idle round must not repeat rows");
+    assert_eq!(h3, h, "an idle round must not move the watermark");
+
+    // A stale upper bound without the exact range must fail closed.
+    let err = probe_query_trace_ids(&db, None, Some(&c))
+        .await
+        .expect_err("a stale snapshot fence must be rejected");
+    assert!(
+        err.contains("STALE_SNAPSHOT_FENCE") || err.contains("RequestOutdated"),
+        "expected a stale snapshot fence rejection, got: {err}"
     );
 
     let _ = fe_grpc_server.shutdown().await;
