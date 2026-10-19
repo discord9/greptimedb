@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use api::v1::alter_table_expr::Kind;
@@ -30,6 +30,7 @@ use api::v1::{
 };
 use auth::user_provider_from_option;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use client::{Client, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, Database, OutputData};
 use common_catalog::consts::{DEFAULT_PRIVATE_SCHEMA_NAME, MITO_ENGINE};
 use common_event_recorder::DEFAULT_EVENTS_TABLE_NAME;
@@ -43,9 +44,9 @@ use common_runtime::Runtime;
 use common_runtime::runtime::{BuilderBuild, RuntimeTrait};
 use common_test_util::find_workspace_path;
 use datatypes::arrow::array::{
-    Array, ArrayRef, Float64Array, Float64Builder, Int32Array, ListBuilder, StringArray,
-    StructArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    UInt64Builder,
+    Array, ArrayRef, Float64Array, Float64Builder, Int32Array, Int64Array, LargeStringArray,
+    ListBuilder, StringArray, StructArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array, UInt64Builder,
 };
 use datatypes::arrow::datatypes::{DataType, Field};
 use datatypes::arrow::ipc::writer::StreamWriter;
@@ -131,6 +132,7 @@ macro_rules! grpc_tests {
                 test_grpc_tls_config,
                 test_grpc_memory_limit,
                 test_flow_exact_sequence_rounds,
+                test_flow_tail_sampling_baseline,
             );
         )*
     };
@@ -2372,21 +2374,25 @@ pub async fn test_flow_exact_sequence_rounds(store_type: StorageType) {
     .await
     .unwrap();
 
-    // Round 1: trace `a`, flushed so its rows live in an SST.
+    // Round 1: only trace `a`, deliberately left in the memtable so the captured
+    // `C` sits *inside* the data that the next single flush will write.
     db.sql(
         "INSERT INTO raw_spans VALUES \
          ('2023-11-14 22:13:20', 'a', 'a1'), ('2023-11-14 22:13:21', 'a', 'a2')",
     )
     .await
     .unwrap();
-    db.sql("admin flush_table('raw_spans')").await.unwrap();
 
     let (round1, c) = probe_query_trace_ids(&db, None, None).await.unwrap();
     assert_eq!(round1, BTreeSet::from(["a".to_string()]));
     assert!(!c.is_empty(), "round 1 must report a source watermark");
 
-    // Round 2: trace `b`, flushed again, so `a`'s rows sit in an older SST that
-    // only a row-level lower bound can exclude.
+    // Append `b` and flush exactly once, so `a` (sequence <= C, already
+    // consumed) and `b` (sequence > C) land in the *same* SST. That layout is
+    // the point: the file as a whole has an upper barrier above C, so file
+    // selection keeps it, and only the row-level `(C, H]` filter can return
+    // just `b`. With one flush per trace this assertion would also pass for an
+    // implementation that dropped the older file wholesale.
     db.sql("INSERT INTO raw_spans VALUES ('2023-11-14 22:13:22', 'b', 'b1')")
         .await
         .unwrap();
@@ -2396,7 +2402,7 @@ pub async fn test_flow_exact_sequence_rounds(store_type: StorageType) {
     assert_eq!(
         round2,
         BTreeSet::from(["b".to_string()]),
-        "exact (C, H] must not re-emit the already-consumed flushed trace `a`"
+        "exact (C, H] must filter inside one SST: `a` is consumed, `b` is new"
     );
     assert_eq!(
         h.keys().collect::<BTreeSet<_>>(),
@@ -2406,6 +2412,23 @@ pub async fn test_flow_exact_sequence_rounds(store_type: StorageType) {
     assert!(
         c.iter().all(|(region, seq)| h[region] > *seq),
         "the watermark must advance after new writes: c={c:?} h={h:?}"
+    );
+
+    // `C` must be a real data boundary, not merely a non-empty increasing
+    // number: replaying the exact range `(0, C]` has to see `a` and must not
+    // see `b`, even though both now live in the same flushed SST (so `C` is
+    // behind the flushed frontier, which exact mode permits).
+    let zero_lower = c
+        .keys()
+        .map(|region| (*region, 0u64))
+        .collect::<HashMap<_, _>>();
+    let (replay, _) = probe_query_trace_ids(&db, Some(&zero_lower), Some(&c))
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        BTreeSet::from(["a".to_string()]),
+        "the reported watermark must bound exactly the rows consumed before it"
     );
 
     // Round 3: no writes. The delta is empty and H stops moving.
@@ -2420,6 +2443,400 @@ pub async fn test_flow_exact_sequence_rounds(store_type: StorageType) {
     assert!(
         err.contains("STALE_SNAPSHOT_FENCE") || err.contains("RequestOutdated"),
         "expected a stale snapshot fence rejection, got: {err}"
+    );
+
+    let _ = fe_grpc_server.shutdown().await;
+}
+
+/// Runs a SQL statement that writes rows and returns the affected row count.
+async fn run_insert_sql(db: &Database, sql: &str) -> usize {
+    let result = db
+        .flight_request()
+        .query_with_terminal_metrics(QueryRequest {
+            query: Some(Query::Sql(sql.to_string())),
+        })
+        .await
+        .unwrap();
+    let OutputData::AffectedRows(affected) = result.output.data else {
+        panic!("expected affected rows output for: {sql}");
+    };
+    affected
+}
+
+/// Runs a SELECT and returns each row as a list of stringified cells.
+async fn fetch_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
+    let result = db
+        .flight_request()
+        .query_with_terminal_metrics(QueryRequest {
+            query: Some(Query::Sql(sql.to_string())),
+        })
+        .await
+        .unwrap();
+    let OutputData::Stream(mut stream) = result.output.data else {
+        panic!("expected a stream output for: {sql}");
+    };
+
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.next().await {
+        batches.push(batch.unwrap());
+    }
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        for row_index in 0..batch.num_rows() {
+            let mut cells = Vec::with_capacity(batch.num_columns());
+            for column_index in 0..batch.num_columns() {
+                let column = batch.column(column_index);
+                cells.push(if column.is_null(row_index) {
+                    "NULL".to_string()
+                } else {
+                    column_value_to_string(column, row_index)
+                });
+            }
+            rows.push(cells);
+        }
+    }
+    rows
+}
+
+/// Stringifies one cell. Only the types used by the PoC tables are supported.
+fn column_value_to_string(column: &ArrayRef, row_index: usize) -> String {
+    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        return array.value(row_index).to_string();
+    }
+    if let Some(array) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return array.value(row_index).to_string();
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return array.value(row_index).to_string();
+    }
+    if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
+        return array.value(row_index).to_string();
+    }
+    if let Some(array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return array.value(row_index).to_string();
+    }
+    format!("{column:?}")
+}
+
+fn baseline_ts(base: DateTime<Utc>, offset_seconds: i64, millis: i64) -> String {
+    (base + ChronoDuration::seconds(offset_seconds) + ChronoDuration::milliseconds(millis))
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// Trace tail sampling, M0 baseline.
+///
+/// Runs the sampling rule from the plan appendix as a plain full-snapshot
+/// query, with `now()` pinned to an injected `T`, and checks that the sink
+/// contents follow the intended rule: a trace is kept once its earliest span
+/// is at least 30s old and it either contains an ERROR span or spans more than
+/// one second.
+pub async fn test_flow_tail_sampling_baseline(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (_db, fe_grpc_server) =
+        setup_grpc_server(store_type, "test_flow_tail_sampling_baseline").await;
+    let addr = fe_grpc_server.bind_addr().unwrap().to_string();
+    let db = Database::new(
+        DEFAULT_CATALOG_NAME,
+        DEFAULT_SCHEMA_NAME,
+        Client::with_urls(vec![addr]),
+    );
+
+    // Fix `T` at 45 seconds past a minute boundary. That keeps it within a
+    // minute of wall-clock time (so the one-hour TTL is harmless) while making
+    // the minute-boundary and 30s-wait cases deterministic.
+    let now = Utc::now();
+    let t = now
+        .with_second(45)
+        .and_then(|value| value.with_nanosecond(0))
+        .unwrap();
+    let scheduled_millis = t.timestamp_millis();
+
+    db.sql(
+        r#"CREATE TABLE raw_spans (
+            `timestamp` TIMESTAMP(9) NOT NULL,
+            timestamp_end TIMESTAMP(9) NULL,
+            duration_nano BIGINT UNSIGNED NULL,
+            trace_id STRING NULL SKIPPING INDEX,
+            span_id STRING NULL,
+            parent_span_id STRING NULL,
+            service_name STRING NULL,
+            span_name STRING NULL,
+            span_kind STRING NULL,
+            span_status_code STRING NULL,
+            span_status_message STRING NULL,
+            `span_attributes.poc.case` STRING NULL,
+            TIME INDEX (`timestamp`),
+            PRIMARY KEY (trace_id, span_id)
+        ) WITH ('append_mode' = 'true', 'preserve_row_sequence' = 'true', 'ttl' = '1h')"#,
+    )
+    .await
+    .unwrap();
+
+    db.sql(
+        r#"CREATE TABLE sampled_spans_baseline (
+            `timestamp` TIMESTAMP(9) NOT NULL,
+            timestamp_end TIMESTAMP(9) NULL,
+            duration_nano BIGINT UNSIGNED NULL,
+            trace_id STRING NULL SKIPPING INDEX,
+            span_id STRING NULL,
+            parent_span_id STRING NULL,
+            service_name STRING NULL,
+            span_name STRING NULL,
+            span_kind STRING NULL,
+            span_status_code STRING NULL,
+            span_status_message STRING NULL,
+            `span_attributes.poc.case` STRING NULL,
+            sample_reason STRING NULL,
+            TIME INDEX (`timestamp`),
+            PRIMARY KEY (trace_id, span_id)
+        ) WITH ('ttl' = '30d')"#,
+    )
+    .await
+    .unwrap();
+
+    // (trace_id, span_id, start offset ms, end offset ms, status, case).
+    // Offsets are relative to `T`, in milliseconds, so sub-second shapes such as
+    // the 1.5s slow trace are exact.
+    let spans: &[(&str, &str, i64, i64, &str, &str)] = &[
+        // Fast, error-free: old enough, but its extent is exactly 1s, which fails
+        // the strictly-greater slow rule.
+        (
+            "normal_fast",
+            "n1",
+            -180_000,
+            -180_000,
+            "STATUS_CODE_OK",
+            "normal",
+        ),
+        (
+            "normal_fast",
+            "n2",
+            -179_000,
+            -179_000,
+            "STATUS_CODE_OK",
+            "normal",
+        ),
+        // ERROR child span selects the whole trace.
+        (
+            "err_child",
+            "e1",
+            -120_000,
+            -120_000,
+            "STATUS_CODE_OK",
+            "error_child",
+        ),
+        (
+            "err_child",
+            "e2",
+            -119_000,
+            -119_000,
+            "STATUS_CODE_ERROR",
+            "error_child",
+        ),
+        // Slow trace: extent is exactly 1.5s, above the 1s threshold.
+        (
+            "slow_trace",
+            "s1",
+            -240_000,
+            -240_000,
+            "STATUS_CODE_OK",
+            "slow",
+        ),
+        (
+            "slow_trace",
+            "s2",
+            -239_000,
+            -238_500,
+            "STATUS_CODE_OK",
+            "slow",
+        ),
+        // An ERROR trace whose earliest span is only 20s old. It satisfies the
+        // keep rule, so the 30s wait is the *only* reason it must be excluded.
+        (
+            "too_young",
+            "y1",
+            -20_000,
+            -20_000,
+            "STATUS_CODE_ERROR",
+            "too_young",
+        ),
+        // Exactly at the 30s wait boundary: the rule is `<=`, so it is selected.
+        (
+            "exactly_30s",
+            "x1",
+            -30_000,
+            -28_000,
+            "STATUS_CODE_OK",
+            "exactly_30s",
+        ),
+        // Older than the 10 minute lookback: must never be selected.
+        (
+            "too_old",
+            "o1",
+            -1_200_000,
+            -1_200_000,
+            "STATUS_CODE_ERROR",
+            "too_old",
+        ),
+        // Crosses a minute boundary; both spans belong to the selected trace.
+        (
+            "cross_minute",
+            "c1",
+            -46_000,
+            -46_000,
+            "STATUS_CODE_ERROR",
+            "cross_minute",
+        ),
+        (
+            "cross_minute",
+            "c2",
+            -44_000,
+            -44_000,
+            "STATUS_CODE_OK",
+            "cross_minute",
+        ),
+        // Exactly at the lookback lower bound: `recent` uses `>=`, so it stays in.
+        (
+            "boundary_lower",
+            "b1",
+            -600_000,
+            -598_000,
+            "STATUS_CODE_OK",
+            "boundary_lower",
+        ),
+        // One second before the lookback lower bound: outside `recent`.
+        (
+            "just_before_lower",
+            "j1",
+            -601_000,
+            -601_000,
+            "STATUS_CODE_ERROR",
+            "just_before_lower",
+        ),
+    ];
+
+    let values = spans
+        .iter()
+        .map(|(trace, span, start, end, status, case)| {
+            format!(
+                "('{}', '{}', {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
+                baseline_ts(t, start.div_euclid(1000), start.rem_euclid(1000)),
+                baseline_ts(t, end.div_euclid(1000), end.rem_euclid(1000)),
+                (*end - *start) * 1_000_000,
+                trace,
+                span,
+                "svc",
+                span,
+                "SPAN_KIND_SERVER",
+                status,
+                case,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let inserted = run_insert_sql(
+        &db,
+        &format!(
+            "INSERT INTO raw_spans \
+             (`timestamp`, timestamp_end, duration_nano, trace_id, span_id, service_name, \
+              span_name, span_kind, span_status_code, `span_attributes.poc.case`) \
+             VALUES {values}"
+        ),
+    )
+    .await;
+    assert_eq!(inserted, spans.len(), "every scenario span must be written");
+
+    // The plan appendix query verbatim, wrapped in the sink insert.
+    let baseline_sql = format!(
+        r#"INSERT INTO sampled_spans_baseline
+SELECT
+  s.`timestamp`, s.timestamp_end, s.duration_nano, s.trace_id, s.span_id,
+  s.parent_span_id, s.service_name, s.span_name, s.span_kind,
+  s.span_status_code, s.span_status_message, s.`span_attributes.poc.case`,
+  t.sample_reason
+FROM (
+  SELECT * FROM raw_spans WHERE `timestamp` >= now() - INTERVAL '10' MINUTE
+) s
+JOIN (
+  SELECT
+    trace_id,
+    CASE
+      WHEN max(CASE WHEN span_status_code = 'STATUS_CODE_ERROR' THEN 1 ELSE 0 END) = 1
+      THEN 'error'
+      ELSE 'slow'
+    END AS sample_reason
+  FROM (SELECT * FROM raw_spans WHERE `timestamp` >= now() - INTERVAL '10' MINUTE)
+  GROUP BY trace_id
+  HAVING min(`timestamp`) <= now() - INTERVAL '30' SECOND
+     AND (
+       max(CASE WHEN span_status_code = 'STATUS_CODE_ERROR' THEN 1 ELSE 0 END) = 1
+       OR max(timestamp_end) > min(`timestamp`) + INTERVAL '1' SECOND
+     )
+) t ON s.trace_id = t.trace_id"#
+    );
+
+    let written = db
+        .flight_request()
+        .with_flow_extensions(&[("flow.scheduled_time_millis", &scheduled_millis.to_string())])
+        .query_with_terminal_metrics(QueryRequest {
+            query: Some(Query::Sql(baseline_sql)),
+        })
+        .await
+        .map(|result| match result.output.data {
+            OutputData::AffectedRows(affected) => affected,
+            other => panic!("expected affected rows, got {other:?}"),
+        })
+        .unwrap();
+
+    let rows = fetch_rows(
+        &db,
+        "SELECT trace_id, sample_reason FROM sampled_spans_baseline",
+    )
+    .await;
+    let mut by_trace: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+    for row in &rows {
+        let entry = by_trace.entry(row[0].clone()).or_default();
+        entry.0 += 1;
+        entry.1.insert(row[1].clone());
+    }
+
+    // Selected traces, with their expected span count and reason.
+    let expected: &[(&str, usize, &str)] = &[
+        ("err_child", 2, "error"),
+        ("slow_trace", 2, "slow"),
+        ("exactly_30s", 1, "slow"),
+        ("cross_minute", 2, "error"),
+        ("boundary_lower", 1, "slow"),
+    ];
+    for (trace, count, reason) in expected {
+        let (actual_count, reasons) = by_trace
+            .get(*trace)
+            .unwrap_or_else(|| panic!("trace {trace} must be sampled, got {by_trace:?}"));
+        assert_eq!(*actual_count, *count, "trace {trace} span count");
+        assert_eq!(
+            reasons,
+            &BTreeSet::from([reason.to_string()]),
+            "trace {trace} sample_reason"
+        );
+    }
+
+    // Traces that must not be sampled at all. `too_young` is an ERROR trace, so
+    // only the 30s wait keeps it out; `too_old` is likewise ERROR and is kept out
+    // only by the 10 minute lookback.
+    for trace in ["normal_fast", "too_young", "too_old", "just_before_lower"] {
+        assert!(
+            !by_trace.contains_key(trace),
+            "trace {trace} must not be sampled, got {by_trace:?}"
+        );
+    }
+
+    let expected_rows: usize = expected.iter().map(|(_, count, _)| count).sum();
+    assert_eq!(
+        written, expected_rows,
+        "the baseline must write one row per span of each selected trace: {by_trace:?}"
     );
 
     let _ = fe_grpc_server.shutdown().await;
