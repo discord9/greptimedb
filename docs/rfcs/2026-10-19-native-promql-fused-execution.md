@@ -7,267 +7,370 @@ Author: "@discord9"
 
 # RFC：Native PromQL 的融合执行模型
 
-# 摘要
+## 1. 目标与决策
 
-PromQL 的区间函数（`rate`、`increase`、`sum_over_time` 等）目前由一条物理节点链求值，每一步之间都要物化中间行批。native 路径则直接在存储层产出的带类型序列（typed series）上求值。
+本 RFC 定义 `FusedSeriesExec` 的可组合执行模型，以及它与 PromPlan、原生批次、内存管理和查询诊断的关系。它是实施设计，文中的新增接口不代表已经实现。
 
-本 RFC 提出该路径的执行模型，涵盖：一次融合能覆盖什么、批量数据如何到达、状态存在哪里、以及输出是什么。本 RFC **刻意不提出最终的 Rust 结构体布局**——先把执行模型谈清楚，再定类型才有意义。
+**第一期就采用可组合的 native 物理表达式树。** 已支持的运算可以按 PromQL 语义自由组合，不限制为一个窗口、若干 map 和一个末尾聚合。实现范围按算子及其数据类型划分，不按完整查询的固定形状划分。
 
-整个设计由一个性质驱动：**函数选择与输入绑定属于物理编译期；热路径只负责把批次喂给已绑定的 kernel。**
+本轮确定以下要求：
 
-# 动机
+1. PromPlan 表达查询语义；物理编译生成已绑定输入、字段、网格和 kernel 的执行树。
+2. Fused 内部直接传递 native 批次；普通行转换只发生在明确的对外边界。
+3. 窗口和即时选点支持分块输入、批量求值及分批输出。三项能力分别实现和验证。
+4. 聚合是可组合节点。完整聚合结果可以继续进入 map、窗口或其他合法节点。
+5. 运行态接入现有查询内存池，并继续使用现有存储扫描配额。
+6. `EXPLAIN` 展示内部计算结构，`EXPLAIN ANALYZE` 展示对应 metrics；远端执行也能在前端观察。
+7. 第一期不引入 JIT、通用 VM、公共子表达式缓存或独立调度框架。
 
-## native 路径要替换掉什么
+本文核对的代码基线是 `upstream/narthex` 的 `a1052c0c0f7`。实验分支和待合 PR 中的批量 kernel 等优化按组件复用，不能当作该基线已经具备的能力。
 
-对于 `rate(x[5m])`，常规计划要为每个网格点、每条序列，从行批里拼出一个样本窗口。从扫描到结果之间的每一层都是 `RecordBatch`，各自带有分配、投影与谓词。
+### 1.1 要解决的问题
 
-raw 序列路径可以跳过这一切：存储直接产出带类型的序列块（`RawSeriesChunk`，`src/datatypes/src/series/raw.rs:96`），而单条序列上的区间函数本质上就是两列上的窗口扫描。已求值序列（`Series`，`src/datatypes/src/series/samples.rs:613`）用 `TimeAxis::Grid`（`src/datatypes/src/series/time.rs:172`）替代逐行时间戳，于是网格成为 schema 的属性，而不是一列数据。
+现有常规 PromQL 路径使用行批和区间数组组织求值。native 路径希望利用原始序列与规则求值网格，减少窗口构造、行列转换及重复绑定。
 
-## 当前原型错在哪里
+早期融合原型还有两个结构问题：从已生成的物理树重新识别查询形状，以及把 window、maps、partial aggregate 固定为顶层字段。原型的 `classify_output` 在构造期使用类型和位置启发式认领列，也缺少可靠的字段来源绑定；它不是逐批执行的热路径开销。
 
-早期原型通过**在物理计划已经存在之后去识别一个区间函数子树**，再把融合节点换进定位到的位置。这带来三个问题：
+已有 kernel、语义测试和实验记录可以复用。固定模板和后置形状匹配不作为新执行模型的基础。是否获得端到端收益由新接线后的测量决定。
 
-1. **机会是从物理树形状里重新发现的。** 优化器只要改变该子树的排列方式，融合路径就会静默不可达。
-2. **融合节点是一个固定模板。** 它把函数、可选 map 链、可选局部聚合作为字段携带，于是每增加一种形状都是在加宽模板，而不是组合出一个计算。
-3. **输出列在运行期分类**，靠"下一个未被认领的 `Float64` 列"认领下一个 field——只有在恰好一个 field 时才没有歧义。
+## 2. 从 PromPlan 到可组合执行树
 
-本 RFC 保留原型的 **kernel**，丢弃它的 **结构**。
+### 2.1 三层职责
 
-# 概览
-
-一个查询被编译成一个或多个 **FusedUnit**。一个单元是一条线性链：
-
-```
-raw scan
-  → 至多一个窗口函数      rate、increase、sum_over_time ...
-  → 任意多个逐点函数      abs、ceil、floor、sqrt、round
-  → 至多一个局部聚合      sum by (...)
-```
-
-单元是"最划得来"的最小片段：单元内部全部在带类型序列上求值，不物化行批；单元外部全是常规物理节点。
-
-单元的输入是带类型的序列，不是行。输出是带类型的序列；若单元以局部聚合结尾，则输出一个列布局在编译期就已固定的批次。
-
-# 详细设计
-
-## 1. 融合范围与边界
-
-### 1.1 一个单元可以包含什么
-
-一个 `FusedUnit` 覆盖**单输入**上的线性链，且必须同时满足：
-
-- **单输入。** 窗口函数与逐点函数链都是单输入运算。
-- **无分区交换。** 单元内部不得出现 shuffle。
-- **无跨序列匹配。** 向量间二元运算、`on()`/`ignoring()` 匹配、集合运算一律在单元之外。
-- **一个求值网格。** 所有阶段共享同一个 `GridSpec`（start、step、len）。
-
-不满足这些条件的形状不融合，由常规物理节点执行。
-
-### 1.2 必须在何处切分
-
-| 切分原因 | 示例 | 由谁处理 |
+| 层 | 内容 | 职责 |
 | --- | --- | --- |
-| 分区交换 | `sum by (job) (...)`，当 `job` 不是分区键 | 既有 `AggregateExec`，两阶段 |
-| 网格改变 | 子查询 `[1h:1m]` 的内层网格 | 内层单元 + 一次显式的网格适配 |
-| 跨序列匹配 | `a + on(x) b` | 既有 join / vector-match 节点 |
-| 标量广播 | `... + 1` | 既有 `ProjectionExec` |
-| 非逐点函数 | `label_replace`、`absent` | 既有专用节点 |
+| PromPlan | 查询运算、依赖、标签与时间语义 | 统一表达 PromQL，不携带某个物理节点的识别规则 |
+| 已绑定 native 物理树 | 输入槽位、字段位置、kernel、网格、分组与匹配规则 | 决定如何在 native 数据上执行 |
+| 每次执行的状态树 | 窗口保留、游标、输出块、聚合和匹配状态、reservation | 按批推进本次执行 |
 
-### 1.3 多输入、分支、共享子表达式
+本文的 PromPlan 指 planner 改造提供的统一语义计划。基线目前仍由 [PromPlanner](../../src/query/src/promql/planner.rs) 从 parser AST 生成 DataFusion LogicalPlan。此 RFC 不另造一套平行的语义 AST，也不宣称基线已有某个可直接调用的 `PromPlan` Rust 类型。
 
-第一期**刻意不支持**。
+Fused 的逻辑承载节点引用 PromPlan 子图及输入边界。内部物理树是它的编译产物，不重新解释函数名字、默认参数、匹配修饰符或标签规则。
 
-多输入单元需要一条规则来决定"哪个输入的到达推进窗口"，还需要一条规则来合并完成信号。`src/promql/src/source/merge.rs` 已经能合并有序输入，但它服务的是行批管线；复用它会把本设计要消除的耦合重新引进来。
+### 2.2 内部结构
 
-被两处引用的子表达式在第一期按重复计算处理，不做公共子表达式消除。
+Fused 内部的执行单位称为**计算节点（`NativeNode`）**。`kernel` 专指节点调用的数值计算函数；一个 Window 节点还拥有窗口推进、批次连接和状态管理职责。每次执行为每个计算节点建立独立的 `NodeMetrics`，不把所有同名函数合成一个诊断对象。
 
-## 2. 批量数据接口
-
-### 2.1 输入
-
-两种输入，均复用既有类型：
-
-- **Raw**：`RawSeriesChunk`（`src/datatypes/src/series/raw.rs:96`）构成的数据流，携带
-  `primary_key: Buffer`、`metric: Option<MetricName>`、`time: RawTimestamps`、
-  `fields: SeriesFields` 以及 `is_last: bool`。
-- **Evaluated**：`Series`（`src/datatypes/src/series/samples.rs:613`）构成的数据流，例如子查询的内层结果，整条序列一次到达。
-
-**`is_last` 就是序列完成信号**（`src/datatypes/src/series/raw.rs:109`），无需新造信号类型。注意其已注明的限制：合并步骤必须跨其所有输入重新计算收尾——这一点只有在存在多输入单元之后才会成为问题。
-
-**有效性**不单独传递。字段是 Arrow 数组，null 即无效样本。在已求值输入路径上，stale marker 作为值保留，`push_series` 已是此语义。
-
-**网格位置**由 `SeriesSchema::eval_grid` 加 `GridRange` 表达，不逐行传列。
-
-### 2.2 窗口求值不等整条序列完成
-
-这是既有求值器的一个性质，本设计必须保留。
-
-窗口 `(T - range_ms, T]` 只需要晚于 `T - range_ms` 的样本。因此在一条序列的非末块上，`RangeEvaluator::push`（`src/promql/src/range_eval.rs:227`）只把网格推进到 `last_ts + offset_ms` 就返回 `None`（`src/promql/src/range_eval.rs:236-242`）；只有 `is_last` 块才收尾该序列。
-
-因此一个单元对**每条序列会产出多个批次**，消费方必须能接受"同一条序列的多批"。`SeriesOrdering::Contiguous`（`src/datatypes/src/series.rs:40`）已经保证每条序列连续，这恰好是这种消费方需要的保证。
-
-### 2.3 批量粒度
-
-热路径以整批为单位工作，绝不逐样本、也绝不逐网格点：
-
-- 输入以 Arrow 数组形式位于 `SeriesFields` 内，不逐样本重建。
-- 窗口函数一次对一段网格位置求值。
-- 逐点函数链作用于整列。
-
-## 3. 状态归属
-
-### 3.1 编译产物与运行态严格分离
+以下结构只说明组合方式，不规定最终 Rust 布局：
 
 ```rust
-// 示意，非最终布局。
-struct FusedPlan {                 // 不可变，经 Arc 跨分区共享
-    kernel: KernelId,              // 已选定的函数，而不是捕获的闭包
-    window: RangeWindow,
-    maps: Arc<[MathOp]>,
-    grid: Arc<EvalGrid>,
-    input_schema: Arc<SeriesSchema>,
-    output_schema: Arc<SeriesSchema>,
-    time_column: String,
-    value_columns: Arc<[String]>,
-    label_columns: Arc<[String]>,
-    partial_agg: Option<PartialAggSpec>,
+struct NativeNode {
+    id: NodeId,
+    expr: NativeExpr,
+    output: NativeType,
 }
 
-struct FusedState {                // 每次 execute(partition) 新建
-    evaluator: RangeEvaluator,
-    agg: Option<PartialAggState>,
+enum NativeExpr {
+    Input(BoundInput),
+    Scalar(BoundScalar),
+    Instant { input: Box<NativeNode>, op: BoundInstant },
+    Window { input: Box<NativeNode>, op: BoundWindow },
+    Map { input: Box<NativeNode>, op: BoundMap },
+    Aggregate { input: Box<NativeNode>, op: BoundAggregate },
+    Binary {
+        left: Box<NativeNode>,
+        right: Box<NativeNode>,
+        op: BoundBinary,
+    },
 }
 ```
 
-- `FusedPlan` 以 `Arc` 引用，不按分区复制。
-- `FusedState` 在 `execute(partition)` 内创建，流结束时丢弃。
-- 按序列的状态（`src/promql/src/range_eval.rs:92` 的 `SeriesState`）在 `is_last` 时清空，不跨序列泄漏。
+每个节点有稳定的计划内 `node_id`、明确的输入和输出类型，以及已绑定的运算。`FusedSeriesExec` 持有这棵树、物理输入和出口绑定，不再持有唯一的 `window`、`maps` 或 `partial_agg` 槽位。
 
-`RangeEvaluator` 已经是这个形状：`try_new` 固定计划，`push` / `push_series` 推进，`finish` 校验收尾。它就是一个单元的 kernel，不需要重写。
+一棵树即可表达本轮需要的组合。二元节点有两个子树；公共子表达式是否共享执行属于以后独立的优化。加入一个已支持运算的合法组合，应只改变编译出的树，不能要求增加一个完整形状的 matcher。
 
-### 3.2 局部聚合状态
+| 运算 | 输入与输出契约 |
+| --- | --- |
+| Instant | 原始样本到求值网格上的值，绑定 lookback、offset 等语义 |
+| Window | 原始样本或已求值样本到本节点输出网格上的值 |
+| Map / 标量广播 | 完整求值值到完整求值值，保持或显式更新字段、标签语义 |
+| Aggregate | 按阶段接受值或聚合状态，输出完整值或聚合状态 |
+| Binary / matching | 按已绑定规则对齐两个输入，执行基数、标签和时间语义检查 |
 
-`PartialAggState` 在一个分区的序列范围内，按 group key 持有累加器：
+合法性来自这些类型及数据依赖。普通 map 不能消费尚未 finalize 的聚合状态；raw 样本也不能跳过 Instant 语义直接当查询求值点。两个窗口之间没有结构上的数量限制。
 
-- **输入**：已求值的 `Series`。
-- **状态**：group key 到累加器（`f64` 加有效性位）的映射。
-- **释放**：该分区数据流结束时一次性产出。
-- **不跨分区共享。** 跨分区的合并属于既有两阶段聚合；单元只产出局部状态。
+每个 Window 独立绑定输入网格和输出网格。Fused 不要求所有节点共用一个 `GridSpec`。Scalar 可以是常数，也可以是绑定了求值网格的计算值，不能把所有 scalar 都假设为时间不变。
 
-## 4. 输出类型与边界
+### 2.3 物理编译与降级
 
-| 单元边界 | 输出 | 类型 |
+物理编译按以下顺序进行：
+
+1. 从 PromPlan 确定运算依赖、类型、所需时间范围和候选 native 区域。
+2. 准备边界输入，检查 raw schema、标签绑定、ordering、分区分布和读取能力。
+3. 为每个节点绑定字段、kernel、输入与输出网格、分组或匹配规则；为真实的数据交换建立边界。
+4. 构造 native 执行树和明确的出口适配器，并生成对应的计划描述。
+5. 某个算子或输入能力尚未接入时，在执行前为该语义片段选择普通 lowering，保留可继续使用的 native 区域。
+
+准备扫描后才能得到的能力，在第 2 步检查。这个要求不意味着必须先构造完整普通物理树，再逆向恢复查询语义。[既有 extension planner 接口](../../src/promql/src/extension_plan/planner.rs) 可接收逻辑节点和已计划输入，具体接点与 PromPlan 接线统一。
+
+降级理由进入计划描述。计划期不支持与查询本身非法分别处理。执行已经开始后遇到数据错误或内存不足，返回错误，不重放输入并切换到另一条路径。
+
+### 2.4 融合边界
+
+增加窗口、改变求值网格、添加标量广播、在完整聚合后继续计算，都不是天然的切分理由。
+
+需要切分的是实际执行边界，例如跨执行分区的数据交换、尚无 native 实现的运算、或当前输入无法满足的分布要求。已共址的二元匹配可以在树内执行；需要重分布时由物理编译安排交换。跨序列运算不因此被永久排除在模型之外。
+
+第一期允许合法节点阻塞式收集必要输入，例如在分区结束时完成聚合。可组合性不要求每个节点都立即产出结果；这些保留状态必须受内存池管理，计划也必须标明其输出时机。
+
+## 3. Native 批次协议
+
+### 3.1 Raw 输入与来源归并
+
+复用 [RawSeriesChunk](../../src/datatypes/src/series/raw.rs)。它携带完整输入身份、时间戳、字段、标签绑定及 `is_last`。
+
+`is_last` 对接收该流的算子表示该 series 在所有相关来源上的完成。即使 Fused 只有一个物理 child，该 child 也可能合并多个 region；来源归并必须在交付 Fused 前正确重算完成信号。
+
+[merge_ordered_raw_series](../../src/promql/src/source/merge.rs) 已经是 typed raw stream 到 typed raw stream 的归并，不经过普通行批。满足它的 schema、绑定及 `KeyThenTime` 要求时可以复用。它处理物理来源归并，不代替表达式的二元 matching。
+
+每个节点声明所需 ordering，编译器校验上游保证。第一版的逐序列窗口状态可要求 `Contiguous` 或更强的顺序；后续支持 `Interleaved` 时可更换状态组织。ordering、分区归属与完成信号是三个独立契约，不能互相替代。
+
+### 3.2 Evaluated 批次
+
+复用 `Series` 的字段和 `TimeAxis::Grid(GridRange)`，在流接口补上分片完成信息：
+
+```rust
+struct EvaluatedChunk {
+    series: Series,
+    is_last: bool,
+}
+```
+
+输入 schema 固定在连接上。批次中的 `GridRange` 使用该连接网格上的绝对 `start/len`，不能使用批内行号代替绝对网格位置，也不能混用内层与外层网格索引。
+
+非末片的区间表示这段网格已经完成求值，缺失位置使用现有 validity 表达。必要的全空区间也应推进下游，不只发送有值的点。计算进度与有效值覆盖范围不同，中间连接不能因裁剪 null 而丢失进度。区间单调且不重叠。
+
+`is_last` 不依赖最后一批有没有有效样本。已经发出前缀，但最后没有新结果时，仍须发出带 series 身份、网格和 `is_last=true` 的空末片。现有 [GridRange](../../src/datatypes/src/series/time.rs) 允许空区间，可以复用这个表示。
+
+每条已开始的 series 恰好关闭一次。map、过滤及出口适配不能吞掉内部连接的完成信息。分区 EOF 不代替尚未关闭的 series；正常 EOF 前必须完成各节点的 drain。
+
+改变标签的节点，对同一输出 series 的数据片、全空片及末片使用一致的变换后身份；不能用输入身份关闭已经改变标签的输出 series。
+
+null、computed stale 值、float/histogram 混合窗口以及标签删除的语义沿用现有实现。批量快路径不能绕过这些语义；按数据类型选择 kernel 或局部回落，不以错误结果换取整条链命中。
+
+### 3.3 聚合状态与 Scalar
+
+聚合中间状态具有单独的已绑定类型和 state schema，不伪装成普通求值值。状态批可以复用 Arrow `RecordBatch` 承载，字段包含分组、求值时间和对应 accumulator state；列布局由编译器绑定。
+
+常数 Scalar 可保留为一个值并在 kernel 中广播。随网格变化的 Scalar 明确携带相应网格和有效性。两者都不要求为了连接下一个 native 节点而先展开成普通结果行。
+
+## 4. 批量执行与状态生命周期
+
+### 4.1 按批推进状态树
+
+不可变执行树可由 `Arc` 共享。每次 `execute(partition)` 创建自己的运行状态，使用实际的输入 partition，禁止固定消费 partition 0。跨 series 的聚合状态与当前 series 的窗口状态分别持有和释放。
+
+采用递归 pull/poll 即可：
+
+1. 当前节点有 ready 输出时，交付一个受行数或字节预算约束的批次。
+2. 否则向 child 拉取输入，更新本节点状态。
+3. child 为 Pending 时向上传递 Pending；同步工作按预算让出执行线程。
+4. series 完成时分批 drain 剩余结果，再发出结束并清理该 series。
+5. 分区结束时完成需要 EOF 的聚合或匹配，并排空输出。
+
+节点之间不建立无界队列，也不各自启动任务。每个节点只保留当前处理块、待交付块及算法必需的状态。CPU 工作继续遵循现有查询执行与运行时约定，不新建 executor 或运行时。
+
+AST 的分派发生在节点或批次边界。kernel 内部仍可遍历样本、网格或 reset；禁止的是每点重新解释 PromPlan、查找函数或恢复列绑定。表达式树节点不强制对应一次普通行物化。
+
+metrics 对应编译后实际执行的计算节点。第一期保留各节点独立执行与计时，不跨 `NativeNode` 合并数值执行区间；直接传递 native 数据不要求每个节点都新建输出数组。若后续把相邻 map 合并成一个 kernel，应展示合并节点及其来源运算，并报告合并后的时间，不能为已经合并的各运算虚构独立耗时。
+
+### 4.2 现有 evaluator 需要的适配
+
+基线 [RangeEvaluator](../../src/promql/src/range_eval.rs) 在非末 raw chunk 上会提前计算，但返回 `None`，只在最后返回完整 `Series`。现有 `push_series` 每次也把输入视为完整 series。两者不等于已经支持分片输出和分片消费。
+
+复用窗口算术及已有正确性语义，增加以下能力：
+
+- 分开输入推进与提取 ready 输出，一次最多生成一批。
+- 给 [GridSeriesBuilder](../../src/promql/src/grid_series.rs) 增加分段取出能力；取出后保留绝对 cursor、series 身份和未完成的窗口状态。
+- 消费 `EvaluatedChunk`，在同一 series 的多个片段之间保留状态。
+- 收到末片后分批 drain，最后一个输出之后才清理 series。
+- 暴露内存增长与保留容量，供运行态管理 reservation。
+
+现有 [select_instants](../../src/promql/src/instant_eval.rs) 接受完整输入轴；Instant 节点也需要保存候选样本、stale 状态和网格游标的增量适配。不能声称现成函数直接具备流式接口。
+
+旧的完整 `Series` 接口可以作为便利包装保留。窗口、即时选点的第一期 native 连接应通过分片接口验收；聚合、matching 等按语义可保留需要完整范围的执行策略，并明确内存与输出时机。
+
+## 5. 可组合的聚合
+
+### 5.1 时间维度与执行阶段
+
+状态索引是 `(group labels, absolute grid index)`，或等价的按网格寻址的每组累加器数组。[现有 planner](../../src/query/src/promql/planner.rs) 也把 timestamp 加入普通聚合的分组键。
+
+`Aggregate` 在物理树上有三种执行阶段：
+
+| 阶段 | 输入 | 输出 |
 | --- | --- | --- |
-| 窗口函数 + 逐点函数链 | 原生已求值序列 | `Series`，`TimeAxis::Grid` |
-| 局部聚合 | 局部聚合状态 | 列布局固定的批次 |
-| 外围物理节点 | 常规结果行 | Arrow `RecordBatch` |
+| Complete | 本执行范围内完整的分组贡献 | 完整的 native evaluated 值 |
+| Partial | 本分区的贡献 | 带求值时间的聚合 state |
+| Final | 已收齐相关贡献的 partial state | 完整的 native evaluated 值 |
 
-**列绑定由物理编译产生，不在运行期推断。** `FusedPlan::time_column`、`value_columns`、`label_columns` 在单元编译时即固定；运行期不做任何 schema 检查来决定布局。这正是消除原型中 `classify_output` 启发式的地方。
+Complete 和 Final 输出的结果可以继续进入 Map、Window、Binary 或另一层 Aggregate。Partial state 只能交给接受该状态类型的运算。
 
-# 查询推演
+复用既有 accumulator 的状态布局与数值语义。若与 DataFusion final aggregate 连接，必须精确匹配其 state schema；内部 native Final 可以复用 accumulator 的 merge/finalize 能力，将完整值构造成 evaluated 批次。
 
-## `abs(x)`
+### 5.2 完整性与分区
 
-没有窗口函数，只有逐点函数链。第一期**不融合**：融合的收益来自窗口求值，而 `abs(x)` 没有窗口。它由既有的 selector 加 projection 执行。
+`PerSeries` 只保证单条 series 完整，不保证一个聚合组完整。编译器必须证明每个 `(group, time)` 的全部贡献位于当前执行范围，才选择 Complete 或执行 Final。
 
-仍然值得一提，因为它确定了一条边界：仅凭逐点函数不构成融合的理由。
+例如按 `Hash(job, host)` 分区时，`sum by(job)` 的一个组仍可能跨分区。分区键与聚合键的名字有交集不是完整性证明。
 
-## `abs(rate(x[5m]))`
+没有更强的分组完成保证时，第一版在本分区 EOF 产出 partial state；完整输入范围上的聚合也可在 EOF finalize。需要交换时复用现有分布式执行边界，交换前后都保留已绑定的类型。
 
-```
-FusedUnit {
-  input:    Raw(scan x)
-  kernel:   Rate，window = { range: 5m, offset: 0 }
-  maps:     [Abs]
-  grid:     语句网格 (start, step, len)
-  output:   Series，TimeAxis::Grid
-}
-```
+`sum by(job)(rate(x[5m])) + 1` 必须先得到每个时间点的完整 sum，再做 native 标量广播。若两个分区各先加 1 再合并，常数会被重复计入。
 
-一个单元，单输入，无聚合。状态：求值器的窗口缓冲与 cursor，加上输出构建器。外围 projection 把产出的 `Series` 转成结果行。
+## 6. Native 连接与 DataFusion 出口
 
-## `sum by (job) (rate(x[5m]))`
+Fused 内部节点不必分别实现 DataFusion `ExecutionPlan`，也不在每条内部边上 pack/unpack frame。它们通过第 3 节的 native 批次直接连接。
 
-```
-FusedUnit {
-  input:       Raw(scan x)
-  kernel:      Rate，window = 5m
-  maps:        []
-  partial_agg: Sum { group_by: [job] }
-  output:      局部状态 (job, 累加器)
-}
-  → 既有 AggregateExec（final）
-```
+`FusedSeriesExec` 的外壳负责 DataFusion 输入、执行上下文、metrics 以及输出协议。出口适配器可以是外壳的已绑定配置，也可以是明确的适配节点：
 
-`job` 是否为分区键决定了要不要 shuffle，但两种情况下单元都只产出局部状态，由既有聚合收尾。
+| 消费方 | 交付方式 |
+| --- | --- |
+| 同一 Fused 内的 native 节点 | 原生数据及状态直接传递 |
+| 普通 Projection / Aggregate / 查询结果出口 | 显式转换为所需的普通行或 aggregate state schema |
+| 必须跨物理节点或传输边界的 native 数据 | 使用该边界明确支持的 carrier 与兼容性契约 |
 
-**第一期只实现"局部状态 + 既有 final 聚合"**，把交换完全交给 DataFusion。这样设计面最小。
+现有 [series_frame](../../src/common/query/src/series_frame.rs) 定义 raw frame 边界，不能当作 evaluated 分片协议已经存在的证据。第一期优先把可共处的计算放在同一 native 树，避免为了串联而创建 `Series → rows → Series` 往返。
 
-## `sum by (job) (rate(x[5m])) + 1`
+普通 `ProjectionExec` 不负责识别 typed series。字段、标签、时间列及 state 列的输出映射来自编译器；边界可验证 schema，但不按下一个 Float64 列猜测来源。
 
-```
-FusedUnit { kernel: Rate，partial_agg: Sum { group_by: [job] } }
-  → 既有 AggregateExec（final: job, sum）
-  → 既有 ProjectionExec（sum + 1）
-```
+输入或输出适配也是计划中可见、可计时、可计费的步骤。它是否物化数组由实际消费者要求决定，不能把 typed 批次本身宣传为所有运算都零拷贝。
 
-**`+ 1` 作用于最终结果行，是标量广播，而不是作用于局部状态。** 聚合的输出就是该 projection 的输入。
+## 7. 接入现有内存管理
 
-设计上的结论正是"在此切开"的意义：**单元完全不需要知道 `+ 1` 的存在。**
+### 7.1 使用哪一层框架
 
-## `sum_over_time(rate(x[5m])[1h:1m])`
+Fused 每次执行的运行态通过 `MemoryConsumer` / `MemoryReservation` 注册到传入的 `TaskContext.runtime_env().memory_pool`。继承现有查询配置和 Greedy/Fair 等策略，不另建 Fused 专属内存池或重复的限额开关。
 
-两个网格，必须分别声明：
+[查询 runtime](../../src/query/src/query_engine/runtime.rs) 在配置有界池时接入 [MetricsMemoryPool](../../src/query/src/query_engine/state.rs)，已有 usage、rejected 和 top-consumer 信息；未设限时继承原有无界行为。
 
-```
-内层 FusedUnit {
-  input:  Raw(scan x)
-  kernel: Rate，window = 5m
-  grid:   内层网格 = [start - 1h, end]，step = 1m
-  output: 内层网格上的 Series
-}
-  → 网格适配
-外层 FusedUnit {
-  input:  Evaluated(内层 Series)
-  kernel: SumOverTime，window = 1h
-  grid:   外层网格 = [start, end]，step = 语句 step
-  output: 外层网格上的 Series
-}
-```
+存储扫描继续使用现有 `QueryMemoryTracker`、`MemoryTrackedStream` 和 mito 内部 scan pool。它们与查询算子 pool 不是一个共享余额，不能宣称全链已经统一计费，也不能把同一 Fused 状态额外向多个框架重复申请。
 
-内层网格的计算由 `subquery_grid`（`src/promql/src/range_eval.rs:573`）给出。
+### 7.2 计费范围与责任
 
-内层结果通过 `push_series`（`src/promql/src/range_eval.rs:249`）进入外层单元，而它要求被推入序列的网格等于输入网格、字段长度匹配。**因此网格适配必须显式进行**，不存在原型那种运行期猜测的位置。
+每个执行实例建立有名称的 consumer，名称可定位 Fused 与 partition。内部 node 记录自己的保留量，用于诊断；同一份状态不因树的父子关系再向池重复申请。
 
-第一期不实现这条：它同时需要单元串联与网格适配。
+以下内存必须纳入实际保留量：
 
-## 第一期实现范围
+- 跨批保留的原始或已求值 Arrow 缓冲、当前块与尚未交付的输出。
+- 窗口样本、reset 索引、游标辅助结构和 builder 容量。
+- 标签、分组键、slot 表、accumulator、二元匹配及必要的大型临时缓冲。
 
-| 形状 | 第一期 | 理由 |
+`Vec` 按 capacity 而非 len 统计。清空逻辑长度但保留容量时不能释放对应额度。一个很小的 Arrow slice 可能保留整个底层分配；同一执行实例当前仍持有的批次和节点状态中，共享底层分配按局部共享关系统计，不能按视图或 chunk 数量虚增。释放后更新当前保留集合，不能用一个永不清理的历史地址集合来判断后续分配。
+
+沿用 DataFusion 的保留者责任：同步流经的批次不因每次传递重复收费；producer 交付后不继续对已移交对象收费，下游跨 poll 或跨批保留时承担 reservation。Fused 内部移交可保持已有额度，生命周期拆分使用现有 reservation 能力。
+
+这一约定不建立跨查询的全局 buffer 地址表，也不为每个批次引入新的额度 token。内存池统计运行态保留量，不等于进程所有 Arrow 分配的精确 heap 追踪。
+
+### 7.3 增长、拒绝与释放
+
+已知的分配或保留增长在发生前 `try_grow`。没有预留接口的 accumulator 按批及时核对 `size()`，连同外部分组表及索引容量调整 reservation；可预估的大增长先预留。
+
+内存不足沿既有资源不足错误返回，停止拉取输入并释放运行态，不绕过限额继续分配。第一期未实现 spill 的节点按不可 spill consumer 注册；不能因为底层可用 FairSpillPool 就宣称本节点具备 spill。
+
+正常结束、错误和取消均释放保留对象及 reservation。释放或移交对象后再 shrink/free，stream 被 drop 时由 RAII 收尾。已经交付的数组遵循下游所有权。
+
+[NativeInstantStream](../../src/promql/src/extension_plan/instant_manipulate/native_exec.rs) 已有注册、try_grow 与失败释放示范。RangeEvaluator、GridSeriesBuilder 及直接使用的 accumulator 仍需接入，不能认为复用它们就自动完成计费。batch 行数或 payload 上限是工作预算，不是 resident memory 限额。
+
+## 8. EXPLAIN、ANALYZE 与 metrics
+
+这些是第一期交付条件。debug 日志仅用于辅助诊断，不能作为判断 native 是否执行的唯一途径。
+
+### 8.1 计划展示
+
+普通 `EXPLAIN` 展示：
+
+- Fused 的物理输入、执行位置、partition 分布和出口模式。
+- 带 `node_id` 的内部树、节点运算和依赖。
+- Window 的输入/输出网格、range、offset、anchor，以及字段绑定。
+- 聚合阶段、分组时间维度和完整性依据；二元 matching 的关键规则。
+- 源 ordering、完成信号的来源，以及普通路径的具体降级理由。
+
+默认输出保持可读，`VERBOSE` 展开绑定细节。内部节点展示在 Fused 的描述中，不伪造为 `ExecutionPlan::children()` 中可独立执行的 child。
+
+纯 `EXPLAIN` 不执行或 poll 数据扫描。若实际 Fused 只在 datanode 构造，需要在远端 query/describe 通道补充只准备并返回计划描述的能力，复用与执行相同的编译器。现有 describe 返回逻辑计划，不能直接当作实际远端物理计划。
+
+前端预期计划和远端已准备计划明确标注，不能用前者声称已确认后者命中。若当前接线没有返回真实远端描述，应把这个缺口作为接线工作完成，不能以一条 debug 日志替代验收。
+
+### 8.2 节点指标与现有采集接口
+
+每个 `NativeNode` 的执行状态持有独立的 `NodeMetrics`。复用 DataFusion `ExecutionPlanMetricsSet` / `MetricBuilder`，并通过 Fused 的 `metrics()` 暴露查询局部指标。每个内部节点、输入适配和出口适配均能关联到计划中的 ID。两个同为 `rate` 的节点分别统计，便于比较它们的输入规模、窗口成本与内存行为。
+
+第一版使用带节点 ID 的查询局部指标名，例如 `native.n3.self_compute_time_ns`、`native.n3.output_values`。不能只把 ID 放在 metric label 中，因为现有 [MetricCollector](../../src/common/recordbatch/src/adapter.rs) 会先执行 `aggregate_by_name()`，同名指标的节点身份会丢失。
+
+`DisplayAs` 输出带相同 ID 的 native 树，TEXT/JSON 的现有 metrics 字段保存节点指标。JSON 的 `param` 包含树描述，metrics 字典用 ID 关联；现有 `children` 继续只表示真实物理 child。本轮不要求先扩展一个新的结构化诊断协议，也不让 common-recordbatch 反向依赖 promql。
+
+| 指标 | 口径 |
+| --- | --- |
+| input/output batches | native 数据块数量，结束片可单独统计 |
+| input samples | 实际摄入的原始或已求值时间位置数，字段值数量另计 |
+| evaluated grid points | 按 series × 时间计的求值位置数，包含无有效结果的位置 |
+| output values / completed series | 实际有效值数量及完成的 series 数 |
+| self_compute_time | 本节点同步计算、状态维护及本地输出构造时间 |
+| current/peak reserved bytes | 当前保留量与本次执行高水位 |
+| groups / state entries | 聚合或匹配状态规模，按适用节点提供 |
+
+`output_rows` 保持 Fused 对外物理输出的含义，不把内部 grid 点、字段值、frame 行与最终结果行混为一个计数。指标单位进入名称或展示说明。
+
+### 8.3 计时与聚合规则
+
+本节点 timer 不包住 child 的 poll 或递归求值。先取得输入，再计本节点的处理；返回 child 前停止计时。计时以批次或工作区间为粒度，不逐样本读取时钟。
+
+Fused 标准 `elapsed_compute` 只计一次整个执行区域自身的工作，包括内部节点和适配器。内部 `native.*.self_compute_time` 作为明细，不再次进入总时间相加。若展示 inclusive 时间，必须明确标注，不能与 self time 求和。
+
+这些 block timer 测量同步工作区间的经过时间，不直接宣称为进程 CPU 时间。并行 partition 的 compute 总量、查询 wall time、存储等待和远端时间分别展示；父子、远端阶段与本地等待不能重复累计。
+
+Fused peak 按执行分区报告，使用该分区同一时刻的区域保留量，不能相加各节点分别发生的 peak。各 partition 的 peak 也不能相加后标作整个 Fused 的同时峰值。峰值指标名称必须保留 partition 身份，例如 `native.p2.n3.peak_reserved_bytes`；Fused 分区高水位同样区分 partition。查询内存池原有指标继续沿用，节点诊断不再制造一份池额度。
+
+### 8.4 远端 ANALYZE
+
+复用现有链路：datanode 的实际 ExecutionPlan 指标经 `MetricCollector → RecordBatchMetrics → Flight metrics` 返回，`MergeScanExec` 保存 sub-stage metrics，前端 [DistAnalyzeExec](../../src/query/src/analyze.rs) 展示 TEXT/JSON。
+
+新增 native 树描述和带 ID 的指标必须经过同一条链路。保留 stage、远端节点、物理节点及查询局部 native ID 的上下文，不能把不同远端实例的 `n3` 混为同一个节点。
+
+默认可按既有方式汇总各 partition 的 count、累计 self time 和有明确时刻口径的 current 值，peak 始终保留 partition 身份。`VERBOSE` 展示分布等细节；其他逐 partition 明细的身份也必须在序列化和按名聚合后保留。指标数随计划与执行分区规模增长，不把 series 标签、primary key 或时间点作为全局 Prometheus label。
+
+## 9. 查询推演与第一期验收
+
+下表是内部树的表达式记法，`Input` 已绑定扫描，`Window` 省略的网格由编译器明确补齐。
+
+| 查询 | 必须能生成的 native 组合 |
+| --- | --- |
+| `abs(x)` | `Map(Abs, Instant(Input(x)))` |
+| `abs(rate(x[5m]))` | `Map(Abs, Window(Rate, Input(x)))` |
+| `sum by(job)(rate(x[5m]))` | `Aggregate(Sum, Window(Rate, Input(x)))` |
+| `sum by(job)(rate(x[5m])) + 1` | 完整聚合或 Final 的 native 输出继续进入 `Map(AddScalar(1), ...)` |
+| `sum_over_time(abs(rate(x[5m]))[1h:1m])` | `Window(SumOverTime, Map(Abs, Window(Rate, Input(x))))` |
+| `rate(a[5m]) + on(job, instance) rate(b[5m])` | 两个 Window 子树进入已绑定 matching 的 Binary，按分布决定是否交换 |
+
+子查询内网格由 [subquery_grid](../../src/promql/src/range_eval.rs) 根据对齐、窗口、offset 和 anchor 计算。外层 Window 绑定 `input_grid=inner` 和 `output_grid=outer`，直接消费内层结果；不先把内层结果重采样到外层网格。现有 [双网格测试](../../src/promql/src/range_eval/tests.rs) 已展示完整 Series 路径上的这种能力，分片连接仍需实现。
+
+第一批实现至少覆盖上述组合需要的 Instant、已有 Range kernel、已有 Map、标量广播、Sum 的 Complete/Partial/Final，以及已有 native binary 算术/matching 的接入。其余算子按明确的能力清单接入；某个暂缺 kernel 不得成为退回固定形状模型的理由。
+
+二元或全组算子可以先复用 [binary_vectors](../../src/promql/src/vector_match.rs) 等已有语义实现，并保留受限额管理的必要输入。不能把它接受完整输入集合的接口误写成现成的逐片算法。
+
+验收覆盖以下几组真实风险：
+
+1. **组合**：增加 map、在 map 后接窗口、在完整聚合后接运算、连接两个输入，只改变树和节点绑定，不增加完整形状识别代码。
+2. **批次**：同一数据按不同 chunk 划分，覆盖空洞、全空中间块、空末片及 reset 跨边界，结果和完成次数一致；长 series 在末块前已有可观察的窗口输出。
+3. **聚合与类型**：两个时间点不能合成一个值；跨分区的 `+1` 只在 Final 后执行；混合 histogram、stale、标签变化继续满足既有语义。
+4. **内存**：小限额实际拒绝；执行中取消和错误后 reservation 回落；共享切片不按视图数虚增；已释放或移交的状态不继续计费。
+5. **可观测性**：真实 server 的 EXPLAIN 显示绑定树，ANALYZE 的 TEXT/JSON 均有可关联的节点指标；远端计划和指标在前端可见；纯 EXPLAIN 不消费样本。
+6. **性能**：新实现重新做端到端与节点区域对照，保留不变控制项和有效性门控。旧 POC 的比例不直接作为本实现收益；同时报告开关 metrics 的开销。
+
+## 10. 实施顺序与复用清单
+
+| 工作 | 复用内容 | 必须新增或适配 |
 | --- | --- | --- |
-| `rate(x[5m])` + map 链 | 是 | 单个单元；既有求值器即可承载 |
-| `sum by (k) (rate(x[5m]))` | 是 | 增加 `PartialAggSpec`；交换留在外部 |
-| `sum by (k) (...) + 1` | 是，自然成立 | `+ 1` 在单元之外 |
-| `abs(x)` | 否 | 无窗口，收益不成立 |
-| 嵌套子查询 | 否 | 需单元串联与网格适配 |
-| 多输入 / 跨序列 | 否 | 需合并完成信号 |
+| 语义与编译 | 正在推进的 PromPlan 接线、现有 PromPlanner 语义 | 子图到已绑定 native 树、类型与分布检查、计划期降级 |
+| 原生输入 | RawSeriesChunk、来源绑定、typed raw merge、扫描配额 | 与实际物理输入能力对接，保留全局完成契约 |
+| 批量执行 | Range kernel、已拆出的 reset/ingest/batch 优化、map | 可组合状态树、Instant/Range 分片接口、builder drain |
+| 聚合与 matching | accumulator/state 语义、native binary kernels | 时间维度、Complete/Partial/Final、批次连接及受限状态 |
+| 输出 | Arrow、Series/GridRange、已有 raw frame | 已绑定出口适配，不在内部连接反复行列转换 |
+| 内存 | TaskContext pool、MemoryConsumer/Reservation、既有扫描框架 | 所有长期保留状态的容量和增长接入、取消释放 |
+| 计划与诊断 | DisplayAs、metrics、RecordBatchMetrics、Flight、DistAnalyzeExec | native ID 与树描述、节点指标、远端只准备的计划可见性 |
 
-# 备选方案
+先定编译树与批次接口，并一起定义内存和 metrics 的运行上下文。随后接入各类节点和出口，再完成实际 planner、远端展示与端到端验收。内存、EXPLAIN 和 ANALYZE 不作为功能上线后的补充项。
 
-## 保留原型的后置子树选择
+已独立拆出的 kernel 优化继续按各自范围评审。Fused、依赖其结构的输出优化和接线按本设计调整；固定 POC 不因单测通过或局部性能接近而成为合并依据。
 
-否决。机会仍将从物理树形状推导，节点仍是加宽的固定模板，输出列仍在运行期分类。
-
-## 只在逻辑层融合，由一个物理节点承担全部
-
-部分采纳：逻辑节点可以表达求值，但"一个**已准备**的扫描能否承载它"取决于只在物理规划之后才存在的 scanner 状态。因此无论节点长什么样，拒绝机制都必须位于物理规划之后。
-
-## 让融合节点带一个通用表达式解释器
-
-暂时否决。通用解释器会用运行期分派取代编译，而这与既定目标正好相反。kernel 保持在编译期选定。
-
-# 开放问题
-
-- `FusedSeriesExec` 应持有 `Arc<FusedPlan>`，还是让编译把计划展开为节点自身的字段？持有计划便于测试与 `EXPLAIN`；展开则少一层间接。
-- 局部聚合是否应进入第一期？当 group key 就是分区键时收益明显；否则只是把计算前移，收益需要实测。
-- 一旦输入需要合并，`RawSeriesChunk::is_last` 必须被重新计算（`src/datatypes/src/series/raw.rs:107-108`）。单输入单元不受影响，但在引入多输入单元之前，模型需要为这次重算指定一个确定的位置。
