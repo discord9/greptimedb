@@ -1280,7 +1280,42 @@ fn gen_bench_dataset(trace_count: usize) -> Vec<BenchSpan> {
 /// Spans appended by one scenario tick: the traces chosen for this tick append a
 /// single normal span, and every fifth of those appends an ERROR span so the
 /// reason of an already sampled trace has to be recomputed.
+/// Traces that keep arriving while the measurement runs: `rate` new traces per
+/// tick, each still collecting spans for two more ticks and decidable only once
+/// it is 30 seconds old. This is the ordinary shape of a trace pipeline, where
+/// the overwhelming majority of traces have finished and only a small recent
+/// band is still changing, so the wait threshold alone keeps feeding the delta.
+fn gen_steady_appends(rate: usize, tick: usize) -> Vec<BenchSpan> {
+    let mut spans = Vec::new();
+    for age in 0..3usize {
+        let Some(born) = tick.checked_sub(age) else {
+            continue;
+        };
+        let base = (born * 5_000) as i64;
+        for index in 0..rate {
+            // Every tenth trace is slow: its last span runs 1.5s past the first.
+            let (start_ms, end_ms) = match age {
+                0 => (base, base),
+                1 => (base + 100, base + 100),
+                _ if index % 10 == 0 => (base + 200, base + 1_700),
+                _ => (base + 200, base + 200),
+            };
+            spans.push(BenchSpan {
+                trace: format!("steady_trace_{born:03}_{index:04}"),
+                span: format!("s{age}"),
+                start_ms,
+                end_ms,
+                status: "STATUS_CODE_OK",
+            });
+        }
+    }
+    spans
+}
+
 fn gen_tick_appends(scenario: &str, trace_count: usize, tick: usize) -> Vec<BenchSpan> {
+    if scenario == "steady" {
+        return gen_steady_appends(trace_count / 100, tick);
+    }
     let selector: usize = match scenario {
         // One percent of the traces change per tick.
         "sparse" => 100,
@@ -1364,13 +1399,16 @@ affected_trace_ids,q1_ms,q2_ms,q3_ms,total_ms,sink_submitted_rows,sink_visible_r
         .filter(|name| !name.is_empty())
         .collect();
 
-    for scenario in ["static", "sparse", "active"]
+    for scenario in ["static", "sparse", "steady", "active"]
         .into_iter()
         .filter(|name| only.iter().any(|wanted| wanted == name))
     {
         let ticks: usize = match std::env::var("POC_TICKS").ok().and_then(|v| v.parse().ok()) {
             Some(explicit) => explicit,
             None if scenario == "static" => 12,
+            // The 30 second wait needs six ticks before the first arrival turns
+            // decidable, so the steady scenario needs a couple of rounds more.
+            None if scenario == "steady" => 9,
             None => 6,
         };
 
@@ -1406,6 +1444,7 @@ affected_trace_ids,q1_ms,q2_ms,q3_ms,total_ms,sink_submitted_rows,sink_visible_r
             }
         }
         let mut state = PocState::default();
+        let mut wait_rounds = 0;
         for tick in 0..=ticks {
             let now = tick_time(tick);
             let appends = gen_tick_appends(scenario, trace_count, tick);
@@ -1414,6 +1453,9 @@ affected_trace_ids,q1_ms,q2_ms,q3_ms,total_ms,sink_submitted_rows,sink_visible_r
             }
             run_baseline(&db, now).await;
             let outcome = run_round(&db, &mut state, now).await;
+            if !outcome.time_trace_ids.is_empty() {
+                wait_rounds += 1;
+            }
 
             if scenario == "static" && tick > 0 {
                 assert!(
@@ -1447,6 +1489,14 @@ affected_trace_ids,q1_ms,q2_ms,q3_ms,total_ms,sink_submitted_rows,sink_visible_r
                     visible.to_string(),
                 ]
                 .join(","),
+            );
+        }
+        if scenario == "steady" {
+            // The point of this scenario: the wait threshold on its own must put
+            // traces into the delta, with no new rows behind them.
+            assert!(
+                wait_rounds > 0,
+                "the 30 second wait must feed the delta on its own in the steady scenario"
             );
         }
         let poc_rows = sink_rows(&db, POC_SINK).await;
