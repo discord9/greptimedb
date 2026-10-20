@@ -34,6 +34,7 @@ use datatypes::series::SeriesOrdering;
 use datatypes::series::raw::RawSeriesChunk;
 use datatypes::series::samples::SeriesSchema;
 use futures::Stream;
+use futures::future::BoxFuture;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -526,6 +527,12 @@ pub trait RawSeriesStream: Stream<Item = Result<RawSeriesChunk, BoxedError>> + S
 pub type SendableRawSeriesStream = Pin<Box<dyn RawSeriesStream>>;
 
 /// Stable identity metadata for one ordinal in a prepared series source.
+///
+/// This currently carries identity only. An executor that wants to decide task counts from
+/// `series × estimated points` needs a per-series cost or size estimate in addition to identity,
+/// and that estimate's design is still undecided: nothing here exposes one, and it must not be
+/// inferred from identity or guessed from an unloaded payload. Until such an estimate exists,
+/// callers can only count series and choose splits from that count.
 #[derive(Clone, Debug)]
 pub struct SeriesInfo {
     /// Complete encoded primary key, not a TSID or hash alone.
@@ -663,13 +670,26 @@ pub trait RegionScanner: Debug + DisplayAs + Send {
     /// without replay. Choose exactly one entrypoint per partition per execution: this prepared
     /// source, [`Self::scan_series_partition`], or [`Self::scan_partition`]. In particular, do
     /// not call the legacy raw-scan default merely because this returns `None`.
+    ///
+    /// This is the optional second route described by the series-api RFC: the streaming
+    /// [`Self::scan_series_partition`] hands out series as it discovers them and never needs a
+    /// total, while a prepared source enumerates first and then splits by ordinal range. Only a
+    /// strategy that needs a global view to decide the split — for example balancing each partition
+    /// by `series × estimated points` — requires this shape.
+    ///
+    /// Preparation is asynchronous because enumeration is real I/O; it must still not load sample
+    /// payloads. The returned future is owned (`'static`) so a caller can release its scanner lock
+    /// before awaiting it.
+    ///
+    /// The default returns `None`. No production scanner overrides this yet; the only non-default
+    /// implementation today is a test double.
     fn prepare_series_partition(
         &self,
         _ctx: &QueryScanContext,
         _metrics_set: &ExecutionPlanMetricsSet,
         _partition: usize,
-    ) -> Result<Option<Arc<dyn PreparedSeriesSource>>, BoxedError> {
-        Ok(None)
+    ) -> BoxFuture<'static, Result<Option<Arc<dyn PreparedSeriesSource>>, BoxedError>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Check if there is any predicate exclude region partition exprs that may be executed in this scanner.
@@ -980,6 +1000,7 @@ mod tests {
         assert!(
             scanner
                 .prepare_series_partition(&ctx, &metrics, 0)
+                .await
                 .unwrap()
                 .is_none()
         );
