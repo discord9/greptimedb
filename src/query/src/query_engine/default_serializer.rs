@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::Schema;
 use common_error::ext::BoxedError;
 use common_function::function::FunctionContext;
 use common_function::function_registry::FUNCTION_REGISTRY;
@@ -26,7 +27,11 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
 use datafusion::execution::{FunctionRegistry, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion_common::DFSchema;
 use datafusion_expr::UserDefinedLogicalNode;
+use datafusion_expr::logical_plan::{
+    EmptyRelation, LogicalTableSource, TableScanBuilder, UNNAMED_TABLE,
+};
 use greptime_proto::substrait_extension::MergeScan as PbMergeScan;
 use promql::functions::{
     AbsentOverTime, AvgOverTime, Changes, CountOverTime, Delta, Deriv, DoubleExponentialSmoothing,
@@ -50,6 +55,37 @@ use substrait::extension_serializer::ExtensionSerializer;
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 
 use crate::dist_plan::MergeScanLogicalPlan;
+use crate::scan_sequence_binding::{RegionSeqs, ScanSequenceBinding};
+
+/// Substrait extension payload of one [`ScanSequenceBinding`].
+///
+/// The payload holds the node's own state only: the wrapped plan travels as the
+/// input of the `ExtensionSingleRel` that carries this node, and the Substrait
+/// consumer re-attaches the decoded child with `with_exprs_and_inputs`.
+///
+/// The message lives here, next to the only code that reads and writes it,
+/// because it is exchanged nowhere else: unlike the region-server scan request
+/// it does not belong to the wire protocol of another crate.
+#[derive(Clone, PartialEq, prost::Message)]
+struct PbScanSequenceBinding {
+    /// Id of the scan position, see [`ScanSequenceBinding::scan_id`].
+    #[prost(uint32, tag = "1")]
+    scan_id: u32,
+    /// Per-region sequence lower bounds, ordered by region id.
+    #[prost(message, repeated, tag = "2")]
+    after_seqs: Vec<PbRegionSeq>,
+}
+
+/// Per-region sequence lower bound of one [`ScanSequenceBinding`].
+#[derive(Clone, PartialEq, prost::Message)]
+struct PbRegionSeq {
+    /// Region the bound belongs to.
+    #[prost(uint64, tag = "1")]
+    region_id: u64,
+    /// Sequence the scan of that region must read after.
+    #[prost(uint64, tag = "2")]
+    seq: u64,
+}
 
 /// Extended [`substrait::extension_serializer::ExtensionSerializer`] but supports [`MergeScanLogicalPlan`] serialization.
 #[derive(Debug)]
@@ -75,6 +111,8 @@ impl SerializerRegistry for DefaultSerializer {
                 input,
             }
             .encode_to_vec())
+        } else if node.name() == ScanSequenceBinding::name() {
+            Self::serialize_scan_sequence_binding(node)
         } else {
             ExtensionSerializer.serialize_logical_plan(node)
         }
@@ -91,9 +129,73 @@ impl SerializerRegistry for DefaultSerializer {
             Err(DataFusionError::Substrait(format!(
                 "Unsupported plan node: {name}"
             )))
+        } else if name == ScanSequenceBinding::name() {
+            Self::deserialize_scan_sequence_binding(bytes)
         } else {
             ExtensionSerializer.deserialize_logical_plan(name, bytes)
         }
+    }
+}
+
+impl DefaultSerializer {
+    /// Encodes the node-local payload of a [`ScanSequenceBinding`].
+    ///
+    /// The wrapped plan is left out on purpose: the Substrait producer encodes
+    /// it as the input of the `ExtensionSingleRel` that carries this node, so
+    /// this payload is exactly the part the node itself owns.
+    fn serialize_scan_sequence_binding(node: &dyn UserDefinedLogicalNode) -> Result<Vec<u8>> {
+        let binding = node
+            .as_any()
+            .downcast_ref::<ScanSequenceBinding>()
+            .expect("Failed to downcast to ScanSequenceBinding");
+
+        Ok(PbScanSequenceBinding {
+            scan_id: binding.scan_id(),
+            after_seqs: binding
+                .after_seqs()
+                .iter()
+                .map(|(&region_id, &seq)| PbRegionSeq { region_id, seq })
+                .collect(),
+        }
+        .encode_to_vec())
+    }
+
+    /// Rebuilds a [`ScanSequenceBinding`] from its node-local payload.
+    ///
+    /// The node comes back on a placeholder input and without its output schema:
+    /// the Substrait consumer of the surrounding `ExtensionSingleRel` re-attaches
+    /// the decoded child with `with_exprs_and_inputs`, which also restores the
+    /// schema, because a binding's schema is its child's schema. This is the
+    /// mechanism every single-input [`UserDefinedLogicalNode`] relies on; it does
+    /// not work for [`MergeScanLogicalPlan`], whose `inputs()` returns nothing.
+    fn deserialize_scan_sequence_binding(bytes: &[u8]) -> Result<Arc<dyn UserDefinedLogicalNode>> {
+        let pb = PbScanSequenceBinding::decode(bytes).map_err(|e| {
+            DataFusionError::Substrait(format!(
+                "Failed to decode {}: {e}",
+                ScanSequenceBinding::name()
+            ))
+        })?;
+        let after_seqs = pb
+            .after_seqs
+            .into_iter()
+            .map(|PbRegionSeq { region_id, seq }| (region_id, seq))
+            .collect::<RegionSeqs>();
+
+        // A binding only wraps a `TableScan`, so the placeholder node is built
+        // over an empty placeholder scan and then handed the placeholder input
+        // the consumer replaces with the decoded child.
+        let placeholder_scan = TableScanBuilder::new(
+            UNNAMED_TABLE,
+            Arc::new(LogicalTableSource::new(Arc::new(Schema::empty()))),
+        )
+        .build()?;
+        let placeholder_input = LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::empty()),
+        });
+
+        ScanSequenceBinding::new(pb.scan_id, after_seqs, placeholder_scan)
+            .with_exprs_and_inputs(vec![], vec![placeholder_input])
     }
 }
 
