@@ -150,6 +150,184 @@ pub(crate) fn hybrid_binary_admitted(
 }
 
 impl PromPlanner {
+    async fn prepare_one_scan(
+        &mut self,
+        matchers: Matchers,
+        selector_count: usize,
+        prom_expr: &PromExpr,
+        logical_scan_id: &mut Option<u32>,
+        logical_ids_differ: &mut bool,
+    ) -> Result<Option<PreparedInput>> {
+        let (Some(metric), Some(time)) = (
+            self.ctx.table_name.clone(),
+            self.ctx.time_index_column.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let tags = self.ctx.tag_columns.clone();
+        let fields = self.ctx.field_columns.clone();
+        // A `__field__` matcher narrows the field set in a projection the existing planner
+        // builds, and the raw series scan below this node has no equivalent: it reports every
+        // field the scan carries. Binding all of them would fold fields the query excluded, so
+        // the route is declined until the field selector is reused here.
+        if self.ctx.field_column_matcher.is_some() || fields.is_empty() {
+            return Ok(None);
+        }
+        // On a delta-temporality table a series' samples are increments, which the existing
+        // planner sums over the window for `increase` and divides by the range for `rate`
+        // ([`PromPlanner::select_delta_range_math`]), per series because the tag can differ
+        // between them. A compiled tree computes both for a cumulative series, so any
+        // `rate`/`increase` over such a table keeps the existing plan; a bare selector still
+        // folds. The guard reads the whole statement, not this selector's subtree: one such
+        // call anywhere admits a tree the existing plan would not build.
+        if tags
+            .iter()
+            .any(|tag| tag == OTLP_AGGREGATION_TEMPORALITY_LABEL)
+            && calls_rate_or_increase(prom_expr)
+        {
+            return Ok(None);
+        }
+        // The selector's own table scan, built by the same method the existing path uses:
+        // the physical planner turns it into the region scan the node reads, and building a
+        // scan here instead would let the two paths disagree about the columns they read.
+        let table_ref = self.table_ref()?;
+        let mut input = self.create_table_scan_plan(table_ref).await?;
+        let logical_scan = metric_scan_and_table_id(&input);
+        let has_verified_metric_rewrite = logical_scan.is_some();
+        // A metric logical table's id is part of the identity its own scan reads: two
+        // logical tables served through one physical table prepare two scans of that one
+        // table, and the ids are what says they are two metrics. A selector whose scan is not
+        // a logical rewrite contributes no id, and a missing id on either side is not a
+        // difference.
+        if let Some((_, _, table_id)) = &logical_scan {
+            match *logical_scan_id {
+                None => *logical_scan_id = Some(*table_id),
+                Some(first) if first != *table_id => *logical_ids_differ = true,
+                Some(_) => {}
+            }
+        }
+        let scan = match logical_scan {
+            Some((mut scan, predicate, _)) => {
+                // Preserve logical field order and the table restriction on the direct
+                // physical scan.
+                let source_schema = scan.source.schema();
+                let Some(mut ordered_projection) = fields
+                    .iter()
+                    .map(|field| source_schema.index_of(field).ok())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Ok(None);
+                };
+                let original_projection = scan.projection.as_ref();
+                let selected_indices = original_projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..source_schema.fields().len()).collect());
+                for index in selected_indices {
+                    let is_field = fields
+                        .iter()
+                        .any(|field| field == source_schema.field(index).name());
+                    if !is_field && !ordered_projection.contains(&index) {
+                        ordered_projection.push(index);
+                    }
+                }
+                scan.filters.push(predicate);
+                scan = TableScanBuilder::from(scan)
+                    .with_projection(Some(ordered_projection))
+                    .build()
+                    .context(DataFusionPlanningSnafu)?;
+                input = LogicalPlan::TableScan(scan.clone());
+                scan
+            }
+            None => match &input {
+                LogicalPlan::TableScan(scan) => scan.clone(),
+                _ => return Ok(None),
+            },
+        };
+        let table = self.table_from_source(&scan.source)?;
+        let table_meta = &table.table_info().meta;
+        // An engine without a raw-series scanner has no frame to give this node, and by the
+        // time the physical planner asks, the logical plan is already this node: the refusal
+        // there is a planning error, not a fallback. So the engine is checked here, where the
+        // existing plan is still the answer. A file-engine table is the concrete case: its
+        // scanner is a `SinglePartitionScanner`, which leaves `raw_series_schema` at the
+        // default `None`. A metric-engine selector is admitted through its verified logical
+        // rewrite, with no separate multi-selector exclusion: each input is a metric logical
+        // table served through that rewrite, and the ids those rewrites carry are what tells
+        // two different ones apart below. Two occurrences of one logical table stay two
+        // scans of the one physical table, answered where that table's region runs them.
+        if !supports_native_raw_series(&table_meta.engine)
+            || (table_meta.engine == METRIC_ENGINE_NAME && !has_verified_metric_rewrite)
+        {
+            return Ok(None);
+        }
+        // The region's raw-series preflight refuses these, and the physical layer turns that
+        // refusal into an error, so decline this route here instead.
+        let time_index_type = table_meta
+            .schema
+            .timestamp_column()
+            .map(|column| &column.data_type);
+        if time_index_type
+            != Some(&datatypes::prelude::ConcreteDataType::timestamp_millisecond_datatype())
+            || table_meta
+                .options
+                .extra_options
+                .get(store_api::mito_engine_options::APPEND_MODE_KEY)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            return Ok(None);
+        }
+        // Preserve the existing single-selector guard that its partition keys are tags.
+        if selector_count == 1
+            && !table_meta
+                .partition_column_names()
+                .all(|column| tags.iter().any(|tag| tag == column))
+        {
+            return Ok(None);
+        }
+        // A multi-scan plan has no placement over a table split into several regions: the
+        // dist analyzer refuses a multi-child node there, so such a query keeps the
+        // existing plan instead of failing.
+        if selector_count > 1 && table_meta.partition_column_names().next().is_some() {
+            return Ok(None);
+        }
+        // The region's columnar series-index samples, one of the readers this scan may be
+        // served by, store `Float64` fields only, and the logical plan cannot tell which
+        // reader arrives. So every field has to be `Float64`: an integer, a `Float32`, a
+        // decimal, a string or a native histogram field keeps the existing plan, which the
+        // physical layer still serves.
+        if !fields.iter().all(|field| {
+            Self::field_column_type(input.schema(), field) == Some(&ArrowDataType::Float64)
+        }) {
+            return Ok(None);
+        }
+        let series_schema = Arc::new(SeriesSchema {
+            fields: fields
+                .iter()
+                .map(|name| FieldSpec {
+                    name: Arc::from(name.as_str()),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            eval_grid: None,
+        });
+        // The row filter is the selector's own: the time range is added after compiling,
+        // because only the compiler knows whether this occurrence reads a window or one
+        // instant.
+        let mut filters = Self::matchers_to_expr(matchers, input.schema())?;
+        if let LogicalPlan::TableScan(table_scan) = &mut input {
+            table_scan.filters.append(&mut filters);
+        } else {
+            return Ok(None);
+        }
+        Ok(Some((
+            input,
+            series_schema,
+            Some(Arc::from(metric)),
+            time,
+            tags,
+        )))
+    }
+
     pub(super) async fn try_plan_native_operand(
         &mut self,
         expr: &PromExpr,
@@ -311,168 +489,17 @@ impl PromPlanner {
                 if selectors.len() == 1 {
                     single_input_context = Some(self.ctx.clone());
                 }
-                let (Some(metric), Some(time)) = (
-                    self.ctx.table_name.clone(),
-                    self.ctx.time_index_column.clone(),
-                ) else {
-                    return Ok(None);
-                };
-                let tags = self.ctx.tag_columns.clone();
-                let fields = self.ctx.field_columns.clone();
-                // A `__field__` matcher narrows the field set in a projection the existing planner
-                // builds, and the raw series scan below this node has no equivalent: it reports every
-                // field the scan carries. Binding all of them would fold fields the query excluded, so
-                // the route is declined until the field selector is reused here.
-                if self.ctx.field_column_matcher.is_some() || fields.is_empty() {
-                    return Ok(None);
-                }
-                // On a delta-temporality table a series' samples are increments, which the existing
-                // planner sums over the window for `increase` and divides by the range for `rate`
-                // ([`PromPlanner::select_delta_range_math`]), per series because the tag can differ
-                // between them. A compiled tree computes both for a cumulative series, so any
-                // `rate`/`increase` over such a table keeps the existing plan; a bare selector still
-                // folds. The guard reads the whole statement, not this selector's subtree: one such
-                // call anywhere admits a tree the existing plan would not build.
-                if tags
-                    .iter()
-                    .any(|tag| tag == OTLP_AGGREGATION_TEMPORALITY_LABEL)
-                    && calls_rate_or_increase(prom_expr)
-                {
-                    return Ok(None);
-                }
-                // The selector's own table scan, built by the same method the existing path uses:
-                // the physical planner turns it into the region scan the node reads, and building a
-                // scan here instead would let the two paths disagree about the columns they read.
-                let table_ref = self.table_ref()?;
-                let mut input = self.create_table_scan_plan(table_ref).await?;
-                let logical_scan = metric_scan_and_table_id(&input);
-                let has_verified_metric_rewrite = logical_scan.is_some();
-                // A metric logical table's id is part of the identity its own scan reads: two
-                // logical tables served through one physical table prepare two scans of that one
-                // table, and the ids are what says they are two metrics. A selector whose scan is not
-                // a logical rewrite contributes no id, and a missing id on either side is not a
-                // difference.
-                if let Some((_, _, table_id)) = &logical_scan {
-                    match logical_scan_id {
-                        None => logical_scan_id = Some(*table_id),
-                        Some(first) if first != *table_id => logical_ids_differ = true,
-                        Some(_) => {}
-                    }
-                }
-                let scan = match logical_scan {
-                    Some((mut scan, predicate, _)) => {
-                        // Preserve logical field order and the table restriction on the direct
-                        // physical scan.
-                        let source_schema = scan.source.schema();
-                        let Some(mut ordered_projection) = fields
-                            .iter()
-                            .map(|field| source_schema.index_of(field).ok())
-                            .collect::<Option<Vec<_>>>()
-                        else {
-                            return Ok(None);
-                        };
-                        let original_projection = scan.projection.as_ref();
-                        let selected_indices = original_projection
-                            .cloned()
-                            .unwrap_or_else(|| (0..source_schema.fields().len()).collect());
-                        for index in selected_indices {
-                            let is_field = fields
-                                .iter()
-                                .any(|field| field == source_schema.field(index).name());
-                            if !is_field && !ordered_projection.contains(&index) {
-                                ordered_projection.push(index);
-                            }
-                        }
-                        scan.filters.push(predicate);
-                        scan = TableScanBuilder::from(scan)
-                            .with_projection(Some(ordered_projection))
-                            .build()
-                            .context(DataFusionPlanningSnafu)?;
-                        input = LogicalPlan::TableScan(scan.clone());
-                        scan
-                    }
-                    None => match &input {
-                        LogicalPlan::TableScan(scan) => scan.clone(),
-                        _ => return Ok(None),
-                    },
-                };
-                let table = self.table_from_source(&scan.source)?;
-                let table_meta = &table.table_info().meta;
-                // An engine without a raw-series scanner has no frame to give this node, and by the
-                // time the physical planner asks, the logical plan is already this node: the refusal
-                // there is a planning error, not a fallback. So the engine is checked here, where the
-                // existing plan is still the answer. A file-engine table is the concrete case: its
-                // scanner is a `SinglePartitionScanner`, which leaves `raw_series_schema` at the
-                // default `None`. A metric-engine selector is admitted through its verified logical
-                // rewrite, with no separate multi-selector exclusion: each input is a metric logical
-                // table served through that rewrite, and the ids those rewrites carry are what tells
-                // two different ones apart below. Two occurrences of one logical table stay two
-                // scans of the one physical table, answered where that table's region runs them.
-                if !supports_native_raw_series(&table_meta.engine)
-                    || (table_meta.engine == METRIC_ENGINE_NAME && !has_verified_metric_rewrite)
-                {
-                    return Ok(None);
-                }
-                // The region's raw-series preflight refuses these, and the physical layer turns that
-                // refusal into an error, so decline this route here instead.
-                let time_index_type = table_meta
-                    .schema
-                    .timestamp_column()
-                    .map(|column| &column.data_type);
-                if time_index_type
-                    != Some(&datatypes::prelude::ConcreteDataType::timestamp_millisecond_datatype())
-                    || table_meta
-                        .options
-                        .extra_options
-                        .get(store_api::mito_engine_options::APPEND_MODE_KEY)
-                        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-                {
-                    return Ok(None);
-                }
-                // Preserve the existing single-selector guard that its partition keys are tags.
-                if selectors.len() == 1
-                    && !table_meta
-                        .partition_column_names()
-                        .all(|column| tags.iter().any(|tag| tag == column))
-                {
-                    return Ok(None);
-                }
-                // A multi-scan plan has no placement over a table split into several regions: the
-                // dist analyzer refuses a multi-child node there, so such a query keeps the
-                // existing plan instead of failing.
-                if selectors.len() > 1 && table_meta.partition_column_names().next().is_some() {
-                    return Ok(None);
-                }
-                // The region's columnar series-index samples, one of the readers this scan may be
-                // served by, store `Float64` fields only, and the logical plan cannot tell which
-                // reader arrives. So every field has to be `Float64`: an integer, a `Float32`, a
-                // decimal, a string or a native histogram field keeps the existing plan, which the
-                // physical layer still serves.
-                if !fields.iter().all(|field| {
-                    Self::field_column_type(input.schema(), field) == Some(&ArrowDataType::Float64)
-                }) {
-                    return Ok(None);
-                }
-                let series_schema = Arc::new(SeriesSchema {
-                    fields: fields
-                        .iter()
-                        .map(|name| FieldSpec {
-                            name: Arc::from(name.as_str()),
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                    eval_grid: None,
-                });
-                // The row filter is the selector's own: the time range is added after compiling,
-                // because only the compiler knows whether this occurrence reads a window or one
-                // instant.
-                let mut filters = Self::matchers_to_expr(matchers, input.schema())?;
-                if let LogicalPlan::TableScan(table_scan) = &mut input {
-                    table_scan.filters.append(&mut filters);
-                } else {
-                    return Ok(None);
-                }
-                prepared.push((input, series_schema, Some(Arc::from(metric)), time, tags));
+                let one = self
+                    .prepare_one_scan(
+                        matchers,
+                        selectors.len(),
+                        prom_expr,
+                        &mut logical_scan_id,
+                        &mut logical_ids_differ,
+                    )
+                    .await?;
+                let Some(one) = one else { return Ok(None) };
+                prepared.push(one);
             }
             Ok(Some((prepared, single_input_context, logical_ids_differ)))
         }
