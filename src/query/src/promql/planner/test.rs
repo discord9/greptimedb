@@ -44,7 +44,7 @@ use datatypes::schema::{ColumnSchema, Schema};
 use datatypes::series::SeriesOrdering;
 use promql::extension_plan::{AggregateFinalize, FusedSeries, HistogramFold, RawSeriesSource};
 use promql::native::plan::NativeExpr;
-use promql_parser::label::Labels;
+use promql_parser::label::{Labels, METRIC_NAME};
 use promql_parser::parser;
 use session::context::QueryContext;
 use store_api::metric_engine_consts::{
@@ -1874,6 +1874,50 @@ async fn metric_discovery_provider(names: &[&str]) -> DfTableSourceProvider {
         .map(|name| ((DEFAULT_SCHEMA_NAME.to_string(), (*name).to_string()), 1, 1))
         .collect::<Vec<_>>();
     build_test_table_provider_with_tsid_tag_fields(&specs).await
+}
+
+#[tokio::test]
+async fn native_metric_discovery_raw_selector_output_declares_metric_name() {
+    let provider = metric_discovery_provider(&["alpha_total", "beta_total"]).await;
+    let plan = build_native_fused_plan_with_provider("{tag_0=\"x\"}", true, provider).await;
+    let fused = find_fused_series(&plan).expect("selector should use fused route");
+    assert!(
+        fused
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| field.name() == METRIC_NAME),
+        "raw selector output schema must declare __name__: {}",
+        fused.schema()
+    );
+    assert_eq!(fused.children().len(), 1, "{plan:?}");
+    let LogicalPlan::Union(union) = &fused.children()[0] else {
+        panic!("expected Union child, got {:#?}", fused.children()[0]);
+    };
+    assert_eq!(union.inputs.len(), 2, "{plan:?}");
+    let names = union
+        .inputs
+        .iter()
+        .map(|input| {
+            let LogicalPlan::Extension(extension) = input.as_ref() else {
+                panic!("expected RawSeriesSource, got {input:?}");
+            };
+            extension
+                .node
+                .as_any()
+                .downcast_ref::<RawSeriesSource>()
+                .expect("RawSeriesSource")
+                .metric_name()
+                .to_string()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        names,
+        ["alpha_total", "beta_total"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
 }
 
 #[tokio::test]

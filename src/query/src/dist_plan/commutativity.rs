@@ -1041,6 +1041,13 @@ mod tests {
     /// plans: the aggregate is split out of it, and the producer below the merge runs the per-series
     /// prefix.
     fn aggregate_finalize_plan(input: LogicalPlan) -> LogicalPlan {
+        aggregate_finalize_plan_with_metric(input, Some("some_metric"))
+    }
+
+    fn aggregate_finalize_plan_with_metric(
+        input: LogicalPlan,
+        metric_name: Option<&str>,
+    ) -> LogicalPlan {
         let stmt = promql_parser::parser::EvalStmt {
             expr: parser::parse("sum(some_metric)").unwrap(),
             ..native_statement()
@@ -1057,7 +1064,7 @@ mod tests {
         .unwrap();
         let binding = FusedSeriesBinding {
             grid: statement_grid(&stmt).unwrap(),
-            metric_name: Some(Arc::from("some_metric")),
+            metric_name: metric_name.map(Arc::from),
             time_index: "ts".to_string(),
             tags: Vec::new(),
         };
@@ -1132,7 +1139,88 @@ mod tests {
     /// still drawn at the producer, which is the same place the existing route draws it.
     #[test]
     fn a_split_aggregate_merges_above_the_region_only_in_process() {
-        let plan = aggregate_finalize_plan(table_scan_plan());
+        let scan = table_scan_plan();
+        let plan = aggregate_finalize_plan(scan.clone());
+        assert!(super::super::analyzer::is_in_process_plan(&plan));
+
+        let raw_source = |input: LogicalPlan, metric: &str| {
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(
+                    RawSeriesSource::try_new(
+                        Arc::from(metric),
+                        vec![],
+                        vec!["v0".to_string()],
+                        input,
+                    )
+                    .unwrap(),
+                ),
+            })
+        };
+        let union = |inputs: Vec<LogicalPlan>| {
+            LogicalPlan::Union(
+                datafusion_expr::logical_plan::Union::try_new_with_loose_types(
+                    inputs.into_iter().map(Arc::new).collect(),
+                )
+                .unwrap(),
+            )
+        };
+        let discovered = aggregate_finalize_plan_with_metric(
+            union(vec![
+                raw_source(scan.clone(), "alpha_total"),
+                raw_source(scan.clone(), "beta_total"),
+            ]),
+            None,
+        );
+        assert!(super::super::analyzer::is_in_process_plan(&discovered));
+        assert!(!super::super::analyzer::is_in_process_plan(
+            &aggregate_finalize_plan(union(vec![
+                raw_source(scan.clone(), "alpha_total"),
+                raw_source(
+                    LogicalPlanBuilder::from(scan.clone())
+                        .filter(datafusion_expr::col("k0").eq(datafusion_expr::lit("x")))
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                    "beta_total",
+                ),
+            ],))
+        ));
+        assert!(!super::super::analyzer::is_in_process_plan(
+            &aggregate_finalize_plan(union(vec![
+                raw_source(scan.clone(), "alpha_total"),
+                raw_source(scan.clone(), ""),
+            ],))
+        ));
+        assert!(!super::super::analyzer::is_in_process_plan(
+            &aggregate_finalize_plan(union(vec![
+                raw_source(
+                    LogicalPlanBuilder::from(scan.clone())
+                        .filter(datafusion_expr::col("k0").eq(datafusion_expr::lit("x")))
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                    "beta_total",
+                ),
+                raw_source(scan.clone(), "alpha_total"),
+            ],))
+        ));
+        assert!(!super::super::analyzer::is_in_process_plan(
+            &aggregate_finalize_plan(union(vec![
+                raw_source(raw_source(scan.clone(), "nested_metric"), "beta_total",),
+                raw_source(scan.clone(), "alpha_total"),
+            ],))
+        ));
+        assert!(
+            datafusion_expr::logical_plan::Union::try_new_with_loose_types(Vec::new()).is_err()
+        );
+        let single_discovered =
+            aggregate_finalize_plan_with_metric(raw_source(scan.clone(), "alpha_total"), None);
+        assert!(super::super::analyzer::is_in_process_plan(
+            &single_discovered
+        ));
+        assert!(super::super::analyzer::is_in_process_plan(
+            &aggregate_finalize_plan(raw_source(scan.clone(), "alpha_total"),)
+        ));
         assert!(
             DFLogicalSubstraitConvertor
                 .encode(&plan, DefaultSerializer)

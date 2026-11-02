@@ -967,7 +967,7 @@ impl PromPlanner {
         // The tags are asked for before the fields, because the walk answers for a tree the
         // compiler produced: a scalar root has no labels at all, and a sample root's are the ones
         // the walk derives or - where it derives none - the ones the existing planner names.
-        let output_tags = match &tree.root().output {
+        let mut output_tags = match &tree.root().output {
             // A scalar has no labels, and its value is named as a bare literal's is.
             NativeType::Scalar(_) => Vec::new(),
             NativeType::Samples(_) => match fused_output_tags(tree.root(), &source_tags) {
@@ -988,6 +988,15 @@ impl PromPlanner {
             },
             NativeType::AggregateState(_) => return Ok(None),
         };
+        // A raw selector reports its per-series metric identity as a label. Keep this out of
+        // aggregate output, whose label semantics are determined by the compiled expression.
+        if matches!(
+            &tree.root().expr,
+            NativeExpr::Instant { input, .. } if matches!(&input.expr, NativeExpr::Input(_))
+        ) && !output_tags.iter().any(|tag| tag == METRIC_NAME)
+        {
+            output_tags.push(METRIC_NAME.to_string());
+        }
         let root_fields = match &tree.root().output {
             // The fields are the compiled root's own: a raw field's name, or the one `vector(s)`
             // gives its result.

@@ -22,6 +22,7 @@ use datafusion::error::Result as DfResult;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::UserDefinedLogicalNode;
 use datafusion_expr::expr::{Exists, InSubquery};
 use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, Subquery, col as col_fn};
@@ -37,7 +38,7 @@ use datafusion_optimizer::push_down_filter::PushDownFilter;
 use datafusion_optimizer::rewrite_set_comparison::RewriteSetComparison;
 use datafusion_optimizer::scalar_subquery_to_join::ScalarSubqueryToJoin;
 use datafusion_optimizer::simplify_expressions::SimplifyExpressions;
-use promql::extension_plan::{AggregateFinalize, FusedSeries, SeriesDivide};
+use promql::extension_plan::{AggregateFinalize, FusedSeries, RawSeriesSource, SeriesDivide};
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use table::metadata::TableType;
 use table::table::adapter::DfTableProviderAdapter;
@@ -586,7 +587,7 @@ fn is_fused_series_plan(plan: &LogicalPlan) -> bool {
 /// partitions' contributions would report one partition's answer as the whole group's. The check is
 /// not implied by the constructor either — `with_exprs_and_inputs` hands a node whatever input an
 /// optimizer rebuilt, so a merge can hold a replacement producer its own constructor never saw.
-fn is_in_process_plan(plan: &LogicalPlan) -> bool {
+pub(super) fn is_in_process_plan(plan: &LogicalPlan) -> bool {
     if is_fused_series_plan(plan) {
         return true;
     }
@@ -604,11 +605,41 @@ fn is_in_process_plan(plan: &LogicalPlan) -> bool {
     let Some(fused) = partial.node.as_any().downcast_ref::<FusedSeries>() else {
         return false;
     };
-    fused.partial_fold().is_some()
-        && matches!(
-            partial.node.inputs().as_slice(),
-            [LogicalPlan::TableScan(_)]
-        )
+    fused.partial_fold().is_some() && is_native_fused_input(fused)
+}
+
+/// Native metric discovery wraps each metric's region scan in a `RawSeriesSource`, then
+/// unions those sources beneath one fused producer. Keep that complete producer in-process just
+/// like the single-scan form: expanding the aggregate merge would put `MergeScan` between each
+/// raw source and its region scan, which `RawSeriesSource` cannot consume.
+fn is_native_fused_input(fused: &FusedSeries) -> bool {
+    let children = fused.children();
+    match children {
+        [LogicalPlan::TableScan(_)] => true,
+        [LogicalPlan::Extension(extension)] => extension
+            .node
+            .as_any()
+            .downcast_ref::<RawSeriesSource>()
+            .is_some_and(|source| {
+                !source.metric_name().is_empty()
+                    && matches!(source.inputs().as_slice(), [LogicalPlan::TableScan(_)])
+            }),
+        [LogicalPlan::Union(union)] => {
+            !union.inputs.is_empty()
+                && union.inputs.iter().all(|input| {
+                    let LogicalPlan::Extension(extension) = input.as_ref() else {
+                        return false;
+                    };
+                    let Some(source) = extension.node.as_any().downcast_ref::<RawSeriesSource>()
+                    else {
+                        return false;
+                    };
+                    !source.metric_name().is_empty()
+                        && matches!(source.inputs().as_slice(), [LogicalPlan::TableScan(_)])
+                })
+        }
+        _ => false,
+    }
 }
 
 impl PlanRewriter {
