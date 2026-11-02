@@ -21,6 +21,7 @@ use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::view::ViewTable;
 use datafusion::datasource::{TableProvider, provider_as_source};
 use datafusion::logical_expr::TableSource;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt, ensure};
@@ -72,6 +73,20 @@ impl DfTableSourceProvider {
     /// Returns the query context.
     pub fn query_ctx(&self) -> &QueryContextRef {
         &self.query_ctx
+    }
+
+    /// Lists logical metric-engine tables visible in the current schema.
+    pub async fn logical_metric_tables(&self, schema: &str) -> Result<Vec<TableRef>> {
+        self.catalog_manager
+            .tables(&self.default_catalog, schema, Some(&self.query_ctx))
+            .try_filter(|table| {
+                std::future::ready(
+                    table.table_info().meta.engine == common_catalog::consts::METRIC_ENGINE
+                        && !table.table_info().is_physical_table(),
+                )
+            })
+            .try_collect()
+            .await
     }
 
     pub fn resolve_table_ref(&self, table_ref: TableReference) -> Result<ResolvedTableReference> {
@@ -372,6 +387,92 @@ Projection: person.id AS a, person.name AS b
   Filter: person.id > Int32(500)
     TableScan: person"#,
             format!("\n{}", source.get_logical_plan().unwrap())
+        );
+    }
+
+    /// Builds a table whose metadata carries the engine and physical-table markers
+    /// `logical_metric_tables` filters on.
+    fn metric_table(table_id: u32, name: &str, engine: &str, physical: bool) -> TableRef {
+        use std::collections::HashMap;
+
+        use table::metadata::{TableInfoBuilder, TableMeta, TableType};
+        use table::requests::TableOptions;
+
+        let mut extra_options = HashMap::new();
+        if physical {
+            extra_options.insert(
+                store_api::metric_engine_consts::PHYSICAL_TABLE_METADATA_KEY.to_string(),
+                "x".to_string(),
+            );
+        }
+        let meta = TableMeta {
+            schema: Arc::new(
+                datatypes::schema::SchemaBuilder::try_from_columns(vec![])
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ),
+            primary_key_indices: vec![],
+            value_indices: vec![],
+            engine: engine.to_string(),
+            next_column_id: 0,
+            options: TableOptions {
+                extra_options,
+                ..Default::default()
+            },
+            created_on: Default::default(),
+            updated_on: Default::default(),
+            partition_key_indices: vec![],
+            column_ids: vec![],
+        };
+        let info = TableInfoBuilder::default()
+            .table_id(table_id)
+            .table_version(0)
+            .name(name.to_string())
+            .schema_name("public".to_string())
+            .catalog_name("greptime".to_string())
+            .desc(None)
+            .table_type(TableType::Base)
+            .meta(meta)
+            .build()
+            .unwrap();
+        table::test_util::EmptyTable::from_table_info(&info)
+    }
+
+    #[tokio::test]
+    async fn logical_metric_tables_lists_only_logical_metric_engine_tables() {
+        let manager = MemoryCatalogManager::with_default_setup();
+        for (id, name, engine, physical) in [
+            (1025u32, "alpha_total", "metric", false),
+            (1026u32, "beta_total", "metric", false),
+            (1024u32, "greptime_physical_table", "metric", true),
+            (1030u32, "mito_table", "mito", false),
+        ] {
+            manager
+                .register_table_sync(crate::RegisterTableRequest {
+                    catalog: "greptime".to_string(),
+                    schema: "public".to_string(),
+                    table_name: name.to_string(),
+                    table_id: id,
+                    table: metric_table(id, name, engine, physical),
+                })
+                .unwrap();
+        }
+        let ctx = Arc::new(QueryContext::with("greptime", "public"));
+        let provider = DfTableSourceProvider::new(manager, false, ctx, DummyDecoder::arc(), true);
+
+        let mut found = provider
+            .logical_metric_tables("public")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|table| table.table_info().name.clone())
+            .collect::<Vec<_>>();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec!["alpha_total".to_string(), "beta_total".to_string()]
         );
     }
 }
