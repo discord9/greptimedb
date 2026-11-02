@@ -261,3 +261,52 @@ fn explicit_raw_frame_ordering(schema: &Schema) -> Option<SeriesOrdering> {
     }
     series_frame_ordering(schema).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use datafusion::logical_expr::LogicalPlan;
+    use datafusion_expr::logical_plan::Union;
+
+    use super::*;
+    use crate::extension_plan::RawSeriesSource;
+
+    /// A union of two raw series sources keeps the frame declaration the fused planner looks for,
+    /// so the node can read several metrics as one input without an intermediate node.
+    #[test]
+    fn union_of_raw_sources_keeps_the_raw_frame_declaration() {
+        // A bare scan stands in for the region scan; the source's own schema is what carries the
+        // frame declaration, so the scan's shape does not matter here.
+        let scan = || {
+            LogicalPlan::EmptyRelation(datafusion_expr::logical_plan::EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(datafusion::common::DFSchema::empty()),
+            })
+        };
+        let source = |metric: &str| {
+            LogicalPlan::Extension(datafusion::logical_expr::Extension {
+                node: Arc::new(
+                    RawSeriesSource::try_new(
+                        Arc::from(metric),
+                        Vec::new(),
+                        vec!["value".to_string()],
+                        scan(),
+                    )
+                    .unwrap(),
+                ),
+            })
+        };
+        let union = LogicalPlan::Union(
+            Union::try_new_with_loose_types(vec![
+                Arc::new(source("alpha_total")),
+                Arc::new(source("beta_total")),
+            ])
+            .unwrap(),
+        );
+
+        assert!(
+            explicit_raw_frame_ordering(union.schema().inner()).is_some(),
+            "the union must still declare a raw explicit-label frame, got metadata: {:?}",
+            union.schema().metadata()
+        );
+    }
+}
