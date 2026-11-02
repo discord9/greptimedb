@@ -40,12 +40,15 @@ use std::time::{Duration, UNIX_EPOCH};
 use common_catalog::consts::{METRIC_ENGINE, MITO_ENGINE, MITO2_ENGINE};
 use common_query::prelude::OTLP_AGGREGATION_TEMPORALITY_LABEL;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, TimeUnit as ArrowTimeUnit};
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, TableScanBuilder};
 use datafusion::prelude::Expr as DfExpr;
 use datafusion_expr::Expr;
+use datafusion_expr::UserDefinedLogicalNodeCore;
+use datafusion_expr::logical_plan::{EmptyRelation, Union};
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use promql::extension_plan::{AggregateFinalize, FusedSeries, FusedSeriesBinding, RawSeriesSource};
@@ -155,6 +158,7 @@ impl PromPlanner {
         matchers: Matchers,
         selector_count: usize,
         prom_expr: &PromExpr,
+        skip_partition_guards: bool,
         logical_scan_id: &mut Option<u32>,
         logical_ids_differ: &mut bool,
     ) -> Result<Option<PreparedInput>> {
@@ -240,7 +244,9 @@ impl PromPlanner {
             }
             None => match &input {
                 LogicalPlan::TableScan(scan) => scan.clone(),
-                _ => return Ok(None),
+                _ => {
+                    return Ok(None);
+                }
             },
         };
         let table = self.table_from_source(&scan.source)?;
@@ -277,7 +283,8 @@ impl PromPlanner {
             return Ok(None);
         }
         // Preserve the existing single-selector guard that its partition keys are tags.
-        if selector_count == 1
+        if !skip_partition_guards
+            && selector_count == 1
             && !table_meta
                 .partition_column_names()
                 .all(|column| tags.iter().any(|tag| tag == column))
@@ -414,6 +421,7 @@ impl PromPlanner {
         }
         // Preserve the original single-selector admission allowlist. Broader binary syntax is only
         // considered for a multi-occurrence root, where the compiled-tree proof below constrains it.
+
         if selectors.len() == 1 && !admitted_single_selector(prom_expr) {
             return Ok(None);
         }
@@ -464,6 +472,7 @@ impl PromPlanner {
             )));
         }
         let original_context = self.ctx.clone();
+        let mut discovered_metric_name = None;
         let preparation = async {
             let mut prepared: Vec<PreparedInput> = Vec::new();
             let mut single_input_context = None;
@@ -477,6 +486,153 @@ impl PromPlanner {
                 // query keeps the plan the existing path builds for it.
                 if !selector.matchers.or_matchers.is_empty() {
                     return Ok(None);
+                }
+                let discover_metrics = selector.name.is_none()
+                    && selector.matchers.or_matchers.is_empty()
+                    && selector.matchers.find_matchers(METRIC_NAME).is_empty()
+                    && selector.matchers.matchers.iter().any(|matcher| {
+                        matcher.name != "__schema__"
+                            && matcher.name != "__database__"
+                            && matcher.name != "__field__"
+                    });
+                if discover_metrics {
+                    // Supplying a temporary name lets preprocessing reset the context and apply
+                    // schema/database and ordinary matchers without its expected NoMetricMatcher.
+                    let matchers =
+                        self.preprocess_label_matchers(&selector.matchers, &Some(String::new()))?;
+
+                    self.ctx.table_name = None;
+                    let effective_schema = self
+                        .ctx
+                        .schema_name
+                        .clone()
+                        .unwrap_or_else(|| self.table_provider.query_ctx().current_schema());
+                    let mut metrics = self
+                        .table_provider
+                        .logical_metric_tables(&effective_schema)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                        .context(DataFusionPlanningSnafu)?;
+                    metrics.sort_by_key(|table| table.table_info().name.clone());
+                    if metrics.is_empty() {
+                        // No discovered metric can supply catalog field metadata. Use the
+                        // selector's default raw value field and the corresponding empty frame.
+                        self.ctx.field_columns = vec![DEFAULT_FIELD_COLUMN.to_string()];
+                        self.ctx.tag_columns.clear();
+                        discovered_metric_name = Some("".to_string());
+                        let fields = self.ctx.field_columns.clone();
+                        let series_schema = Arc::new(SeriesSchema {
+                            fields: fields
+                                .iter()
+                                .map(|name| FieldSpec {
+                                    name: Arc::from(name.as_str()),
+                                })
+                                .collect::<Vec<_>>()
+                                .into(),
+                            eval_grid: None,
+                        });
+                        let schema = Arc::new(
+                            DFSchema::try_from(
+                                common_query::series_frame::raw_series_frame_schema_with_ordering(
+                                    &series_schema,
+                                    &store_api::region_engine::RawLabelSource::Explicit,
+                                    SeriesOrdering::Contiguous,
+                                )
+                                .context(DataFusionPlanningSnafu)?,
+                            )
+                            .context(DataFusionPlanningSnafu)?,
+                        );
+                        let time = DEFAULT_TIME_INDEX_COLUMN.to_string();
+                        prepared.push((
+                            LogicalPlan::EmptyRelation(EmptyRelation {
+                                produce_one_row: false,
+                                schema,
+                            }),
+                            series_schema,
+                            None,
+                            time,
+                            Vec::new(),
+                        ));
+                    } else {
+                        let mut sources = Vec::with_capacity(metrics.len());
+                        let mut selector_metadata = None;
+                        for table in metrics {
+                            self.ctx.table_name = Some(table.table_info().name.clone());
+                            let setup = self.setup_context().await?;
+
+                            if setup.is_some() {
+                                return Err(DataFusionError::Plan(format!(
+                                    "discovered metric {} could not be prepared: setup_context declined",
+                                    table.table_info().name
+                                )))
+                                .context(DataFusionPlanningSnafu);
+                            }
+                            let Some((scan, schema, metric, time, tags)) = self
+                                .prepare_one_scan(
+                                    matchers.clone(),
+                                    selectors.len(),
+                                    prom_expr,
+                                    true,
+                                    &mut logical_scan_id,
+                                    &mut logical_ids_differ,
+                                )
+                                .await?
+                            else {
+                                return Err(DataFusionError::Plan(format!(
+                                    "discovered metric {} could not be prepared: prepare_one_scan declined a guard",
+                                    table.table_info().name
+                                )))
+                                .context(DataFusionPlanningSnafu);
+                            };
+                            let Some(metric) = metric else {
+                                return Err(DataFusionError::Plan(format!(
+                                    "discovered metric {} could not be prepared: scan has no metric name",
+                                    table.table_info().name
+                                )))
+                                .context(DataFusionPlanningSnafu);
+                            };
+
+                            let fields = schema
+                                .fields
+                                .iter()
+                                .map(|field| field.name.to_string())
+                                .collect();
+                            discovered_metric_name.get_or_insert_with(|| metric.to_string());
+                            sources.push(LogicalPlan::Extension(Extension {
+                                node: Arc::new(
+                                    RawSeriesSource::try_new(
+                                        metric.clone(),
+                                        tags.clone(),
+                                        fields,
+                                        scan,
+                                    )
+                                    .context(DataFusionPlanningSnafu)?,
+                                ),
+                            }));
+                            if selector_metadata.is_none() && selectors.len() == 1 {
+                                single_input_context = Some(self.ctx.clone());
+                            }
+                            selector_metadata.get_or_insert((schema, time, tags, metric));
+                        }
+                        let Some((schema, time, tags, single_metric)) = selector_metadata else {
+                            return Ok(None);
+                        };
+                        let (union, metric) = if sources.len() == 1 {
+                            (sources.pop().unwrap(), Some(single_metric))
+                        } else {
+                            (
+                                LogicalPlan::Union(
+                                    Union::try_new_with_loose_types(
+                                        sources.into_iter().map(Arc::new).collect(),
+                                    )
+                                    .context(DataFusionPlanningSnafu)?,
+                                ),
+                                None,
+                            )
+                        };
+                        prepared.push((union, schema, metric, time, tags));
+                    }
+                    continue;
                 }
                 let matchers =
                     match self.preprocess_label_matchers(&selector.matchers, &selector.name) {
@@ -494,6 +650,7 @@ impl PromPlanner {
                         matchers,
                         selectors.len(),
                         prom_expr,
+                        false,
                         &mut logical_scan_id,
                         &mut logical_ids_differ,
                     )
@@ -508,6 +665,7 @@ impl PromPlanner {
         let Some((mut prepared, single_input_context, logical_ids_differ)) = preparation? else {
             return Ok(None);
         };
+        let discovered_metric_name = discovered_metric_name.as_deref();
         // Selectors over one table share one region, so the node runs there over every scan. When
         // they read more than one table, each scan answers from its own region and the node runs
         // above them; see `RawSeriesSource`. A metric logical table's id is part of the identity it
@@ -595,18 +753,71 @@ impl PromPlanner {
             if compiled_input.source_index != index {
                 return Ok(None);
             }
-            // The range this selector reads is the compiler's own: a window and an instant differ
-            // in which side of the lookback or range their scan starts on, and an anchor can move
-            // the whole range outside the statement's. The bound belongs to the scan, so it is
-            // pushed down before two occurrences are compared: two selectors over different windows
-            // or offsets read different rows even when nothing else about them differs.
             let (start, end, inclusive) = compiled_input
                 .requirement
                 .raw_scan_bounds()
                 .context(DataFusionPlanningSnafu)?;
             let filter = scan_time_filter(start, end, inclusive, time);
-            if let LogicalPlan::TableScan(table_scan) = &mut *scan {
+            if let LogicalPlan::Extension(extension) = scan
+                && extension.node.as_any().is::<RawSeriesSource>()
+            {
+                let mut inputs = extension
+                    .node
+                    .inputs()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let Some(LogicalPlan::TableScan(table_scan)) = inputs.first_mut() else {
+                    return Err(DataFusionError::Internal(
+                        "RawSeriesSource input is not a TableScan".into(),
+                    ))
+                    .context(DataFusionPlanningSnafu);
+                };
                 table_scan.filters.push(filter);
+                let replacement = extension
+                    .node
+                    .with_exprs_and_inputs(vec![], inputs)
+                    .context(DataFusionPlanningSnafu)?;
+                *scan = LogicalPlan::Extension(Extension { node: replacement });
+            } else if let LogicalPlan::Union(union) = scan {
+                for child in &mut union.inputs {
+                    let raw = child
+                        .as_ref()
+                        .clone()
+                        .transform_up(|plan| {
+                            if let LogicalPlan::Extension(extension) = &plan
+                                && let Some(source) =
+                                    extension.node.as_any().downcast_ref::<RawSeriesSource>()
+                            {
+                                let mut inputs =
+                                    source.inputs().into_iter().cloned().collect::<Vec<_>>();
+                                if inputs.len() != 1 {
+                                    return Err(DataFusionError::Internal(format!(
+                                        "RawSeriesSource child at {index} must have exactly one TableScan input for time-bound pushdown"
+                                    )));
+                                }
+                                let LogicalPlan::TableScan(scan) = &mut inputs[0] else {
+                                    return Err(DataFusionError::Internal(format!(
+                                        "RawSeriesSource child at {index} does not have a TableScan input for time-bound pushdown"
+                                    )));
+                                };
+                                scan.filters.push(filter.clone());
+                                let replacement = source.with_exprs_and_inputs(vec![], inputs)?;
+                                return Ok(datafusion::common::tree_node::Transformed::yes(
+                                    LogicalPlan::Extension(Extension {
+                                        node: Arc::new(replacement),
+                                    }),
+                                ));
+                            }
+                            Ok(datafusion::common::tree_node::Transformed::no(plan))
+                        })
+                        .context(DataFusionPlanningSnafu)?;
+                    *child = Arc::new(raw.data);
+                }
+            } else if let LogicalPlan::TableScan(table_scan) = scan {
+                table_scan.filters.push(filter);
+            } else if let LogicalPlan::EmptyRelation(_) = scan {
+                // The typed empty input has no scan to constrain.
             } else {
                 return Err(DataFusionError::Internal(format!(
                     "the child at {index} is not the table scan this route prepared"
@@ -621,6 +832,9 @@ impl PromPlanner {
         let children = prepared
             .into_iter()
             .map(|(scan, schema, metric, _, tags)| {
+                if !matches!(scan, LogicalPlan::TableScan(_)) {
+                    return Ok(scan);
+                }
                 if !cross_table {
                     return Ok(scan);
                 }
@@ -702,10 +916,27 @@ impl PromPlanner {
             {
                 return Ok(None);
             }
-            let (legacy_fields, legacy_tags) = self
-                .legacy_output_columns(prom_expr, query_engine_state)
-                .await?;
-            let output_schema = fused_output_schema(&legacy_fields, &legacy_tags, &time)?;
+            let (output_fields, output_tags) = if let Some(metric_name) = discovered_metric_name {
+                let tags = match &root.expr {
+                    NativeExpr::Aggregate { op, .. } => match &op.group {
+                        Grouping::By(names) => names.iter().map(|name| name.to_string()).collect(),
+                        Grouping::Without(excluded) => tags
+                            .iter()
+                            .filter(|tag| !excluded.iter().any(|name| name.as_ref() == *tag))
+                            .cloned()
+                            .collect(),
+                    },
+                    _ => tags.clone(),
+                };
+                (
+                    aggregate_output_field_names(&root.expr, &series_schema.fields, metric_name),
+                    tags,
+                )
+            } else {
+                self.legacy_output_columns(prom_expr, query_engine_state)
+                    .await?
+            };
+            let output_schema = fused_output_schema(&output_fields, &output_tags, &time)?;
             let Some(rawinput) = children.into_iter().next() else {
                 return Ok(None);
             };
@@ -860,6 +1091,44 @@ impl PromPlanner {
             interval: Duration::from_millis(self.ctx.interval as u64),
             lookback_delta: Duration::from_millis(self.ctx.lookback_delta as u64),
         })
+    }
+}
+
+fn aggregate_output_field_names(
+    node: &NativeExpr,
+    fields: &[FieldSpec],
+    metric_name: &str,
+) -> Vec<String> {
+    match node {
+        NativeExpr::Aggregate { input, op } => {
+            let input_fields = input
+                .output
+                .samples()
+                .map(|schema| schema.fields.as_ref())
+                .unwrap_or(fields);
+            let prefix = match op.kind {
+                promql::native::plan::AggregateKind::Sum => "sum",
+                promql::native::plan::AggregateKind::Avg => "avg",
+                promql::native::plan::AggregateKind::Count => "count",
+                promql::native::plan::AggregateKind::Min => "min",
+                promql::native::plan::AggregateKind::Max => "max",
+                promql::native::plan::AggregateKind::Group => "group",
+                promql::native::plan::AggregateKind::Stddev => "stddev",
+                promql::native::plan::AggregateKind::Stdvar => "stdvar",
+                promql::native::plan::AggregateKind::Quantile { .. } => "quantile",
+            };
+            input_fields
+                .iter()
+                .map(|field| format!("{prefix}({metric_name}.{})", field.name))
+                .collect()
+        }
+        NativeExpr::Map { input, .. } => {
+            aggregate_output_field_names(&input.expr, fields, metric_name)
+        }
+        NativeExpr::Binary { left, .. } => {
+            aggregate_output_field_names(&left.expr, fields, metric_name)
+        }
+        _ => fields.iter().map(|field| field.name.to_string()).collect(),
     }
 }
 
@@ -1365,9 +1634,6 @@ fn supports_native_raw_series(engine: &str) -> bool {
     matches!(engine, MITO_ENGINE | MITO2_ENGINE | METRIC_ENGINE)
 }
 
-/// Recognizes only the metric logical-table scan emitted by `create_table_scan_plan`, and reports
-/// the logical table's id together with the scan: the rewrite's `__table_id = <id>` restriction is
-/// the logical table the rewrite stands for, so it is the identity a selector over it reads.
 fn metric_scan_and_table_id(
     plan: &LogicalPlan,
 ) -> Option<(datafusion::logical_expr::TableScan, Expr, u32)> {

@@ -47,6 +47,10 @@ use promql::native::plan::NativeExpr;
 use promql_parser::label::Labels;
 use promql_parser::parser;
 use session::context::QueryContext;
+use store_api::metric_engine_consts::{
+    DATA_SCHEMA_TABLE_ID_COLUMN_NAME, DATA_SCHEMA_TSID_COLUMN_NAME, LOGICAL_TABLE_METADATA_KEY,
+    PHYSICAL_TABLE_METADATA_KEY,
+};
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use table::Table;
 use table::metadata::{FilterPushDownType, TableInfoBuilder, TableMetaBuilder};
@@ -1570,8 +1574,13 @@ async fn build_test_table_provider_with_tsid_tag_fields_and_field_order(
 
         let schema = Arc::new(Schema::new(columns));
         let primary_key_indices = (0..(2 + physical_num_tag)).collect::<Vec<_>>();
+        let mut options = table::requests::TableOptions::default();
+        options
+            .extra_options
+            .insert(PHYSICAL_TABLE_METADATA_KEY.to_string(), "true".to_string());
         let table_meta = TableMetaBuilder::empty()
             .schema(schema)
+            .options(options)
             .primary_key_indices(primary_key_indices)
             .value_indices(
                 (2 + physical_num_tag..2 + physical_num_tag + 1 + physical_num_field).collect(),
@@ -1857,6 +1866,174 @@ fn find_fused_series(plan: &LogicalPlan) -> Option<&FusedSeries> {
     }
 
     plan.inputs().into_iter().find_map(find_fused_series)
+}
+
+async fn metric_discovery_provider(names: &[&str]) -> DfTableSourceProvider {
+    let specs = names
+        .iter()
+        .map(|name| ((DEFAULT_SCHEMA_NAME.to_string(), (*name).to_string()), 1, 1))
+        .collect::<Vec<_>>();
+    build_test_table_provider_with_tsid_tag_fields(&specs).await
+}
+
+#[tokio::test]
+async fn native_metric_discovery_produces_one_fused_union_child() {
+    let provider = metric_discovery_provider(&["alpha_total", "beta_total"]).await;
+    let plan = build_native_fused_plan_with_provider("{tag_0=\"x\"}", true, provider).await;
+    let fused = find_fused_series(&plan).expect("selector should use fused route");
+    assert_eq!(fused.children().len(), 1, "{plan:?}");
+    let LogicalPlan::Union(union) = &fused.children()[0] else {
+        panic!("expected Union child, got {:#?}", fused.children()[0]);
+    };
+    assert_eq!(union.inputs.len(), 2, "{plan:?}");
+    let names = union
+        .inputs
+        .iter()
+        .map(|input| {
+            let LogicalPlan::Extension(extension) = input.as_ref() else {
+                panic!("expected RawSeriesSource, got {input:?}");
+            };
+            extension
+                .node
+                .as_any()
+                .downcast_ref::<RawSeriesSource>()
+                .expect("RawSeriesSource")
+                .metric_name()
+                .to_string()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        names,
+        ["alpha_total", "beta_total"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+}
+
+#[tokio::test]
+async fn native_metric_discovery_single_metric_is_not_a_two_input_union() {
+    let provider = metric_discovery_provider(&["alpha_total"]).await;
+    let plan = build_native_fused_plan_with_provider("{tag_0=\"x\"}", true, provider).await;
+    let fused = find_fused_series(&plan).expect("selector should use fused route");
+    assert_eq!(fused.children().len(), 1);
+    match &fused.children()[0] {
+        LogicalPlan::Union(union) => {
+            assert_eq!(
+                union.inputs.len(),
+                1,
+                "single discovered metric must not become two inputs"
+            );
+            let LogicalPlan::Extension(extension) = union.inputs[0].as_ref() else {
+                panic!("expected raw source")
+            };
+            assert_eq!(
+                extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<RawSeriesSource>()
+                    .unwrap()
+                    .metric_name(),
+                "alpha_total"
+            );
+        }
+        LogicalPlan::Extension(extension) => {
+            let raw = extension
+                .node
+                .as_any()
+                .downcast_ref::<RawSeriesSource>()
+                .unwrap();
+            assert_eq!(raw.metric_name(), "alpha_total");
+            assert_eq!(raw.inputs().len(), 1);
+            assert!(matches!(raw.inputs()[0], LogicalPlan::TableScan(_)));
+        }
+        other => panic!("unexpected single metric child: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn native_metric_discovery_sum_matches_named_selector_schema() {
+    let provider = metric_discovery_provider(&["alpha_total", "beta_total"]).await;
+    let discovered =
+        build_native_fused_plan_with_provider("sum({tag_0=\"x\"})", true, provider).await;
+    let discovered_schema = discovered.schema().as_arrow().clone();
+
+    let provider = metric_discovery_provider(&["alpha_total", "beta_total"]).await;
+    let named =
+        build_native_fused_plan_with_provider("sum(alpha_total{tag_0=\"x\"})", false, provider)
+            .await;
+    let named_schema = named.schema().as_arrow().clone();
+    let columns = |schema: &arrow::datatypes::Schema| {
+        schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().clone(), field.data_type().clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(columns(&discovered_schema), columns(&named_schema));
+}
+
+#[tokio::test]
+async fn native_metric_discovery_sum_zero_metrics_produces_typed_empty_result() {
+    let provider = metric_discovery_provider(&[]).await;
+    let plan = build_native_fused_plan_with_provider("sum({tag_0=\"x\"})", true, provider).await;
+    let fused = find_fused_series(&plan).expect("empty aggregate should use fused route");
+    assert!(matches!(fused.children()[0], LogicalPlan::EmptyRelation(_)));
+    assert_eq!(
+        fused.schema().fields().len(),
+        8,
+        "zero discovered metrics produce a schema-only empty result with the default tags and fields"
+    );
+}
+
+#[tokio::test]
+async fn native_metric_discovery_pushes_time_bounds_to_every_union_scan() {
+    let provider = metric_discovery_provider(&["alpha_total", "beta_total"]).await;
+    let plan = build_native_fused_plan_with_provider("{tag_0=\"x\"}", true, provider).await;
+    let fused = find_fused_series(&plan).expect("selector should use fused route");
+    let LogicalPlan::Union(union) = &fused.children()[0] else {
+        panic!("expected union")
+    };
+    let mut scans = Vec::new();
+    for input in &union.inputs {
+        let LogicalPlan::Extension(extension) = input.as_ref() else {
+            panic!("expected raw source")
+        };
+        let raw = extension
+            .node
+            .as_any()
+            .downcast_ref::<RawSeriesSource>()
+            .unwrap();
+        let mut pending = raw.inputs().into_iter().cloned().collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            match node {
+                LogicalPlan::TableScan(scan) => scans.push(scan),
+                other => pending.extend(other.inputs().into_iter().cloned()),
+            }
+        }
+    }
+    assert_eq!(scans.len(), 2, "one underlying scan per source: {plan:?}");
+    for scan in scans {
+        assert!(
+            scan.filters
+                .iter()
+                .any(|filter| filter.to_string().contains("timestamp")),
+            "missing time bound in {:?}: {plan:?}",
+            scan.filters
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_metric_discovery_zero_metrics_plans_typed_empty_child() {
+    let provider = metric_discovery_provider(&[]).await;
+    let plan = build_native_fused_plan_with_provider("{tag_0=\"x\"}", true, provider).await;
+    let fused = find_fused_series(&plan).expect("empty selector should still plan fused route");
+    assert_eq!(fused.children().len(), 1, "{plan:?}");
+    assert!(
+        matches!(fused.children()[0], LogicalPlan::EmptyRelation(_)),
+        "expected typed empty child: {plan:?}"
+    );
 }
 
 /// Timestamp over raw and evaluated vectors both use native execution, with anchors and offsets retained.
