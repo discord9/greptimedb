@@ -88,27 +88,39 @@ impl DropTableExecutor {
     /// Checks whether table exists.
     /// - Early returns if table not exists and `drop_if_exists` is `true`.
     /// - Throws an error if table not exists and `drop_if_exists` is `false`.
+    /// - Throws an error if the name maps to a different table ID.
     pub async fn on_prepare(&self, ctx: &DdlContext) -> Result<Control<()>> {
         let table_ref = self.table.table_ref();
 
-        let exist = ctx
+        let table_name = ctx
             .table_metadata_manager
             .table_name_manager()
-            .exists(TableNameKey::new(
+            .get(TableNameKey::new(
                 table_ref.catalog,
                 table_ref.schema,
                 table_ref.table,
             ))
             .await?;
 
-        if !exist && self.drop_if_exists {
-            return Ok(Control::Stop);
-        }
+        let Some(table_name) = table_name else {
+            return if self.drop_if_exists {
+                Ok(Control::Stop)
+            } else {
+                error::TableNotFoundSnafu {
+                    table_name: table_ref.to_string(),
+                }
+                .fail()
+            };
+        };
 
         ensure!(
-            exist,
-            error::TableNotFoundSnafu {
-                table_name: table_ref.to_string()
+            table_name.table_id() == self.table_id,
+            error::UnexpectedSnafu {
+                err_msg: format!(
+                    "Table {table_ref} maps to ID {}, but drop task targets ID {}",
+                    table_name.table_id(),
+                    self.table_id
+                ),
             }
         );
 
@@ -586,6 +598,7 @@ mod tests {
             .time_index("ts")
             .primary_keys(["host".into()])
             .table_name(name)
+            .table_id(1024_u32)
             .build()
             .unwrap()
             .into();

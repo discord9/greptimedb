@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::assert_matches;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_procedure_test::execute_procedure_until_done;
@@ -23,6 +25,8 @@ use store_api::storage::TableId;
 use crate::ddl::drop_view::{DropViewProcedure, DropViewState};
 use crate::ddl::test_util::create_table::test_create_table_task;
 use crate::ddl::tests::create_view::{test_create_view_task, test_table_names};
+use crate::error::Error;
+use crate::key::table_name::TableNameKey;
 use crate::key::table_route::TableRouteValue;
 use crate::rpc::ddl::DropViewTask;
 use crate::test_util::{MockDatanodeManager, new_ddl_context};
@@ -91,6 +95,67 @@ async fn test_on_prepare_not_view_err() {
     // It's not a view, expect error
     let err = procedure.on_prepare().await.unwrap_err();
     assert_eq!(err.status_code(), StatusCode::InvalidArguments);
+}
+
+#[tokio::test]
+async fn test_on_prepare_rejects_reused_view_name() {
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
+    let old_id = 1024;
+    let new_id = 1025;
+    let view_name = "foo";
+    for (name, id) in [("renamed", old_id), (view_name, new_id)] {
+        let mut task = test_create_view_task(name);
+        task.view_info.ident.table_id = id;
+        ddl_context
+            .table_metadata_manager
+            .create_view_metadata(
+                task.view_info,
+                task.create_view.logical_plan,
+                test_table_names(),
+                vec!["a".to_string()],
+                vec!["number".to_string()],
+                "the definition".to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for drop_if_exists in [false, true] {
+        let task = new_drop_view_task(view_name, old_id, drop_if_exists);
+        let mut procedure = DropViewProcedure::new(task, ddl_context.clone());
+        let err = procedure.on_prepare().await.unwrap_err();
+        assert_matches!(
+            err,
+            Error::Unexpected { err_msg, .. }
+                if err_msg == "View greptime.public.foo maps to ID 1025, but drop task targets ID 1024"
+        );
+        assert_eq!(DropViewState::Prepare, procedure.state());
+        assert_eq!(
+            new_id,
+            ddl_context
+                .table_metadata_manager
+                .table_name_manager()
+                .get(TableNameKey::new(
+                    DEFAULT_CATALOG_NAME,
+                    DEFAULT_SCHEMA_NAME,
+                    view_name,
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .table_id()
+        );
+        assert!(
+            ddl_context
+                .table_metadata_manager
+                .view_info_manager()
+                .get(new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[tokio::test]

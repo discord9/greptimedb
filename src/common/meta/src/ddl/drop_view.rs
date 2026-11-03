@@ -72,28 +72,40 @@ impl DropViewProcedure {
     /// Checks whether view exists.
     /// - Early returns if view not exists and `drop_if_exists` is `true`.
     /// - Throws an error if view not exists and `drop_if_exists` is `false`.
+    /// - Throws an error if the name maps to a different view ID.
     pub(crate) async fn on_prepare(&mut self) -> Result<Status> {
         let table_ref = self.data.table_ref();
 
-        let exists = self
+        let view_name = self
             .context
             .table_metadata_manager
             .table_name_manager()
-            .exists(TableNameKey::new(
+            .get(TableNameKey::new(
                 table_ref.catalog,
                 table_ref.schema,
                 table_ref.table,
             ))
             .await?;
 
-        if !exists && self.data.task.drop_if_exists {
-            return Ok(Status::done());
-        }
+        let Some(view_name) = view_name else {
+            return if self.data.task.drop_if_exists {
+                Ok(Status::done())
+            } else {
+                error::ViewNotFoundSnafu {
+                    view_name: table_ref.to_string(),
+                }
+                .fail()
+            };
+        };
 
         ensure!(
-            exists,
-            error::ViewNotFoundSnafu {
-                view_name: table_ref.to_string(),
+            view_name.table_id() == self.data.view_id(),
+            error::UnexpectedSnafu {
+                err_msg: format!(
+                    "View {table_ref} maps to ID {}, but drop task targets ID {}",
+                    view_name.table_id(),
+                    self.data.view_id()
+                ),
             }
         );
 

@@ -55,10 +55,10 @@ use crate::ddl::test_util::{
 use crate::ddl::undrop_table::UndropTableProcedure;
 use crate::ddl::{DetectingRegion, RegionFailureDetectorController, TableMetadata};
 #[cfg(feature = "enterprise")]
-use crate::error::{self, Error};
+use crate::error;
+use crate::error::Error;
 #[cfg(feature = "enterprise")]
 use crate::key::MetadataKey;
-#[cfg(feature = "enterprise")]
 use crate::key::table_name::TableNameKey;
 use crate::key::table_route::TableRouteValue;
 #[cfg(feature = "enterprise")]
@@ -404,6 +404,68 @@ async fn test_on_prepare_table_not_exists_err() {
     assert_eq!(err.status_code(), StatusCode::TableNotFound);
     assert_eq!(procedure.data.dropped_at, None);
     assert_eq!(procedure.data.retention_expires_at, None);
+}
+
+#[tokio::test]
+async fn test_on_prepare_rejects_reused_table_name() {
+    let node_manager = Arc::new(MockDatanodeManager::new(()));
+    let ddl_context = new_ddl_context(node_manager);
+    let old_id = 1024;
+    let new_id = 1025;
+    let table_name = "foo";
+    for (name, id) in [("renamed", old_id), (table_name, new_id)] {
+        let task = test_create_table_task(name, id);
+        ddl_context
+            .table_metadata_manager
+            .create_table_metadata(
+                task.table_info,
+                TableRouteValue::physical(vec![]),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for drop_if_exists in [false, true] {
+        let task = new_drop_table_task(table_name, old_id, drop_if_exists);
+        let mut procedure = DropTableProcedure::new(task, ddl_context.clone());
+        let err = procedure.on_prepare().await.unwrap_err();
+        assert_matches!(
+            err,
+            Error::Unexpected { err_msg, .. }
+                if err_msg == "Table greptime.public.foo maps to ID 1025, but drop task targets ID 1024"
+        );
+        assert_eq!(DropTableState::Prepare, procedure.data.state);
+        assert!(procedure.data.physical_table_id.is_none());
+        assert!(procedure.data.dropped_at.is_none());
+        assert!(procedure.data.retention_expires_at.is_none());
+        assert!(procedure.data.drop_generation.is_none());
+        assert!(procedure.dropping_regions.is_empty());
+        assert_eq!(
+            new_id,
+            ddl_context
+                .table_metadata_manager
+                .table_name_manager()
+                .get(TableNameKey::new(
+                    DEFAULT_CATALOG_NAME,
+                    DEFAULT_SCHEMA_NAME,
+                    table_name,
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .table_id()
+        );
+        assert!(
+            ddl_context
+                .table_metadata_manager
+                .table_info_manager()
+                .get(new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[cfg(feature = "enterprise")]
