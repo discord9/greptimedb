@@ -301,6 +301,12 @@ struct QueryResult {
     columns: Vec<String>,
     /// Every column type, in schema order.
     column_types: Vec<DataType>,
+    /// Label column names, in schema order.
+    label_columns: Vec<String>,
+    /// Time column name.
+    time_column: String,
+    /// Value column name.
+    value_column: String,
     /// The rows, in a canonical order.
     rows: Vec<ResultRow>,
 }
@@ -339,6 +345,11 @@ impl QueryResult {
                 )
             })
             .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let time_column = columns[time_index].clone();
+        let label_columns = label_indices
+            .iter()
+            .map(|index| columns[*index].clone())
             .collect::<Vec<_>>();
         let value_indices = fields
             .iter()
@@ -386,9 +397,13 @@ impl QueryResult {
             (left.ts_millis, &left.labels).cmp(&(right.ts_millis, &right.labels))
         });
 
+        let value_column = columns[value_indices[0]].clone();
         Self {
             columns,
             column_types,
+            label_columns,
+            time_column,
+            value_column,
             rows,
         }
     }
@@ -405,12 +420,16 @@ struct AggregateCase {
     /// make checkable. With `per_partition` those are all four partitions' values and their spread
     /// is bounded too. `None` leaves only "some value" to the assertion.
     root_values: Option<usize>,
-    /// The `partial state:` line the producer must show, when the fixture fixes which aggregate the
-    /// split cut out. The producer then exports that aggregate's *state*, not an answer, so a
-    /// group's values are finished by the merge above it rather than once per partition.
+    /// The stage marker the producer must show (`sum by [hostname] partial`), when the fixture
+    /// fixes which aggregate the split cut out. The producer then exports that aggregate's *state*,
+    /// not an answer, so a group's values are finished by the merge above it rather than once per
+    /// partition.
     partial_state: Option<&'static str>,
     /// Whether this case's global aggregate has an explicitly specified single owner.
     single_owner: bool,
+    /// Native output schema. The native aggregate preserves its source field name (`v`), rather
+    /// than the legacy planner's computed-expression name.
+    native_value_column: &'static str,
 }
 
 /// Builds one case from a PromQL expression and its `(labels, value)` rows.
@@ -432,6 +451,7 @@ fn case(promql: String, expected: &[(&[(&str, &str)], f64)], per_partition: bool
         root_values: None,
         partial_state: None,
         single_owner: false,
+        native_value_column: "v",
     }
 }
 
@@ -1268,7 +1288,7 @@ fn assert_rows(actual: &[ResultRow], expected: &[ResultRow], context: &str) {
 }
 
 /// Asserts the native boundary's ordered names and types, independently of legacy names.
-fn assert_native_columns(native: &QueryResult, tags: &[&str], query: &str) {
+fn assert_native_column_layout(native: &QueryResult, tags: &[&str], query: &str) {
     let mut expected = vec!["ts", "v"];
     expected.extend_from_slice(tags);
     assert_eq!(
@@ -1288,6 +1308,64 @@ fn assert_native_columns(native: &QueryResult, tags: &[&str], query: &str) {
     for ty in &native.column_types[2..] {
         assert_eq!(DataType::Utf8, *ty, "`{query}`: native label type");
     }
+}
+
+/// Asserts the native schema against the value field and labels expected from the fixture.
+fn assert_native_schema(
+    native: &QueryResult,
+    value_column: &str,
+    expected_rows: &[ResultRow],
+    query: &str,
+) {
+    assert!(
+        !expected_rows.is_empty(),
+        "`{query}`: native schema needs independently expected nonempty rows"
+    );
+    let mut expected = vec!["ts".to_string(), value_column.to_string()];
+    expected.extend(expected_rows[0].labels.keys().cloned());
+    let mut actual = native.columns.clone();
+    expected.sort();
+    actual.sort();
+    assert_eq!(
+        expected, actual,
+        "`{query}`: unexpected native output schema"
+    );
+}
+
+/// Asserts the native route preserves legacy label/time columns and names its value field explicitly.
+fn assert_native_columns(
+    native: &QueryResult,
+    legacy: &QueryResult,
+    query: &str,
+    expected_value_column: &str,
+) {
+    let sorted = |columns: &[String]| {
+        let mut columns = columns.to_vec();
+        columns.sort();
+        columns
+    };
+    assert_eq!(
+        legacy.time_column, native.time_column,
+        "`{query}`: native time column must match legacy"
+    );
+    assert_eq!(
+        sorted(&legacy.label_columns),
+        sorted(&native.label_columns),
+        "`{query}`: native label columns must match legacy, order-insensitively"
+    );
+    assert_eq!(
+        expected_value_column, native.value_column,
+        "`{query}`: native value column must use the compiled root field name"
+    );
+    assert_eq!(
+        1,
+        native
+            .columns
+            .iter()
+            .filter(|column| *column == expected_value_column)
+            .count(),
+        "`{query}`: native result must have exactly one value column"
+    );
 }
 
 /// The `native.root.output_values` counts of the fused producers in `capture`, per partition.
@@ -1671,7 +1749,7 @@ async fn check_two_source_segregation(
         legacy.columns,
         "`{query}`: the legacy plan names the value column after its expression"
     );
-    assert_native_columns(&native, &[], &query);
+    assert_native_column_layout(&native, &[], &query);
     assert_rows(
         &native.rows,
         &legacy.rows,
@@ -1770,7 +1848,7 @@ async fn check_nested_aggregate_case(
     assert_rows(&legacy.rows, &case.expected, &format!("legacy `{query}`"));
 
     let (native, capture) = run_query(instance, &case.promql, true, observer).await;
-    assert_native_columns(&native, &[], &query);
+    assert_native_column_layout(&native, &[], &query);
     assert_rows(
         &native.rows,
         &legacy.rows,
@@ -1803,7 +1881,7 @@ async fn check_case(instance: &Arc<Instance>, observer: &NativePlanObserver, cas
         .keys()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_native_columns(&native, &tags, &query);
+    assert_native_column_layout(&native, &tags, &query);
     if promql.starts_with("count ") {
         assert!(
             legacy.column_types.contains(&DataType::Int64),
@@ -1815,6 +1893,8 @@ async fn check_case(instance: &Arc<Instance>, observer: &NativePlanObserver, cas
         &legacy.rows,
         &format!("native `{query}` vs legacy"),
     );
+    assert_native_schema(&native, case.native_value_column, &case.expected, &query);
+    assert_native_columns(&native, &legacy, &query, "v");
     assert_rows(&native.rows, &case.expected, &format!("native `{query}`"));
 
     assert_eq!(
@@ -1983,6 +2063,214 @@ async fn check_case(instance: &Arc<Instance>, observer: &NativePlanObserver, cas
         // contributions. Keep the per-partition activity check above; contribution totals belong
         // to the exact native root input_samples metric checked here.
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_aggregate_topk_over_global_partitions() {
+    common_telemetry::init_default_ut_logging();
+    const TABLE: &str = "native_topk_counters";
+    const T1: i64 = BASE_SECS + 180;
+    const T2: i64 = BASE_SECS + 600;
+    let observer = Arc::new(NativePlanObserver::default());
+    let plugins = Plugins::new();
+    plugins.insert(Arc::clone(&observer) as PhysicalPlanWrapperRef);
+    let standalone = GreptimeDbStandaloneBuilder::new("native_aggregate_topk")
+        .with_query_options(QueryOptions {
+            experimental_native_promql: true,
+            ..Default::default()
+        })
+        .with_plugin(plugins)
+        .build()
+        .await;
+    let instance = Arc::clone(standalone.fe_instance());
+    execute_sql(&instance, &format!(
+        "CREATE TABLE {TABLE} (ts TIMESTAMP(3) TIME INDEX, hostname STRING, device STRING, \"region\" STRING, v DOUBLE, PRIMARY KEY (hostname, device, \"region\")) WITH ('compaction.type' = 'twcs', 'compaction.twcs.trigger_file_num' = '100')"
+    )).await;
+    // Flush host00/dev0 first and host00/dev1 last; flush each of the 28 series independently.
+    let order = std::iter::once((0usize, 0usize))
+        .chain((1..14).flat_map(|host| (0..2).map(move |device| (host, device))))
+        .chain(std::iter::once((0usize, 1usize)));
+    for (host, device) in order {
+        let slope_before = 140 - 10 * host as i64;
+        let slope_after = 10 + 10 * host as i64;
+        let mut values = Vec::new();
+        for elapsed in (0i64..=600).step_by(30) {
+            let value =
+                100_000 + slope_before * elapsed.min(300) + slope_after * (elapsed - 300).max(0);
+            values.push(format!(
+                "({}, 'host{host:02}', 'dev{device}', 'us-west-2', {value}.0)",
+                (BASE_SECS + elapsed) * 1000
+            ));
+        }
+        execute_sql(
+            &instance,
+            &format!(
+                "INSERT INTO {TABLE} (ts, hostname, device, \"region\", v) VALUES {}",
+                values.join(",")
+            ),
+        )
+        .await;
+        execute_sql(&instance, &format!("ADMIN FLUSH_TABLE('{TABLE}')")).await;
+    }
+    let promql = format!(
+        "topk(10, sum by(hostname)(rate({TABLE}{{device!=\"lo\",region=\"us-west-2\"}}[5m])))"
+    );
+    let sql = format!("TQL EVAL ({T1}, {T2}, '7m') {promql}");
+    let run = async |native: bool| {
+        let mark = observer.mark();
+        let mut ctx = QueryContext::with_db_name(None);
+        ctx.set_extension(QUERY_PARALLELISM_HINT, SCAN_PARTITIONS.to_string());
+        ctx.set_extension(NATIVE_PROMQL_EXTENSION_KEY, native.to_string());
+        let output = instance
+            .do_query(&sql, Arc::new(ctx))
+            .await
+            .remove(0)
+            .unwrap();
+        let batches = match output.data {
+            OutputData::Stream(stream) => collect_batches(stream).await.unwrap(),
+            OutputData::RecordBatches(batches) => batches,
+            other => panic!("unexpected output: {other:?}"),
+        };
+        (
+            QueryResult::from_batches(&batches, &sql),
+            NativeCapture::from_plans(&observer.since(mark)),
+        )
+    };
+    let (legacy, legacy_capture) = run(false).await;
+    assert!(legacy_capture.fused.is_empty() && legacy_capture.finalize.is_empty());
+    let (native, capture) = run(true).await;
+    assert_native_columns(&native, &legacy, &sql, "v");
+    assert_rows(
+        &native.rows,
+        &legacy.rows,
+        &format!("native vs legacy `{sql}`"),
+    );
+    assert_eq!(20, native.rows.len(), "both timestamps return ten rows");
+    let distinct_timestamps = native
+        .rows
+        .iter()
+        .map(|row| row.ts_millis)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        [T1 * 1000, T2 * 1000]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        distinct_timestamps
+    );
+    let mut expected = Vec::new();
+    for (ts, hosts, post) in [(T1 * 1000, 0..10, false), (T2 * 1000, 4..14, true)] {
+        for host in hosts {
+            let slope = if post {
+                10 + 10 * host
+            } else {
+                140 - 10 * host
+            };
+            let scale = if post { 2.0 } else { 1.3 };
+            expected.push(ResultRow {
+                ts_millis: ts,
+                labels: [("hostname".to_string(), format!("host{host:02}"))].into(),
+                value: Some(slope as f64 * scale),
+            });
+        }
+    }
+    expected.sort_by(|a, b| (a.ts_millis, &a.labels).cmp(&(b.ts_millis, &b.labels)));
+    assert_native_schema(&native, "v", &expected, &sql);
+    assert_rows(&native.rows, &expected, &format!("expected `{sql}`"));
+    assert_eq!(1, capture.fused.len());
+    assert_eq!(1, capture.finalize.len());
+    let fused_plan = displayable(capture.fused[0].as_ref())
+        .indent(false)
+        .to_string();
+    assert!(
+        fused_plan.contains("sum by [hostname] partial"),
+        "{fused_plan}"
+    );
+    assert!(
+        !fused_plan.to_ascii_lowercase().contains("topk"),
+        "{fused_plan}"
+    );
+    let finalize_plan = displayable(capture.finalize[0].as_ref())
+        .indent(false)
+        .to_string();
+    assert!(
+        finalize_plan.to_ascii_lowercase().contains("topk"),
+        "{finalize_plan}"
+    );
+    let per_partition = fused_root_metric_per_partition(&capture, ROOT_OUTPUT_VALUES_METRIC, &sql);
+    assert!(
+        per_partition
+            .iter()
+            .all(|count| count.is_some_and(|count| count > 0)),
+        "{per_partition:?}"
+    );
+    // The cross-producer requirement lives in the deterministic fixtures instead, which pin which
+    // suffixes the split accepts above the cut and which it declines
+    // (`native_fused_split_declines_a_whole_vector_suffix`).
+    // Which producer holds which series follows from the storage scheduler and a legal schedule can
+    // hand one partition every series but two, so asserting it here would pin a scheduling accident
+    // rather than the merge.
+}
+
+/// The native route executes `sum(clamp(...))` to 10 in `field_0`; the full standalone's legacy
+/// route also answers 10. The planner unit harness is the one where legacy rejects `clamp`, because
+/// its bare `MemoryCatalogManager` does not resolve the function; that divergence is pinned by
+/// `native_fused_clamp_aggregate_is_admitted`, not by this standalone integration test.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_aggregate_clamp_executes_on_both_routes() {
+    common_telemetry::init_default_ut_logging();
+
+    let observer = Arc::new(NativePlanObserver::default());
+    let plugins = Plugins::new();
+    plugins.insert(Arc::clone(&observer) as PhysicalPlanWrapperRef);
+    let standalone = GreptimeDbStandaloneBuilder::new("native_aggregate_clamp")
+        .with_query_options(QueryOptions {
+            experimental_native_promql: true,
+            ..Default::default()
+        })
+        .with_plugin(plugins)
+        .build()
+        .await;
+    let instance = Arc::clone(standalone.fe_instance());
+    setup_fixture(&instance).await;
+    let promql = format!("sum(clamp({GAUGE_TABLE}, 1, 2))");
+    let query = tql_eval(&promql);
+
+    let (native, capture) = run_query(&instance, &promql, true, &observer).await;
+    assert_eq!(1, native.rows.len(), "native `{query}`");
+    assert_eq!(EVAL_MILLIS, native.rows[0].ts_millis, "native `{query}`");
+    assert!(native.rows[0].labels.is_empty(), "native `{query}` labels");
+    assert!(
+        close_enough(native.rows[0].value.unwrap(), 10.0),
+        "native `{query}` value"
+    );
+    assert_eq!("v", native.value_column, "native `{query}` value column");
+    assert_eq!(2, native.columns.len(), "native `{query}` columns");
+    assert_eq!(1, capture.fused.len(), "native `{query}` fused producers");
+    for fused in &capture.fused {
+        assert_fused_reads_scan_directly(fused, &format!("native `{query}`"));
+        let plan = displayable(fused.as_ref()).indent(false).to_string();
+        assert!(
+            plan.contains("sum by [] partial"),
+            "native `{query}` must export the aggregate partial state:\n{plan}"
+        );
+    }
+    assert!(
+        !capture.finalize.is_empty(),
+        "native `{query}` must execute the frontend aggregate finalize"
+    );
+
+    // The planner unit harness uses a bare MemoryCatalogManager and rejects clamp in legacy
+    // planning. The standalone query context registers clamp for legacy, so this test deliberately
+    // pins the separately observed standalone behavior instead of routing through check_case.
+    let (legacy, legacy_capture) = run_query(&instance, &promql, false, &observer).await;
+    assert!(legacy_capture.fused.is_empty() && legacy_capture.finalize.is_empty());
+    assert_eq!(1, legacy.rows.len(), "legacy `{query}`");
+    assert_eq!(EVAL_MILLIS, legacy.rows[0].ts_millis, "legacy `{query}`");
+    assert!(legacy.rows[0].labels.is_empty(), "legacy `{query}` labels");
+    assert!(
+        close_enough(legacy.rows[0].value.unwrap(), 10.0),
+        "legacy `{query}` value"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2402,7 +2690,9 @@ async fn native_histogram_over_the_cut_splits_and_matches_legacy() {
             &format!("native `{query}`"),
         );
         let tags: &[&str] = if *single_owner { &[] } else { &["job"] };
-        assert_native_columns(&native, tags, &query);
+        assert_native_column_layout(&native, tags, &query);
+        assert_native_schema(&native, "v", &legacy.rows, &query);
+        assert_native_columns(&native, &legacy, &query, "v");
         // The equivalence the admission rests on: the rows the same statement reports over the
         // complete input, labels included.
         assert_rows(

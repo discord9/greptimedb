@@ -83,7 +83,7 @@ use store_api::storage::RegionId;
 mod frame_output;
 
 use super::{
-    FusedOutputFormat, FusedSeries, FusedSeriesBinding, MAX_TAG_COUNT, OutputColumn, POLL_BUDGET,
+    FusedOutputFormat, FusedSeries, FusedSeriesBinding, OutputColumn, POLL_BUDGET,
     series_to_record_batch,
 };
 use crate::evaluated::EvaluatedChunk;
@@ -1346,7 +1346,7 @@ impl Drop for StagedStream {
 }
 
 #[test]
-fn fused_series_envelope_round_trip_and_rejects_unsupported_payloads() {
+fn fused_series_ordinary_encoding_round_trip_and_rejects_unsupported_payloads() {
     let tree = rate_tree();
     let original_binding = binding(&tree);
     // A frame-output node is checked against the codec's own frame layout, so it is built with
@@ -1363,13 +1363,66 @@ fn fused_series_envelope_round_trip_and_rejects_unsupported_payloads() {
     .unwrap();
     let bytes = node.serialize().unwrap();
     let decoded = FusedSeries::deserialize(&bytes).unwrap();
-    assert_eq!(
-        crate::native::wire::encode_prefix(decoded.tree()).unwrap(),
-        crate::native::wire::encode_prefix(node.tree()).unwrap()
-    );
+    assert_eq!(decoded.tree(), node.tree());
     assert_eq!(decoded.binding(), node.binding());
     assert_eq!(decoded.schema(), node.schema());
-    assert!(fused(rate_tree()).serialize().is_err());
+    let rows = fused(rate_tree());
+    let row_decoded = FusedSeries::deserialize(&rows.serialize().unwrap()).unwrap();
+    assert_eq!(row_decoded.schema(), rows.schema());
+    assert_eq!(row_decoded.tree(), rows.tree());
+
+    // A legal noncanonical order must survive the wire unchanged.
+    let canonical = rows.schema().as_arrow();
+    let reordered_schema = Arc::new(Schema::new(vec![
+        canonical.field_with_name(VALUE).unwrap().clone(),
+        canonical.field_with_name(HOST).unwrap().clone(),
+        canonical.field_with_name(NAME).unwrap().clone(),
+        canonical.field_with_name(TIME).unwrap().clone(),
+    ]));
+    let reordered = FusedSeries::try_new(
+        Arc::from(PROMQL),
+        rows.tree().clone(),
+        rows.binding().clone(),
+        rows.children().to_vec(),
+        Arc::new(
+            datafusion::common::DFSchema::try_from(reordered_schema.as_ref().clone()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let reordered_decoded = FusedSeries::deserialize(&reordered.serialize().unwrap()).unwrap();
+    assert_eq!(reordered_decoded.schema(), reordered.schema());
+
+    // The output schema owns the label layout; the source binding may have no tags or different
+    // labels after a tree operation such as label rewriting.
+    let empty_binding = binding_of(rows.tree(), raw_schema(), Vec::new());
+    let empty_tags = FusedSeries::try_new(
+        Arc::from(PROMQL),
+        rate_tree(),
+        empty_binding,
+        vec![input_plan(frame_schema())],
+        output_schema().to_dfschema_ref().unwrap(),
+    )
+    .unwrap();
+    let decoded = FusedSeries::deserialize(&empty_tags.serialize().unwrap()).unwrap();
+    assert_eq!(decoded.binding().tags, empty_tags.binding().tags);
+    assert_eq!(decoded.schema(), empty_tags.schema());
+
+    let projected = fused(binary_tree(raw_schema(), raw_schema()));
+    let projected_bytes = projected.serialize().unwrap();
+    let projected_decoded = FusedSeries::deserialize(&projected_bytes).unwrap();
+    assert_eq!(projected_decoded.schema(), projected.schema());
+
+    // A state-exporting producer never crosses the wire: the frame's state content has no wire
+    // form, so the producer stays on the machine that reads the samples.
+    let partial = partial_node(AggregateKind::Sum);
+    assert!(
+        partial
+            .serialize()
+            .unwrap_err()
+            .to_string()
+            .contains("exporting aggregate state"),
+        "a state-exporting producer must be refused by the serializer"
+    );
     let mut bad_version = bytes.clone();
     bad_version[..4].copy_from_slice(&99u32.to_le_bytes());
     assert!(
@@ -1379,6 +1432,15 @@ fn fused_series_envelope_round_trip_and_rejects_unsupported_payloads() {
             .contains("version")
     );
     assert!(FusedSeries::deserialize(&bytes[..5]).is_err());
+    let mut trailing_payload = bytes.clone();
+    let payload_len = u32::from_le_bytes(trailing_payload[4..8].try_into().unwrap()) as usize;
+    trailing_payload.insert(8 + payload_len, 0);
+    trailing_payload[4..8].copy_from_slice(&((payload_len + 1) as u32).to_le_bytes());
+    assert!(FusedSeries::deserialize(&trailing_payload).is_err());
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(FusedSeries::deserialize(&trailing).is_err());
 }
 
 /// A payload written under the shape that still carried a partial fold is refused by its version,
@@ -1440,29 +1502,234 @@ fn envelope_node_with_tags(tags: Vec<String>) -> FusedSeries {
     .expect("the frame layout matches the evaluated root")
 }
 
-/// The largest tag count the envelope supports is written whole.
-#[test]
-fn fused_series_envelope_serializes_the_maximum_tag_count() {
-    let tags: Vec<String> = (0..MAX_TAG_COUNT).map(|i| format!("t{i}")).collect();
-    let node = envelope_node_with_tags(tags);
+fn mutate_envelope_payload(
+    bytes: &[u8],
+    mutate: impl FnOnce(&mut super::FusedSeriesPayload),
+) -> Vec<u8> {
+    let (mut payload, remainder) =
+        postcard::take_from_bytes::<super::FusedSeriesPayload>(&bytes[8..]).unwrap();
+    assert!(remainder.is_empty());
+    mutate(&mut payload);
+    let changed = postcard::to_stdvec(&payload).unwrap();
+    let mut result = Vec::with_capacity(8 + changed.len());
+    result.extend(3u32.to_le_bytes());
+    result.extend((changed.len() as u32).to_le_bytes());
+    result.extend(changed);
+    result
+}
+
+fn mutate_schema(bytes: &[u8], schema: Schema) -> Vec<u8> {
+    mutate_envelope_payload(bytes, |payload| payload.output_schema = schema)
+}
+
+fn scalar_node(tree: NativeTree, value_name: &str) -> FusedSeries {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(value_name, DataType::Float64, true),
+    ]));
+    FusedSeries::try_new(
+        Arc::from(PROMQL),
+        tree,
+        FusedSeriesBinding {
+            grid: grid(),
+            time_index: TIME.into(),
+            tags: Vec::new(),
+            metric_name: None,
+        },
+        Vec::new(),
+        Arc::new(datafusion::common::DFSchema::try_from(schema.as_ref().clone()).unwrap()),
+    )
+    .unwrap()
+}
+
+fn assert_decode_error(bytes: &[u8], expected: &str) {
+    let error = FusedSeries::deserialize(bytes).unwrap_err().to_string();
     assert!(
-        node.serialize().is_ok(),
-        "the maximum tag count must still serialize"
+        error.contains(expected),
+        "expected {expected:?}, got {error:?}"
     );
 }
 
-/// The encoder must refuse the tag count, so it never writes a payload its own decoder rejects.
 #[test]
-fn fused_series_envelope_rejects_excess_tag_count() {
-    let tags: Vec<String> = (0..=MAX_TAG_COUNT).map(|i| format!("t{i}")).collect();
-    let node = envelope_node_with_tags(tags);
-    let message = node.serialize().unwrap_err().to_string();
-    assert!(message.contains("too many FusedSeries tags"), "{message}");
-    assert!(message.contains(&MAX_TAG_COUNT.to_string()), "{message}");
-    assert!(
-        message.contains(&(MAX_TAG_COUNT + 1).to_string()),
-        "{message}"
+fn plain_rows_decode_rejects_invalid_schemas() {
+    let node = fused(rate_tree());
+    let bytes = node.serialize().unwrap();
+    let scalar = scalar_node(scalar_tree(grid(), 1.0), "clock_value");
+    let scalar_bytes = scalar.serialize().unwrap();
+    let scalar_with_tag = mutate_envelope_payload(&scalar_bytes, |payload| {
+        let mut fields = payload.output_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new(HOST, DataType::Utf8, true)));
+        payload.output_schema = Schema::new(fields);
+    });
+    assert_decode_error(&scalar_with_tag, "cannot produce 1 tag columns");
+
+    let malformed_schemas = [
+        (
+            Schema::new(vec![Field::new(TIME, DataType::Utf8, false)]),
+            "must be Timestamp",
+        ),
+        (
+            Schema::new(vec![
+                Field::new(
+                    TIME,
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+                Field::new(VALUE, DataType::Float64, true),
+                Field::new(VALUE, DataType::Float64, true),
+            ]),
+            "duplicate",
+        ),
+        (
+            Schema::new(vec![
+                Field::new(
+                    TIME,
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+                Field::new(HOST, DataType::Utf8, true),
+                Field::new(NAME, DataType::Utf8, true),
+            ]),
+            "missing field column",
+        ),
+        (
+            Schema::new(vec![
+                Field::new(
+                    TIME,
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+                Field::new(VALUE, DataType::Float64, true),
+                Field::new(HOST, DataType::Float64, true),
+                Field::new(NAME, DataType::Utf8, true),
+            ]),
+            "must be Utf8",
+        ),
+    ];
+    for (schema, expected) in malformed_schemas {
+        assert_decode_error(&mutate_schema(&bytes, schema), expected);
+    }
+
+    let scalar_decoded = FusedSeries::deserialize(&scalar_bytes).unwrap();
+    assert_eq!(scalar_decoded.schema(), scalar.schema());
+
+    // Binding tags describe the source; the carried schema independently describes outputs.
+    let empty_binding = binding_of(node.tree(), raw_schema(), Vec::new());
+    let cross_table = FusedSeries::try_new(
+        Arc::from(PROMQL),
+        node.tree().clone(),
+        empty_binding,
+        node.children().to_vec(),
+        output_schema().to_dfschema_ref().unwrap(),
+    )
+    .unwrap();
+    let decoded = FusedSeries::deserialize(&cross_table.serialize().unwrap()).unwrap();
+    assert_eq!(decoded.schema(), cross_table.schema());
+    assert!(decoded.binding().tags.is_empty());
+}
+
+#[test]
+fn a_non_default_column_order_survives_the_round_trip() {
+    let tree = rate_tree();
+    let binding = binding(&tree);
+    let reordered = Schema::new_with_metadata(
+        vec![
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new(
+                TIME,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(HOST, DataType::Utf8, true)
+                .with_metadata([("origin".to_string(), "carried".to_string())].into()),
+            Field::new(NAME, DataType::Utf8, true),
+        ],
+        [("schema-origin".to_string(), "carried".to_string())].into(),
     );
+    let node = FusedSeries::try_new(
+        Arc::from(PROMQL),
+        tree,
+        binding,
+        vec![input_plan(frame_schema())],
+        Arc::new(datafusion::common::DFSchema::try_from(reordered.clone()).unwrap()),
+    )
+    .unwrap();
+    let decoded = FusedSeries::deserialize(&node.serialize().unwrap()).unwrap();
+    assert_eq!(decoded.schema(), node.schema());
+    assert_eq!(decoded.schema().as_arrow().metadata(), reordered.metadata());
+    assert_eq!(
+        decoded
+            .schema()
+            .field_with_name(None, HOST)
+            .unwrap()
+            .metadata(),
+        reordered.field_with_name(HOST).unwrap().metadata()
+    );
+}
+
+#[test]
+fn series_frame_decode_rejects_schema_mismatch() {
+    let node = envelope_node_with_tags(vec![HOST.into(), NAME.into()]);
+    let bytes = node.serialize().unwrap();
+    let wrong = mutate_envelope_payload(&bytes, |payload| {
+        let mut fields = payload.output_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Utf8, true)));
+        payload.output_schema = Schema::new(fields);
+    });
+    assert_decode_error(&wrong, "SeriesFrame schema does not match");
+}
+
+#[test]
+fn state_export_decode_rejects_schema_and_format_mismatch() {
+    let tree = partial_tree(rate_tree(), AggregateKind::Sum, &[HOST, JOB]);
+    let node = FusedSeries::try_new_state_export(
+        Arc::from(PROMQL),
+        tree.clone(),
+        binding_of(&tree, raw_schema(), vec![HOST.to_string(), JOB.to_string()]),
+        vec![input_plan(frame_schema())],
+    )
+    .unwrap();
+    // A state exporter is refused by the serializer, so its decode-time contracts are exercised
+    // through a payload that says what a state exporter's payload would say.
+    let bytes = mutate_envelope_payload(
+        &envelope_node_with_tags(vec![HOST.into(), NAME.into()])
+            .serialize()
+            .unwrap(),
+        |payload| {
+            payload.tree = node.tree().clone();
+            payload.output_schema = node.schema().as_arrow().clone();
+            payload.format = FusedOutputFormat::SeriesFrame;
+        },
+    );
+    assert_eq!(
+        FusedSeries::deserialize(&bytes).unwrap().tree(),
+        node.tree()
+    );
+
+    let wrong_schema = mutate_envelope_payload(&bytes, |payload| {
+        let mut fields = payload.output_schema.fields().to_vec();
+        fields.swap(0, 1);
+        payload.output_schema = Schema::new(fields);
+    });
+    assert_decode_error(&wrong_schema, "SeriesFrame schema does not match");
+
+    // Exported state has no row layout, so a payload that claims rows is refused.
+    let wrong_format = mutate_envelope_payload(&bytes, |payload| {
+        payload.format = FusedOutputFormat::PlainRows;
+    });
+    assert_decode_error(&wrong_format, "Partial stage requires SeriesFrame output");
+}
+
+#[test]
+fn fused_series_encoding_round_trips_large_tag_lists() {
+    let tags: Vec<String> = (0..1025).map(|i| format!("t{i}")).collect();
+    let node = envelope_node_with_tags(tags);
+    let decoded = FusedSeries::deserialize(&node.serialize().unwrap()).unwrap();
+    assert_eq!(decoded.binding().tags, node.binding().tags);
 }
 
 #[test]

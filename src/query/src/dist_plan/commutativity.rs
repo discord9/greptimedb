@@ -997,49 +997,48 @@ mod tests {
         );
     }
 
-    /// The encoding gate is what kept the node on the frontend, and it only exists for a plan that
-    /// has to be encoded.
-    ///
-    /// `PlanRewriter::should_expand` asked two questions about a node before it let the descent
-    /// continue, and the Substrait one came first: unless the *whole* root plan encoded, every
-    /// subtree that failed to encode was expanded on, whichever way `check_plan` answered. A
-    /// `FusedSeries` node has no serializer branch — `ExtensionSerializer` answers `NotImplemented`
-    /// for every name it does not list — so over the wire the boundary is still drawn at the node
-    /// and the region receives the bare scan.
-    ///
-    /// A plan handed to `RegionServer::handle_read` as a `LogicalPlan` is never encoded, so there
-    /// the gate has nothing to say and the commutativity arm decides: the node rides inside the
-    /// merge scan.
+    /// Ordinary fused producers are serializable; placement follows the in-process routing rules.
     #[test]
-    fn fused_series_rides_to_the_region_only_when_regions_are_reached_in_process() {
+    fn fused_series_encoding_and_placement_are_independent() {
         let plan = fused_series_plan(table_scan_plan());
+        let encoded = DFLogicalSubstraitConvertor
+            .encode(&plan, DefaultSerializer)
+            .expect("FusedSeries uses its ordinary serializer");
+        assert!(!encoded.is_empty());
 
+        let in_process = analyze(DistPlannerAnalyzer::new(true), plan.clone());
+        assert!(any_remote_input_holds(&in_process, holds_fused_series));
+
+        // A partial producer exports aggregate state, which has no wire form: it serializes only
+        // inside the region that reads the samples, never across the boundary. Its final half is
+        // frontend-side for the same reason.
+        let split = split_aggregate_plan(table_scan_plan());
+        let final_node = as_final_split(&split).expect("the split's final half");
+        let [producer] = final_node.children() else {
+            panic!("expected the final node to have one partial child: {split}")
+        };
         assert!(
             DFLogicalSubstraitConvertor
-                .encode(&plan, DefaultSerializer)
+                .encode(producer, DefaultSerializer)
                 .is_err(),
-            "the fused node encodes now, so the encoding gate decides nothing"
+            "a state-exporting producer must not cross the wire"
         );
-        assert!(
-            DFLogicalSubstraitConvertor
-                .encode(&table_scan_plan(), DefaultSerializer)
-                .is_ok(),
-            "the scan under the fused node encodes, so the fused node is the only reason this plan does not"
-        );
-
-        // Over the wire the plan has to encode, so the boundary is drawn at the node.
-        let encoded = analyze(DistPlannerAnalyzer::new(false), plan.clone());
-        assert!(
-            !any_remote_input_holds(&encoded, holds_fused_series),
-            "the analyzer placed the node although its plan has to encode: {encoded}"
-        );
-
-        // In process nothing is encoded, so the categorizer places the node.
-        let in_process = analyze(DistPlannerAnalyzer::new(true), plan);
-        assert!(
-            any_remote_input_holds(&in_process, holds_fused_series),
-            "the analyzer kept the node on the frontend although regions are reached in process: {in_process}"
-        );
+        let placed = analyze(DistPlannerAnalyzer::new(true), split);
+        assert!(as_final_split(&placed).is_some());
+        let child = placed.inputs();
+        let [child] = child.as_slice() else {
+            panic!("expected the final node's input: {placed}")
+        };
+        let scan = first_merge_scan(child).expect("merge scan below the final node");
+        let producer = first_fused_series(scan.input()).expect("partial producer in region input");
+        assert!(matches!(
+            &producer.tree().root().expr,
+            NativeExpr::Aggregate { op, .. } if op.stage == AggregateStage::Partial
+        ));
+        assert!(matches!(
+            &producer.tree().root().output,
+            NativeType::AggregateState(_)
+        ));
     }
 
     /// A split aggregate over a scan and bound to `sum(some_metric)`.
@@ -1212,10 +1211,11 @@ mod tests {
         })
     }
 
-    /// Only the real partial state-exporting child gets the in-process exception; an ordinary
-    /// values-producing fused child over the same scan does not.
+    /// The state exception covers the state-exporting producer only. An ordinary values-producing
+    /// fused child over the same scan is placed by the encoding gate instead: it encodes, so the
+    /// region may run it, while the final half still never crosses.
     #[test]
-    fn a_final_over_an_ordinary_fused_series_keeps_the_encoding_gate() {
+    fn an_ordinary_producer_is_placed_by_encodability_not_by_the_state_exception() {
         let scan = table_scan_plan();
         let split = split_aggregate_plan(scan.clone());
         let producer_placed = analyze(DistPlannerAnalyzer::new(true), split.clone());
@@ -1228,8 +1228,12 @@ mod tests {
         let swapped = final_over(split, values);
         let analyzed = analyze(DistPlannerAnalyzer::new(true), swapped);
         assert!(
-            !any_remote_input_holds(&analyzed, holds_fused_series),
-            "an ordinary fused node exports no state, so the exception does not apply: {analyzed}"
+            as_final_split(&analyzed).is_some(),
+            "the final half never crosses the wire: {analyzed}"
+        );
+        assert!(
+            any_remote_input_holds(&analyzed, holds_fused_series),
+            "an ordinary fused node encodes, so the region may run it: {analyzed}"
         );
         assert!(
             any_remote_input_holds(&analyzed, holds_table_scan),

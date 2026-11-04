@@ -55,7 +55,7 @@ pub(crate) const HISTOGRAM_ROUTING_EXCLUDED_LABELS: [&str; 4] =
     [BUCKET_LABEL, "__name__", "__type__", "__unit__"];
 
 /// `histogram_quantile` or `histogram_fraction` with its constant arguments.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum HistogramFunction {
     /// `histogram_quantile(q, v)`.
     Quantile(f64),
@@ -278,7 +278,7 @@ pub(crate) fn histogram_string(h: &HistogramView<'_>) -> Result<String> {
 }
 
 /// A function of one native histogram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
 pub enum NativeHistogramFunction {
     Count,
     Sum,
@@ -349,5 +349,33 @@ impl NativeHistogramFunction {
             Self::StdDev => native::variance(h, buckets)?.sqrt(),
             Self::StdVar => native::variance(h, buckets)?,
         })
+    }
+}
+
+impl PartialEq for HistogramFunction {
+    fn eq(&self, o: &Self) -> bool {
+        match (self, o) {
+            (Self::Quantile(a), Self::Quantile(b)) => a.to_bits() == b.to_bits(),
+            (Self::Fraction { lower: a, upper: b }, Self::Fraction { lower: c, upper: d }) => {
+                a.to_bits() == c.to_bits() && b.to_bits() == d.to_bits()
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for HistogramFunction {}
+impl std::hash::Hash for HistogramFunction {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            Self::Quantile(x) => {
+                0u8.hash(h);
+                x.to_bits().hash(h)
+            }
+            Self::Fraction { lower, upper } => {
+                1u8.hash(h);
+                lower.to_bits().hash(h);
+                upper.to_bits().hash(h)
+            }
+        }
     }
 }

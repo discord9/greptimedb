@@ -22,7 +22,7 @@ use crate::series::SeriesLabels;
 use crate::series::time::TimeAxis;
 
 /// Aggregate whose accumulator is represented by a state frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AggregateStateKind {
     Sum,
     Count,
@@ -82,7 +82,7 @@ impl AggregateStateKind {
 }
 
 /// One named accumulator column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StateComponent {
     Value,
     Mean,
