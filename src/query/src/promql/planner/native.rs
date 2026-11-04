@@ -973,9 +973,12 @@ impl PromPlanner {
         if multi_input && depends_on_input_order(root) {
             return Ok(None);
         }
-        // The native output schema can name only compiled value fields, the time index and tag
-        // columns. A grouping by metric name has no tag column to represent the distinct groups, so
-        // this route declines it rather than claiming those groups are interchangeable.
+        // The native output schema can name only compiled value fields, the time index and the tag
+        // columns a source declares. A discovered source declares `__name__` because the name is
+        // what tells two metrics with equal labels apart, so a nameless selector's names survive a
+        // grouping by `__name__` (#10106). A named selector's source does not declare it - the table
+        // name is the metric name - so a tree reading more than one such source cannot report the
+        // distinct groups and declines instead of claiming they are interchangeable.
         if multi_input && groups_by_metric_name(root) {
             return Ok(None);
         }
@@ -1645,10 +1648,11 @@ fn segment_tree(
     // such subtree inside it has nothing to cut, and cutting anything else - an aggregate's own
     // state, a constant - is either impossible or a plain recomputation of the same work in one
     // more node. Cutting on locality alone would accept one here.
-    // A grouping by `__name__` keeps that label while the fused node's declared columns cannot
-    // name it. With multiple sources, groups differing only by metric name would therefore be
-    // reported under one label set. A single-source tree cannot merge distinct metric-name groups
-    // this way, so this restriction is specific to multi-source segmentation.
+    // A grouping by `__name__` keeps that label, so the node has to publish it. A discovered
+    // source declares it; a named selector's source does not, because its table name is the metric
+    // name. With more than one source the node therefore cannot name the groups it folds, and they
+    // would be reported under one label set. A single source cannot merge distinct metric-name
+    // groups this way, which is why this restriction is specific to multi-source segmentation.
     if children.len() > 1 && groups_by_metric_name(tree.root()) {
         return Ok(None);
     }
@@ -2289,9 +2293,9 @@ fn depends_on_input_order(node: &NativeNode) -> bool {
 /// than an answer given.
 ///
 /// `without(...)` needs no such check: both routes drop `__name__` there. Nor does a tree with one
-/// selector: it reads one metric, so every group it folds carries the same name and naming that name
-/// or dropping it cannot merge two groups. What the check is for is the tree that reads more than one
-/// metric, which is the one a multi-input node is bound for.
+/// source: a discovered selector's source declares `__name__` per metric, and a named one folds one
+/// metric whose name cannot merge two groups. What the check is for is the tree reading more than one
+/// source, where only a discovered source can report a name at all.
 fn groups_by_metric_name(node: &NativeNode) -> bool {
     let grouping_names_metric = |op: &BoundAggregate| matches!(&op.group, Grouping::By(names) if names.iter().any(|name| name.as_ref() == METRIC_NAME));
     match &node.expr {
