@@ -27,7 +27,8 @@ use datatypes::series::histogram::{
 };
 use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{
-    DenseSamplesRef, FieldSpec, SampleRef, Samples, Series, SeriesFields, SeriesSchema,
+    DenseSamplesRef, FieldSpec, HistogramSamples, SampleRef, Samples, Series, SeriesFields,
+    SeriesSchema,
 };
 use datatypes::series::time::{EvalGrid, GridRange, GridSpan, GridSpec, TimeAxis};
 use datatypes::series::{Label, SeriesLabels, SeriesOrdering};
@@ -8683,6 +8684,42 @@ fn name_of(chunk: &EvaluatedChunk) -> Option<&str> {
     chunk.series.metric.name()
 }
 
+/// The [`Emitted`] tables a tree built from `node` keeps, as `(broadcast, window it reads)`.
+///
+/// The second answer is `false` when the broadcast's vector side is not a window, which is what
+/// tells a table its own node keeps from one the node below it already keeps.
+fn emitted_tables(node: NativeNode) -> (bool, bool) {
+    let tree = NativeTree::try_new(node).unwrap();
+    let mut inputs = Vec::new();
+    let mut binary_before = 0;
+    let root = RuntimeNode::build(
+        tree.root(),
+        &pool(),
+        &mut inputs,
+        &mut binary_before,
+        "root".to_string(),
+        None,
+    )
+    .unwrap()
+    .0;
+    let RuntimeOp::Broadcast {
+        left, right, state, ..
+    } = root.op
+    else {
+        panic!("the tree did not build a broadcast at its root");
+    };
+    let vector = if matches!(left.op, RuntimeOp::Window { .. }) {
+        left
+    } else {
+        right
+    };
+    let window = match vector.op {
+        RuntimeOp::Window { state, .. } => state.emitted.is_some(),
+        _ => false,
+    };
+    (state.emitted.is_some(), window)
+}
+
 /// A constant on the right multiplies every value of the vector and drops the metric name.
 ///
 /// The chunk arrives as it is pushed, before the input ends: a broadcast answers a chunk from that
@@ -8762,6 +8799,42 @@ fn sum_grouping(group: Grouping) -> BoundAggregate {
         kind: AggregateKind::Sum,
         group,
         stage: AggregateStage::Complete,
+    }
+}
+
+/// A `Partial` `sum` over `inner`, ungrouped, exporting state for a later merge.
+///
+/// A partial aggregate folds only this execution's contributions and keeps what it folded until its
+/// input ends, so a duplicate it read would end up in one group rather than being answered as two.
+fn partial_sum(inner: NativeNode) -> NativeNode {
+    let samples = inner
+        .output
+        .samples()
+        .expect("a partial aggregate reads an evaluated vector");
+    let grid = inner
+        .output
+        .grid()
+        .expect("a partial aggregate reads an evaluated vector")
+        .clone();
+    let (kind, components) = crate::native::plan::aggregate_state_binding(AggregateKind::Sum)
+        .expect("sum keeps a mergeable state");
+    let state = Arc::new(AggregateStateSchema {
+        group: Grouping::By(Arc::new([])),
+        kind,
+        components: components.into(),
+        accumulators: samples.fields.clone(),
+        grid,
+    });
+    NativeNode {
+        expr: NativeExpr::Aggregate {
+            input: Box::new(inner),
+            op: BoundAggregate {
+                kind: AggregateKind::Sum,
+                group: Grouping::By(Arc::new([])),
+                stage: AggregateStage::Partial,
+            },
+        },
+        output: NativeType::AggregateState(state),
     }
 }
 
@@ -9876,6 +9949,537 @@ fn a_broadcast_refuses_two_series_that_share_a_label_set_and_releases_the_reserv
         0,
         "error retained execution bytes: {message}"
     );
+}
+
+/// A literal arithmetic broadcast hands out the label set its vector side already checked, so it
+/// keeps no [`Emitted`] table of its own — and the window below it keeps its own.
+///
+/// A table is what refuses a second series collapsing onto one label set, and the window is where a
+/// dropped name makes that collapse happen. A second copy above it would record every label set the
+/// window hands out to decide what the window has already decided.
+#[test]
+fn a_literal_arithmetic_over_a_name_dropping_window_keeps_no_emitted_table() {
+    let grid = grid(0, 60_000, 2);
+    let streaming = || {
+        window_with(
+            evaluated_input(Arc::clone(&grid)),
+            RangeFunction::Increase,
+            120_000,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        )
+    };
+    let collecting = || {
+        window_with(
+            map(evaluated_input(Arc::clone(&grid)), vec![MathOp::Abs]),
+            RangeFunction::Increase,
+            120_000,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        )
+    };
+    // `increase` drops the metric name, so both shapes stand on a window whose table already covers
+    // the identities this node would hand out -- and the operation is neither `rate` nor a
+    // multiplication, which is not what decides it.
+    assert_eq!(
+        emitted_tables(broadcast_right(streaming(), 2.0, BinaryOp::Add, false)),
+        (false, true),
+        "a streaming window repeats its table under a constant add"
+    );
+    assert_eq!(
+        emitted_tables(broadcast_left(2.0, streaming(), BinaryOp::Add, false)),
+        (false, true),
+        "a constant on the left is the same one-to-one map"
+    );
+    assert_eq!(
+        emitted_tables(broadcast_right(collecting(), 2.0, BinaryOp::Mul, false)),
+        (false, true),
+        "a collecting window repeats its table too"
+    );
+    // A window that keeps the metric name hands out identities the operation has not seen: the
+    // multiplication drops the name, so two names of one tag set become one label set above it.
+    assert_eq!(
+        emitted_tables(broadcast_right(
+            window_with(
+                evaluated_input(Arc::clone(&grid)),
+                RangeFunction::LastOverTime,
+                120_000,
+                Some(Arc::clone(&grid)),
+                Arc::clone(&grid),
+            ),
+            2.0,
+            BinaryOp::Mul,
+            false,
+        )),
+        (true, true),
+        "a name-preserving window leaves the collision to the node above it"
+    );
+    // The vector side is the source itself, so nothing below this node dropped a name and this node
+    // is the only one that can refuse: `a_broadcast_refuses_two_series_that_share_a_label_set_and_
+    // releases_the_reservation` is the refusal that rests on the table it keeps.
+    assert_eq!(
+        emitted_tables(broadcast_right(
+            evaluated_input(Arc::clone(&grid)),
+            2.0,
+            BinaryOp::Mul,
+            false,
+        )),
+        (true, false),
+        "a source under the broadcast leaves it the only node that can refuse"
+    );
+}
+
+/// What a literal arithmetic broadcast hands on under a name-dropping window keeps its positions:
+/// series that differ only by name hold different ones, so nothing collides, each hands over its own
+/// close, and the constant reaches every value that is there.
+///
+/// `sum_over_time` over a 1 ms window answers each position its input holds a sample at, so the two
+/// series occupy disjoint positions and the missing samples in between stay missing. The window
+/// drops the name, so both answer under one label set: what lets them through is occupancy, which
+/// the broadcast neither widens nor narrows.
+#[test]
+fn a_literal_arithmetic_over_a_name_dropping_window_keeps_the_positions_it_reads() {
+    let grid = grid(0, 60_000, 4);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let window = || {
+        window_with(
+            evaluated_input(Arc::clone(&grid)),
+            RangeFunction::SumOverTime,
+            1,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        )
+    };
+    let trees = [
+        NativeTree::try_new(broadcast_right(window(), 2.0, BinaryOp::Add, false)).unwrap(),
+        NativeTree::try_new(broadcast_left(2.0, window(), BinaryOp::Add, false)).unwrap(),
+    ];
+    for tree in &trees {
+        let pool = pool();
+        let mut execution = executor(tree, Arc::clone(&pool));
+        execution
+            .push_evaluated(
+                InputId::new(0),
+                evaluated_chunk_of(
+                    &schema,
+                    named_metric("requests", "x"),
+                    0,
+                    vec![Some(1.0), None, Some(3.0)],
+                    true,
+                ),
+            )
+            .unwrap();
+        execution
+            .push_evaluated(
+                InputId::new(0),
+                evaluated_chunk_of(
+                    &schema,
+                    named_metric("requests_total", "x"),
+                    1,
+                    vec![Some(2.0), None, Some(5.0)],
+                    true,
+                ),
+            )
+            .unwrap();
+        let out = run(&mut execution);
+        let mut points = decided(&out);
+        points.sort_by_key(|(position, _)| *position);
+        assert_eq!(
+            points,
+            vec![
+                (0, Some(3.0)),
+                (1, Some(4.0)),
+                (2, Some(5.0)),
+                (3, Some(7.0))
+            ],
+            "the positions the two series hold apart were not each mapped by the constant"
+        );
+        assert!(out.iter().all(|chunk| name_of(chunk).is_none()));
+        assert_eq!(
+            out.iter().filter(|chunk| chunk.is_last).count(),
+            2,
+            "each source series closes once, and the broadcast keeps its close"
+        );
+        assert_eq!(execution.state().reserved_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+}
+
+/// A collecting window that drops the metric name hands its flush to the literal arithmetic above
+/// it, which keeps no table of its own and so passes every position of that flush on.
+///
+/// The window collects because its input reports fragments, merges the two series that share a tag
+/// set once their name is gone, and answers only when the input ends: what reaches the broadcast is
+/// that flush, its closes included. The second tag set the flush answers holds no value, so the
+/// chunk that closes it carries no row -- the one a consumer tells "nothing more here" by.
+#[test]
+fn a_literal_arithmetic_over_a_collecting_window_hands_on_its_flush() {
+    let grid = grid(0, 60_000, 4);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let tree = NativeTree::try_new(broadcast_right(
+        window_with(
+            map(evaluated_input(Arc::clone(&grid)), vec![MathOp::Abs]),
+            RangeFunction::SumOverTime,
+            1,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        ),
+        2.0,
+        BinaryOp::Add,
+        false,
+    ))
+    .unwrap();
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    // Two series differing only by name hold the halves of the grid the other leaves empty, and a
+    // third tag set holds no value at all.
+    execution
+        .push_evaluated(
+            InputId::new(0),
+            evaluated_chunk_of(
+                &schema,
+                named_metric("requests", "x"),
+                0,
+                vec![Some(1.0), Some(2.0)],
+                true,
+            ),
+        )
+        .unwrap();
+    execution
+        .push_evaluated(
+            InputId::new(0),
+            evaluated_chunk_of(
+                &schema,
+                named_metric("requests_total", "x"),
+                2,
+                vec![Some(4.0), Some(5.0)],
+                true,
+            ),
+        )
+        .unwrap();
+    execution
+        .push_evaluated(
+            InputId::new(0),
+            evaluated_chunk_of(&schema, named_metric("requests", "y"), 0, vec![None], true),
+        )
+        .unwrap();
+    assert!(
+        execution.next_chunk().unwrap().is_none(),
+        "the collector answered before its input ended"
+    );
+
+    let out = run(&mut execution);
+    let mut points = decided(&out);
+    points.sort_by_key(|(position, _)| *position);
+    assert_eq!(
+        points,
+        vec![
+            (0, Some(3.0)),
+            (1, Some(4.0)),
+            (2, Some(6.0)),
+            (3, Some(7.0))
+        ],
+        "the positions the flush merged were not each mapped by the constant"
+    );
+    assert!(out.iter().all(|chunk| name_of(chunk).is_none()));
+    assert!(
+        out.iter()
+            .any(|chunk| chunk.is_last && chunk.series.time.is_empty()),
+        "the tag set the flush answered empty did not close on a chunk carrying no row"
+    );
+    assert_eq!(
+        out.iter().filter(|chunk| chunk.is_last).count(),
+        2,
+        "each series the flush answered closes once"
+    );
+    assert_eq!(execution.state().reserved_bytes(), 0);
+    assert_eq!(pool.reserved(), 0);
+}
+
+/// The window below a literal arithmetic broadcast refuses two series that collapse onto one label
+/// set, and it does so before the aggregate above can fold them into one group.
+///
+/// The broadcast keeps no table for this shape, so the refusal is the window's -- which is also what
+/// keeps it upstream: a duplicate the partial aggregate read would land in one group and answer a
+/// wrong value instead of refusing, and the reservations would be held until the fold answered.
+#[test]
+fn a_window_under_a_literal_arithmetic_refuses_the_collision_it_collapses() {
+    let out_grid = grid(0, 60_000, 5);
+    let tree = NativeTree::try_new(partial_sum(broadcast_right(
+        window_with(
+            input(),
+            RangeFunction::Rate,
+            300_000,
+            None,
+            Arc::clone(&out_grid),
+        ),
+        2.0,
+        BinaryOp::Mul,
+        false,
+    )))
+    .unwrap();
+    let schema = raw_schema();
+    let counter = [0, 60_000, 120_000, 180_000, 240_000];
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    let metrics = metrics_of(&execution);
+    execution
+        .push_raw(
+            InputId::new(0),
+            raw_chunk_of(
+                &schema,
+                b"series-a",
+                host_metric(Some("")),
+                &counter,
+                &[1.0, 2.0, 3.0, 4.0, 5.0],
+                true,
+            ),
+        )
+        .unwrap();
+    assert!(
+        execution.next_state().unwrap().is_none(),
+        "the partial aggregate answered before its input ended"
+    );
+    // The second series is a different one to the scan and the same one to `rate`: the window is
+    // where the two meet, and the broadcast above it has no table to notice it.
+    execution
+        .push_raw(
+            InputId::new(0),
+            raw_chunk_of(
+                &schema,
+                b"series-b",
+                host_metric(None),
+                &counter,
+                &[6.0, 7.0, 8.0, 9.0, 10.0],
+                true,
+            ),
+        )
+        .unwrap();
+    let error = match execution.next_state() {
+        Ok(None) => panic!("the second series settled nothing at all"),
+        Ok(Some(_)) => panic!("a second series left the window under the first one's label set"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("vector cannot contain metrics with the same labelset")
+            && message.contains("two series hold a value of field 0"),
+        "expected the window's refusal, got: {message:?}"
+    );
+    // The node the refusal comes from is the one named: the window under the broadcast's left
+    // operand, not the broadcast that hands its answer on.
+    assert!(
+        message.contains("native.window at root.input.left"),
+        "the refusal does not name the window that made it: {message:?}"
+    );
+    assert_eq!(
+        count(&metrics, "root", NodeMetric::OUTPUT_BATCHES),
+        0,
+        "the aggregate answered a group from a stream the window refused"
+    );
+    assert_eq!(
+        execution.state().reserved_bytes(),
+        0,
+        "error retained execution bytes: {message}"
+    );
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "error retained a pool reservation: {message}"
+    );
+}
+
+/// A window that keeps the metric name leaves the collision to the broadcast, which still keeps the
+/// table that refuses it.
+///
+/// `last_over_time` reports the name it read, so the two series stay distinct under it; the
+/// multiplication drops the name, and the two then hold one label set at the same positions. Nothing
+/// below this node has checked that identity, so this node is where it is refused.
+#[test]
+fn a_name_preserving_window_leaves_the_collision_to_the_broadcast() {
+    let grid = grid(0, 60_000, 2);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let tree = NativeTree::try_new(broadcast_right(
+        window_with(
+            evaluated_input(Arc::clone(&grid)),
+            RangeFunction::LastOverTime,
+            60_000,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        ),
+        2.0,
+        BinaryOp::Mul,
+        false,
+    ))
+    .unwrap();
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    execution
+        .push_evaluated(
+            InputId::new(0),
+            evaluated_chunk_of(
+                &schema,
+                named_metric("requests", "x"),
+                0,
+                vec![Some(1.0), Some(2.0)],
+                true,
+            ),
+        )
+        .unwrap();
+    let first = execution
+        .next_chunk()
+        .unwrap()
+        .expect("the first series answers under its own name dropped");
+    assert_eq!(
+        decided(std::slice::from_ref(&first)),
+        vec![(0, Some(2.0)), (1, Some(4.0))]
+    );
+    execution
+        .push_evaluated(
+            InputId::new(0),
+            evaluated_chunk_of(
+                &schema,
+                named_metric("requests_total", "x"),
+                0,
+                vec![Some(3.0), Some(4.0)],
+                true,
+            ),
+        )
+        .unwrap();
+    let error = execution
+        .next_chunk()
+        .expect_err("the two names become one label set at the positions both hold");
+    let message = error.to_string();
+    assert!(
+        message.contains("vector cannot contain metrics with the same labelset")
+            && message.contains("two series hold a value of field 0"),
+        "expected the collision the broadcast produces, got: {message:?}"
+    );
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "error retained a pool reservation: {message}"
+    );
+    assert_eq!(
+        execution.state().reserved_bytes(),
+        0,
+        "error retained execution bytes: {message}"
+    );
+}
+
+/// Literal arithmetic over a name-dropping window keeps only the positions it was handed:
+/// multiplication scales histograms, while unsupported arithmetic drops their samples without
+/// dropping floats or the series close. The window already checks the identities and positions.
+#[test]
+fn a_histogram_window_under_literal_arithmetic_never_expands_occupancy() {
+    let grid = grid(0, 60_000, 4);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let window = || {
+        window_with(
+            evaluated_input(Arc::clone(&grid)),
+            RangeFunction::SumOverTime,
+            1,
+            Some(Arc::clone(&grid)),
+            Arc::clone(&grid),
+        )
+    };
+    let mut metric = named_metric("requests", "x");
+    metric.set("__type__", "histogram".into()).unwrap();
+    metric.set("__unit__", "seconds".into()).unwrap();
+    let mut expected_metric = named_metric("requests", "x");
+    expected_metric.remove("__name__");
+    let mixed = Samples::try_from_mixed(
+        Float64Array::from(vec![Some(3.0), None, None, Some(5.0)]),
+        HistogramSamples::try_new(
+            UInt32Array::from(vec![None, Some(0), None, None]),
+            histogram_table(1, 4),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mixed = EvaluatedChunk::try_new(
+        Series {
+            metric: metric.clone(),
+            time: TimeAxis::Grid(GridRange::try_new(Arc::clone(&grid), 0, 4).unwrap()),
+            fields: SeriesFields::one(mixed),
+        },
+        true,
+    )
+    .unwrap();
+    let histograms = evaluated_histogram_chunk_of(
+        &schema,
+        metric,
+        0,
+        vec![Some(0), None, Some(0), None],
+        &histogram_table(1, 4),
+        true,
+    );
+
+    for (op, literal_left, input, expected, dropped) in [
+        (
+            BinaryOp::Mul,
+            false,
+            mixed.clone(),
+            vec![(0, Some(6.0)), (1, None), (3, Some(10.0))],
+            false,
+        ),
+        (
+            BinaryOp::Mul,
+            true,
+            mixed.clone(),
+            vec![(0, Some(6.0)), (1, None), (3, Some(10.0))],
+            false,
+        ),
+        (
+            BinaryOp::Add,
+            false,
+            mixed,
+            vec![(0, Some(5.0)), (1, None), (3, Some(7.0))],
+            true,
+        ),
+        (
+            BinaryOp::Add,
+            false,
+            histograms,
+            vec![(0, None), (2, None)],
+            true,
+        ),
+    ] {
+        let root = if literal_left {
+            broadcast_left(2.0, window(), op, false)
+        } else {
+            broadcast_right(window(), 2.0, op, false)
+        };
+        assert_eq!(emitted_tables(root.clone()), (false, true));
+        let tree = NativeTree::try_new(root).unwrap();
+        let pool = pool();
+        let collector = common_query::promql_annotations::PromqlAnnotationCollector::default();
+        let mut state = NativeExecutionState::try_new(&tree, Arc::clone(&pool), None).unwrap();
+        state.set_annotations(Some(collector.clone()));
+        let mut execution = NativeExecutor::new(state);
+        execution.push_evaluated(InputId::new(0), input).unwrap();
+        let out = run(&mut execution);
+
+        assert_eq!(decided(&out), expected);
+        assert_eq!(out.iter().filter(|chunk| chunk.is_last).count(), 1);
+        for chunk in &out {
+            assert_eq!(chunk.series.metric, expected_metric);
+        }
+        let counts = out.iter().flat_map(histogram_counts).collect::<Vec<_>>();
+        assert_eq!(counts, if dropped { vec![] } else { vec![8.0] });
+        let mut warnings = Vec::new();
+        let mut infos = Vec::new();
+        collector.append_to(&mut warnings, &mut infos);
+        assert_eq!(
+            infos
+                .iter()
+                .any(|info| info.contains("dropped native histogram samples")),
+            dropped,
+            "unexpected histogram drop annotation: {infos:?}"
+        );
+        assert_eq!(execution.state().reserved_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
 }
 
 /// A series that ended is one member of a group, not the group: nothing is answered until the input
@@ -11866,4 +12470,302 @@ fn exporting_a_partial_charges_the_fold_and_the_groups_it_builds() {
         "the admitted figure covers the fold ({fold_bytes}) and the exported groups ({chunk_bytes}): {}",
         charges[0]
     );
+}
+
+/// The executor runs a short name-dropping window below a literal broadcast on chunked input.
+#[test]
+fn native_perf_track_window_literal() {
+    let grid = grid(0, 1_000, 128);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let root = || {
+        broadcast_right(
+            window_with(
+                evaluated_input(Arc::clone(&grid)),
+                RangeFunction::SumOverTime,
+                1,
+                Some(Arc::clone(&grid)),
+                Arc::clone(&grid),
+            ),
+            2.0,
+            BinaryOp::Mul,
+            false,
+        )
+    };
+    let tree = NativeTree::try_new(root()).unwrap();
+    let mut execution = executor(&tree, pool());
+    let RuntimeOp::Broadcast { state, left, .. } = &execution.state.root.op else {
+        panic!("expected broadcast")
+    };
+    assert!(state.emitted.is_none());
+    let RuntimeOp::Window { state, .. } = &left.op else {
+        panic!("expected window")
+    };
+    assert!(state.emitted.is_some());
+    assert_eq!(
+        emitted_tables(broadcast_right(
+            window_with(
+                evaluated_input(Arc::clone(&grid)),
+                RangeFunction::LastOverTime,
+                1,
+                Some(Arc::clone(&grid)),
+                Arc::clone(&grid)
+            ),
+            2.0,
+            BinaryOp::Mul,
+            false,
+        )),
+        (true, true)
+    );
+    assert_eq!(
+        emitted_tables(broadcast_right(
+            evaluated_input(Arc::clone(&grid)),
+            2.0,
+            BinaryOp::Mul,
+            false
+        )),
+        (true, false)
+    );
+    let mut output = Vec::new();
+    for id in 0..16 {
+        let label = id.to_string();
+        for chunk in 0..4 {
+            let start = chunk * 32;
+            let values = (start..start + 32)
+                .map(|p| (p % 11 != 0).then_some((id * 128 + p) as f64))
+                .collect();
+            execution
+                .push_evaluated(
+                    InputId::new(0),
+                    evaluated_chunk_of(
+                        &schema,
+                        named_metric("requests", &label),
+                        start,
+                        values,
+                        chunk == 3,
+                    ),
+                )
+                .unwrap();
+            while let Some(chunk) = execution.next_chunk().unwrap() {
+                output.push(chunk);
+            }
+        }
+    }
+    output.extend(execution.finish().unwrap());
+    let mut seen = vec![vec![None; 128]; 16];
+    let mut closes = [0; 16];
+    for chunk in &output {
+        assert_eq!(chunk.series.metric.name(), None);
+        let id: usize = chunk.series.metric.get("job").unwrap().parse().unwrap();
+        assert_eq!(chunk.series.metric.tags().len(), 1);
+        closes[id] += usize::from(chunk.is_last);
+        let values = sample_values(chunk);
+        for (position, row) in chunk.series.time.positions() {
+            assert_eq!(
+                chunk.series.time.timestamp(row),
+                Some(position as i64 * 1_000)
+            );
+            if let Some(value) = values[row] {
+                assert!(
+                    seen[id][position].replace(value).is_none(),
+                    "duplicate output position"
+                );
+            }
+        }
+    }
+    assert_eq!(closes, [1; 16]);
+    for (id, values) in seen.iter().enumerate() {
+        for (p, value) in values.iter().enumerate() {
+            assert_eq!(*value, (p % 11 != 0).then_some((id * 128 + p) as f64 * 2.0));
+        }
+    }
+    assert_eq!(execution.state().reserved_bytes(), 0);
+}
+
+/// The direct sum fold is reached through the real complete aggregate, including sparse axes.
+#[test]
+fn native_perf_sum_direct_fold() {
+    let grid = grid(0, 1_000, 256);
+    let input = evaluated_input_of(2, Arc::clone(&grid));
+    let schema = input.output.samples().unwrap().clone();
+    let tree =
+        NativeTree::try_new(aggregate(input, sum_grouping(Grouping::By(Arc::new([]))))).unwrap();
+    let positions: Vec<_> = (32..96).chain(192..256).collect();
+    let run_form = |split: bool| {
+        let mut execution = executor(&tree, pool());
+        for id in 0..2 {
+            let label = id.to_string();
+            let ranges: &[(usize, usize)] = if split {
+                &[(0, 63), (63, 64), (64, 97), (97, 128)]
+            } else {
+                &[(0, 128)]
+            };
+            for &(begin, end) in ranges {
+                let rows = &positions[begin..end];
+                let mut spans: Vec<GridSpan> = Vec::new();
+                for &p in rows {
+                    if let Some(last) = spans.last_mut()
+                        && last.start() + last.len() == p
+                    {
+                        *last = GridSpan::new(last.start(), last.len() + 1);
+                    } else {
+                        spans.push(GridSpan::new(p, 1));
+                    }
+                }
+                let fields = (0..2)
+                    .map(|field| {
+                        Samples::from_float(Float64Array::from(
+                            rows.iter()
+                                .map(|&p| {
+                                    (p != 70 && p % (field + 3) != id)
+                                        .then_some((id * 10 + field + p) as f64)
+                                })
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .collect();
+                let series = Series::try_new(
+                    &schema,
+                    named_metric("requests", &label),
+                    TimeAxis::from_grid_spans(Arc::clone(&grid), spans).unwrap(),
+                    SeriesFields::try_from_vec(fields).unwrap(),
+                )
+                .unwrap();
+                execution
+                    .push_evaluated(
+                        InputId::new(0),
+                        EvaluatedChunk::try_new(series, end == 128).unwrap(),
+                    )
+                    .unwrap();
+                assert!(execution.next_chunk().unwrap().is_none());
+            }
+        }
+        let out = execution.finish().unwrap();
+        assert_eq!(execution.state().reserved_bytes(), 0);
+        out
+    };
+    let whole = run_form(false);
+    let split = run_form(true);
+    let collect = |chunks: &[EvaluatedChunk]| {
+        let mut result = vec![vec![None; 256]; 2];
+        let mut closes = 0;
+        for chunk in chunks {
+            assert_eq!(chunk.series.metric.name(), None);
+            assert!(chunk.series.metric.tags().is_empty());
+            closes += usize::from(chunk.is_last);
+            for (p, row) in chunk.series.time.positions() {
+                assert_eq!(chunk.series.time.timestamp(row), Some(p as i64 * 1_000));
+                for (field, values) in result.iter_mut().enumerate() {
+                    let sample = field_values(chunk, field)[row];
+                    if let Some(sample) = sample {
+                        assert!(values[p].replace(sample).is_none());
+                    }
+                }
+            }
+        }
+        assert_eq!(closes, 1);
+        result
+    };
+    let whole = collect(&whole);
+    assert_eq!(whole, collect(&split));
+    for (field, values) in whole.iter().enumerate() {
+        for (p, actual) in values.iter().enumerate() {
+            let expected = if positions.contains(&p) {
+                let contributions: Vec<_> = (0..2)
+                    .filter(|&id| p != 70 && p % (field + 3) != id)
+                    .map(|id| (id * 10 + field + p) as f64)
+                    .collect();
+                (!contributions.is_empty()).then(|| contributions.iter().sum::<f64>())
+            } else {
+                None
+            };
+            assert_eq!(*actual, expected, "field {field}, position {p}");
+        }
+    }
+}
+
+/// A source broadcast retains clean tag backing, while dirty tags take the filtering path.
+#[test]
+fn native_perf_clean_label_sharing() {
+    let grid = grid(0, 1_000, 8);
+    let schema = evaluated_schema(Arc::clone(&grid));
+    let root = broadcast_right(
+        evaluated_input(Arc::clone(&grid)),
+        2.0,
+        BinaryOp::Mul,
+        false,
+    );
+    assert_eq!(emitted_tables(root.clone()), (true, false));
+    let tree = NativeTree::try_new(root).unwrap();
+    let mut execution = executor(&tree, pool());
+    for id in 0..19 {
+        let mut tags: Vec<_> = (0..8)
+            .map(|tag| Label {
+                name: format!("tag{tag}").into(),
+                value: format!("{id}-{tag}").into(),
+            })
+            .collect();
+        match id {
+            16 => tags.push(Label {
+                name: "__type__".into(),
+                value: "gauge".into(),
+            }),
+            17 => tags.push(Label {
+                name: "__unit__".into(),
+                value: "seconds".into(),
+            }),
+            18 => tags.push(Label {
+                name: "empty".into(),
+                value: "".into(),
+            }),
+            _ => {}
+        }
+        let input = SeriesLabels::try_new(Some("requests".into()), tags).unwrap();
+        let len = id % 8 + 1;
+        execution
+            .push_evaluated(
+                InputId::new(0),
+                evaluated_chunk_of(
+                    &schema,
+                    input.clone(),
+                    0,
+                    (0..len).map(|p| Some((id + p) as f64)).collect(),
+                    true,
+                ),
+            )
+            .unwrap();
+        let mut output = execution.next_chunk().unwrap().unwrap();
+        assert!(output.is_last);
+        assert_eq!(output.series.metric.name(), None);
+        assert_eq!(output.series.metric.tags().len(), 8);
+        assert_eq!(
+            sample_values(&output),
+            (0..len)
+                .map(|p| Some((id + p) as f64 * 2.0))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            output.series.time.timestamps().unwrap().as_ref(),
+            &(0..len).map(|p| p as i64 * 1_000).collect::<Vec<_>>()
+        );
+        for tag in 0..8 {
+            assert_eq!(
+                output.series.metric.get(&format!("tag{tag}")),
+                input.get(&format!("tag{tag}"))
+            );
+        }
+        for removed in ["__type__", "__unit__", "empty"] {
+            assert_eq!(output.series.metric.get(removed), None);
+        }
+        if id < 16 {
+            assert_eq!(output.series.metric.tags().as_ptr(), input.tags().as_ptr());
+            output.series.metric.set("tag0", "changed".into()).unwrap();
+            assert_ne!(output.series.metric.tags().as_ptr(), input.tags().as_ptr());
+            assert_eq!(input.get("tag0"), Some(format!("{id}-0").as_str()));
+            assert_eq!(output.series.metric.get("tag0"), Some("changed"));
+        } else {
+            assert_ne!(output.series.metric.tags().as_ptr(), input.tags().as_ptr());
+        }
+    }
+    assert!(execution.finish().unwrap().is_empty());
+    assert_eq!(execution.state().reserved_bytes(), 0);
 }

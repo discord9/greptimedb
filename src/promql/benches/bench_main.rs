@@ -14,10 +14,12 @@
 
 use criterion::criterion_main;
 
+mod bench_native_execute;
 mod bench_range_fn;
 mod bench_vector_match;
 
 criterion_main! {
+    bench_native_execute::benches,
     bench_range_fn::benches,
     bench_vector_match::benches_group
 }
