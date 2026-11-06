@@ -345,12 +345,24 @@ fn flush_batch(
         };
         kernel(&batch, &mut pending.columns[index]);
     }
-    for (offset, &grid_index) in pending.indices.iter().enumerate() {
-        row.clear();
-        for column in &pending.columns {
-            row.push(column[offset].map(GridSample::Float));
+    // A previous per-window result may still own a boxed histogram. The row-wise path drops it
+    // before its first append, so the dense path must do the same.
+    row.clear();
+    let dense = pending.columns.len() == 1
+        && pending.columns[0].iter().all(Option::is_some)
+        && pending
+            .indices
+            .windows(2)
+            .all(|pair| pair[1] == pair[0] + 1)
+        && output.push_dense_floats(&pending.indices, &pending.columns[0]);
+    if !dense {
+        for (offset, &grid_index) in pending.indices.iter().enumerate() {
+            row.clear();
+            for column in &pending.columns {
+                row.push(column[offset].map(GridSample::Float));
+            }
+            output.push_samples(grid_index, row)?;
         }
-        output.push_samples(grid_index, row)?;
     }
     pending.clear_points();
     Ok(())

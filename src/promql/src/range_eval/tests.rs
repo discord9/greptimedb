@@ -40,7 +40,8 @@ use rand::{Rng, SeedableRng};
 
 use super::{
     CounterReset, FieldSamples, FloatWindow, POSITION_COMPARISONS, PendingBatch, RangeEvaluator,
-    RangeFunction, RangeModifier, RangeWindow, WindowKernel, accumulate, subquery_grid,
+    RangeFunction, RangeModifier, RangeWindow, WindowKernel, accumulate, flush_batch,
+    subquery_grid,
 };
 use crate::evaluated::EvaluatedChunk;
 use crate::functions::{
@@ -1678,6 +1679,330 @@ fn a_fixed_window_over_histograms_keeps_the_estimate_bounded() {
         peak_retained(64),
         "a fixed-size window over a series of histograms grew with the length of the series"
     );
+}
+
+/// The flush chooses the dense writer only for a contiguous, present single column. The row is
+/// left empty on that path, making the dispatch distinguishable from row-wise transposition.
+#[test]
+fn dense_batch_flush_and_rowwise_fallbacks() {
+    let eval_grid = grid(0, 1, 10);
+    let schema = Arc::new(SeriesSchema {
+        fields: raw_schema(1).fields,
+        eval_grid: Some(eval_grid.clone()),
+    });
+    let nan = f64::from_bits(0x7ff8_0000_0000_0123);
+    let cases = [
+        (
+            vec![0, 1, 2, 3, 4],
+            vec![vec![
+                Some(nan),
+                Some(-0.0),
+                Some(0.0),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+            ]],
+            true,
+        ),
+        (vec![0, 1, 2], vec![vec![Some(1.0), None, Some(3.0)]], false),
+        (
+            vec![0, 2, 3],
+            vec![vec![Some(1.0), Some(2.0), Some(3.0)]],
+            false,
+        ),
+        (
+            vec![0, 1, 2],
+            vec![
+                vec![Some(1.0), None, Some(3.0)],
+                vec![None, Some(2.0), Some(4.0)],
+            ],
+            false,
+        ),
+    ];
+    for (indices, columns, dense) in cases {
+        let fields = columns.len();
+        let schema = if fields == 1 {
+            schema.clone()
+        } else {
+            Arc::new(SeriesSchema {
+                fields: raw_schema(fields).fields,
+                eval_grid: Some(eval_grid.clone()),
+            })
+        };
+        let mut pending = PendingBatch::with_fields(fields);
+        pending.indices = indices.clone();
+        pending.eval_ts = indices.iter().map(|&index| index as i64).collect();
+        let input_fields: Vec<_> = (0..fields).map(|_| FieldSamples::default()).collect();
+        let mut outputs = columns.clone().into_iter();
+        let mut kernel: super::BatchKernel = Box::new(move |_, output| {
+            *output = outputs.next().unwrap();
+        });
+        let mut output = GridSeriesBuilder::try_new(schema.clone()).unwrap();
+        let mut reference = GridSeriesBuilder::try_new(schema).unwrap();
+        for (offset, &index) in indices.iter().enumerate() {
+            let row: Vec<_> = columns
+                .iter()
+                .map(|column| column[offset].map(GridSample::Float))
+                .collect();
+            reference.push_samples(index, &row).unwrap();
+        }
+        let mut row = vec![Some(GridSample::Float(99.0))];
+        let mut calls = 0;
+        flush_batch(
+            &mut kernel,
+            &mut pending,
+            &input_fields,
+            1,
+            &mut row,
+            &mut output,
+            &mut calls,
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            row.is_empty(),
+            dense,
+            "dense writer did not match eligibility"
+        );
+        assert!(pending.is_empty());
+        assert!(pending.indices.is_empty());
+        let actual = output.finish(metric(3)).unwrap().unwrap();
+        let expected = reference.finish(metric(3)).unwrap().unwrap();
+        assert_eq!(
+            crate::grid_series::reference::run_ranges(&actual),
+            crate::grid_series::reference::run_ranges(&expected),
+        );
+        assert_pieces_eq(&[actual], &expand(&expected), &metric(3));
+    }
+}
+
+/// Empty flushes retain the previous row; a nonempty dense flush releases its histogram before
+/// writing. An out-of-order batch falls back to the original error without clearing pending data.
+#[test]
+fn batch_flush_releases_row_and_preserves_fallback_errors() {
+    let eval_grid = grid(0, 1, 5);
+    let schema = Arc::new(SeriesSchema {
+        fields: raw_schema(1).fields,
+        eval_grid: Some(eval_grid.clone()),
+    });
+    let histogram =
+        OwnedHistogram::parse("0/0/0/3ff0000000000000/3ff0000000000000/0/1_1/3ff0000000000000///");
+    let mut row = vec![Some(GridSample::Histogram(Box::new(
+        FloatHistogram::try_from_view(&histogram.view()).unwrap(),
+    )))];
+    assert!(super::boxed_bytes(&row) > 0);
+    let mut pending = PendingBatch::with_fields(1);
+    let fields = [FieldSamples::default()];
+    let mut calls = 0;
+    let mut output = GridSeriesBuilder::try_new(schema).unwrap();
+    let mut kernel: super::BatchKernel = Box::new(|batch, out| {
+        out.clear();
+        out.extend(std::iter::repeat_n(Some(2.0), batch.eval_ts.len()));
+    });
+    flush_batch(
+        &mut kernel,
+        &mut pending,
+        &fields,
+        1,
+        &mut row,
+        &mut output,
+        &mut calls,
+    )
+    .unwrap();
+    assert!(super::boxed_bytes(&row) > 0);
+    assert_eq!(calls, 0);
+
+    pending.indices.push(1);
+    pending.eval_ts.push(1);
+    flush_batch(
+        &mut kernel,
+        &mut pending,
+        &fields,
+        1,
+        &mut row,
+        &mut output,
+        &mut calls,
+    )
+    .unwrap();
+    assert!(row.is_empty());
+    assert_eq!(super::boxed_bytes(&row), 0);
+    assert!(pending.is_empty());
+    assert_eq!(pending.columns, [vec![Some(2.0)]]);
+
+    // Index 1 has already been written, so the builder must leave the batch for start_row to
+    // reject and keep the failing row and pending points just as the original path did.
+    pending.indices.push(1);
+    pending.eval_ts.push(1);
+    let error = flush_batch(
+        &mut kernel,
+        &mut pending,
+        &fields,
+        1,
+        &mut row,
+        &mut output,
+        &mut calls,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("grid series index 1 is not increasing"),
+        "{error}"
+    );
+    assert_eq!(pending.indices, [1]);
+    assert_eq!(pending.eval_ts, [1]);
+    assert!(matches!(row.as_slice(), [Some(GridSample::Float(v))] if *v == 2.0));
+
+    // On an error later in the batch, the original path retains the earlier successful row too.
+    let mut output = GridSeriesBuilder::try_new(Arc::new(SeriesSchema {
+        fields: raw_schema(1).fields,
+        eval_grid: Some(eval_grid),
+    }))
+    .unwrap();
+    pending.indices = vec![4, 5];
+    pending.eval_ts = vec![4, 5];
+    let error = flush_batch(
+        &mut kernel,
+        &mut pending,
+        &fields,
+        1,
+        &mut row,
+        &mut output,
+        &mut calls,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("grid series index 5 is not increasing"),
+        "{error}"
+    );
+    assert_eq!(pending.indices, [4, 5]);
+    let partial = output.finish(metric(0)).unwrap().unwrap();
+    assert_eq!(
+        crate::grid_series::reference::run_ranges(&partial),
+        vec![(4, 1)]
+    );
+}
+
+/// A histogram already in the current builder makes the dense probe fall back to row writes,
+/// preserving its side indices; the boxed row is released before the batch is appended.
+#[test]
+fn dense_batch_after_histogram_falls_back_to_row_writes() {
+    let schema = Arc::new(SeriesSchema {
+        fields: raw_schema(1).fields,
+        eval_grid: Some(grid(0, 1, 4)),
+    });
+    let histogram =
+        OwnedHistogram::parse("0/0/0/3ff0000000000000/3ff0000000000000/0/1_1/3ff0000000000000///");
+    let value = || {
+        GridSample::Histogram(Box::new(
+            FloatHistogram::try_from_view(&histogram.view()).unwrap(),
+        ))
+    };
+    let mut output = GridSeriesBuilder::try_new(schema).unwrap();
+    output.push_samples(0, &[Some(value())]).unwrap();
+    let mut row = vec![Some(value())];
+    let mut pending = PendingBatch::with_fields(1);
+    pending.indices = vec![1, 2];
+    pending.eval_ts = vec![1, 2];
+    let fields = [FieldSamples::default()];
+    let mut kernel: super::BatchKernel = Box::new(|_, out| {
+        out.clear();
+        out.extend([Some(-0.0), Some(f64::INFINITY)]);
+    });
+    let mut calls = 0;
+    flush_batch(
+        &mut kernel,
+        &mut pending,
+        &fields,
+        1,
+        &mut row,
+        &mut output,
+        &mut calls,
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(super::boxed_bytes(&row), 0);
+    assert!(matches!(row.as_slice(), [Some(GridSample::Float(v))] if *v == f64::INFINITY));
+    let series = output.finish(metric(0)).unwrap().unwrap();
+    assert_eq!(
+        crate::grid_series::reference::run_ranges(&series),
+        vec![(0, 3)]
+    );
+    let field = &series.fields.as_slice()[0];
+    assert!(matches!(field.sample(0), SampleRef::Histogram(_)));
+    assert!(matches!(field.sample(1), SampleRef::Float(v) if v.to_bits() == (-0.0f64).to_bits()));
+    assert!(matches!(field.sample(2), SampleRef::Float(v) if v == f64::INFINITY));
+}
+
+/// Dense 61-point and multi-batch rate/increase results match per-window evaluation bit for bit,
+/// whether one input chunk closes the series or a prefix is handed out before the final chunk.
+#[test]
+fn dense_counter_batches_match_per_window_across_chunks() {
+    let window = RangeWindow {
+        range_ms: 30_000,
+        offset_ms: 0,
+        anchor_ms: None,
+        modifier: None,
+    };
+    for function in [RangeFunction::Rate, RangeFunction::Increase] {
+        for points in [61, 600] {
+            // The sample before grid position zero makes even the first batch fully present.
+            let rows: Vec<Row> = (-1..points as i64)
+                .map(|index| (index * 10_000, vec![Some((index + 2) as f64)]))
+                .collect();
+            for split in [false, true] {
+                let grid = grid(0, 10_000, points);
+                let mut batched =
+                    RangeEvaluator::try_new(&raw_schema(1), grid.clone(), window, function)
+                        .unwrap();
+                let mut reference = RangeEvaluator::with_kernel(
+                    &raw_schema(1),
+                    grid,
+                    window,
+                    function.kernel(0),
+                    true,
+                    true,
+                )
+                .unwrap();
+                let pieces = if split {
+                    let at = (rows.len() / 2).min(550);
+                    vec![
+                        chunk(&rows[..at], 1, 4, false),
+                        chunk(&rows[at..], 1, 4, true),
+                    ]
+                } else {
+                    vec![chunk(&rows, 1, 4, true)]
+                };
+                let actual = collect_chunks(&mut batched, &pieces);
+                let expected = collect_chunks(&mut reference, &pieces);
+                assert!(batched.batch_call_count() >= if points > 512 { 2 } else { 1 });
+                assert_eq!(actual.len(), expected.len());
+                assert_eq!(actual.len(), if split { 2 } else { 1 });
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|piece| piece.series.time.len())
+                        .sum::<usize>(),
+                    points as usize
+                );
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(actual.is_last, index + 1 == pieces.len());
+                    assert_eq!(actual.is_last, expected.is_last);
+                    assert_eq!(actual.series.metric, output_metric(function, 4));
+                    assert_eq!(
+                        crate::grid_series::reference::run_ranges(&actual.series),
+                        crate::grid_series::reference::run_ranges(&expected.series)
+                    );
+                    assert_pieces_eq(
+                        std::slice::from_ref(&actual.series),
+                        &expand(&expected.series),
+                        &output_metric(function, 4),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A batch spanning more grid points than `EVALUATION_BATCH` flushes in the middle of one

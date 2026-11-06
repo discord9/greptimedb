@@ -86,6 +86,111 @@ fn the_series_of_one_push_sequence_matches_the_pushed_rows() {
     }
 }
 
+/// Dense batches keep the exact bits, axis and labels of row-wise writes, including after a
+/// prefix hand-out. Their Vec capacities also follow the same grow-one allocation sequence.
+#[test]
+fn dense_float_batches_match_row_writes_across_prefixes() {
+    let schema = grid_schema(1, 700);
+    let mut dense = GridSeriesBuilder::try_new(schema.clone()).unwrap();
+    let mut rows = GridSeriesBuilder::try_new(schema).unwrap();
+    let special = [
+        f64::from_bits(0x7ff8_0000_0000_0123),
+        -0.0,
+        0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for (start, end) in [(1, 514), (520, 650)] {
+        let indices: Vec<_> = (start..end).collect();
+        let values: Vec<_> = indices
+            .iter()
+            .map(|index| Some(special[index % special.len()]))
+            .collect();
+        assert!(dense.push_dense_floats(&indices, &values));
+        for (&index, &value) in indices.iter().zip(&values) {
+            rows.push_samples(index, &[value.map(GridSample::Float)])
+                .unwrap();
+        }
+        assert_eq!(dense.indices.capacity(), rows.indices.capacity());
+        assert_eq!(dense.fields.capacity(), rows.fields.capacity());
+        assert_eq!(
+            dense.fields[0].values.capacity(),
+            rows.fields[0].values.capacity()
+        );
+        assert_eq!(dense.next, rows.next);
+
+        let actual = dense.take_buffered(metric(7)).unwrap().unwrap();
+        let expected = rows.take_buffered(metric(7)).unwrap().unwrap();
+        assert_eq!(actual.metric, expected.metric);
+        assert_eq!(run_ranges(&actual), run_ranges(&expected));
+        let bits = |series: &Series| {
+            let mut cursor = series.fields.as_slice()[0].cursor();
+            series
+                .time
+                .positions()
+                .map(|(position, row)| match cursor.at(row).unwrap() {
+                    SampleRef::Float(value) => (position, value.to_bits()),
+                    _ => panic!("expected a float"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&actual), bits(&expected));
+    }
+
+    // An empty first row advances `next` without creating a field; the batch can follow it.
+    dense.begin_series();
+    rows.begin_series();
+    dense.push_samples(0, &[None]).unwrap();
+    rows.push_samples(0, &[None]).unwrap();
+    assert!(dense.push_dense_floats(&[1], &[Some(-0.0)]));
+    rows.push_samples(1, &[Some(GridSample::Float(-0.0))])
+        .unwrap();
+    let actual = dense.finish(metric(1)).unwrap().unwrap();
+    let expected = rows.finish(metric(1)).unwrap().unwrap();
+    assert_eq!(run_ranges(&actual), run_ranges(&expected));
+    assert!(
+        matches!(actual.fields.as_slice()[0].sample(0), SampleRef::Float(v) if v.to_bits() == (-0.0f64).to_bits())
+    );
+}
+
+/// A previous histogram needs a side index per row, so dense floats leave the builder untouched
+/// and the normal row path extends the mixed column instead.
+#[test]
+fn dense_float_batch_refuses_a_histogram_builder_without_changes() {
+    let schema = grid_schema(1, 5);
+    let mut builder = GridSeriesBuilder::try_new(schema).unwrap();
+    let histogram =
+        OwnedHistogram::parse("0/0/0/3ff0000000000000/3ff0000000000000/0/1_1/3ff0000000000000///");
+    builder
+        .push_samples(
+            0,
+            &[Some(GridSample::Histogram(Box::new(
+                FloatHistogram::try_from_view(&histogram.view()).unwrap(),
+            )))],
+        )
+        .unwrap();
+    assert!(!builder.push_dense_floats(&[1, 2], &[Some(-0.0), Some(f64::INFINITY)]));
+    assert_eq!(builder.next, 1);
+    assert_eq!(builder.indices, [0]);
+    assert_eq!(builder.fields[0].values.len(), 1);
+    assert_eq!(
+        builder.fields[0].histograms.as_ref().unwrap().indices.len(),
+        1
+    );
+    builder
+        .push_samples(1, &[Some(GridSample::Float(-0.0))])
+        .unwrap();
+    builder
+        .push_samples(2, &[Some(GridSample::Float(f64::INFINITY))])
+        .unwrap();
+    let series = builder.finish(metric(0)).unwrap().unwrap();
+    assert_eq!(run_ranges(&series), vec![(0, 3)]);
+    let field = &series.fields.as_slice()[0];
+    assert!(matches!(field.sample(0), SampleRef::Histogram(_)));
+    assert!(matches!(field.sample(1), SampleRef::Float(v) if v.to_bits() == (-0.0f64).to_bits()));
+    assert!(matches!(field.sample(2), SampleRef::Float(v) if v == f64::INFINITY));
+}
+
 #[test]
 fn builder_rejects_invalid_rows() {
     let mut builder = GridSeriesBuilder::try_new(grid_schema(2, 4)).unwrap();

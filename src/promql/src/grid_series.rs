@@ -249,6 +249,39 @@ impl GridSeriesBuilder {
         Ok(())
     }
 
+    /// Appends a dense single-field float batch, or leaves the builder untouched for row-wise
+    /// fallback. The caller supplies nonempty, equally long slices of consecutive increasing,
+    /// grid-valid indices and all-`Some` values, with one field in the input schema.
+    pub(crate) fn push_dense_floats(&mut self, indices: &[usize], values: &[Option<f64>]) -> bool {
+        let (Some(&first), Some(&last)) = (indices.first(), indices.last()) else {
+            return false;
+        };
+        if self.schema.fields.len() != 1
+            || first < self.next
+            || last >= self.grid.spec().len as usize
+            || self
+                .fields
+                .first()
+                .is_some_and(|field| field.histograms.is_some())
+        {
+            return false;
+        }
+        if self.fields.is_empty() {
+            self.fields = (0..1).map(|_| FieldBuilder::new(0)).collect();
+        }
+        // Keep the same grow-one Vec allocation behavior as `push_samples`.
+        for &index in indices {
+            self.indices.push(index);
+        }
+        let field = &mut self.fields[0];
+        for value in values {
+            field.values.push(value.unwrap_or_default());
+        }
+        field.nulls.append_n_non_nulls(values.len());
+        self.next = last + 1;
+        true
+    }
+
     /// Validates the row and retains it; returns whether it holds a value to write.
     fn start_row(&mut self, index: usize, len: usize, empty: bool) -> Result<bool> {
         if len != self.schema.fields.len() {

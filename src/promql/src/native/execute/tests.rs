@@ -2344,6 +2344,86 @@ fn a_fanout_enqueue_failure_releases_every_recipient() {
     );
 }
 
+/// The native Window route preserves labels, grid positions and per-series close across a dense
+/// rate prefix, and still returns its reservation if a later input exceeds the budget.
+#[test]
+fn dense_rate_window_closes_each_series_and_releases_a_rejected_reservation() {
+    let out_grid = grid(0, 10_000, 61);
+    let tree = NativeTree::try_new(window_with(
+        input(),
+        RangeFunction::Rate,
+        30_000,
+        None,
+        Arc::clone(&out_grid),
+    ))
+    .unwrap();
+    let schema = raw_schema();
+    let timestamps: Vec<i64> = (-1..61).map(|i| i * 10_000).collect();
+    let values: Vec<f64> = (1..=62).map(|i| i as f64).collect();
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    for (key, host) in [(b"series-a".as_slice(), "a"), (b"series-b".as_slice(), "b")] {
+        let labels = named_metric("requests", host);
+        let mut expected = labels.clone();
+        expected.remove("__name__");
+        for (start, end, last) in [(0, 32, false), (32, 62, true)] {
+            execution
+                .push_raw(
+                    InputId::new(0),
+                    raw_chunk_of(
+                        &schema,
+                        key,
+                        labels.clone(),
+                        &timestamps[start..end],
+                        &values[start..end],
+                        last,
+                    ),
+                )
+                .unwrap();
+            let chunk = execution.next_chunk().unwrap().expect("a dense chunk");
+            assert_eq!(chunk.is_last, last);
+            assert_eq!(chunk.series.metric, expected);
+            let expected_positions = if last { 31..61 } else { 0..31 };
+            let points = decided(&[chunk]);
+            assert_eq!(points.len(), expected_positions.len());
+            for ((position, value), expected_position) in points.into_iter().zip(expected_positions)
+            {
+                assert_eq!(position, expected_position);
+                let expected_rate = if position == 0 { 0.05_f64 } else { 0.1_f64 };
+                assert_eq!(value.unwrap().to_bits(), expected_rate.to_bits());
+            }
+        }
+    }
+    assert!(execution.finish().unwrap().is_empty());
+    assert_eq!(pool.reserved(), 0);
+
+    // Let one dense batch run before rejecting a later oversized chunk; this exercises release of
+    // the actual Window state, rather than only a failure at the first input admission.
+    let pool = bounded_pool(64 << 10);
+    let mut rejected = executor(&tree, Arc::clone(&pool));
+    rejected
+        .push_raw(
+            InputId::new(0),
+            raw_chunk(&schema, &timestamps, &values, false),
+        )
+        .unwrap();
+    let prefix = rejected.next_chunk().unwrap().expect("dense prefix");
+    assert!(!prefix.is_last);
+    assert_eq!(prefix.series.time.len(), 61);
+    assert!(pool.reserved() > 0);
+    let large_times: Vec<i64> = (1..=100_000).map(|i| 600_000 + i).collect();
+    let large_values = vec![63.0; large_times.len()];
+    let error = rejected
+        .push_raw(
+            InputId::new(0),
+            raw_chunk(&schema, &large_times, &large_values, true),
+        )
+        .unwrap_err();
+    assert!(is_resources_exhausted(&error), "{error}");
+    assert_eq!(rejected.state().reserved_bytes(), 0);
+    assert_eq!(pool.reserved(), 0);
+}
+
 /// A chunk the pool cannot admit fails the execution and gives back everything it already held.
 ///
 /// The window holds the first chunk's samples, so the second one is refused against a reservation
