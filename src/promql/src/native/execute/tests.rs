@@ -346,7 +346,6 @@ fn window_and_limitk_collect_only_unified_contributions() {
             None,
         )
         .unwrap()
-        .0
     };
 
     let raw_window = build(window_with(
