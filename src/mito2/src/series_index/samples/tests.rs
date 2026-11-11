@@ -1683,3 +1683,186 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
         }
     }
 }
+
+/// Like [`batch`], but every row carries its own `tag_0` label, so two rows may
+/// describe different series while sharing the same `(table_id, tsid)` hash.
+fn labeled_batch(meta: &RegionMetadataRef, rows: &[(Sample, &str)]) -> RecordBatch {
+    let samples: Vec<Sample> = rows.iter().map(|(sample, _)| *sample).collect();
+    let base = batch(meta, &samples, false);
+    let keys: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|(sample, label)| new_sparse_primary_key(&[label, "b"], meta, sample.0, sample.1))
+        .collect();
+    let keys: ArrayRef = Arc::new(BinaryArray::from_iter_values(
+        keys.iter().map(Vec::as_slice),
+    ));
+    let mut columns: Vec<ArrayRef> = base.columns().to_vec();
+    columns[2] = keys;
+    RecordBatch::try_new(base.schema(), columns).unwrap()
+}
+
+/// Opens a samples writer for a fresh artifact, returning it with the store so the
+/// test can observe the write result instead of unwrapping it.
+async fn fresh_writer(
+    format: &ColumnarSamplesFormat,
+    store: &ObjectStore,
+    meta: &RegionMetadataRef,
+) -> (Box<dyn FormatWriter>, FileId) {
+    let file_id = FileId::random();
+    let generation = FileId::random();
+    let prefix = format!("{}/samples/{generation}/", meta.region_id.as_u64());
+    let writer = format
+        .writer(meta.clone(), store.clone(), &prefix, file_id, generation)
+        .await
+        .unwrap();
+    // The manifest records this file id as its source, and the reader refuses a handle
+    // whose entry file id differs, so the handle below must reuse it.
+    (writer, file_id)
+}
+
+// Reproduction: the native samples writer keys its input check — and its block
+// boundaries — by the *hash* identity `(table_id, tsid)` instead of the exact
+// primary key, so two legitimate series that share a tsid look like one series
+// whose timestamps went backwards.
+//
+// The input below is ordered by the region's storage identity: rows sort by the
+// encoded sparse primary key, and inside one key they sort by time. Series `a`
+// (sparse key ["a","b"], table_id=1, tsid=7) sorts before series `b` (sparse key
+// ["b","b"], same table_id=1, tsid=7), and each series has its own ascending time
+// range 100,200 — which is what region data looks like, since distinct series
+// cover overlapping windows. The decoded hash identity of both keys is identical,
+// so `SamplesWriter::write_batch` sees `(7@100, 7@200, 7@100, 7@200)` and rejects
+// the batch as unsorted. The order is fine; the identity assumption is not.
+#[tokio::test]
+async fn repro_colliding_tsids_error_even_though_input_is_key_sorted() {
+    let store = store();
+    let m = metadata();
+    let format = ColumnarSamplesFormat::default();
+    let key_a = new_sparse_primary_key(&["a", "b"], &m, 1, 7);
+    let key_b = new_sparse_primary_key(&["b", "b"], &m, 1, 7);
+    // The input is sorted by the storage identity; assert it instead of assuming it.
+    assert!(
+        key_a < key_b,
+        "the sparse primary keys are not in key order"
+    );
+    let rows: Vec<(Sample, &str)> = vec![
+        ((1, 7, 100, 1, 0, Some(1)), "a"),
+        ((1, 7, 200, 1, 0, Some(2)), "a"),
+        ((1, 7, 100, 1, 0, Some(3)), "b"),
+        ((1, 7, 200, 1, 0, Some(4)), "b"),
+    ];
+    // `(primary key, time)` order: key ascends between groups, time ascends inside a group.
+    let sort_key: Vec<(Vec<u8>, i64)> = rows
+        .iter()
+        .map(|(sample, label)| {
+            (
+                new_sparse_primary_key(&[label, "b"], &m, sample.0, sample.1),
+                sample.2,
+            )
+        })
+        .collect();
+    let mut sorted = sort_key.clone();
+    sorted.sort();
+    assert_eq!(
+        sort_key, sorted,
+        "input is not sorted by (primary key, timestamp)"
+    );
+    let input = labeled_batch(&m, &rows);
+    let (mut writer, _) = fresh_writer(&format, &store, &m).await;
+    let result = writer.write(&input).await;
+    assert!(
+        result.is_ok(),
+        "the batch is sorted by the sparse primary key and by time inside each key, \
+         but the writer rejected it because the two series share the hash identity \
+         (table_id=1, tsid=7): {}",
+        result.unwrap_err()
+    );
+}
+
+/// The same two colliding series, but with disjoint time ranges (100,200 then
+/// 300,400) so the `(table_id, tsid)` stream is globally increasing and the
+/// writer's ordering check passes. The write succeeds and the samples of series
+/// `b` are then stored under the same identity as series `a`, in the same block:
+/// the artifact carries no labels at all, so every one of these rows is served as
+/// series `a` from here on. This path corrupts silently instead of erroring.
+#[tokio::test]
+async fn repro_colliding_tsids_merge_silently_when_time_increases() {
+    let store = store();
+    let m = metadata();
+    let format = ColumnarSamplesFormat::default();
+    let key_a = new_sparse_primary_key(&["a", "b"], &m, 1, 7);
+    let key_b = new_sparse_primary_key(&["b", "b"], &m, 1, 7);
+    assert!(
+        key_a < key_b,
+        "the sparse primary keys are not in key order"
+    );
+    let rows: Vec<(Sample, &str)> = vec![
+        ((1, 7, 100, 1, 0, Some(1)), "a"),
+        ((1, 7, 200, 1, 0, Some(2)), "a"),
+        ((1, 7, 300, 1, 0, Some(3)), "b"),
+        ((1, 7, 400, 1, 0, Some(4)), "b"),
+    ];
+    let input = labeled_batch(&m, &rows);
+    let (mut writer, source_file_id) = fresh_writer(&format, &store, &m).await;
+    writer.write(&input).await.unwrap();
+    let artifact = writer.finish().await.unwrap();
+    let (purger, _) = series_index_channel(store.clone());
+    // The reader requires the manifest's recorded source file id to equal the entry's, so
+    // the handle reuses the one the writer recorded; a random pair is rejected before any
+    // row is read, which would hide what this test is about.
+    let file_id = source_file_id;
+    let handle = SamplesFileHandle::new(
+        RegionFileId::new(m.region_id, file_id),
+        SamplesEntry {
+            file_id,
+            artifact,
+            source_file_ids: Vec::new(),
+            window: None,
+            source_windows: Default::default(),
+        },
+        purger,
+    );
+    let reader = format.reader(store, handle).await.unwrap();
+    let out = reader
+        .read(full_request())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let observed = collect_rows(&out);
+    let identities: BTreeSet<(u32, u64)> = observed.iter().map(|r| (r.0, r.1)).collect();
+    assert_eq!(
+        identities.len(),
+        2,
+        "samples of two label sets `a`/`b` were written but the artifact knows a \
+         single (table_id, tsid); series `b`'s rows are indistinguishable from \
+         series `a`'s: {observed:?}"
+    );
+}
+
+/// Control: the identical batch shape with distinct tsids round-trips as two
+/// identities and every sample keeps its own timestamp.
+#[tokio::test]
+async fn repro_colliding_tsids_control_distinct_tsids_round_trip() {
+    let store = store();
+    let m = metadata();
+    let format = ColumnarSamplesFormat::default();
+    let rows: Vec<(Sample, &str)> = vec![
+        ((1, 7, 100, 1, 0, Some(1)), "a"),
+        ((1, 7, 200, 1, 0, Some(2)), "a"),
+        ((1, 8, 100, 1, 0, Some(3)), "b"),
+        ((1, 8, 200, 1, 0, Some(4)), "b"),
+    ];
+    let handle = build(&format, &store, m.clone(), &[labeled_batch(&m, &rows)]).await;
+    let reader = format.reader(store, handle).await.unwrap();
+    let out = reader
+        .read(full_request())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_rows(&out),
+        rows.iter().map(|(sample, _)| *sample).collect::<Vec<_>>()
+    );
+}

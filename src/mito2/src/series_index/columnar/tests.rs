@@ -1435,3 +1435,234 @@ fn reusable_payload_decoder_preserves_bounds_and_recovers_after_errors() {
         first
     );
 }
+
+/// Decodes the hash identity `(table_id, tsid)` the series writer keeps its state
+/// by, plus the label set that the format stores next to it.
+fn decoded_identity(key: &[u8], meta: &RegionMetadataRef) -> (MetricSeriesId, Vec<Option<String>>) {
+    let tags = crate::series_index::writer::tag_columns(meta);
+    let mut offsets = mito_codec::row_converter::SparseOffsetsCache::new();
+    let mut buf = Vec::new();
+    crate::series_index::writer::decode_series_identity(key, &tags, &mut offsets, &mut buf).unwrap()
+}
+
+/// Reads `TABLE_ID, TSID, ROW_COUNT, tag_0, tag_1` back as one row per series.
+async fn series_rows(
+    format: &ColumnarSeriesFormat,
+    store: &ObjectStore,
+    handle: SeriesIndexFileHandle,
+) -> Vec<(u32, u64, u64, Option<String>, Option<String>)> {
+    let reader = format.reader(store.clone(), handle).await.unwrap();
+    let batches = reader
+        .read(request(&[
+            TABLE_ID_COLUMN,
+            TSID_COLUMN,
+            ROW_COUNT_COLUMN,
+            "tag_0",
+            "tag_1",
+        ]))
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let table_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let tsids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let counts = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let tag_0 = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let tag_1 = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                table_ids.value(i),
+                tsids.value(i),
+                counts.value(i),
+                (!tag_0.is_null(i)).then(|| tag_0.value(i).to_owned()),
+                (!tag_1.is_null(i)).then(|| tag_1.value(i).to_owned()),
+            ));
+        }
+    }
+    rows
+}
+
+// Reproduction: the native series writer treats the *hash* identity
+// `(table_id, tsid)` as the series identity, while the region's storage identity
+// is the encoded sparse primary key (which additionally carries the labels).
+//
+// The input written below is ordered by the storage identity: it is one batch per
+// series, the sparse key of series "a" sorts before the sparse key of series "b",
+// and timestamps increase (100 then 200), so nothing about the batch is out of
+// order. The only unusual property is that both label sets hash to the same tsid,
+// which the format must tolerate because `tsid` is a hash of the labels, not a
+// unique key.
+//
+// `ColumnarWriter::append_key` compares decoded `(table_id, tsid)` pairs
+// (`if id == row.id`), so it folds series "b" into series "a"'s row: one row
+// instead of two, the first label set kept, the row counts summed. This path has
+// no way to notice the collision, so it corrupts silently instead of erroring.
+#[tokio::test]
+async fn repro_colliding_tsids_merge_silently_when_time_increases() {
+    let store = store();
+    let meta = metadata();
+    let format = ColumnarSeriesFormat::default();
+    let series_a = new_sparse_primary_key(&["a", "x"], &meta, 1, 7);
+    let series_b = new_sparse_primary_key(&["b", "x"], &meta, 1, 7);
+    // Order the input by the storage identity and assert it instead of assuming it.
+    assert!(
+        series_a < series_b,
+        "the sparse primary keys are not in key order"
+    );
+    let input = [
+        series_a.clone(),
+        series_a.clone(),
+        series_b.clone(),
+        series_b.clone(),
+    ];
+    let mut key_sorted = input.to_vec();
+    key_sorted.sort();
+    assert_eq!(
+        input.to_vec(),
+        key_sorted,
+        "input is not sorted by primary key"
+    );
+    // The two keys are different series but decode to the same hash identity.
+    assert_eq!(
+        decoded_identity(&series_a, &meta).0,
+        MetricSeriesId {
+            table_id: 1,
+            tsid: 7
+        }
+    );
+    assert_eq!(
+        decoded_identity(&series_b, &meta).0,
+        MetricSeriesId {
+            table_id: 1,
+            tsid: 7
+        }
+    );
+    assert_eq!(
+        decoded_identity(&series_a, &meta).1,
+        [Some("a".to_string()), Some("x".to_string())]
+    );
+    assert_eq!(
+        decoded_identity(&series_b, &meta).1,
+        [Some("b".to_string()), Some("x".to_string())]
+    );
+    // Globally increasing timestamps: nothing in the input looks out of order.
+    let handle = build(
+        &format,
+        &store,
+        &[
+            batch(&input[..2], false, 100),
+            batch(&input[2..], false, 200),
+        ],
+    )
+    .await;
+    let rows = series_rows(&format, &store, handle).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "two label sets `a`/`b` were written under a key-sorted input but the series \
+         artifact holds a single row, so the second series was merged into the first \
+         (and its label set dropped): {rows:?}"
+    );
+}
+
+// Control for the test above: the same batch shape with *distinct* tsids stays two
+// rows, so the merging there comes from the shared hash identity, not from the batch
+// shape, the reader, or the assertions.
+#[tokio::test]
+async fn repro_colliding_tsids_control_distinct_tsids_stay_distinct() {
+    let store = store();
+    let meta = metadata();
+    let format = ColumnarSeriesFormat::default();
+    let series_a = new_sparse_primary_key(&["a", "x"], &meta, 1, 7);
+    let series_b = new_sparse_primary_key(&["b", "x"], &meta, 1, 8);
+    let input = [series_a.clone(), series_a, series_b.clone(), series_b];
+    let mut key_sorted = input.to_vec();
+    key_sorted.sort();
+    assert_eq!(
+        input.to_vec(),
+        key_sorted,
+        "input is not sorted by primary key"
+    );
+    let handle = build(
+        &format,
+        &store,
+        &[
+            batch(&input[..2], false, 100),
+            batch(&input[2..], false, 200),
+        ],
+    )
+    .await;
+    let rows = series_rows(&format, &store, handle).await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, 7, 2, Some("a".to_owned()), Some("x".to_owned())),
+            (1, 8, 2, Some("b".to_owned()), Some("x".to_owned())),
+        ]
+    );
+}
+
+// The series writer never decodes timestamps, so it also merges the colliding
+// series when each series restarts its own time range — the exact input the
+// samples writer rejects with "sample input is not sorted" (see
+// `series_index::samples::tests::repro_colliding_tsids_error_even_though_input_is_key_sorted`).
+// Written out to show that this path cannot notice the collision at all: it reports
+// success while the second series is gone from the artifact.
+#[tokio::test]
+async fn repro_colliding_tsids_merge_silently_even_when_time_resets() {
+    let store = store();
+    let meta = metadata();
+    let format = ColumnarSeriesFormat::default();
+    let series_a = new_sparse_primary_key(&["a", "x"], &meta, 1, 7);
+    let series_b = new_sparse_primary_key(&["b", "x"], &meta, 1, 7);
+    assert!(
+        series_a < series_b,
+        "the sparse primary keys are not in key order"
+    );
+    let input = [series_a.clone(), series_a, series_b.clone(), series_b];
+    let mut key_sorted = input.to_vec();
+    key_sorted.sort();
+    assert_eq!(
+        input.to_vec(),
+        key_sorted,
+        "input is not sorted by primary key"
+    );
+    let handle = build(
+        &format,
+        &store,
+        &[
+            batch(&input[..2], false, 100),
+            batch(&input[2..], false, 100),
+        ],
+    )
+    .await;
+    let rows = series_rows(&format, &store, handle).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "the write succeeded although the two label sets share (table_id, tsid); the \
+         series artifact now holds one merged row: {rows:?}"
+    );
+}
