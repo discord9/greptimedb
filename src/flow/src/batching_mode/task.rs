@@ -598,6 +598,104 @@ impl BatchingTask {
             .map(Some)
     }
 
+    /// Verifies that every source table still keeps data back to `start`.
+    ///
+    /// This is the range-scoped counterpart of
+    /// [`Self::validate_recovery_retention`]: a caller that reads one bounded range
+    /// instead of the flow's recovery scope states that range directly, so it must
+    /// not need a flow `expire_after` and must not re-derive the flow's retention
+    /// lower bound. What must hold is that each source's own TTL still covers the
+    /// range start relative to the current clock: `Forever` covers every range, an
+    /// `Instant` TTL cannot be shown to cover a start that moves with the clock,
+    /// and a `Duration` TTL covers a start younger than the TTL. The check is
+    /// read-only and leaves task state untouched.
+    pub async fn validate_range_source_ttl(&self, start: Timestamp) -> Result<(), Error> {
+        for name in &self.config.source_table_names {
+            let ttl = self.source_table_ttl(name).await?;
+            match ttl {
+                TimeToLive::Forever => {}
+                TimeToLive::Instant => {
+                    return UnexpectedSnafu {
+                        reason: format!(
+                            "Flow {} source table {} has an instant TTL, so no range start can be \
+                             shown to be covered by it",
+                            self.config.flow_id,
+                            name.join(".")
+                        ),
+                    }
+                    .fail();
+                }
+                TimeToLive::Duration(ttl) => {
+                    let cutoff = Timestamp::current_millis()
+                        .sub_duration(ttl)
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+                    if start <= cutoff {
+                        return UnexpectedSnafu {
+                            reason: format!(
+                                "Flow {} range starts at {start:?}, older than source table {}'s \
+                                 TTL {ttl:?} cutoff {cutoff:?}",
+                                self.config.flow_id,
+                                name.join(".")
+                            ),
+                        }
+                        .fail();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective TTL of one recorded source table, including an inherited one.
+    async fn source_table_ttl(&self, name: &[String; 3]) -> Result<TimeToLive, Error> {
+        let table = self
+            .config
+            .catalog_manager
+            .table(&name[0], &name[1], &name[2], None)
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?
+            .context(UnexpectedSnafu {
+                reason: format!(
+                    "Flow {} source table {} is unavailable for range TTL validation",
+                    self.config.flow_id,
+                    name.join(".")
+                ),
+            })?;
+        if let Some(ttl) = table.table_info().meta.options.ttl {
+            return Ok(ttl);
+        }
+        let manager = self
+            .config
+            .catalog_manager
+            .as_any()
+            .downcast_ref::<KvBackendCatalogManager>()
+            .context(UnexpectedSnafu {
+                reason: format!(
+                    "Flow {} cannot resolve inherited TTL for source table {} during a range audit",
+                    self.config.flow_id,
+                    name.join(".")
+                ),
+            })?;
+        Ok(manager
+            .table_metadata_manager_ref()
+            .schema_manager()
+            .get(SchemaNameKey::new(&name[0], &name[1]))
+            .await
+            .map_err(BoxedError::new)
+            .context(ExternalSnafu)?
+            .context(UnexpectedSnafu {
+                reason: format!(
+                    "Flow {} schema {}.{} is unavailable for range TTL validation",
+                    self.config.flow_id, name[0], name[1]
+                ),
+            })?
+            .ttl
+            .map(Into::into)
+            .unwrap_or(TimeToLive::Forever))
+    }
+
     /// Verifies that recovery can still read all source data required by its retained scope.
     pub async fn validate_recovery_retention(
         &self,
@@ -861,6 +959,7 @@ impl BatchingTask {
                 request,
                 &extensions,
                 &HashMap::new(),
+                None,
                 &mut peer_desc,
             )
             .await?;
@@ -1436,6 +1535,7 @@ impl BatchingTask {
                     req,
                     &extension_refs,
                     &snapshot_seqs,
+                    None,
                     &mut peer_desc,
                 )
                 .await
