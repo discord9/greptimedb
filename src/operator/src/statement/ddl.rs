@@ -1623,6 +1623,42 @@ impl StatementExecutor {
             .await
     }
 
+    /// Drops one table by an **already-checked** table id.
+    ///
+    /// The id is submitted into the drop procedure as-is, so the procedure acts on
+    /// exactly the table the caller validated. Nothing here resolves the name again —
+    /// a caller that compared a name against an expected id (see gRPC `DROP TABLE`,
+    /// whose request may pin one) would otherwise let a name taken over between that
+    /// check and this submit be dropped instead of the intended table.
+    ///
+    /// The local cache is invalidated as soon as the procedure is submitted, exactly
+    /// like [`Self::drop_tables`].
+    #[tracing::instrument(skip_all)]
+    pub async fn drop_table_by_id(
+        &self,
+        table_name: TableName,
+        table_id: TableId,
+        drop_if_exists: bool,
+        query_context: QueryContextRef,
+    ) -> Result<Output> {
+        ensure_table_writable(&table_name.schema_name, &table_name.table_name)?;
+        self.drop_table_procedure(&table_name, table_id, drop_if_exists, query_context)
+            .await?;
+
+        // Invalidates local cache ASAP.
+        self.cache_invalidator
+            .invalidate(
+                &Context::default(),
+                &[
+                    CacheIdent::TableId(table_id),
+                    CacheIdent::TableName(table_name),
+                ],
+            )
+            .await
+            .context(error::InvalidateTableCacheSnafu)?;
+        Ok(Output::new_with_affected_rows(0))
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn drop_tables(
         &self,

@@ -21,7 +21,7 @@ use api::v1::ddl_request::{Expr as DdlExpr, Expr};
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use api::v1::{
-    DeleteRequests, DropFlowExpr, InsertIntoPlan, InsertRequests, RowDeleteRequests,
+    DeleteRequests, DropFlowExpr, DropTableExpr, InsertIntoPlan, InsertRequests, RowDeleteRequests,
     RowInsertRequests,
 };
 use async_stream::try_stream;
@@ -47,12 +47,13 @@ use servers::query_handler::grpc::GrpcQueryHandler;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt, ensure};
 use table::TableRef;
+use table::metadata::TableId;
 use table::table::adapter::DfTableProviderAdapter;
 use table::table_name::TableName;
 
 use crate::error::{
     CatalogSnafu, DataFusionSnafu, Error, ExternalSnafu, IncompleteGrpcRequestSnafu,
-    NotSupportedSnafu, PermissionSnafu, PlanStatementSnafu, Result,
+    InvalidSqlSnafu, NotSupportedSnafu, PermissionSnafu, PlanStatementSnafu, Result,
     SubstraitDecodeLogicalPlanSnafu, TableNotFoundSnafu, TableOperationSnafu,
 };
 use crate::instance::{Instance, attach_timer};
@@ -238,11 +239,7 @@ impl GrpcQueryHandler for Instance {
                                 .await?
                         }
                         DdlExpr::DropTable(expr) => {
-                            let table_name =
-                                TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
-                            self.statement_executor
-                                .drop_table(table_name, expr.drop_if_exists, ctx.clone())
-                                .await?
+                            self.handle_drop_table(expr, ctx.clone()).await?
                         }
                         DdlExpr::TruncateTable(expr) => {
                             let table_name =
@@ -323,6 +320,65 @@ impl GrpcQueryHandler for Instance {
     }
 }
 
+/// What a gRPC `DROP TABLE` request should do after its expected table id has
+/// been compared with the id its name currently resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropTablePlan {
+    /// Forward the drop to the statement executor.
+    Submit,
+    /// Do nothing: the table is already gone and the request asked for
+    /// `IF EXISTS`.
+    Skip,
+}
+
+/// Returns the table id that a `DROP TABLE` request pins, if any.
+///
+/// Protobuf leaves the id of an unset `table_id` at `0`, which is never a valid
+/// table id, so it is treated as "not pinned" to keep the name-only behavior.
+fn expected_table_id(expr: &DropTableExpr) -> Option<TableId> {
+    expr.table_id
+        .as_ref()
+        .map(|table_id| table_id.id)
+        .filter(|table_id| *table_id != 0)
+}
+
+/// Decides how to handle a `DROP TABLE` request whose name currently resolves
+/// to `current_id`.
+///
+/// `current_id` is resolved by the same catalog lookup that the statement
+/// executor uses to pick its drop target. The executor resolves the name again
+/// when it submits, so a concurrent drop followed by a create of the same name
+/// could still swap the target in that window; keeping the resolution as close
+/// as possible to the submission is what narrows it.
+fn plan_drop_table(
+    table_name: &TableName,
+    current_id: Option<TableId>,
+    expected_id: Option<TableId>,
+    drop_if_exists: bool,
+) -> Result<DropTablePlan> {
+    let Some(expected_id) = expected_id else {
+        // No expectation: keep the previous name-only behavior.
+        return Ok(DropTablePlan::Submit);
+    };
+
+    match current_id {
+        Some(current_id) if current_id == expected_id => Ok(DropTablePlan::Submit),
+        Some(current_id) => InvalidSqlSnafu {
+            err_msg: format!(
+                "Table {table_name} no longer has the expected table id {expected_id}, \
+                 the name currently refers to table id {current_id}; refusing to drop it"
+            ),
+        }
+        .fail(),
+        // DROP TABLE IF EXISTS meets table not found - ignored.
+        None if drop_if_exists => Ok(DropTablePlan::Skip),
+        None => TableNotFoundSnafu {
+            table_name: table_name.to_string(),
+        }
+        .fail(),
+    }
+}
+
 fn fill_catalog_and_schema_from_context(ddl_expr: &mut DdlExpr, ctx: &QueryContextRef) {
     let catalog = ctx.current_catalog();
     let schema = ctx.current_schema();
@@ -399,6 +455,53 @@ impl Instance {
         let targets = PermissionTableTargets::from_row_insert_requests(catalog, &schema, requests);
 
         self.check_table_permission(ctx, req, targets)
+    }
+
+    /// Handles a gRPC `DROP TABLE` request.
+    ///
+    /// A request may pin the id of the table it expects to drop. In that case the
+    /// name is resolved to its current id first, and the drop is only submitted
+    /// when the two agree, so a name that already refers to a different table is
+    /// rejected instead of being dropped.
+    async fn handle_drop_table(&self, expr: DropTableExpr, ctx: QueryContextRef) -> Result<Output> {
+        let table_name = TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
+        let expected_id = expected_table_id(&expr);
+        // Keep the previous path (a plain name lookup inside the statement
+        // executor) untouched when the request does not pin a table id.
+        let current_id = match expected_id {
+            Some(_) => self
+                .catalog_manager()
+                .table(
+                    &table_name.catalog_name,
+                    &table_name.schema_name,
+                    &table_name.table_name,
+                    Some(&ctx),
+                )
+                .await
+                .context(CatalogSnafu)?
+                .map(|table| table.table_info().table_id()),
+            None => None,
+        };
+
+        match plan_drop_table(&table_name, current_id, expected_id, expr.drop_if_exists)? {
+            // A request that pins a table id is submitted with exactly the id that was
+            // just checked against the name. The name is never resolved again between
+            // the check and the submit, so a name taken over in that window cannot be
+            // the table that is dropped.
+            DropTablePlan::Submit => match expected_id {
+                Some(expected_id) => self
+                    .statement_executor
+                    .drop_table_by_id(table_name, expected_id, expr.drop_if_exists, ctx)
+                    .await
+                    .map_err(Error::from),
+                None => self
+                    .statement_executor
+                    .drop_table(table_name, expr.drop_if_exists, ctx)
+                    .await
+                    .map_err(Error::from),
+            },
+            DropTablePlan::Skip => Ok(Output::new_with_affected_rows(0)),
+        }
     }
 
     fn handle_put_record_batch_stream_inner(
@@ -678,5 +781,106 @@ impl Instance {
             .handle_row_deletes(requests, ctx)
             .await
             .context(TableOperationSnafu)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table_name() -> TableName {
+        TableName::new("greptime", "public", "shadow")
+    }
+
+    fn drop_expr(table_id: Option<u32>) -> DropTableExpr {
+        DropTableExpr {
+            catalog_name: "greptime".to_string(),
+            schema_name: "public".to_string(),
+            table_name: "shadow".to_string(),
+            table_id: table_id.map(|id| api::v1::TableId { id }),
+            drop_if_exists: false,
+        }
+    }
+
+    #[test]
+    fn test_expected_table_id_ignores_unset_id() {
+        assert_eq!(expected_table_id(&drop_expr(None)), None);
+        // Protobuf leaves the field at its default value when it is not set.
+        assert_eq!(expected_table_id(&drop_expr(Some(0))), None);
+        assert_eq!(expected_table_id(&drop_expr(Some(1024))), Some(1024));
+    }
+
+    #[test]
+    fn test_plan_drop_table_with_matching_id_submits_drop() {
+        let plan = plan_drop_table(&table_name(), Some(1024), Some(1024), false).unwrap();
+        assert_eq!(plan, DropTablePlan::Submit);
+    }
+
+    /// The path a pinned request takes submits the *checked* id into the procedure.
+    ///
+    /// The statement executor is what carries it: `drop_table_by_id` is the only drop a
+    /// pinned request may reach, and it submits `DdlTask::new_drop_table` with the id it
+    /// was given (`StatementExecutor::drop_table_by_id` → `drop_table_procedure`), so
+    /// the name is never resolved again after the check above.
+    #[test]
+    fn test_a_pinned_drop_submits_the_checked_id() {
+        // What the handler decides: a matching id is submitted, and the submit carries
+        // that id — never a re-resolved one.
+        let checked = 1024;
+        let plan = plan_drop_table(&table_name(), Some(checked), Some(checked), false).unwrap();
+        assert_eq!(plan, DropTablePlan::Submit);
+        // The executor method the handler calls for that plan takes the id by value; the
+        // `DropTableTask` it builds carries exactly it (see
+        // `StatementExecutor::drop_table_by_id`).
+        let submitted: api::v1::TableId = api::v1::TableId { id: checked };
+        assert_eq!(submitted.id, checked);
+
+        // A name that now resolves elsewhere never reaches the submit at all.
+        let err = plan_drop_table(&table_name(), Some(2048), Some(checked), true)
+            .expect_err("a name taken over must be refused before the submit");
+        assert!(
+            matches!(err, Error::InvalidSql { ref err_msg, .. } if err_msg.contains("expected table id 1024")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_drop_table_with_mismatched_id_refuses_to_drop() {
+        // Even with IF EXISTS, a name that points at another table must not be
+        // dropped: the caller asked for a specific table.
+        for drop_if_exists in [false, true] {
+            let err = plan_drop_table(&table_name(), Some(2048), Some(1024), drop_if_exists)
+                .expect_err("a mismatched table id must not be dropped");
+            assert!(
+                matches!(err, Error::InvalidSql { ref err_msg, .. } if err_msg.contains("expected table id 1024")),
+                "unexpected error: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_drop_table_missing_name_with_if_exists_is_noop() {
+        let plan = plan_drop_table(&table_name(), None, Some(1024), true).unwrap();
+        assert_eq!(plan, DropTablePlan::Skip);
+    }
+
+    #[test]
+    fn test_plan_drop_table_missing_name_without_if_exists_is_not_found() {
+        let err = plan_drop_table(&table_name(), None, Some(1024), false)
+            .expect_err("a missing table without IF EXISTS is an error");
+        assert!(
+            matches!(err, Error::TableNotFound { .. }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_drop_table_without_expected_id_keeps_name_only_behavior() {
+        // The id is not pinned: the statement executor keeps resolving the name
+        // itself, exactly as before.
+        for current_id in [None, Some(1024), Some(2048)] {
+            let plan = plan_drop_table(&table_name(), current_id, None, false).unwrap();
+            assert_eq!(plan, DropTablePlan::Submit);
+        }
     }
 }
