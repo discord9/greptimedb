@@ -459,6 +459,9 @@ impl MergeInput {
 pub(super) struct NodeBuffer {
     metrics: Arc<NodeMetrics>,
     reservation: MemoryReservation,
+    /// What this node keeps for the grid timestamps it materialized, folded into every
+    /// re-estimate of its own figure; see [`NodeBuffer::reserve_grid`].
+    grid: usize,
 }
 
 impl NodeBuffer {
@@ -474,7 +477,33 @@ impl NodeBuffer {
         Self {
             metrics,
             reservation: consumer.register(pool),
+            grid: 0,
         }
+    }
+
+    /// Reserves the timestamps of `grid` before this node reads them, once for the execution.
+    ///
+    /// An [`EvalGrid`] allocates its timestamps on first access and keeps them for as long as the
+    /// plan holds the grid, which outlives the chunk a node read them for. The node that triggers
+    /// that allocation therefore reserves the array and keeps the reservation: giving it back with
+    /// the workspace would leave the execution holding bytes no reservation covers, which is what a
+    /// grid of a million deferred points -- the reason the array is deferred at all -- would go
+    /// unnoticed through. Only the node that materializes it reserves it: a grid that is already
+    /// materialized, whether the plan built it eagerly or a node below or beside this one needed it
+    /// first, was charged to whoever materialized it, so this node grows by nothing.
+    pub(super) fn reserve_grid(&mut self, grid: &EvalGrid) -> Result<()> {
+        if grid.is_materialized() {
+            return Ok(());
+        }
+        let len = usize::try_from(grid.spec().len).map_err(|_| {
+            DataFusionError::Execution("grid length does not fit memory size".to_string())
+        })?;
+        let bytes = len.checked_mul(std::mem::size_of::<i64>()).ok_or_else(|| {
+            DataFusionError::Execution("grid timestamp size overflow".to_string())
+        })?;
+        self.grow(bytes)?;
+        self.grid = self.grid.saturating_add(bytes);
+        Ok(())
     }
 
     /// Reserves `bytes` beside what this node already holds.
@@ -488,9 +517,11 @@ impl NodeBuffer {
     ///
     /// What a node that consumes its input chunk by chunk holds afterwards is not the sum of what
     /// it consumed, so the reservation is set from the state that is left rather than grown per
-    /// chunk.
+    /// chunk. What a grid's array takes is not part of that figure: the node keeps it for as long
+    /// as it lives, so it stays reserved on top of what the caller measured.
     pub(super) fn resize(&mut self, bytes: usize) -> Result<()> {
-        self.reservation.try_resize(bytes)?;
+        self.reservation
+            .try_resize(bytes.saturating_add(self.grid))?;
         self.record();
         Ok(())
     }
@@ -4053,6 +4084,12 @@ impl RuntimeNode {
                 state,
             } => {
                 if !std::mem::replace(produced, true) {
+                    // `time()` and the date functions read every point of the grid, so this node is
+                    // what materializes a deferred grid's timestamps.
+                    state
+                        .buffer
+                        .reserve_grid(grid)
+                        .map_err(|error| state.context(error))?;
                     let schema = scalar_schema(Arc::clone(grid));
                     state
                         .produce(grid, || match date {
@@ -5006,9 +5043,13 @@ impl RuntimeNode {
                 ..
             } => {
                 let child = input.finish_windows();
+                // Finishing evaluates the points still owed, which reads the grid's timestamps.
                 let own = window
                     .take()
-                    .map_or(Ok(()), RangeEvaluator::finish)
+                    .map_or(Ok(()), |evaluator| {
+                        state.buffer.reserve_grid(evaluator.grid())?;
+                        RangeEvaluator::finish(evaluator)
+                    })
                     .map_err(|error| state.context(error));
                 child.and(own)
             }
@@ -5333,21 +5374,16 @@ impl NodeState {
     ) -> Result<Option<EvaluatedChunk>> {
         let positions = chunk.series.time.len();
         let closing = chunk.is_last;
-        // The kernel reads the grid's timestamps, which it materializes when they are deferred.
-        let grid_points = schema.eval_grid.as_ref().map_or(0, |grid| {
-            usize::try_from(grid.spec().len).unwrap_or(usize::MAX)
-        });
+        // The kernel reads the grid's timestamps, which materializes them when the grid is
+        // deferred. They stay materialized for the rest of the execution, so this node reserves
+        // them beside what it holds and keeps them there rather than treating them as a workspace
+        // it gives back.
+        if let Some(grid) = schema.eval_grid.as_deref() {
+            self.buffer.reserve_grid(grid)?;
+        }
         let workspace = built_series_workspace_bytes(&chunk.series)?;
-        let scratch = grid_points
-            .checked_mul(std::mem::size_of::<i64>())
-            .and_then(|timestamps| timestamps.checked_add(workspace))
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "the workspace of timestamp does not fit one address space".to_string(),
-                )
-            })?;
         self.buffer.grow(evaluated_bytes(&chunk))?;
-        self.buffer.grow(scratch)?;
+        self.buffer.grow(workspace)?;
         let labels = drop_metric_name(&chunk.series.metric)?;
         let metrics = Arc::clone(&self.buffer.metrics);
         let result = {
@@ -5518,6 +5554,9 @@ impl NodeState {
         merge: &mut Option<MergeInput>,
         chunk: NativeChunk,
     ) -> Result<Option<EvaluatedChunk>> {
+        // A window reads the grid's timestamps to place every point it decides, which materializes
+        // a deferred grid; the array stays materialized, so the reservation for it is kept.
+        self.buffer.reserve_grid(window.grid())?;
         if let Some(merge) = merge.as_mut() {
             let NativeChunk::Evaluated(chunk) = chunk else {
                 return Err(DataFusionError::Execution(
@@ -5912,6 +5951,11 @@ impl NodeState {
             ));
         };
         let (positions, closing) = (chunk.time.len(), chunk.is_last);
+        // A selection that answers with timestamps reads every point of the grid, which materializes
+        // a deferred grid's array; the reservation is kept because the array is.
+        if instant.selection.value != InstantValue::Sample {
+            self.buffer.reserve_grid(&instant.selection.output_grid)?;
+        }
         // The chunk is held from here on: a selection keeps every chunk of a series until the one
         // that closes it, so what this node reserves for is the series it has buffered.
         self.buffer.grow(raw_bytes(&chunk))?;
@@ -6069,6 +6113,8 @@ impl NodeState {
             // evaluator never read a series and the charge goes back.
             return self.buffer.shrink(merge.bytes);
         }
+        // The merged series is evaluated by the window, which reads the grid's timestamps.
+        self.buffer.reserve_grid(window.grid())?;
         // The workspace the merge allocates is charged before it runs, from the rows, segments and
         // fields of the fragments as they were collected.
         let workspace = merge.workspace_bytes();

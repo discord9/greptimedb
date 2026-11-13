@@ -1252,6 +1252,135 @@ fn eval_time_reports_seconds_and_dates_of_the_grid() {
     assert_eq!(pool.reserved(), 0);
 }
 
+/// The bytes a grid's timestamps take, which is what an execution reserves for the array.
+fn grid_array_bytes(grid: &EvalGrid) -> usize {
+    usize::try_from(grid.spec().len).unwrap() * std::mem::size_of::<i64>()
+}
+
+/// A grid whose timestamps are still deferred, as a subquery's or an anchored step's is: the plan
+/// is compiled without allocating them, and the execution that reads them allocates once.
+fn deferred_grid(start: i64, step: i64, len: u64) -> Arc<EvalGrid> {
+    let grid = EvalGrid::try_deferred(GridSpec::try_new(start, step, len).unwrap()).unwrap();
+    assert!(!grid.is_materialized());
+    Arc::new(grid)
+}
+
+/// The node that materializes a deferred grid reserves its array and keeps that reservation.
+///
+/// A deferred grid is what keeps compilation proportional to the plan rather than to the timestamp
+/// count, so the array it eventually needs is allocated at execution: the node that triggers the
+/// allocation reserves it, and a pool that cannot hold it refuses the query instead of letting it
+/// take the array unasked. What it reserved stays reserved for as long as the node lives, because
+/// the array outlives the chunk the node read it for.
+#[test]
+fn a_node_that_materializes_a_deferred_grid_reserves_it_for_its_lifetime() {
+    let points = 1_000u64;
+    let grid = deferred_grid(0, 60_000, points);
+    let array = grid_array_bytes(&grid);
+    let tree = NativeTree::try_new(vector_of(eval_time(None, Arc::clone(&grid)))).unwrap();
+
+    // One byte short of the array: the node that would allocate it is refused instead.
+    let pool = bounded_pool(array - 1);
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    let error = execution.next_chunk().unwrap_err();
+    assert!(is_resources_exhausted(&error), "{error}");
+    assert!(
+        !grid.is_materialized(),
+        "a refused node materialized the grid anyway"
+    );
+    assert_eq!(pool.reserved(), 0);
+
+    // Room for the array and the chunk built from it: the query answers, and what the node keeps
+    // once its chunk has been handed on is the array alone.
+    let chunk = grid_chunk_bytes(&grid).unwrap();
+    let pool = bounded_pool(array + chunk);
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    assert!(execution.next_chunk().unwrap().is_some());
+    assert!(
+        grid.is_materialized(),
+        "the node did not materialize the grid"
+    );
+    assert_eq!(
+        execution.state().reserved_bytes(),
+        array,
+        "the materialized grid was not kept reserved after its chunk was handed on"
+    );
+    drop(execution);
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "the array's reservation outlived its node"
+    );
+}
+
+/// A grid that is already materialized is charged to nobody: the execution reads the array that is
+/// there, and only the node that allocates it reserves it.
+///
+/// This is also what keeps two nodes reading one grid from charging it twice, and what makes a grid
+/// the plan built eagerly -- [`EvalGrid::try_new`] rather than [`EvalGrid::try_deferred`] -- cost
+/// the execution nothing.
+#[test]
+fn a_materialized_grid_is_not_reserved_again() {
+    let points = 1_000u64;
+    let grid = grid(0, 60_000, points);
+    let array = grid_array_bytes(&grid);
+    assert!(grid.is_materialized());
+    let chunk = grid_chunk_bytes(&grid).unwrap();
+    let tree = NativeTree::try_new(vector_of(eval_time(None, Arc::clone(&grid)))).unwrap();
+    // A pool one byte short of the array *and* the chunk: the deferred grid above needed both, and
+    // this one needs the chunk alone.
+    let pool = bounded_pool(array + chunk - 1);
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    assert!(execution.next_chunk().unwrap().is_some());
+    assert_eq!(execution.state().reserved_bytes(), 0);
+    drop(execution);
+    assert_eq!(pool.reserved(), 0);
+}
+
+/// A window reads the grid's timestamps to place every point it decides, so it materializes a
+/// deferred output grid and keeps that reservation as well.
+#[test]
+fn a_window_reserves_the_grid_it_materializes() {
+    let points = 1_000u64;
+    let grid = deferred_grid(0, 60_000, points);
+    let array = grid_array_bytes(&grid);
+    let schema = raw_schema();
+    let tree = NativeTree::try_new(window(input(), Arc::clone(&grid))).unwrap();
+
+    // A pool short of the array refuses the window instead of letting it take the array unasked.
+    let short = bounded_pool(array - 1);
+    let mut execution = executor(&tree, Arc::clone(&short));
+    execution
+        .push_raw(InputId::new(0), raw_chunk(&schema, &[0], &[1.0], true))
+        .unwrap();
+    let error = execution.next_chunk().unwrap_err();
+    assert!(is_resources_exhausted(&error), "{error}");
+    assert!(
+        !grid.is_materialized(),
+        "a refused window materialized the grid anyway"
+    );
+    assert_eq!(short.reserved(), 0);
+
+    // With room for the array the window keeps it while it holds the series it is evaluating.
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool));
+    execution
+        .push_raw(InputId::new(0), raw_chunk(&schema, &[0], &[1.0], false))
+        .unwrap();
+    drop(execution.next_chunk().unwrap());
+    assert!(
+        grid.is_materialized(),
+        "the window did not materialize the grid"
+    );
+    let held = execution.state().reserved_bytes();
+    assert!(
+        held >= array,
+        "the window gave the grid's array back: {held} bytes held, {array} reserved for the grid"
+    );
+    drop(execution);
+    assert_eq!(pool.reserved(), 0);
+}
+
 /// `vector(c)` hands the constant on as one unlabelled series over the whole grid.
 #[test]
 fn vector_of_a_constant_is_one_unlabelled_series() {

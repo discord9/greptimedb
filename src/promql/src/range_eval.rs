@@ -700,6 +700,14 @@ impl RangeEvaluator {
         })
     }
 
+    /// The evaluation grid this evaluator decides points of.
+    ///
+    /// Every window ends at a point of it and is read at that point's timestamp, so a caller
+    /// reserving for what the evaluator is about to allocate reserves this grid's timestamps.
+    pub fn grid(&self) -> &Arc<EvalGrid> {
+        &self.grid
+    }
+
     /// Chunks appended without the per-sample loop. Test-only: both paths produce the same
     /// output by construction, so a test that only compared output could not tell whether the
     /// bulk path ran at all.
