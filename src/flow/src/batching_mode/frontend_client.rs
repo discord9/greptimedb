@@ -497,13 +497,24 @@ impl FrontendClient {
 
     /// Execute a flow query and return terminal metrics. `snapshot_seqs` are
     /// optional read upper bounds used only by snapshot-fenced repair chunks.
-    pub(crate) async fn query_with_terminal_metrics(
+    ///
+    /// `timezone` is the session timezone the statement is planned in. It is
+    /// passed explicitly because the two frontend paths otherwise disagree: a
+    /// distributed client carries the timezone of the [`Database`] it was built
+    /// with, and a standalone context starts from the server default.
+    // The signature mirrors the frontend call it makes: the statement, the flow
+    // extensions, the snapshot bounds and the session it is planned in are all
+    // inputs of one request, and splitting them into a struct only for this call
+    // would hide that they travel together.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_with_terminal_metrics(
         &self,
         catalog: &str,
         schema: &str,
         request: QueryRequest,
         extensions: &[(&str, &str)],
         snapshot_seqs: &HashMap<u64, u64>,
+        timezone: Option<Timezone>,
         peer_desc: &mut Option<PeerDesc>,
     ) -> Result<OutputWithMetrics, Error> {
         let flow_extensions = build_flow_extensions(extensions)?;
@@ -516,7 +527,10 @@ impl FrontendClient {
                 if query.parallelism > 0 {
                     hints.push((QUERY_PARALLELISM_HINT, query_parallelism.as_str()));
                 }
-                let db = self.get_random_active_frontend(catalog, schema).await?;
+                let mut db = self.get_random_active_frontend(catalog, schema).await?;
+                if let Some(timezone) = timezone {
+                    db.database.set_timezone(timezone.to_string());
+                }
                 *peer_desc = Some(PeerDesc::Dist {
                     peer: db.peer.clone(),
                 });
@@ -547,13 +561,16 @@ impl FrontendClient {
                 for (key, value) in extensions {
                     extensions_map.insert((*key).to_string(), (*value).to_string());
                 }
-                let ctx = QueryContextBuilder::default()
+                let mut ctx = QueryContextBuilder::default()
                     .current_catalog(catalog.to_string())
                     .current_schema(schema.to_string())
                     .extensions(extensions_map)
                     .channel(Channel::Internal)
-                    .snapshot_seqs(Arc::new(RwLock::new(snapshot_seqs.clone())))
-                    .build();
+                    .snapshot_seqs(Arc::new(RwLock::new(snapshot_seqs.clone())));
+                if let Some(timezone) = timezone {
+                    ctx = ctx.timezone(timezone);
+                }
+                let ctx = ctx.build();
                 let ctx = Arc::new(ctx);
                 let database_client = {
                     database_client
@@ -1236,6 +1253,7 @@ mod tests {
                 },
                 &[],
                 &HashMap::new(),
+                None,
                 &mut peer_desc,
             )
             .await
@@ -1274,6 +1292,7 @@ mod tests {
                 },
                 &[("flow.return_region_seq", "true")],
                 &HashMap::new(),
+                None,
                 &mut peer_desc,
             )
             .await
@@ -1300,6 +1319,7 @@ mod tests {
                 },
                 &[("flow.return_region_seq", "true")],
                 &HashMap::from([(1, 10), (2, 20)]),
+                None,
                 &mut peer_desc,
             )
             .await
@@ -1326,6 +1346,7 @@ mod tests {
                 },
                 &[("flow.return_region_seq", "not-a-bool")],
                 &HashMap::new(),
+                None,
                 &mut peer_desc,
             )
             .await
