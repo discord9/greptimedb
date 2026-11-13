@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
-use api::v1::{CreateTableExpr, QueryRequest, RowInsertRequests};
+use api::v1::{CreateTableExpr, DropTableExpr, QueryRequest, RowInsertRequests};
 use client::{Client, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, Database, OutputWithMetrics};
 use common_error::ext::BoxedError;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager, load_client_tls_config};
@@ -362,6 +362,27 @@ impl FrontendClient {
         .with_context(|_| CreateSinkTableSnafu {
             create: create.clone(),
         })
+    }
+
+    /// Drops a table through the frontend.
+    ///
+    /// The caller may pin the id it expects to drop in `expr.table_id`; the
+    /// frontend then refuses the drop unless the name still resolves to that id.
+    pub async fn drop_table(
+        &self,
+        expr: DropTableExpr,
+        catalog: &str,
+        schema: &str,
+    ) -> Result<u32, Error> {
+        self.handle(
+            Request::Ddl(api::v1::DdlRequest {
+                expr: Some(api::v1::ddl_request::Expr::DropTable(expr)),
+            }),
+            catalog,
+            schema,
+            &mut None,
+        )
+        .await
     }
 
     /// Executes SQL with an optional timezone override.
@@ -1509,6 +1530,141 @@ mod tests {
                 .iter()
                 .all(|failure| !failure.contains("health check timed out")),
             "sequential probes would time out before both requests reach the barrier: {failures:?}"
+        );
+    }
+
+    /// Records the requests and query contexts that reach the "frontend".
+    #[derive(Debug)]
+    struct RecordingDdlHandler {
+        requests: Mutex<Vec<Request>>,
+        contexts: Mutex<Vec<QueryContextRef>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GrpcQueryHandlerWithBoxedError for RecordingDdlHandler {
+        async fn do_query(
+            &self,
+            request: Request,
+            ctx: QueryContextRef,
+        ) -> std::result::Result<Output, BoxedError> {
+            self.requests.lock().unwrap().push(request);
+            self.contexts.lock().unwrap().push(ctx);
+            Ok(Output::new_with_affected_rows(0))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectingDdlHandler;
+
+    #[async_trait::async_trait]
+    impl GrpcQueryHandlerWithBoxedError for RejectingDdlHandler {
+        async fn do_query(
+            &self,
+            _request: Request,
+            _ctx: QueryContextRef,
+        ) -> std::result::Result<Output, BoxedError> {
+            Err(BoxedError::new(
+                UnexpectedSnafu {
+                    reason: "refusing to drop table 1024, the name now refers to table 2048",
+                }
+                .build(),
+            ))
+        }
+    }
+
+    fn drop_table_expr(table_id: Option<u32>) -> DropTableExpr {
+        DropTableExpr {
+            catalog_name: "greptime".to_string(),
+            schema_name: "public".to_string(),
+            table_name: "shadow".to_string(),
+            table_id: table_id.map(|id| api::v1::TableId { id }),
+            drop_if_exists: true,
+        }
+    }
+
+    fn drop_table_client(handler: &Arc<dyn GrpcQueryHandlerWithBoxedError>) -> FrontendClient {
+        FrontendClient::from_grpc_handler(Arc::downgrade(handler), QueryOptions::default())
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_forwards_expected_table_id_and_context() {
+        let handler = Arc::new(RecordingDdlHandler {
+            requests: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
+        });
+        let grpc_handler: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
+        let client = drop_table_client(&grpc_handler);
+        let expr = drop_table_expr(Some(1024));
+
+        let affected_rows = client
+            .drop_table(expr.clone(), "test_catalog", "test_schema")
+            .await
+            .unwrap();
+        assert_eq!(affected_rows, 0);
+
+        let requests = handler.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            Request::Ddl(api::v1::DdlRequest {
+                expr: Some(api::v1::ddl_request::Expr::DropTable(forwarded)),
+            }) => {
+                assert_eq!(forwarded.catalog_name, expr.catalog_name);
+                assert_eq!(forwarded.schema_name, expr.schema_name);
+                assert_eq!(forwarded.table_name, expr.table_name);
+                assert_eq!(forwarded.table_id.as_ref().map(|id| id.id), Some(1024));
+                assert!(forwarded.drop_if_exists);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let contexts = handler.contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].current_catalog(), "test_catalog");
+        assert_eq!(contexts[0].current_schema(), "test_schema");
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_without_expected_table_id_keeps_name_only_request() {
+        let handler = Arc::new(RecordingDdlHandler {
+            requests: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
+        });
+        let grpc_handler: Arc<dyn GrpcQueryHandlerWithBoxedError> = handler.clone();
+        let client = drop_table_client(&grpc_handler);
+        let expr = drop_table_expr(None);
+
+        client
+            .drop_table(expr.clone(), "greptime", "public")
+            .await
+            .unwrap();
+
+        let requests = handler.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        match &requests[0] {
+            Request::Ddl(api::v1::DdlRequest {
+                expr: Some(api::v1::ddl_request::Expr::DropTable(forwarded)),
+            }) => {
+                assert_eq!(forwarded.table_name, expr.table_name);
+                assert!(forwarded.table_id.is_none());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_surfaces_frontend_rejection() {
+        let handler: Arc<dyn GrpcQueryHandlerWithBoxedError> = Arc::new(RejectingDdlHandler);
+        let client = drop_table_client(&handler);
+
+        let err = client
+            .drop_table(drop_table_expr(Some(1024)), "greptime", "public")
+            .await
+            .expect_err("the frontend rejection must be surfaced as an error");
+        assert!(matches!(err, Error::External { .. }), "unexpected: {err:?}");
+        let last_err = common_error::ext::StackError::last(&err).to_string();
+        assert!(
+            last_err.contains("refusing to drop table 1024"),
+            "unexpected: {last_err}"
         );
     }
 }
