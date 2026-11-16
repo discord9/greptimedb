@@ -2030,7 +2030,7 @@ async fn assert_raw_scan_fused_formats(observer: &NativeFusedObserver, frontend:
     );
 
     observer.clear();
-    let (_, row_schema, _) = promql_output(frontend, "native_demo", true, "0", "2").await;
+    let (_, row_schema, _) = promql_output(frontend, "native_demo", Some(true), "0", "2").await;
     let origin = observer.take("native_demo");
     let children = origin.children();
     assert_eq!(children.len(), 1, "the fused origin has exactly one child");
@@ -2250,15 +2250,17 @@ async fn assert_raw_scan_fused_formats(observer: &NativeFusedObserver, frontend:
 async fn promql_output(
     frontend: &Arc<Instance>,
     query: &str,
-    native: bool,
+    native: Option<bool>,
     start: &str,
     end: &str,
 ) -> (Arc<dyn ExecutionPlan>, SchemaRef, Vec<PromqlRow>) {
     let mut query_ctx = QueryContextBuilder::default();
-    if native {
+    // `None` states nothing, so the session and the engine-wide default answer; `Some(false)` asks
+    // for the existing route explicitly, which the engine default cannot say on its own.
+    if let Some(native) = native {
         query_ctx = query_ctx.set_extension(
             "query.experimental_native_promql".to_string(),
-            "true".to_string(),
+            native.to_string(),
         );
     }
     let prom_query = PromQuery {
@@ -2449,9 +2451,16 @@ pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
                 "/v1/prometheus/api/v1/query?query={}&time=1",
                 encode(query)
             ));
-            if native {
-                request = request.header(native_hint.0, native_hint.1);
-            }
+            // The engine-wide default is on here, so the request states the route it wants in both
+            // directions: a missing value would leave the choice to the default, which is native.
+            request = request.header(
+                native_hint.0,
+                if native {
+                    "query.experimental_native_promql=true"
+                } else {
+                    "query.experimental_native_promql=false"
+                },
+            );
             let res = request.send().await;
             assert_eq!(res.status(), StatusCode::OK, "`{query}`, native={native}");
             let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
@@ -2506,9 +2515,16 @@ pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
         let mut request = client.get(&format!(
             "/v1/prometheus/api/v1/query_range?query={query}&start=0&end=2&step=1s"
         ));
-        if native {
-            request = request.header(native_hint.0, native_hint.1);
-        }
+        // Both routes are asked for explicitly: the engine default is on, so leaving the value out
+        // would ask for neither.
+        request = request.header(
+            native_hint.0,
+            if native {
+                "query.experimental_native_promql=true"
+            } else {
+                "query.experimental_native_promql=false"
+            },
+        );
         let res = request.send().await;
         assert_eq!(res.status(), StatusCode::OK, "range query, native={native}");
         let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
@@ -2716,7 +2732,7 @@ pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
         } else {
             &[]
         };
-        let (plan, schema, rows) = promql_output(frontend, query, true, start, end).await;
+        let (plan, schema, rows) = promql_output(frontend, query, Some(true), start, end).await;
         assert_rows_eq(&rows, &expected, query);
         assert_native_result_schema(&schema, tags, query);
         let fused = assert_native_plan(&plan, scan_partitions, query);
@@ -2733,13 +2749,13 @@ pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
             query,
         );
 
-        // Without the per-query hint the same statement runs the legacy pipeline, which must answer
-        // with the same rows.
+        // A request that turns the route off runs the legacy pipeline, which must answer with the
+        // same rows. The engine default is on here, so the request value is what selects the route.
         let (legacy_plan, legacy_schema, legacy_rows) =
-            promql_output(frontend, query, false, start, end).await;
+            promql_output(frontend, query, Some(false), start, end).await;
         assert!(
             !executes_fused_series(&legacy_plan),
-            "`{query}` without the hint executed the fused route"
+            "`{query}` with the route turned off executed the fused plan"
         );
         assert_rows_eq(&legacy_rows, &expected, query);
         assert_legacy_result_schema(&legacy_schema, tags, query);
@@ -2760,7 +2776,7 @@ pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
     // different partition layout than the four non-empty queries above.
     let query = "native_demo{host=\"absent\"} * 100";
     observer.clear();
-    let (plan, schema, rows) = promql_output(frontend, query, true, "0", "2").await;
+    let (plan, schema, rows) = promql_output(frontend, query, Some(true), "0", "2").await;
     assert!(rows.is_empty(), "`{query}` reported {} rows", rows.len());
     assert_native_result_schema(&schema, &["host"], query);
     assert!(
@@ -2806,14 +2822,14 @@ pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
     // Without the per-query hint the same statement runs the legacy pipeline, which must answer
     // with the same empty typed result.
     let (legacy_plan, legacy_schema, legacy_rows) =
-        promql_output(frontend, query, false, "0", "2").await;
+        promql_output(frontend, query, Some(false), "0", "2").await;
     assert!(
         !executes_fused_series(&legacy_plan),
-        "`{query}` without the hint executed the fused route"
+        "`{query}` with the route turned off executed the fused plan"
     );
     assert!(
         legacy_rows.is_empty(),
-        "`{query}` without the hint reported {} rows",
+        "`{query}` with the route turned off reported {} rows",
         legacy_rows.len()
     );
     assert_legacy_result_schema(&legacy_schema, &["host"], query);
