@@ -15592,3 +15592,254 @@ async fn native_composed_binary_restores_the_context_after_a_refused_operand() {
         "a refused operand must not stop the next query"
     );
 }
+
+/// The harness's engine state, with the distributed planner switch set.
+fn build_query_engine_state_with_dist_planner() -> QueryEngineState {
+    QueryEngineState::new(
+        new_memory_catalog_manager().unwrap(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+        Plugins::default(),
+        QueryOptions::default(),
+    )
+}
+
+/// A pointwise chain above a subquery is the split the window alone needs, one node further up.
+///
+/// `abs(min_over_time(rate(x[1m])[1m:1m]))` reads across series - `rate` drops the metric name - so
+/// the analyzer gathers it and a segment is required for it. What it wraps is a window over an
+/// evaluated input, which answers one series of its own grid at a time, and the math kernel, the
+/// `timestamp` and the scalar broadcast above it do too: the split is the per-series prefix below
+/// the window, exactly as it is for the window on its own. The chain therefore stays above the
+/// frames - the rows node's own tree holds no window - and the window becomes the frame under it.
+#[tokio::test]
+async fn native_fused_pointwise_chain_over_a_subquery_window_answers_natively() {
+    for (query, wrapper) in [
+        (
+            "abs(min_over_time(rate(some_metric[1m])[1m:1m]))",
+            "Map abs",
+        ),
+        // A second wrapper over the first is cut the same way: the rows node holds the whole chain
+        // above the frame, and the window under it is a frame of its own.
+        (
+            "abs(ceil(min_over_time(rate(some_metric[1m])[1m:1m])))",
+            "Map abs",
+        ),
+        (
+            "timestamp(min_over_time(rate(some_metric[1m])[1m:1m]))",
+            "Timestamp",
+        ),
+        (
+            "min_over_time(rate(some_metric[1m])[1m:1m]) * 2",
+            "Binary * ignoring [] one-to-one",
+        ),
+    ] {
+        let plan = build_native_fused_plan(query, true).await;
+        let display = plan.display_indent().to_string();
+        let fused = find_fused_series(&plan)
+            .unwrap_or_else(|| panic!("`{query}` must enter the native route: {display}"));
+        // The pointwise chain answers rows on the statement's grid, above a frame.
+        assert!(
+            fused.tree().to_string().contains(wrapper),
+            "`{query}`: the rows node keeps the pointwise wrapper: {display}"
+        );
+        assert!(
+            !fused.tree().to_string().contains("Window"),
+            "`{query}`: the window is the frame below the chain, not part of the rows node: {display}"
+        );
+        let [input] = fused.children() else {
+            panic!("`{query}`: the rows node reads one frame: {display}");
+        };
+        let frame = find_fused_series(input)
+            .unwrap_or_else(|| panic!("`{query}`: the rows node reads a segment: {display}"));
+        assert_eq!(
+            promql::extension_plan::FusedOutputFormat::SeriesFrame,
+            frame.format(),
+            "`{query}`: the chain reads a series frame: {display}"
+        );
+        // The window over the evaluated input is inside that frame, and the `rate` over the raw
+        // scan is the per-series prefix the split exists for.
+        let trees = fused_trees(&plan);
+        assert_eq!(
+            3,
+            trees.len(),
+            "`{query}`: the rows node and the frames under it: {trees:#?}"
+        );
+        assert!(
+            frame.tree().root().any(&|node| matches!(
+                &node.expr,
+                NativeExpr::Window { op, .. } if op.input_grid.is_some()
+            )),
+            "`{query}`: the frame holds the window over the evaluated input: {display}"
+        );
+        let below = trees[1..].join("\n");
+        assert!(
+            below.contains("Window min_over_time")
+                && below.contains("Window rate")
+                && below.contains("Input raw samples"),
+            "`{query}`: the prefix still reads the raw scan: {trees:#?}"
+        );
+        // The rows layout names the value after the statement, then the statement's labels, then
+        // the name column a computed value reports nothing for.
+        let names = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![
+                "timestamp",
+                parser::parse(query).unwrap().to_string().as_str(),
+                "tag_0",
+                "__name__"
+            ],
+            names,
+            "`{query}`: {display}"
+        );
+    }
+}
+
+/// A subquery the analyzer gathers answers natively with the chain and without it.
+///
+/// The two shapes around this one are unchanged: `min_over_time(rate(x[1m])[1m:1m])` answers as the
+/// window itself, and `abs(rate(x[1m]))` is not cross-series at all, so it needs no segment and
+/// keeps reading its own scan in one node.
+#[tokio::test]
+async fn native_fused_subquery_shapes_around_the_chain_are_unchanged() {
+    // The window on its own: the rows node is the window, over the per-series prefix.
+    let window = "min_over_time(rate(some_metric[1m])[1m:1m])";
+    let plan = build_native_fused_plan(window, true).await;
+    let display = plan.display_indent().to_string();
+    let fused = find_fused_series(&plan)
+        .unwrap_or_else(|| panic!("`{window}` must enter the native route: {display}"));
+    assert!(
+        matches!(&fused.tree().root().expr, NativeExpr::Window { op, .. } if op.input_grid.is_some()),
+        "`{window}`: the statement root is the window: {display}"
+    );
+    assert_eq!(
+        2,
+        fused_trees(&plan).len(),
+        "`{window}`: the window and its prefix: {display}"
+    );
+
+    // A math kernel over a raw window reads no series across, so it is one node over its scan.
+    let raw = "abs(rate(some_metric[1m]))";
+    let plan = build_native_fused_plan(raw, true).await;
+    let display = plan.display_indent().to_string();
+    let fused = find_fused_series(&plan)
+        .unwrap_or_else(|| panic!("`{raw}` must enter the native route: {display}"));
+    assert_eq!(
+        1,
+        fused_trees(&plan).len(),
+        "`{raw}`: nothing is cut out of it: {display}"
+    );
+    assert!(
+        !is_fused_series(&fused.children()[0]),
+        "`{raw}`: the node reads its own scan: {display}"
+    );
+}
+
+/// A chain whose input is not a window over an evaluated input is still refused.
+///
+/// The gate admits the evaluated-input window and the pointwise wrappers above it and nothing else.
+/// `quantile(0.9, rate(x[5m]))` folds the whole vector at a point, so the `abs` above it wraps a
+/// fold rather than a per-series answer: the fold cannot be cut, and the statement keeps the plan
+/// the existing planner builds. A collapsing label rewrite over a partitioned table is refused the
+/// same way even though the chain above it ends at a window, which is what keeps admission from
+/// standing in for the analyzer's placement.
+#[tokio::test]
+async fn native_fused_pointwise_chain_over_a_whole_vector_fold_still_declines() {
+    for query in [
+        // `quantile` is one value per point over the whole vector, and it is not a fold the split
+        // can halve.
+        "abs(quantile(0.9, rate(some_metric[5m])))",
+        // A merge under the chain is a canonical boundary, and a partitioned table cannot answer
+        // one from a single region.
+        r#"abs(label_replace(some_metric, "tag_0", "same", "tag_0", ".*"))"#,
+    ] {
+        let native = build_native_fused_plan_with_provider(
+            query,
+            true,
+            native_engine_provider(vec![0]).await,
+        )
+        .await;
+        let fallback = build_native_fused_plan_with_provider(
+            query,
+            false,
+            native_engine_provider(vec![0]).await,
+        )
+        .await;
+        assert!(
+            find_fused_series(&native).is_none(),
+            "`{query}` must keep the existing plan: {}",
+            native.display_indent()
+        );
+        assert_eq!(
+            native.display_indent().to_string(),
+            fallback.display_indent().to_string(),
+            "`{query}`: the native setting plans exactly what the existing planner plans"
+        );
+    }
+    // The same statement without a partitioned table: `quantile` still folds the whole vector.
+    let query = "abs(quantile(0.9, rate(some_metric[5m])))";
+    let plan = build_native_fused_plan(query, true).await;
+    assert!(
+        find_fused_series(&plan).is_none(),
+        "`{query}` must keep the existing plan: {}",
+        plan.display_indent()
+    );
+}
+
+/// The chain answers natively wherever the window under it does.
+///
+/// A table partitioned on its tag columns keeps whole series in one region, and one partitioned on
+/// its time index splits a series across regions: the segment reads the second through a raw
+/// source, so the fragments of a series are reconciled before the window folds them. The
+/// distributed planner plans every read above the regions, and the statement is admitted there too.
+#[tokio::test]
+async fn native_fused_pointwise_chain_over_a_subquery_respects_placement() {
+    let query = "abs(min_over_time(rate(some_metric[1m])[1m:1m]))";
+    // Partitioned on its tag: whole series per region.
+    let plan =
+        build_native_fused_plan_with_provider(query, true, native_engine_provider(vec![0]).await)
+            .await;
+    assert!(
+        find_fused_series(&plan).is_some(),
+        "`{query}` on a tag-partitioned table: {}",
+        plan.display_indent()
+    );
+    // Partitioned on its time index: one series spans regions, so the prefix reads a raw source.
+    let plan =
+        build_native_fused_plan_with_provider(query, true, native_engine_provider(vec![1]).await)
+            .await;
+    let display = plan.display_indent().to_string();
+    assert!(
+        find_fused_series(&plan).is_some(),
+        "`{query}` on a time-partitioned table: {display}"
+    );
+    assert!(
+        display.contains("RawSeriesSource"),
+        "`{query}`: a split series is read through a raw source: {display}"
+    );
+    // The distributed planner plans every read above the regions; the statement is still admitted.
+    let state = build_query_engine_state_with_dist_planner();
+    let plan = PromPlanner::stmt_to_plan_with_annotations(
+        native_engine_provider(vec![]).await,
+        &build_eval_stmt(query),
+        &state,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        find_fused_series(&plan).is_some(),
+        "`{query}` under the distributed planner: {}",
+        plan.display_indent()
+    );
+}

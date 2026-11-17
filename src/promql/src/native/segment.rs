@@ -77,17 +77,35 @@ pub type RootSchema = fn(&str, &NativeTree, &[Vec<String>], &str, FieldKind) -> 
 /// a map or a binary operation whose operands are not evaluated vectors, so every branch below is
 /// one that produces values rather than raw samples.
 pub fn pointwise_operand(node: &NativeNode) -> bool {
+    // A selection reads the raw samples below it; anything else below it is a value computed from a
+    // whole series, not a scan.
+    pointwise_over(node, |node| {
+        matches!(
+            &node.expr,
+            NativeExpr::Instant { input, .. } | NativeExpr::Window { input, .. }
+                if matches!(input.expr, NativeExpr::Input(_))
+        )
+    })
+}
+
+/// Whether `node` is a chain of the pointwise wrappers around a node `leaf` admits.
+///
+/// A math kernel, a timestamp, a parameterized map whose parameters read no data and a scalar
+/// broadcast each read one series of their input and write one series of their own, so a chain of
+/// them neither gathers nor regroups anything and the node the chain bottoms out at is the one that
+/// decides what the chain is: [`pointwise_operand`] asks for the per-series read of raw samples, and
+/// [`pointwise_over_evaluated_window`] for a window over an evaluated input. Both questions are
+/// asked about the same wrappers, so they are answered by the same walk.
+fn pointwise_over(node: &NativeNode, leaf: fn(&NativeNode) -> bool) -> bool {
     match &node.expr {
-        // A selection reads the raw samples below it; anything else below it is a value computed
-        // from a whole series, not a scan.
-        NativeExpr::Instant { input, .. } | NativeExpr::Window { input, .. } => {
-            matches!(input.expr, NativeExpr::Input(_))
+        NativeExpr::Map { input, .. } | NativeExpr::Timestamp { input } => {
+            pointwise_over(input, leaf)
         }
-        NativeExpr::Map { input, .. } | NativeExpr::Timestamp { input } => pointwise_operand(input),
-        // A parameter that reads no data has the same value in every execution.
+        // A parameter that reads no data has the same value in every execution, so the map stays one
+        // series in, one series out.
         NativeExpr::ParameterizedMap {
             input, parameters, ..
-        } => pointwise_operand(input) && parameters.iter().all(NativeNode::is_data_free),
+        } => pointwise_over(input, leaf) && parameters.iter().all(NativeNode::is_data_free),
         // A scalar that reads no data is broadcast over the vector side's positions. Two vectors
         // are a match between two series sets, which is the shape this route cannot split.
         NativeExpr::Binary {
@@ -98,15 +116,19 @@ pub fn pointwise_operand(node: &NativeNode) -> bool {
             let scalar = |side: &NativeNode| matches!(side.output, NativeType::Scalar(_));
             matching.cardinality == Cardinality::OneToOne
                 && match (scalar(left), scalar(right)) {
-                    (true, false) => left.is_data_free() && pointwise_operand(right),
-                    (false, true) => right.is_data_free() && pointwise_operand(left),
+                    (true, false) => left.is_data_free() && pointwise_over(right, leaf),
+                    (false, true) => right.is_data_free() && pointwise_over(left, leaf),
                     _ => false,
                 }
         }
         // An aggregate folds a group, a vector operation reads the whole vector, and a bare input or
         // scalar is not a per-series evaluation. A parameterized topk or histogram reads the whole
-        // vector, and `scalar()` answers from it.
-        NativeExpr::Input(_)
+        // vector, and `scalar()` answers from it. None of them is a wrapper, and neither is a
+        // selection or a window: the chain ends here, and the caller's `leaf` is what says whether
+        // that end is a shape it accepts.
+        NativeExpr::Instant { .. }
+        | NativeExpr::Window { .. }
+        | NativeExpr::Input(_)
         | NativeExpr::Scalar(_)
         | NativeExpr::EvalTime { .. }
         | NativeExpr::VectorOf { .. }
@@ -117,7 +139,7 @@ pub fn pointwise_operand(node: &NativeNode) -> bool {
         | NativeExpr::Vector { .. }
         | NativeExpr::Set { .. }
         | NativeExpr::Merge { .. }
-        | NativeExpr::Info { .. } => false,
+        | NativeExpr::Info { .. } => leaf(node),
     }
 }
 
@@ -219,6 +241,20 @@ fn evaluated_input_window(node: &NativeNode) -> bool {
     matches!(&node.expr, NativeExpr::Window { op, .. } if op.input_grid.is_some())
 }
 
+/// Whether `node` answers each series of an evaluated-input window on its own, one node at a time.
+///
+/// The wrappers are the ones [`pointwise_operand`] passes through - a math kernel, a timestamp, a
+/// parameterized map whose parameters read no data, and a scalar broadcast - because those are the
+/// nodes that read one series of their input and write one series of their own. A statement such as
+/// `abs(min_over_time(rate(x[1m])[1m:1m]))` is therefore the tree [`evaluated_input_window`]
+/// describes with a pointwise chain above it: the per-series prefix below the window is still what
+/// keeps the partitions it scanned, and the pointwise nodes above it neither gather nor regroup
+/// anything. Any other root is not this shape: an aggregate, a vector operation or a `scalar()` call
+/// reads the whole vector, and a window over raw samples is not an evaluated input at all.
+fn pointwise_over_evaluated_window(node: &NativeNode) -> bool {
+    pointwise_over(node, evaluated_input_window)
+}
+
 /// Whether the dist analyzer places a segment over `node` region-locally.
 ///
 /// A segment is a `FusedSeries` node the analyzer has to move below the `MergeScan` for the physical
@@ -242,11 +278,14 @@ fn cut_as_segment(node: &NativeNode, canonical_segmentation: bool) -> bool {
     // A window over an evaluated input answers per series on its own grid, so its own shape says
     // nothing about where a segment over it can go: it drops the metric name, so two of the series
     // it answers can end under one label set, and the dist analyzer reads it as cross-series
-    // ([`region_local_segment`]). Cutting one where the analyzer will not place it leaves a
+    // ([`region_local_segment`]). A pointwise chain above one is the same tree one node up, and it
+    // is no more placeable: cut on its own, such a segment is one the analyzer keeps above the merge,
+    // where nothing below it is a region scan, so the statement falls back to the existing plan
+    // instead of answering natively. Cutting one where the analyzer will not place it leaves a
     // `FusedSeries` above the `MergeScan` that the physical planner cannot build, so the segment is
     // only taken where the analyzer places it region-locally; otherwise the per-series prefix
     // inside the window is cut instead, and where there is none the statement keeps the plan it had.
-    if evaluated_input_window(node) && !region_local_segment(node) {
+    if pointwise_over_evaluated_window(node) && !region_local_segment(node) {
         return false;
     }
     // A window over an evaluated input is answered per series on its own grid, so it is not the
@@ -1002,10 +1041,12 @@ pub fn segment_tree(
     // their input is read. A window over an evaluated input can need that split even where
     // [`input_locality`] reports a local tree - it drops the metric name, so [`reads_across_series`]
     // reads it as cross-series - and the per-series prefix inside it is what keeps the partitions it
-    // scanned. Proceeding only admits the attempt: every cut is admitted by `cut_as_segment`
-    // individually, which is where the analyzer's placement is asked.
+    // scanned. A pointwise chain above such a window is the same tree one node further up: it reads
+    // and writes one series at a time, so it neither gathers nor regroups, and the split it needs is
+    // the one the window alone needs. Proceeding only admits the attempt: every cut is admitted by
+    // `cut_as_segment` individually, which is where the analyzer's placement is asked.
     if !matches!(input_locality(tree.root()), InputLocality::SinglePartition)
-        && !evaluated_input_window(tree.root())
+        && !pointwise_over_evaluated_window(tree.root())
     {
         return None;
     }
@@ -1033,11 +1074,15 @@ pub fn segment_tree(
     let mut changed = false;
     loop {
         // A tree the analyzer keeps partition-local needs no segment; a window over an evaluated
-        // input is still worth attempting one for, so its per-series prefix keeps its partitions.
+        // input - or the pointwise chain above one - is still worth attempting one for, so its
+        // per-series prefix keeps its partitions. The chain is asked for again here because the
+        // first pass leaves it in place above the segments it cut: the window it wraps is then read
+        // from a frame rather than from a scan, so the next pass cuts the window itself out and
+        // leaves the pointwise chain reading that frame.
         if !matches!(
             input_locality(current_tree.root()),
             InputLocality::SinglePartition
-        ) && !evaluated_input_window(current_tree.root())
+        ) && !pointwise_over_evaluated_window(current_tree.root())
         {
             break;
         }

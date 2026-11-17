@@ -16816,3 +16816,148 @@ async fn native_promql_matrix_root_matches_legacy() {
     let legacy = run(&instance, &observer, sql, false).await;
     assert_eq!(native, legacy);
 }
+
+/// A pointwise chain above a subquery answers what Prometheus answers.
+///
+/// `abs(min_over_time(rate(x[1m])[1m:1m]))` is a window over an evaluated input with a math kernel
+/// above it. `rate` drops the metric name, so the statement reads across series and the analyzer
+/// gathers it; the window answers one series of its own grid at a time and so does the `abs` above
+/// it, so the split it needs is the one the window alone needs. The numbers below are the ones
+/// Prometheus computes for these samples:
+///
+/// Every series is a linear counter sampled every 20s from 180s to 420s. `rate(x[1m])` reads 40s of
+/// that window's samples and extrapolates them to the whole window - the 20s between the window
+/// start and the first sample is under the 1.1 x 20s threshold, so it is not clamped - and answers
+/// the series' own slope: `a` 1.0/s, `b` 1.5/s and `c` 2.0/s. A 60s subquery at a 60s step folds
+/// points carrying that same slope, which is what makes the answer independent of which of them the
+/// fold keeps. `abs` of a non-negative rate is the rate, and `ceil` moves 1.0, 1.5 and 2.0 to 1.0,
+/// 2.0 and 2.0. `rate`, `min_over_time` and the math kernel all drop the metric name, so the name
+/// column a rows answer declares is null in every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_promql_pointwise_over_subquery_answers_prometheus() {
+    common_telemetry::init_default_ut_logging();
+    let config = mito2::config::MitoConfig {
+        experimental_series_scan_v2: true,
+        ..Default::default()
+    };
+    let (standalone, observer) = native_test_instance(
+        GreptimeDbStandaloneBuilder::new("native_promql_pointwise_subquery")
+            .with_mito_config(config),
+    )
+    .await;
+    let instance = standalone.fe_instance().clone();
+    let mut rows = Vec::new();
+    for (host, step) in [("a", 20.0), ("b", 30.0), ("c", 40.0)] {
+        for (index, ts) in (180..=420).step_by(20).enumerate() {
+            rows.push(format!(
+                "('{host}', {}, {})",
+                ts * 1000,
+                step * index as f64
+            ));
+        }
+    }
+    execute_all(
+        &instance,
+        &format!(
+            "CREATE TABLE native_pointwise (host STRING, ts TIMESTAMP(3) TIME INDEX, val DOUBLE, PRIMARY KEY (host)); \
+             INSERT INTO native_pointwise (host, ts, val) VALUES {}",
+            rows.join(", ")
+        ),
+        QueryContext::arc(),
+    )
+    .await;
+
+    // What Prometheus answers for these samples: the rate of each series, and `ceil` of it.
+    let answer = [("a", 1.0, 1.0), ("b", 1.5, 2.0), ("c", 2.0, 2.0)];
+    let expected = |ceil: bool| {
+        answer
+            .iter()
+            .map(|(host, rate, rounded)| {
+                (
+                    300_000_i64,
+                    host.to_string(),
+                    if ceil { *rounded } else { *rate },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let instant = |query: &str| format!("TQL EVAL (300, 300, '1s') {query}");
+    for (query, ceil) in [
+        (
+            "abs(min_over_time(rate(native_pointwise[1m])[1m:1m]))",
+            false,
+        ),
+        ("min_over_time(rate(native_pointwise[1m])[1m:1m])", false),
+        ("abs(rate(native_pointwise[1m]))", false),
+        (
+            "abs(ceil(min_over_time(rate(native_pointwise[1m])[1m:1m])))",
+            true,
+        ),
+    ] {
+        let sql = instant(query);
+        observer.clear();
+        let (rows, names) =
+            native_rows_and_names(native_tql_output(&instance, &sql, true).await, Some("host"))
+                .await;
+        assert_eq!(rows, expected(ceil), "{sql}");
+        assert_eq!(
+            names,
+            Some(expected(ceil).iter().map(|_| None).collect()),
+            "{sql}: the name column is declared and null in every row"
+        );
+        assert!(
+            observer.fused().is_some(),
+            "{sql} did not execute a FusedSeriesExec: {:#?}",
+            observer.root_plan()
+        );
+    }
+
+    // The same statement answers the same values at every point of a range.
+    let range = "TQL EVAL (300, 420, '1m') abs(min_over_time(rate(native_pointwise[1m])[1m:1m]))";
+    observer.clear();
+    let (rows, names) = native_rows_and_names(
+        native_tql_output(&instance, range, true).await,
+        Some("host"),
+    )
+    .await;
+    let expected_range = [300_000_i64, 360_000, 420_000]
+        .into_iter()
+        .flat_map(|step| {
+            answer
+                .iter()
+                .map(move |(host, rate, _)| (step, host.to_string(), *rate))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected_range, "{range}");
+    assert_eq!(
+        names,
+        Some(expected_range.iter().map(|_| None).collect()),
+        "{range}: the name column is declared and null in every row"
+    );
+    assert!(
+        observer.fused().is_some(),
+        "{range} did not execute a FusedSeriesExec: {:#?}",
+        observer.root_plan()
+    );
+
+    // Partitioning the scan does not change the answer: one partition and four agree with it.
+    let single = instant("abs(min_over_time(rate(native_pointwise[1m])[1m:1m]))");
+    let mut partitioned = Vec::new();
+    for parallelism in [1, 4] {
+        let rows = native_rows(
+            instance
+                .do_query(&single, native_query_context(true, parallelism))
+                .await
+                .remove(0)
+                .unwrap(),
+            Some("host"),
+        )
+        .await;
+        partitioned.push(rows);
+    }
+    assert_eq!(
+        partitioned[0], partitioned[1],
+        "{single}: partitioning changed the answer"
+    );
+    assert_eq!(partitioned[1], expected(false), "{single}");
+}
