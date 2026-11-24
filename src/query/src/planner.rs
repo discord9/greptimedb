@@ -54,8 +54,8 @@ use store_api::metric_engine_consts::DATA_SCHEMA_TSID_COLUMN_NAME;
 use crate::dist_plan::DistPlannerOptions;
 use crate::dist_plan::region_local_node;
 use crate::error::{
-    CteColumnSchemaMismatchSnafu, PlanSqlSnafu, QueryPlanSnafu, Result, SqlSnafu,
-    UnimplementedSnafu,
+    CteColumnSchemaMismatchSnafu, CteColumnsNotPublishableSnafu, NativeRemoteTopologySnafu,
+    PlanSqlSnafu, QueryPlanSnafu, Result, SqlSnafu, UnimplementedSnafu,
 };
 use crate::log_query::planner::LogQueryPlanner;
 use crate::optimizer::expr_depth;
@@ -93,17 +93,33 @@ pub trait LogicalPlanner: Send + Sync {
 ///
 /// A fused node that reads no region is the one exception: it has nothing to place in a region, so
 /// the frontend evaluates it and the transport this gate protects is never used.
-fn remote_native_raw_plan_supported(plan: &LogicalPlan) -> bool {
-    /// `region_local` says the nearest enclosing node reads its scan where that scan is planned, so
-    /// the subtree below it travels inside the region's own plan.
+///
+/// `None` says a distributed planner can carry every scan in `plan`; `Some(reason)` names the
+/// topology it cannot place. The reason is what the route reports instead of planning the statement
+/// again: an answer may not change route because its plan turned out not to fit the transport.
+fn remote_native_raw_plan_unsupported(plan: &LogicalPlan) -> Option<&'static str> {
+    /// A table scan nothing above reads where the scan is planned, so no node in the plan says
+    /// which region it is read in: shipping it across the boundary would leave a scan with no
+    /// region below it.
+    const UNPLACED_SCAN: &str = "a table scan that no region-local fused node encloses, so no node names the region it is read in";
+    /// A raw source whose input is not the one scan it names: the region it promises and the scan
+    /// it reads are then two different reads.
+    const UNBOUND_RAW_SOURCE: &str = "a raw-series source that does not read exactly one table scan, so the region it names is not the scan below it";
+    /// Neither an input that names its region nor a node the analyzer would move into one, and the
+    /// statement is not one the frontend finishes by itself.
+    const NO_REGION_SOURCE: &str = "neither a raw-series source nor a region-local fused node, so nothing in the plan names a region to read";
+
+    /// The gap in the subtree, if any: `region_local` says the nearest enclosing node reads its
+    /// scan where that scan is planned, so the subtree below it travels inside the region's own
+    /// plan.
     fn walk(
         plan: &LogicalPlan,
         region_local: bool,
         found_raw: &mut bool,
         found_region_local: &mut bool,
-    ) -> bool {
+    ) -> Option<&'static str> {
         match plan {
-            LogicalPlan::TableScan(_) => region_local,
+            LogicalPlan::TableScan(_) => (!region_local).then_some(UNPLACED_SCAN),
             LogicalPlan::Extension(extension) => {
                 if extension
                     .node
@@ -111,10 +127,10 @@ fn remote_native_raw_plan_supported(plan: &LogicalPlan) -> bool {
                     .is::<promql::extension_plan::RawSeriesSource>()
                 {
                     *found_raw = true;
-                    return matches!(
-                        extension.node.inputs().as_slice(),
-                        [LogicalPlan::TableScan(_)]
-                    );
+                    return match extension.node.inputs().as_slice() {
+                        [LogicalPlan::TableScan(_)] => None,
+                        _ => Some(UNBOUND_RAW_SOURCE),
+                    };
                 }
                 let region_local = extension
                     .node
@@ -126,18 +142,35 @@ fn remote_native_raw_plan_supported(plan: &LogicalPlan) -> bool {
                     .node
                     .inputs()
                     .iter()
-                    .all(|child| walk(child, region_local, found_raw, found_region_local))
+                    .find_map(|child| walk(child, region_local, found_raw, found_region_local))
             }
             _ => plan
                 .inputs()
                 .iter()
-                .all(|child| walk(child, region_local, found_raw, found_region_local)),
+                .find_map(|child| walk(child, region_local, found_raw, found_region_local)),
         }
     }
     let mut found_raw = false;
     let mut found_region_local = false;
-    walk(plan, false, &mut found_raw, &mut found_region_local)
-        && (found_raw || found_region_local || is_regionless_fused_plan(plan))
+    if let Some(reason) = walk(plan, false, &mut found_raw, &mut found_region_local) {
+        return Some(reason);
+    }
+    (!(found_raw || found_region_local || is_regionless_fused_plan(plan)))
+        .then_some(NO_REGION_SOURCE)
+}
+
+/// Admits a native plan to a distributed planner, or refuses it naming the topology that cannot be
+/// placed.
+///
+/// The route answers a shape it built and the transport cannot carry with this error rather than
+/// with the existing planner's plan: planning the statement again would answer something the option
+/// asked this route to plan with another route's answer, and the caller could not tell the two
+/// apart.
+fn admit_remote_native_plan(plan: &LogicalPlan) -> Result<()> {
+    match remote_native_raw_plan_unsupported(plan) {
+        Some(reason) => NativeRemoteTopologySnafu { reason }.fail(),
+        None => Ok(()),
+    }
 }
 
 /// Whether `plan` is a native fused plan with no region below it.
@@ -281,6 +314,10 @@ fn unwrap_dictionary(data_type: &DataType) -> &DataType {
 /// it. This wraps the native plan in the projection that publishes the existing planner's answer for
 /// the same statement instead.
 ///
+/// `legacy` is planned for its columns alone: this reads their schema and builds the projection over
+/// `native`, so no row of it is ever read. It is derived information - the names a CTE's columns have
+/// - and not a second answer to the statement.
+///
 /// One column follows the answer rather than the existing planner: a native rows answer declares the
 /// per-row metric name, which the existing planner never publishes, and that column is part of what
 /// the statement answers. It is appended after the existing planner's columns, so those keep their
@@ -296,22 +333,28 @@ fn unwrap_dictionary(data_type: &DataType) -> &DataType {
 /// The mapping is the identity on every column both plans publish alike - the time index and the
 /// label columns, which carry the same metadata on both routes now - and is a cast for a column
 /// whose identity is unambiguous: one native column of the same type once both are unencoded, no
-/// per-column metadata to lose and the same nullability. `None` says the two plans admit no such
+/// per-column metadata to lose and the same nullability. An error says the two plans admit no such
 /// mapping - a differently named time index, an ambiguous set of columns left over, or a column a
-/// cast cannot reproduce faithfully - and the caller then keeps the existing plan rather than publish
-/// a column it cannot fill faithfully.
-fn publish_legacy_schema(native: LogicalPlan, legacy: &LogicalPlan) -> Option<LogicalPlan> {
+/// cast cannot reproduce faithfully - and the statement is refused rather than published under a
+/// column this cannot fill faithfully. The error names the columns left empty, because that is the
+/// statement's own answer: the columns a CTE exposes are the existing planner's, and they do not
+/// follow the route.
+fn publish_legacy_schema(native: LogicalPlan, legacy: &LogicalPlan) -> Result<LogicalPlan> {
     let native_schema = native.schema().clone();
     let legacy_schema = legacy.schema();
-
     // A frame's declaration is schema metadata describing the columns under it, and a projection
-    // that renames and reorders them cannot keep it. A statement that publishes one keeps the
-    // existing plan.
+    // that renames and reorders them cannot keep it.
     if publishes_series_frame(native_schema.as_ref()) {
-        return None;
+        return CteColumnsNotPublishableSnafu {
+            reason:
+                "the native answer publishes a series frame declaration, and a projection that \
+                     renames and reorders its columns cannot keep one"
+                    .to_string(),
+        }
+        .fail();
     }
     if publishes_columns(native_schema.as_ref(), legacy_schema.as_ref()) {
-        return Some(native);
+        return Ok(native);
     }
 
     let native_fields = native_schema
@@ -373,7 +416,25 @@ fn publish_legacy_schema(native: LogicalPlan, legacy: &LogicalPlan) -> Option<Lo
             *source = Some(*native_index);
         }
     }
-    let source = source.into_iter().collect::<Option<Vec<usize>>>()?;
+    // The columns the mapping left empty, named so the refusal says which ones they are.
+    let unmapped = source
+        .iter()
+        .enumerate()
+        .filter(|(_, native_index)| native_index.is_none())
+        .map(|(legacy_index, _)| {
+            let field = legacy_schema.field(legacy_index);
+            format!("`{}` ({:?})", field.name(), field.data_type())
+        })
+        .collect::<Vec<_>>();
+    let Some(source) = source.into_iter().collect::<Option<Vec<usize>>>() else {
+        return CteColumnsNotPublishableSnafu {
+            reason: format!(
+                "no column of the native answer can fill {} faithfully",
+                unmapped.join(", ")
+            ),
+        }
+        .fail();
+    };
 
     let mut exprs = Vec::with_capacity(source.len());
     for ((_, legacy_field), native_index) in legacy_schema.iter().zip(source) {
@@ -414,16 +475,20 @@ fn publish_legacy_schema(native: LogicalPlan, legacy: &LogicalPlan) -> Option<Lo
     }
     let plan = LogicalPlanBuilder::from(native)
         .project(exprs)
-        .ok()?
-        .build()
-        .ok()?;
+        .and_then(|builder| builder.build())
+        .map_err(|error| {
+            CteColumnsNotPublishableSnafu {
+                reason: format!("the projection that publishes them does not build: {error}"),
+            }
+            .build()
+        })?;
     // The published columns are the ones this set out to publish, or the native plan is not used at
     // all: what a CTE exposes may not change for a reason this did not predict. The legacy columns
     // come first and in their order; the name column, when the answer declared one, is last.
     let published = plan.schema();
     let legacy_len = legacy_schema.fields().len();
     let expected_len = legacy_len + usize::from(name_source.is_some());
-    (published.fields().len() == expected_len
+    let publishes = published.fields().len() == expected_len
         && published.metadata() == legacy_schema.metadata()
         && legacy_schema.iter().zip(published.iter()).all(
             |((_, legacy_field), (_, published_field))| {
@@ -441,8 +506,16 @@ fn publish_legacy_schema(native: LogicalPlan, legacy: &LogicalPlan) -> Option<Lo
                 && published.is_nullable() == wanted.is_nullable()
                 && published.metadata() == wanted.metadata()
                 && datatypes::schema::is_metric_name_field(published.as_ref())
-        }))
-    .then_some(plan)
+        });
+    if !publishes {
+        return CteColumnsNotPublishableSnafu {
+            reason: "the projection does not publish exactly the columns the existing planner \
+                     publishes"
+                .to_string(),
+        }
+        .fail();
+    }
+    Ok(plan)
 }
 
 pub struct DfLogicalPlanner {
@@ -704,11 +777,12 @@ impl DfLogicalPlanner {
     /// Plans a PromQL statement, offering it to the native fused-series route when the statement
     /// may take it and the query options it is planned with ask for it.
     ///
-    /// `native_route_allowed` states whether the statement may take the route at all: a PromQL
-    /// statement embedded in a CTE may not (see [`Self::tql_to_logical_plan`]), every other one
-    /// may. Everything else the route depends on is read from the query options snapshot the
-    /// statement is planned with, where every option is already resolved as request > session
-    /// `SET` > engine default.
+    /// `native_route_allowed` states whether the statement may take the route at all: every
+    /// statement whose plan is an answer may, and the one plan that is not an answer - the existing
+    /// planner's columns a hybrid CTE publishes (see [`Self::tql_to_logical_plan`]) - is planned
+    /// with the route off. Everything else the route depends on is read from the query options
+    /// snapshot the statement is planned with, where every option is already resolved as request >
+    /// session `SET` > engine default.
     #[tracing::instrument(skip_all)]
     async fn plan_pql(
         &self,
@@ -769,7 +843,7 @@ impl DfLogicalPlanner {
             table_provider(),
             stmt,
             &self.engine_state,
-            promql_annotations.clone(),
+            promql_annotations,
             // A fallback rewriter can wrap a native region scan in an unusable MergeScan.
             native_requested,
         )
@@ -778,27 +852,16 @@ impl DfLogicalPlanner {
         .context(QueryPlanSnafu)?;
 
         // A distributed planner plans a native statement over per-selector raw sources, and a
-        // statement that reads no table needs none. Anything else keeps the existing plan. Decide
-        // while the original statement is still available: physical planning cannot fall back
-        // safely. An engine with no distributed planner plans no region, so there is nothing to
-        // admit its plan against.
-        let plan = if native_requested
-            && self.engine_state.with_dist_planner()
-            && !remote_native_raw_plan_supported(&plan)
-        {
-            PromPlanner::stmt_to_plan_with_annotations(
-                table_provider(),
-                stmt,
-                &self.engine_state,
-                promql_annotations,
-                false,
-            )
-            .await
-            .map_err(BoxedError::new)
-            .context(QueryPlanSnafu)?
-        } else {
-            plan
-        };
+        // statement that reads no table needs none. A plan that names no such source cannot be
+        // handed to it, and there is no second plan to hand it instead: the existing planner's
+        // answer is what this route was asked not to give. So the shape is refused here, naming the
+        // topology it cannot place.
+        //
+        // Only a query this route is on for builds such a plan, and an engine with no distributed
+        // planner plans no region, so there is nothing to admit the plan against.
+        if native_requested && self.engine_state.with_dist_planner() {
+            admit_remote_native_plan(&plan)?;
+        }
         let context = QueryEngineContext::new(scheduled_state, query_ctx);
         Ok(self
             .engine_state
@@ -930,12 +993,21 @@ impl DfLogicalPlanner {
                     return Ok(plan);
                 }
                 // What the CTE publishes is SQL-visible, and this route names and orders its output
-                // its own way, so its own schema cannot stand in for the existing planner's: plan
-                // the statement for that schema and publish it over the native answer. A statement
-                // whose columns that projection cannot fill faithfully keeps the existing plan
-                // instead of changing the schema the CTE exposes.
-                let existing = self.plan_pql(eval, query_ctx, false).await?;
-                Ok(publish_legacy_schema(plan, &existing).unwrap_or(existing))
+                // its own way, so its own schema cannot stand in for the existing planner's: the
+                // two routes name the value column differently (`rate(some_metric[5m])` here, the
+                // expression the existing planner built or the source field there), order the
+                // columns differently, and carry a label in different Arrow types. So the
+                // statement is planned once more with the route off, for that schema and nothing
+                // else.
+                //
+                // That plan is derived information - the columns the answer is published under -
+                // and never the CTE's answer: nothing reads a row of it, and the projection below
+                // is built over the native plan. What it does mean is that a native answer whose
+                // columns this projection cannot fill faithfully is refused: the columns a CTE
+                // exposes may not silently follow the route, and answering the statement with the
+                // plan that named them would be that substitution.
+                let schema_source = self.plan_pql(eval, query_ctx, false).await?;
+                publish_legacy_schema(plan, &schema_source)
             }
             Tql::Explain(_) => UnimplementedSnafu {
                 operation: "TQL EXPLAIN in CTEs",
@@ -1219,6 +1291,8 @@ mod tests {
     use catalog::RegisterTableRequest;
     use catalog::memory::MemoryCatalogManager;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_query::OutputData;
     use common_recordbatch::RecordBatch;
     use common_recordbatch::util::collect_batches;
@@ -1697,7 +1771,10 @@ mod tests {
             if with_dist_planner {
                 // The gate admits the plan instead of replanning it through the legacy route: one
                 // source per region under a fused node.
-                assert!(remote_native_raw_plan_supported(&plan), "{display}");
+                assert!(
+                    remote_native_raw_plan_unsupported(&plan).is_none(),
+                    "{display}"
+                );
             }
             assert_eq!(
                 display.contains("RawSeriesSource"),
@@ -1705,6 +1782,166 @@ mod tests {
                 "with_dist_planner={with_dist_planner}, query={query}: {display}"
             );
         }
+    }
+
+    /// A plan a distributed planner cannot carry is refused, naming the topology it cannot place.
+    ///
+    /// The route answers a shape it built that no region can read with this error rather than with
+    /// the existing planner's plan: planning the statement again would answer a statement the
+    /// option asked this route to plan with another route's answer, and nothing would tell the
+    /// caller. A plan whose scans name no region is that shape - what the existing planner builds
+    /// for a plain SQL statement is one, and no native plan may be one.
+    #[tokio::test]
+    async fn a_native_plan_no_region_can_carry_is_refused() {
+        // A scan under no node the analyzer would move into a region: nothing names the region it
+        // is read in, so a distributed planner would have to ship the scan itself across the
+        // boundary.
+        let unplaced_scan = parse_sql_to_plan("SELECT id FROM test").await;
+        assert!(
+            remote_native_raw_plan_unsupported(&unplaced_scan).is_some(),
+            "{unplaced_scan}"
+        );
+        let error = admit_remote_native_plan(&unplaced_scan).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot plan this statement over regions"),
+            "{message}"
+        );
+        assert!(message.contains("table scan"), "{message}");
+        assert_eq!(error.status_code(), StatusCode::Unsupported);
+
+        // The shape this route does build for a deployed frontend is admitted: one raw source per
+        // selector, each over the one scan it names.
+        let engine = create_promql_test_engine_with(
+            crate::options::QueryOptions {
+                experimental_native_promql: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let query_ctx = native_discovery_query_ctx();
+        let plan = plan_remote_native_promql(&engine, &query_ctx, "rate(some_metric[5m])").await;
+        assert!(
+            remote_native_raw_plan_unsupported(&plan).is_none(),
+            "{}",
+            plan.display_indent()
+        );
+        admit_remote_native_plan(&plan).expect("every region carries its own source");
+    }
+
+    /// Plans `WITH q AS (TQL EVAL (0, 10, '5s') <promql>) SELECT * FROM q`, which publishes the
+    /// statement as a table the outer SQL query reads, with the native route stated as `native`
+    /// asks and a distributed planner under it.
+    ///
+    /// The route is stated per query, so the two plans differ in the route and in nothing else.
+    async fn plan_native_promql_cte(
+        promql: &str,
+        native: bool,
+    ) -> crate::error::Result<LogicalPlan> {
+        let engine = create_promql_test_engine_with(crate::options::QueryOptions::default(), true);
+        let query_ctx = Arc::new(
+            QueryContextBuilder::default()
+                .set_extension(NATIVE_PROMQL_EXTENSION_KEY.to_string(), native.to_string())
+                .build(),
+        );
+        let sql = format!("WITH q AS (TQL EVAL (0, 10, '5s') {promql}) SELECT * FROM q");
+        let stmt = QueryLanguageParser::parse_sql(&sql, &query_ctx).unwrap();
+        engine.planner().plan(&stmt, query_ctx).await
+    }
+
+    /// A CTE the native route answers keeps that answer and publishes the existing planner's columns
+    /// over it: what a CTE exposes is SQL-visible, so the columns do not follow the route - the rows
+    /// do.
+    #[tokio::test]
+    async fn a_native_cte_publishes_the_existing_planners_columns_over_its_answer() {
+        // `sum(some_metric)` folds every label away, so the two answers publish the same columns
+        // but for one: the native answer declares the per-row name column, and the existing planner
+        // publishes the value under the name of the expression it planned.
+        let existing = plan_native_promql_cte("sum(some_metric)", false)
+            .await
+            .unwrap();
+        let native = plan_native_promql_cte("sum(some_metric)", true)
+            .await
+            .unwrap();
+
+        assert!(
+            native.display_indent().to_string().contains("FusedSeries"),
+            "the CTE is answered by the native plan, not by the one that names its columns: {}",
+            native.display_indent()
+        );
+        let published = native.schema();
+        let wanted = existing.schema();
+        assert_eq!(
+            published.fields().len(),
+            wanted.fields().len() + 1,
+            "the existing planner's columns, then the name the answer carries: {published}"
+        );
+        for (published_field, wanted_field) in published.fields().iter().zip(wanted.fields()) {
+            assert_eq!(published_field.name(), wanted_field.name(), "{published}");
+            assert_eq!(
+                published_field.data_type(),
+                wanted_field.data_type(),
+                "{published}"
+            );
+            assert_eq!(
+                published_field.is_nullable(),
+                wanted_field.is_nullable(),
+                "{published}"
+            );
+            assert_eq!(
+                published_field.metadata(),
+                wanted_field.metadata(),
+                "{published}"
+            );
+        }
+        assert_eq!(
+            published.fields().last().unwrap().name(),
+            "__name__",
+            "the name column the answer declares follows the existing planner's columns: {published}"
+        );
+    }
+
+    /// A native answer the CTE cannot publish the existing planner's columns over is refused.
+    ///
+    /// A labelled statement is one: the existing planner publishes each label as a non-nullable
+    /// dictionary-encoded column, and the native answer carries it as a nullable plain text one, so
+    /// no expression fills that column without changing what the CTE exposes. Answering the
+    /// statement with the plan that named the columns - which is what this used to do - is the
+    /// silent substitution the route does not make.
+    #[tokio::test]
+    async fn a_native_cte_whose_columns_cannot_be_published_is_refused() {
+        let error = plan_native_promql_cte("rate(some_metric[5m])", true)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot publish the columns a CTE exposes"),
+            "{message}"
+        );
+        assert!(message.contains("`tag_0`"), "{message}");
+
+        // With the route off the CTE is planned by the planner whose columns those are, unchanged.
+        let existing = plan_native_promql_cte("rate(some_metric[5m])", false)
+            .await
+            .unwrap();
+        assert!(
+            !existing
+                .display_indent()
+                .to_string()
+                .contains("FusedSeries"),
+            "{}",
+            existing.display_indent()
+        );
+        assert_eq!(
+            column_names(&existing),
+            vec![
+                "timestamp".to_string(),
+                "prom_rate(timestamp_range,field_0,timestamp,Int64(300000))".to_string(),
+                "tag_0".to_string(),
+                "tag_1".to_string()
+            ],
+            "{existing}"
+        );
     }
 
     /// Plans `query` on the fixture engine with the native route requested. The engine is one with
@@ -2707,13 +2944,14 @@ mod tests {
         );
     }
 
-    /// A statement whose columns do not pair keeps the existing plan.
+    /// A statement whose columns do not pair is refused.
     ///
-    /// Publishing a column this cannot fill would change what the CTE means, so a shape it cannot
-    /// map faithfully is refused instead: the caller keeps the existing plan and the CTE keeps the
-    /// columns it has always published.
+    /// Publishing a column this cannot fill would change what the CTE means, and answering the
+    /// statement with the plan that named the columns would answer a statement the option asked
+    /// this route to plan with another route's answer. So a shape it cannot map faithfully is
+    /// refused, naming the columns no native column can fill.
     #[test]
-    fn a_shape_with_no_faithful_column_mapping_keeps_the_existing_plan() {
+    fn a_shape_with_no_faithful_column_mapping_is_refused() {
         // One native value column cannot fill two of the existing plan's value columns.
         let two_values = plan_publishing_marked(
             &[
@@ -2724,7 +2962,13 @@ mod tests {
             ],
             "ts",
         );
-        assert!(publish_legacy_schema(native_answer(), &two_values).is_none());
+        let error = publish_legacy_schema(native_answer(), &two_values).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("`lhs.val - rhs.val`"), "{message}");
+        assert!(
+            !message.contains("`host`"),
+            "the labels paired, and the refusal names only the columns left empty: {message}"
+        );
 
         // A time index the other route had to rename is marked as the time index on both sides, and
         // a column that carries metadata is never reproduced by a cast.
@@ -2744,7 +2988,7 @@ mod tests {
             ],
             "ts",
         );
-        assert!(publish_legacy_schema(renamed_time, &existing).is_none());
+        assert!(publish_legacy_schema(renamed_time, &existing).is_err());
     }
 
     #[tokio::test]

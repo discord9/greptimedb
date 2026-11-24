@@ -92,6 +92,18 @@ pub enum Error {
         location: Location,
     },
 
+    /// The native fused-series route planned a statement a distributed planner cannot carry: no
+    /// node under the plan names the region each of its scans is read in, so the frontend would
+    /// have to ship a bare scan across a region boundary. The route has no second plan - the
+    /// existing planner's answer is not a substitute for a statement the option asked this route to
+    /// plan - so this reports the topology the plan cannot place.
+    #[snafu(display("native PromQL cannot plan this statement over regions: {reason}"))]
+    NativeRemoteTopology {
+        reason: &'static str,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failure during query parsing, query: {}", query))]
     QueryParse {
         query: String,
@@ -345,6 +357,22 @@ pub enum Error {
         location: Location,
     },
 
+    /// A hybrid CTE publishes the columns the existing PromQL planner publishes for the same
+    /// statement, because those are the columns the outer SQL query reads - and a column list the
+    /// CTE declares is applied to them by position. The native fused-series answer names and orders
+    /// its own columns, so publishing it means filling every one of the existing planner's from a
+    /// native column; a statement no native column can fill faithfully has no answer this route can
+    /// publish, and it is refused rather than answered by the plan that named the columns.
+    #[snafu(display(
+        "cannot publish the columns a CTE exposes for this PromQL statement: {}",
+        reason
+    ))]
+    CteColumnsNotPublishable {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to convert value for region pruning"))]
     ConvertValue {
         source: datatypes::error::Error,
@@ -444,7 +472,9 @@ impl ErrorExt for Error {
             TableMutation { source, .. } => source.status_code(),
             MissingTableMutationHandler { .. } => StatusCode::Unexpected,
             GetRegionMetadata { .. } => StatusCode::RegionNotReady,
-            TableReadOnly { .. } => StatusCode::Unsupported,
+            TableReadOnly { .. }
+            | NativeRemoteTopology { .. }
+            | CteColumnsNotPublishable { .. } => StatusCode::Unsupported,
 
             GetFulltextOptions { source, .. }
             | GetSkippingIndexOptions { source, .. }
