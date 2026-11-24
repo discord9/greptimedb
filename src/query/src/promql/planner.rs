@@ -321,9 +321,10 @@ impl PromPlanner {
     /// Plans a PromQL statement and passes the optional collector to histogram UDFs.
     ///
     /// `native_fused` enables the native fused-series route: the statement is offered to
-    /// [`compile`](crate::promql::native_compile::compile) first, and whatever that compiler does
-    /// not accept is planned by the existing path, unchanged. See
-    /// [`Self::try_plan_native_fused`].
+    /// [`compile`](crate::promql::native_compile::compile) first, and a statement that compiler
+    /// does not bind is refused - see [`native::declined`] - because with the route on the existing
+    /// planner is not a fallback. With `native_fused` off the statement is planned by the existing
+    /// path, unchanged. See [`Self::try_plan_native_fused`].
     pub async fn stmt_to_plan_with_annotations(
         table_provider: DfTableSourceProvider,
         stmt: &EvalStmt,
@@ -340,14 +341,21 @@ impl PromPlanner {
 
         // The whole statement is offered to the native compiler first, because that compiler folds
         // a range function and the math functions over it into one tree: offered any later, the
-        // expression has already been split into the nodes those functions would have shared. A
-        // shape it does not accept is planned by the existing path exactly as if it were not here.
+        // expression has already been split into the nodes those functions would have shared.
         if let Some(plan) = planner
             .try_plan_native_fused(&stmt.expr, query_engine_state)
             .await?
         {
             return planner.strip_tsid_column(plan);
         }
+        // Nothing was planned because the route is off for this query: it answered `None` only for
+        // that. A route that is on answers a shape it does not bind with its own error, which the
+        // `?` above has already returned, so the existing planner is never a second answer for a
+        // statement the option asked this route to plan.
+        debug_assert!(
+            !planner.native_fused,
+            "a route that is on does not fall through to the existing planner"
+        );
         let plan = planner
             .prom_root_expr_to_plan(&stmt.expr, query_engine_state)
             .await?;

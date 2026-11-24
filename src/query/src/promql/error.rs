@@ -220,6 +220,26 @@ pub enum Error {
         location: Location,
     },
 
+    /// The native fused-series route is on for this query and does not bind the shape it was
+    /// given. It is not a query error: the statement is well formed, and with the option off the
+    /// existing planner plans it. The route has no second plan, so this says what the route lacks.
+    #[snafu(display("native PromQL cannot answer this expression: {reason}"))]
+    NativeDeclined {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// A shape this crate's own compiler cannot produce, seen by the planner binding it: a
+    /// contradiction between what was compiled and what was prepared. It is this route's bug
+    /// rather than a query it does not answer.
+    #[snafu(display("native PromQL internal invariant violated: {reason}"))]
+    NativeInvariant {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Matcher operator {matcher_op} is not supported for {matcher}"))]
     UnsupportedMatcherOp {
         matcher_op: String,
@@ -304,6 +324,8 @@ impl ErrorExt for Error {
             MultipleMetricMatchers { .. } | NoMetricMatcher { .. } => StatusCode::InvalidSyntax,
 
             MultiFieldsNotSupported { .. } => StatusCode::Unsupported,
+            NativeDeclined { .. } => StatusCode::Unsupported,
+            NativeInvariant { .. } => StatusCode::Internal,
             Catalog { source, .. } => source.status_code(),
         }
     }

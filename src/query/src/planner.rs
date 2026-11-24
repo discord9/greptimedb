@@ -923,9 +923,10 @@ impl DfLogicalPlanner {
                 };
                 let plan = self.plan_pql(eval, query_ctx.clone(), true).await?;
                 if !contains_native_fused(&plan) {
-                    // The route was not taken - it is off for this query, or it declined this
-                    // shape - so this is the existing plan, which already publishes what a CTE has
-                    // always published.
+                    // The route was not taken - it is off for this query - so this is the existing
+                    // plan, which already publishes what a CTE has always published. A route that
+                    // is on has no second plan to fall back to: a shape it does not bind has
+                    // already failed by now.
                     return Ok(plan);
                 }
                 // What the CTE publishes is SQL-visible, and this route names and orders its output
