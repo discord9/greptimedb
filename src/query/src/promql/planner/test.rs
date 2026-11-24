@@ -4526,45 +4526,215 @@ async fn native_fused_engine_without_raw_series_falls_back() {
     );
 }
 
+/// The plan `query` gets, or `None` when the planner refuses it.
+///
+/// A field the raw series scan cannot read must not change what the statement answers, and some of
+/// these statements the existing planner refuses outright: that refusal is its answer, so a test has
+/// to be able to hold the route to it instead of unwrapping a plan.
+async fn plan_or_refusal(
+    query: &str,
+    native_fused: bool,
+    table_provider: DfTableSourceProvider,
+) -> Option<LogicalPlan> {
+    PromPlanner::stmt_to_plan_with_annotations(
+        table_provider,
+        &build_eval_stmt(query),
+        &build_query_engine_state(),
+        None,
+        native_fused,
+    )
+    .await
+    .ok()
+}
+
 /// A value field the raw-series readers cannot serve keeps the existing plan.
 ///
 /// The route admits two kinds: a `Float64`, which every reader serves, and the canonical native
 /// histogram struct, which the ordinary scan reads while the columnar samples - `Float64` only -
-/// are skipped for that selection. Everything else, including numeric types the columnar samples
-/// do not store, has no raw representation and keeps the existing plan; a bare selector over such
-/// a field answered normally before this route existed.
+/// are skipped for that selection. Everything else - a string, a boolean, a decimal - has no raw
+/// representation and keeps the existing plan whatever the shape of the statement, including the
+/// shapes that publish a `Float64` for a numeric field: `some_metric * 2` casts a string as readily
+/// as an integer, and the route still refuses it because no raw frame can hold the values.
 #[tokio::test]
 async fn native_fused_unsupported_field_type_falls_back() {
     for field_type in [
         ConcreteDataType::string_datatype(),
         ConcreteDataType::boolean_datatype(),
-        // Arrow's `is_numeric` includes the decimals while the region's preflight does not, so
-        // asking Arrow would let a decimal field through to a planning error.
+        // Arrow's `is_numeric` includes the decimals, so a decimal field only stays out because
+        // the route's own numeric set leaves the decimals out; asking Arrow would let it through.
         ConcreteDataType::decimal128_datatype(10, 2),
-        // Numeric, but not the `Float64` the columnar samples store.
-        ConcreteDataType::int64_datatype(),
-        ConcreteDataType::float32_datatype(),
     ] {
-        let native = build_native_fused_plan_with_provider(
+        for query in [
             "some_metric",
+            "some_metric * 2",
+            "sum(some_metric)",
+            "min(some_metric)",
+            "rate(some_metric[5m])",
+        ] {
+            let native = plan_or_refusal(
+                query,
+                true,
+                build_test_table_provider_with_field_type(field_type.clone()).await,
+            )
+            .await;
+            let without_flag = plan_or_refusal(
+                query,
+                false,
+                build_test_table_provider_with_field_type(field_type.clone()).await,
+            )
+            .await;
+            match (&native, &without_flag) {
+                (Some(native_plan), Some(legacy_plan)) => {
+                    assert!(
+                        find_fused_series(native_plan).is_none(),
+                        "{field_type} must not reach the native route: {query}"
+                    );
+                    assert_eq!(
+                        native_plan.display_indent().to_string(),
+                        legacy_plan.display_indent().to_string(),
+                        "{field_type} must keep the existing plan: {query}"
+                    );
+                }
+                _ => assert_eq!(
+                    native.is_some(),
+                    without_flag.is_some(),
+                    "{field_type}: the route must answer what the existing planner answers for \
+                     {query}"
+                ),
+            }
+        }
+    }
+}
+
+/// A numeric field the raw scan casts is admitted only under the shapes whose existing plan
+/// publishes a `Float64` for it too.
+///
+/// The scan hands the node a `Float64` (`series_scan/raw.rs` casts every numeric field), while the
+/// fused node declares one `Float64` value column per field. The existing planner publishes that same
+/// float for an arithmetic argument, for `min`/`max`/`avg`/`stddev`/`stdvar`/`quantile`/`group` and for
+/// a range function, but copies the field's own type through a bare selector, `sum` over an integer,
+/// `count`, `count_values`, `abs` and the other math functions. Admission therefore follows the shape,
+/// and a shape whose existing plan publishes the field's own type keeps that plan.
+#[tokio::test]
+async fn native_fused_numeric_field_admission_follows_the_shape() {
+    use ConcreteDataType as Dt;
+
+    for (field_type, query, admitted) in [
+        // A bare selector reports the field's own type, so it keeps the existing plan.
+        (Dt::int64_datatype(), "some_metric", false),
+        (Dt::float32_datatype(), "some_metric", false),
+        (Dt::uint64_datatype(), "some_metric", false),
+        // Arithmetic casts both operands, so the answer is a float under either route.
+        (Dt::int64_datatype(), "some_metric * 2", true),
+        (Dt::int64_datatype(), "some_metric + some_metric", true),
+        (Dt::float32_datatype(), "some_metric * 2", true),
+        (Dt::uint64_datatype(), "some_metric + some_metric", true),
+        // An aggregate whose UDAF answers a float for every numeric input.
+        (Dt::int64_datatype(), "min(some_metric)", true),
+        (Dt::int64_datatype(), "max(some_metric)", true),
+        (Dt::int64_datatype(), "avg(some_metric)", true),
+        (Dt::int64_datatype(), "stddev(some_metric)", true),
+        (Dt::uint64_datatype(), "quantile(0.5, some_metric)", true),
+        (Dt::int64_datatype(), "group(some_metric)", true),
+        // `sum` folds a float as a `Float64` and keeps an integer's own type.
+        (Dt::float32_datatype(), "sum(some_metric)", true),
+        (Dt::int64_datatype(), "sum(some_metric)", false),
+        (Dt::uint64_datatype(), "sum(some_metric)", false),
+        // `sum` publishes what it folds, so an integer answer one level down stays out as well.
+        (
+            Dt::float32_datatype(),
+            r#"sum(count_values("v", some_metric))"#,
+            false,
+        ),
+        // A range function answers a `Float64` for every numeric input.
+        (Dt::int64_datatype(), "rate(some_metric[5m])", true),
+        (Dt::int64_datatype(), "increase(some_metric[5m])", true),
+        (Dt::int64_datatype(), "sum_over_time(some_metric[5m])", true),
+        (Dt::uint64_datatype(), "changes(some_metric[5m])", true),
+        (Dt::float32_datatype(), "rate(some_metric[5m])", true),
+        // A count is an `Int64` whatever the field holds.
+        (Dt::int64_datatype(), "count(some_metric)", false),
+        (
+            Dt::float32_datatype(),
+            r#"count_values("v", some_metric)"#,
+            false,
+        ),
+        // A math function keeps the type it is given, and so does a negation.
+        (Dt::int64_datatype(), "abs(some_metric)", false),
+        (Dt::int64_datatype(), "-some_metric", false),
+        // A comparison without `bool` filters on the field's own column.
+        (Dt::int64_datatype(), "some_metric > 2", false),
+    ] {
+        take_reported_decline();
+        let native = build_native_fused_plan_with_provider(
+            query,
             true,
             build_test_table_provider_with_field_type(field_type.clone()).await,
         )
         .await;
-        let without_flag = build_native_fused_plan_with_provider(
-            "some_metric",
-            false,
+        let reason = take_reported_decline();
+        if admitted {
+            let fused = find_fused_series(&native).unwrap_or_else(|| {
+                panic!(
+                    "{query} over {field_type} must reach the native route: {}",
+                    native.display_indent_schema()
+                )
+            });
+            // The value column is the one kind the node publishes, which is what the existing plan
+            // publishes for this shape too.
+            assert_eq!(
+                &ArrowDataType::Float64,
+                native_value_field(fused, query).data_type(),
+                "{query} over {field_type} publishes a float"
+            );
+            assert_eq!(
+                None, reason,
+                "{query} over {field_type} declined although it is admitted"
+            );
+        } else {
+            let without_flag = build_native_fused_plan_with_provider(
+                query,
+                false,
+                build_test_table_provider_with_field_type(field_type.clone()).await,
+            )
+            .await;
+            assert!(
+                find_fused_series(&native).is_none(),
+                "{query} over {field_type} must not reach the native route"
+            );
+            assert_eq!(
+                native.display_indent().to_string(),
+                without_flag.display_indent().to_string(),
+                "{query} over {field_type} must keep the existing plan"
+            );
+        }
+    }
+
+    // The refusal names the type the shape publishes, rather than reporting a selection whose fields
+    // disagree. A binary root is left out here: its own attempt is followed by the composition's,
+    // which records its answer last.
+    for (field_type, query) in [
+        (Dt::int64_datatype(), "some_metric"),
+        (Dt::float32_datatype(), "some_metric"),
+        (Dt::uint64_datatype(), "some_metric"),
+        (Dt::int64_datatype(), "sum(some_metric)"),
+        (Dt::uint64_datatype(), "sum(some_metric)"),
+        (Dt::int64_datatype(), "count(some_metric)"),
+        (Dt::float32_datatype(), r#"count_values("v", some_metric)"#),
+        (Dt::int64_datatype(), "abs(some_metric)"),
+        (Dt::int64_datatype(), "-some_metric"),
+    ] {
+        take_reported_decline();
+        let _ = build_native_fused_plan_with_provider(
+            query,
+            true,
             build_test_table_provider_with_field_type(field_type.clone()).await,
         )
         .await;
-        assert!(
-            find_fused_series(&native).is_none(),
-            "{field_type} must not reach the native route"
-        );
         assert_eq!(
-            native.display_indent().to_string(),
-            without_flag.display_indent().to_string(),
-            "{field_type} must keep the existing plan"
+            Some("numeric_field_published_as_its_own_type"),
+            take_reported_decline(),
+            "{query} over {field_type}: the refusal names the type the shape publishes"
         );
     }
 }
