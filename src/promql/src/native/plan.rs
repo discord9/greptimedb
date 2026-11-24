@@ -580,9 +580,13 @@ pub fn binary_output_field_kind(
             // With no possible samples, retain the legacy float layout for an empty result.
             Some(kind.unwrap_or(FieldKind::Float))
         }
-        // Comparison and bool behavior is separate from arithmetic's empty-field layout.
+        // A comparison over one kind answers that kind's samples, which is what keeps a histogram
+        // column a histogram. A comparison over two kinds answers no sample at all: the kernel
+        // reports every mixed pair - `(Float, Histogram)` and `(Histogram, Float)` included - as
+        // unsupported and skips it without counting a match (`vector_match::elem_binop`), so the
+        // column is the same empty float layout arithmetic keeps for a pair that can emit nothing.
         _ if left == right => Some(left),
-        _ => None,
+        _ => Some(FieldKind::Float),
     }
 }
 
@@ -694,7 +698,32 @@ impl NativeNode {
             // float otherwise. Naming it here is what lets `sum(count_over_time(h[5m]))` - a float
             // built from histograms - declare a float column, and `sum(h)` declare a histogram one.
             NativeExpr::Aggregate { op, .. } => Some(aggregate_output_kind(op)),
-            _ => None,
+            // A whole-vector operation either hands on the series it selected - a ranking keeps the
+            // ones it ranked, `limit_ratio` the ones its hash kept, and `sort` the same series in
+            // another order - so the field keeps the kind it read, which is the rule the
+            // per-point `k` form above already states for the same `TopK`. The other three compute
+            // the value: `absent` writes `1.0` where the input held nothing, `histogram_quantile`
+            // and `histogram_fraction` reduce a classic histogram to one float, and `count_values`
+            // counts samples as floats.
+            NativeExpr::Vector { input, op } => Some(match op {
+                BoundVectorOp::TopK { .. }
+                | BoundVectorOp::LimitK { .. }
+                | BoundVectorOp::LimitRatio { .. }
+                | BoundVectorOp::Sort(_) => kind_of(input)?,
+                BoundVectorOp::Absent { .. }
+                | BoundVectorOp::Histogram(_)
+                | BoundVectorOp::CountValues { .. } => FieldKind::Float,
+            }),
+            // `info` answers the base series' own samples with the info series' data labels added,
+            // so the field is the base's field: natively it never reads the info series' values as
+            // the answer (`info` is selected as a timestamp, `InstantValue::InfoTimestamp`).
+            NativeExpr::Info { base, .. } => kind_of(base),
+            // A parameterized map is a math function over its input - `round` and the three
+            // `clamp`s - and math skips native histogram samples rather than converting them
+            // (`map::map_math`), so the field shape is unchanged and keeps the input's kind. The
+            // two scalar functions, `max_of` and `min_of`, take a scalar input, whose kind is a
+            // float whether or not the source carries histograms.
+            NativeExpr::ParameterizedMap { input, .. } => kind_of(input),
         }
     }
 }
