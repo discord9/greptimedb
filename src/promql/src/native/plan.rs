@@ -165,9 +165,11 @@ pub fn fused_output_tags(node: &NativeNode, source_tags: &[Vec<String>]) -> Opti
         }
         // An aggregate reports the grouping labels its input carries: `by(...)` keeps exactly the
         // ones it names, and `without(...)` keeps the rest and drops the metric name, as Prometheus
-        // does. A grouping by `__name__` keeps the name where the input reports one; a named scan
-        // only reports it among the runtime labels, so the aggregate keeps it there and publishes no
-        // column for it, which is what `sum by (__name__)` over one metric reports.
+        // does. A grouping by `__name__` keeps the name where the input reports one - which is
+        // `source_tags`'s answer, not the schema's: a named input declares it when the statement
+        // reads more than one, so the groups two metrics form stay apart, and a statement reading
+        // one leaves the column to the rows layout's appended name, which is what `sum by
+        // (__name__)` over one metric reports.
         NativeExpr::Aggregate { input, op } => {
             let input_tags = fused_output_tags(input, source_tags)?;
             Some(match &op.group {

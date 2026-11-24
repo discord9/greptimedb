@@ -64,8 +64,8 @@ use promql::native::plan::{
 };
 use promql::native::segment::{
     self, NATIVE_ORDERING, canonical_boundary_stages, canonical_local_prefix,
-    contains_canonical_merge, contains_global_consumer, groups_by_metric_name,
-    region_local_segment, segment_tree, with_row_name_column,
+    contains_canonical_merge, contains_global_consumer, region_local_segment, segment_tree,
+    with_row_name_column,
 };
 // Kept reachable here because this crate reads them through this module's own path: the dist
 // planner's commutativity check asks whether a fused node is per-series work, and this crate's
@@ -73,7 +73,7 @@ use promql::native::segment::{
 pub(crate) use promql::native::segment::{
     independent_scan_pair, is_empty_discovered_input, pointwise_operand,
 };
-use promql_parser::label::{METRIC_NAME, MatchOp, Matchers};
+use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     EvalStmt, Expr as PromExpr, MatrixSelector, ParenExpr, SubqueryExpr, VectorSelector,
@@ -1071,16 +1071,20 @@ impl PromPlanner {
                         //
                         // An empty raw series frame is an ordinary input to the node; multi-input placement
                         // and partition normalization are decided after compilation. A `__field__` matcher
-                        // is declined for a scan this route can read, and the same refusal keeps the empty
-                        // input from claiming a field layout the matcher would have decided.
-                        if self.ctx.field_column_matcher.is_some() {
-                            return Ok(declined("field_selector_on_an_empty_input"));
-                        }
+                        // decides which fields that frame declares: it is the one place the field layout of
+                        // this input is stated, and no table matched to state it otherwise. A matcher whose
+                        // answer is a set over a table's field columns has none to read here, so that
+                        // selection keeps the plan the existing planner would have built for it.
+                        let Some(fields) = empty_discovered_fields(self.ctx.field_column_matcher.as_deref())
+                        else {
+                            return Ok(declined("field_selector_names_no_field_to_read"));
+                        };
                         prepared.push(empty_discovered_input(
                             self.ctx
                                 .time_index_column
                                 .clone()
                                 .unwrap_or_else(|| DEFAULT_TIME_INDEX_COLUMN.to_string()),
+                            empty_discovered_series_schema(fields),
                         )?);
                         continue;
                     }
@@ -1485,14 +1489,35 @@ impl PromPlanner {
                 .context(DataFusionPlanningSnafu);
             }
         }
+        // The node reads more than one input when the tree has more than one selector occurrence: the
+        // compiler binds one input per occurrence. Each is bound to its own source where the plan is split
+        // over regions, or to one bare scan per occurrence where a region can run the node itself.
+        let multi_input = selectors.len() > 1;
+        // The tag columns each input declares, which is what the output layout is derived from.
+        //
+        // A tree over more than one input cannot be told apart by those columns alone: two occurrences
+        // bound to two metrics agree on every one of them, so a grouping by the metric name would fold
+        // both metrics into one group and publish two rows under one label set. `__name__` is not a
+        // column of any scan - it is the name every series of a metric-bound scan carries - so a
+        // statement reading several inputs declares it among each one's tags, exactly as a discovered
+        // source does, and the grouping keeps it as a group label. A statement reading one input binds
+        // one metric, whose name cannot tell two of its own groups apart; there the column is only
+        // appended by [`with_row_name_column`].
         let source_tags = prepared
             .iter()
-            .map(|(_, _, _, _, tags, _, _, _)| tags.clone())
+            .map(|(_, _, metric, _, tags, _, _, _)| {
+                let mut tags = tags.clone();
+                if multi_input && metric.is_some() && !tags.iter().any(|tag| tag == METRIC_NAME) {
+                    tags.push(METRIC_NAME.to_string());
+                }
+                tags
+            })
             .collect::<Vec<_>>();
         // The complete runtime label set of each input: a scan bound to one metric names every series it
         // hands over, so `__name__` is one of its labels even though it is not a tag column. Rewriting the
         // name of a named scan is therefore a rewrite of an existing label, and a discovered source
-        // declares the name among its tags itself.
+        // declares the name among its tags itself. Unlike [`source_tags`] this is the runtime answer for
+        // every input, whatever the statement's shape.
         let runtime_source_tags = prepared
             .iter()
             .map(|(_, _, metric, _, tags, _, _, _)| {
@@ -1556,10 +1581,6 @@ impl PromPlanner {
         let computed_key_case =
             matches!(locality, InputLocality::SinglePartition) && matching_operands_drop_key(root);
         let required_placement = !per_partition || computed_key_case;
-        // The node reads more than one input when the tree has more than one selector occurrence: the
-        // compiler binds one input per occurrence. Each is bound to its own source where the plan is split
-        // over regions, or to one bare scan per occurrence where a region can run the node itself.
-        let multi_input = selectors.len() > 1;
         // A region runs one node over its own scans only when the table it reads is not split into
         // regions and the tree's root is per-partition work: a partitioned table's region reads
         // neither the other scans nor the fragments another region holds, and a whole-vector
@@ -1568,9 +1589,20 @@ impl PromPlanner {
         // scans: physical planning accepts either all frames or all bare scans, not a mixture.
         // With a distributed planner every read is planned above the regions, so each occurrence
         // reads through its own source.
+        //
+        // A canonical merge is the other shape that has to read through a source, and the reason
+        // does not depend on how many occurrences the statement has: the boundary's producer runs
+        // above the regions, so a bare region scan would give it neither a raw-series frame nor the
+        // pieces another region holds - and physical planning refuses that node after the statement
+        // has already committed to this route. Reading each occurrence through its own
+        // `RawSeriesSource` puts the producer on the frontend instead, above every region, with its
+        // canonical router above all of them; so a partitioned table whose tree holds a canonical
+        // merge is planned that way whatever its selector count.
         let spans_regions = query_engine_state.with_dist_planner();
+        let canonical_merge = contains_canonical_merge(root);
         let per_source_inputs = cross_table
             || spans_regions
+            || (any_partitioned && canonical_merge)
             || (multi_input
                 && (any_partitioned
                     || required_placement
@@ -1624,25 +1656,13 @@ impl PromPlanner {
             })
             .collect::<std::result::Result<Vec<_>, DataFusionError>>()
             .context(DataFusionPlanningSnafu)?;
-        // A canonical boundary routes each label set to one owner above its own producer, and a
-        // region-local producer only sees the partitions of the region it runs in.
-        //
-        // A partitioned table's region read has no raw-series frame to give a canonical producer, so
-        // physical planning cannot convert the node and the query fails after the plan is
-        // committed, so such a statement declines here.
-        //
-        // The other placement is not a decline. A canonical boundary whose pieces of one label set
-        // can be spread over regions reads `RawSeriesSource` children, one per region: the analyzer
-        // expands them into merge scans, and the producer runs on the frontend above every region
-        // with its canonical router above all of them, so each label set is collected from every
-        // region's contribution, and a collision across regions is reported as Prometheus reports
-        // it.
-        //
-        // A tree with no canonical merge claims no label-set answer, so it is untouched: a
-        // per-series query on a partitioned table keeps fusing.
-        if !spans_regions && any_partitioned && contains_canonical_merge(root) {
-            return Ok(declined("canonical_merge_over_partitioned_sources"));
-        }
+        // What a canonical boundary needs from its children is a raw-series frame, which is what
+        // [`per_source_inputs`] decided above: a boundary over a partitioned table reads each
+        // occurrence through its own `RawSeriesSource`, so its producer runs on the frontend above
+        // every region with its canonical router above all of them, and each label set is collected
+        // from every region's contribution - a collision across regions is reported as Prometheus
+        // reports it. A tree with no canonical merge claims no label-set answer, so it is untouched:
+        // a per-series query on a partitioned table keeps fusing over the bare scans it read before.
         // The kind the tree's root answers with, which every output column follows. It is not the kind the
         // inputs carry: `count_over_time`, `histogram_count` and `timestamp` reduce a histogram to a
         // float, while a selector, a histogram-answering range function and a label rewrite pass it on.
@@ -1692,12 +1712,12 @@ impl PromPlanner {
             return Ok(declined("answer_depends_on_input_order"));
         }
         // The native output schema can name only compiled value fields, the time index and the tag
-        // columns a source declares. A discovered source declares `__name__` because the name tells two
-        // metrics with equal labels apart (#10106); a named source does not, so a tree reading more than
-        // one such source cannot report the distinct groups and declines.
-        if multi_input && groups_by_metric_name(root) {
-            return Ok(declined("grouping_by_metric_name_over_several_sources"));
-        }
+        // columns a source declares, and `source_tags` declares the metric name of every occurrence of
+        // a statement reading more than one input - the label a grouping by `__name__` keeps, so that
+        // the groups two metrics form stay apart. A statement reading one input binds one metric,
+        // whose grouping by that name cannot separate two rows it names alike; there the column is
+        // the appended one, and no shape needs refusing.
+        //
         // Catch the shape refusals before choosing native execution: errors raised during physical
         // planning cannot fall back. This includes unsupported aggregates and `topk`, `limitk` or
         // CountValues groupings; it does not cover data-dependent errors raised while executing the
@@ -2002,15 +2022,14 @@ impl PromPlanner {
 /// The typed empty input of a discovered selector that matched no metric table.
 ///
 /// No table matched, so there is no scan and no metric name: the input is an empty raw series frame, the
-/// one input a [`FusedSeries`] node already reads. It is bound to a schema of one field and no grid
-/// because that is the layout this route compiles a selector against; the planner re-lays it out in the
+/// one input a [`FusedSeries`] node already reads. `schema` is the layout this route compiles a selector
+/// against - one field per field the selection names, and no grid; the planner re-lays it out in the
 /// schema of the set operation it takes part in. No row is ever read, so a surviving name decides only
 /// what an operator answering on its own - `absent` - calls its value column.
 ///
 /// The empty plan declares the frame a scan would declare, so physical planning reads it as the frame
 /// producer it is, with explicit labels rather than a scan's storage key.
-fn empty_discovered_input(time_index: String) -> Result<PreparedInput> {
-    let schema = empty_discovered_series_schema();
+fn empty_discovered_input(time_index: String, schema: Arc<SeriesSchema>) -> Result<PreparedInput> {
     let input = empty_discovered_frame(&schema)?;
     // No table stands behind this input, so no region splits it along a partition column - and no
     // metadata states what its keys would survive, which is the answer that collects.
@@ -2038,14 +2057,45 @@ fn empty_discovered_frame(schema: &SeriesSchema) -> Result<LogicalPlan> {
     }))
 }
 
-/// The raw series schema of the typed empty input [`empty_discovered_input`] builds.
-fn empty_discovered_series_schema() -> Arc<SeriesSchema> {
+/// The raw series schema of the typed empty input [`empty_discovered_input`] builds, declaring `fields`.
+fn empty_discovered_series_schema(fields: Vec<String>) -> Arc<SeriesSchema> {
     Arc::new(SeriesSchema {
-        fields: Arc::from([FieldSpec {
-            name: Arc::from(DEFAULT_FIELD_COLUMN),
-        }]),
+        fields: fields
+            .iter()
+            .map(|name| FieldSpec {
+                name: Arc::from(name.as_str()),
+            })
+            .collect::<Vec<_>>()
+            .into(),
         eval_grid: None,
     })
+}
+
+/// The value fields an input that reads no table declares.
+///
+/// A selection keeps the field columns its `__field__` matcher names, and no metric table matched this
+/// selector, so the only field names this input can be given are the ones the matcher states itself: an
+/// `=` names one field. The selector that carries no such matcher gets the one default field, which is
+/// the name this route gives the single value column it reads a scan's field into.
+///
+/// `None` is a matcher whose answer is a set over the fields a table carries - `!=`, `=~` and `!~` keep
+/// or drop columns by a rule over every one of them - because an input that reads no table has none to
+/// apply that rule to. Such a selection keeps the plan the existing planner would have built for it
+/// rather than claiming a layout nothing decided.
+fn empty_discovered_fields(matchers: Option<&[Matcher]>) -> Option<Vec<String>> {
+    let Some(matchers) = matchers else {
+        return Some(vec![DEFAULT_FIELD_COLUMN.to_string()]);
+    };
+    let mut fields = Vec::with_capacity(matchers.len());
+    for matcher in matchers {
+        if matcher.op != MatchOp::Equal {
+            return None;
+        }
+        if !fields.iter().any(|field| field == &matcher.value) {
+            fields.push(matcher.value.clone());
+        }
+    }
+    Some(fields)
 }
 
 /// Whether `expr` asks for `absent_over_time`, whose window is read through a fold that keeps the

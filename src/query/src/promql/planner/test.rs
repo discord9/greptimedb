@@ -47,6 +47,7 @@ use datafusion::logical_expr::{Extension, UserDefinedLogicalNodeCore, col};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema, is_metric_name_field};
 use datatypes::series::SeriesOrdering;
+use datatypes::series::frame::SeriesFrameDeclaration;
 use promql::extension_plan::FieldKind;
 use promql::extension_plan::{
     FusedSeries, HistogramFold, InputLocality, RawSeriesSource, input_locality,
@@ -2546,6 +2547,105 @@ async fn native_metric_discovery_without_a_matching_metric_answers_absent_and_or
     );
 }
 
+/// A `__field__` matcher on a selection that matches no table declares the field it names.
+///
+/// The matcher is what decides which of a scan's field columns a selection keeps, and no metric
+/// table matched this one, so the only field names this input can be given are the ones the matcher
+/// states itself. The empty frame declares exactly those and the statement answers the empty
+/// vector, with the layout any one-field selection publishes: the time index, the value named after
+/// the expression, and the labels. The frame is what the matcher decides, not the answer.
+///
+/// A matcher whose answer is a set over a table's field columns - `!=`, `=~`, `!~` - has no such
+/// columns to read here, so that selection keeps the existing plan rather than claiming a layout
+/// nothing decided; `native_empty_discovery_keeps_a_field_operator_it_cannot_apply` holds that.
+#[tokio::test]
+async fn native_empty_discovery_declares_the_field_its_matcher_names() {
+    let layout = |plan: &LogicalPlan| {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>()
+    };
+    // The same statement without a matcher: the value column is named after the expression, so the
+    // rows layouts are compared by the types they carry rather than by that name.
+    let (plain, _) = execute_no_match_discovery(r#"{job="api"}"#).await;
+    for (query, field) in [
+        (r#"{__field__="field_0", job="api"}"#, "field_0"),
+        // The matcher decides the name: the input declares the field the statement asks for, not
+        // the default one this route gives a selection that names no field.
+        (r#"{__field__="measured", job="api"}"#, "measured"),
+    ] {
+        let (plan, batches) = execute_no_match_discovery(query).await;
+        let fused = find_fused_series(&plan)
+            .unwrap_or_else(|| panic!("`{query}` left the native route: {plan:?}"));
+        assert_eq!(
+            0,
+            batch_rows(&batches),
+            "`{query}` answered rows over a selection that matches no metric: {plan:?}"
+        );
+        // The one input is the typed empty frame, and it declares the field the matcher names.
+        let [LogicalPlan::EmptyRelation(relation)] = fused.children() else {
+            panic!("`{query}`: the empty input is the node's only child: {plan:?}");
+        };
+        let declaration = SeriesFrameDeclaration::parse(relation.schema.as_arrow())
+            .unwrap_or_else(|error| panic!("`{query}` declares no raw series frame: {error}"));
+        assert_eq!(
+            vec![field.to_string()],
+            declaration
+                .series()
+                .fields
+                .iter()
+                .map(|field| field.name.to_string())
+                .collect::<Vec<_>>(),
+            "`{query}`: the empty frame declares the field the matcher names"
+        );
+        assert_eq!(
+            layout(&plain),
+            layout(&plan),
+            "`{query}` publishes the layout a selection of one field publishes: {plan:?}"
+        );
+        assert_eq!(
+            METRIC_NAME,
+            plan.schema().fields().last().unwrap().name(),
+            "`{query}`: {plan:?}"
+        );
+    }
+}
+
+/// The zero-match answer of a `__field__` operator this route cannot apply keeps the existing plan.
+///
+/// The field operators other than `=` keep or drop columns by a rule over every field a table
+/// carries, and an input that reads no table has none: there is no layout to state, so the
+/// selection is not one this route answers.
+#[tokio::test]
+async fn native_empty_discovery_keeps_a_field_operator_it_cannot_apply() {
+    for query in [
+        r#"{__field__=~"field.*", job="api"}"#,
+        r#"{__field__!="field_0", job="api"}"#,
+    ] {
+        let plan = PromPlanner::stmt_to_plan_with_annotations(
+            metric_discovery_provider(&["alpha_total", "beta_total"]).await,
+            &build_eval_stmt(query),
+            &build_query_engine_state(),
+            None,
+            true,
+        )
+        .await;
+        match plan {
+            // The existing planner has no table to bind, which is the plan this route leaves it.
+            Err(error) => assert!(
+                error.to_string().contains("not found"),
+                "`{query}` reports the existing planner's own refusal: {error}"
+            ),
+            Ok(plan) => panic!(
+                "`{query}` claimed a field layout nothing decided: {}",
+                plan.display_indent()
+            ),
+        }
+    }
+}
+
 /// A zero-match discovery selector is a real input even when another selector reads a metric.
 #[tokio::test]
 async fn native_zero_match_discovery_with_real_selector_binds_both_inputs() {
@@ -3765,36 +3865,51 @@ async fn label_functions_reject_a_destination_label_that_names_a_value_field() {
     }
 }
 
-/// A label rewrite that collapses the partition column cannot be answered by one region.
+/// A label rewrite that collapses the partition column runs as a canonical boundary.
 ///
-/// The canonical boundary's router only collects the pieces its own region's producer holds, so a
-/// table split into several regions would answer a canonical label set from whichever region held a
-/// piece of it. The route therefore declines that tree - and only that tree: `rate` on the same
-/// partitioned table keeps fusing, which the test above asserts. Declining means the existing
-/// planner's plan, exactly.
+/// The rewrite gives series from different regions one label set, so the pieces of that set have to
+/// meet before the answer is written. A region-local producer only sees the partitions of the region
+/// it runs in, which is why this shape used to keep the existing plan. Reading the occurrence through
+/// its own `RawSeriesSource` instead puts the merge's producer on the frontend, above every region,
+/// with its canonical router above all of them - the placement the distributed planner already used -
+/// so each label set is collected from every region's contribution.
+///
+/// Only a tree with a canonical merge claims a label-set answer: `rate` on the same partitioned table
+/// keeps fusing over the bare scan it read, which the tag-partitioned test above asserts.
 #[tokio::test]
-async fn native_fused_partitioned_table_label_rewrite_falls_back() {
+async fn native_fused_partitioned_table_label_rewrite_plans_a_canonical_boundary() {
     let query = r#"label_replace(some_metric, "tag_0", "same", "tag_0", ".*")"#;
-    let native =
+    let plan =
         build_native_fused_plan_with_provider(query, true, native_engine_provider(vec![0]).await)
             .await;
-    let fallback =
-        build_native_fused_plan_with_provider(query, false, native_engine_provider(vec![0]).await)
-            .await;
+    let fused = find_fused_series(&plan).unwrap_or_else(|| {
+        panic!(
+            "a collapsing rewrite over a partitioned table must fuse: {}",
+            plan.display_indent()
+        )
+    });
+    // The boundary is the two nodes: the producer merges the pieces of one label set on the
+    // frontend, and the consumer above it publishes the rows.
     assert!(
-        find_fused_series(&native).is_none(),
-        "a collapsing rewrite over a partitioned table must keep the existing plan: {}",
-        native.display_indent()
+        matches!(fused.tree().root().expr, NativeExpr::Input(_)),
+        "the statement's rows are read from the boundary below: {}",
+        plan.display_indent()
     );
+    let trees = fused_trees(&plan);
     assert!(
-        !native.display_indent().to_string().contains("FusedSeries"),
-        "{}",
-        native.display_indent()
+        trees
+            .iter()
+            .any(|tree| tree.contains("Merge: canonical label-set merge")),
+        "{query} answers without the boundary the rewrite needs: {trees:?}\n{}",
+        plan.display_indent()
     );
+    // The occurrence reads through its own raw source, which is what the producer above the regions
+    // reads: a bare scan would be read region-locally and the frame would never reach the producer.
     assert_eq!(
-        native.display_indent().to_string(),
-        fallback.display_indent().to_string(),
-        "the native setting must plan exactly what the existing planner plans"
+        vec![("some_metric".to_string(), vec!["field_0".to_string()])],
+        fused_sources(&plan),
+        "{query}: the boundary reads the occurrence through its own source: {}",
+        plan.display_indent()
     );
 }
 
@@ -10724,6 +10839,136 @@ async fn native_sum_by_name_separates_discovered_metrics() {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
         "{plan}"
+    );
+}
+
+/// Every raw source the plan reads, as the metric it names and the field columns it declares.
+///
+/// A source's tags are the scan's own columns, which never hold `__name__`: the name is the metric
+/// the source binds, which the frame reports as a label of its own.
+fn fused_sources(plan: &LogicalPlan) -> Vec<(String, Vec<String>)> {
+    fn visit(plan: &LogicalPlan, sources: &mut Vec<(String, Vec<String>)>) {
+        if let LogicalPlan::Extension(Extension { node }) = plan
+            && let Some(source) = node.as_any().downcast_ref::<RawSeriesSource>()
+        {
+            sources.push((source.metric_name().to_string(), source.fields().to_vec()));
+        }
+        for input in plan.inputs() {
+            visit(input, sources);
+        }
+    }
+    let mut sources = Vec::new();
+    visit(plan, &mut sources);
+    sources
+}
+
+/// A tree reading more than one metric-bound input declares the name each input reports.
+///
+/// `__name__` is not a column of any scan: it is the name every series of a metric-bound input
+/// carries, so a source names it and nothing else. A statement reading one input can only ever
+/// report the one name it binds, which no grouping by the name can use to tell two of its groups
+/// apart - but a statement reading two binds two names, and `by (__name__)` groups by exactly that
+/// identity. Each of those sources therefore declares the name it reports, as a discovered source
+/// does, and the output layout names the label the grouping keeps instead of publishing the two
+/// metrics under one label set.
+#[tokio::test]
+async fn native_multi_input_grouping_by_name_declares_each_input_name() {
+    for query in [
+        // Two aggregates, one per metric table, in one binary.
+        "sum by (__name__) (some_metric) + sum by (__name__) (other_metric)",
+        // The same pair through set membership, which keeps the left side's answer.
+        "sum by (__name__) (some_metric) or sum by (__name__) (other_metric)",
+    ] {
+        let plan = build_native_fused_plan_with_provider(
+            query,
+            true,
+            native_two_table_provider(vec![]).await,
+        )
+        .await;
+        assert!(
+            find_fused_series(&plan).is_some(),
+            "`{query}` left the native route: {}",
+            plan.display_indent()
+        );
+        // Each occurrence is bound to the metric table it reads, which is the name the grouping
+        // above it groups by.
+        let mut metrics = fused_input_metrics(&plan);
+        metrics.sort();
+        assert_eq!(
+            vec!["other_metric".to_string(), "some_metric".to_string()],
+            metrics,
+            "`{query}`: one input per metric table: {}",
+            plan.display_indent()
+        );
+        // The tree groups by the name on both sides, which is the label the declaration has to
+        // carry: `by (__name__)` keeps a label no scan column holds.
+        let fused = find_fused_series(&plan).expect("a fused node");
+        let (left, right) = match &fused.tree().root().expr {
+            NativeExpr::Binary { left, right, .. } => (left, right),
+            NativeExpr::Set { left, right, .. } => (left, right),
+            other => panic!(
+                "`{query}` reads both inputs in one node, not {other:?}: {}",
+                plan.display_indent()
+            ),
+        };
+        for side in [left, right] {
+            let NativeExpr::Aggregate { op, .. } = &side.expr else {
+                panic!(
+                    "`{query}`: an operand is not the aggregate it was written as: {}",
+                    plan.display_indent()
+                );
+            };
+            assert_eq!(
+                Grouping::By(Arc::new([Arc::from(METRIC_NAME)])),
+                op.group,
+                "`{query}`: both sides group by the name: {}",
+                plan.display_indent()
+            );
+        }
+        let declared_names = plan
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| is_metric_name_field(field))
+            .count();
+        assert_eq!(
+            1,
+            declared_names,
+            "`{query}`: the rows layout declares the name once: {:?}",
+            plan.schema()
+        );
+        assert_eq!(
+            METRIC_NAME,
+            plan.schema().fields().last().unwrap().name(),
+            "`{query}`: the name column comes after the labels: {}",
+            plan.display_indent()
+        );
+    }
+}
+
+/// A statement reading one metric-bound input keeps the layout it had: its one name cannot tell
+/// two of its own groups apart, so the column stays the appended one rather than a group label.
+#[tokio::test]
+async fn native_single_input_grouping_by_name_keeps_the_appended_column() {
+    let query = "sum by (__name__) (some_metric)";
+    let plan =
+        build_native_fused_plan_with_provider(query, true, native_two_table_provider(vec![]).await)
+            .await;
+    assert!(
+        find_fused_series(&plan).is_some(),
+        "`{query}` left the native route: {}",
+        plan.display_indent()
+    );
+    let expression = parser::parse(query).unwrap().to_string();
+    assert_eq!(
+        vec!["timestamp", expression.as_str(), METRIC_NAME],
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        "{query}: {}",
+        plan.display_indent()
     );
 }
 

@@ -2547,6 +2547,271 @@ async fn native_promql_rows_name_each_row_after_its_metric() {
     }
 }
 
+/// `sum by (__name__)` over metric-bound inputs groups by the identity of the series.
+///
+/// `__name__` is not a column of any scan: it is the name every series of a metric-bound input
+/// carries. A statement reading one input binds one name, which is what the appended name column
+/// reports; one reading two binds two, and the grouping keeps the name as a group label, so the two
+/// metrics stay in groups of their own instead of folding into one label set.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_promql_group_by_name_over_several_metrics() {
+    common_telemetry::init_default_ut_logging();
+    let config = mito2::config::MitoConfig {
+        experimental_series_scan_v2: true,
+        ..Default::default()
+    };
+    let (standalone, observer) = native_test_instance(
+        GreptimeDbStandaloneBuilder::new("native_promql_group_by_name").with_mito_config(config),
+    )
+    .await;
+    let instance = standalone.fe_instance().clone();
+    execute_all(
+        &instance,
+        "CREATE TABLE native_gbn_phy (ts TIMESTAMP TIME INDEX, v DOUBLE) \
+             ENGINE=metric WITH (\"physical_metric_table\" = \"\"); \
+         CREATE TABLE native_gbn_demo (host STRING NULL, ts TIMESTAMP NOT NULL, v DOUBLE NULL, \
+             TIME INDEX (ts), PRIMARY KEY (host)) \
+             ENGINE=metric WITH (on_physical_table = 'native_gbn_phy'); \
+         CREATE TABLE native_gbn_other (host STRING NULL, ts TIMESTAMP NOT NULL, v DOUBLE NULL, \
+             TIME INDEX (ts), PRIMARY KEY (host)) \
+             ENGINE=metric WITH (on_physical_table = 'native_gbn_phy'); \
+         INSERT INTO native_gbn_demo (host, ts, v) VALUES ('a', 0, 2), ('b', 0, 5); \
+         INSERT INTO native_gbn_other (host, ts, v) VALUES ('c', 0, 8)",
+        QueryContext::arc(),
+    )
+    .await;
+
+    // One name per statement is the appended column: the existing route declares no such column,
+    // so the comparison is the one every native rows test makes.
+    for (query, reported) in [
+        // One metric, grouped by its own name: the column reports what the aggregate grouped by.
+        (
+            "sum by (__name__) (native_gbn_demo)",
+            ReportedName::Metric("native_gbn_demo"),
+        ),
+        // Two metric-bound inputs in one tree, each summed by its own name and then matched. The sum
+        // computes a value of its own and drops the name it read, as Prometheus does, so the column
+        // is there and null.
+        (
+            "sum by (__name__) (native_gbn_demo) + sum by (__name__) (native_gbn_other)",
+            ReportedName::Nothing,
+        ),
+    ] {
+        let sql = format!("TQL EVAL (0, 0, '1s') {query}");
+        observer.clear();
+        let native = eval_text_rows(native_tql_output(&instance, &sql, true).await, reported);
+        assert_native_rows_plan(&observer);
+        let legacy = eval_text(native_tql_output(&instance, &sql, false).await);
+        assert_eq!(
+            legacy, native,
+            "{query}: the native answer is the existing one"
+        );
+    }
+
+    // A cross-metric tree whose answer keeps the name reports the metric its row was read from, so
+    // the grouping names the metric it grouped. `or` keeps the series whose label set the left side
+    // does not hold, and a metric-bound input's name is not one of its tags: both sides are summed
+    // to one series with no labels, so the left side's row is the answer - as it is on the existing
+    // route, whose answer differs only in the name column it does not declare.
+    let query = "sum by (__name__) (native_gbn_demo) or sum by (__name__) (native_gbn_other)";
+    let sql = format!("TQL EVAL (0, 0, '1s') {query}");
+    observer.clear();
+    let (rows, names) =
+        native_rows_and_names(native_tql_output(&instance, &sql, true).await, None).await;
+    assert_native_rows_plan(&observer);
+    assert_eq!(
+        Some(vec![Some("native_gbn_demo".to_string())]),
+        names,
+        "{query}: the row reports the metric it was read from"
+    );
+    assert_eq!(
+        vec![(0, "__name__=native_gbn_demo".to_string(), 7.0)],
+        rows,
+        "{query}: the left side's series is the answer"
+    );
+    let legacy_rows = native_rows(native_tql_output(&instance, &sql, false).await, None).await;
+    assert_eq!(
+        vec![7.0],
+        legacy_rows
+            .iter()
+            .map(|(_, _, value)| *value)
+            .collect::<Vec<_>>(),
+        "{query}: the existing route answers the same series"
+    );
+}
+
+/// The layout a native one-field answer publishes: the time index, one value, then the labels with
+/// the metric name last.
+fn assert_one_field_native_layout(batches: &common_recordbatch::RecordBatches, query: &str) {
+    let declared = batches.schema();
+    let schema = declared.arrow_schema();
+    let fields = schema.fields();
+    assert!(
+        matches!(fields[0].data_type(), DataType::Timestamp(..)),
+        "{query}: the time index comes first: {schema:?}"
+    );
+    assert_eq!(
+        1,
+        fields
+            .iter()
+            .filter(|field| field.data_type() == &DataType::Float64)
+            .count(),
+        "{query}: one value column: {schema:?}"
+    );
+    assert!(
+        datatypes::schema::is_metric_name_field(fields.last().unwrap()),
+        "{query}: the metric name comes after the labels: {schema:?}"
+    );
+}
+
+/// A `__field__` selection that matches no metric table answers the empty vector.
+///
+/// The matcher decides which of a scan's field columns a selection keeps, and no table matched this
+/// one, so the field names the empty input declares are exactly the ones the matcher states. The
+/// statement answers the empty vector rather than the existing planner's missing-table error, under
+/// the layout every one-field selection publishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_promql_field_selector_over_no_table_answers_empty() {
+    common_telemetry::init_default_ut_logging();
+    let config = mito2::config::MitoConfig {
+        experimental_series_scan_v2: true,
+        ..Default::default()
+    };
+    let (standalone, observer) = native_test_instance(
+        GreptimeDbStandaloneBuilder::new("native_promql_field_selector_empty")
+            .with_mito_config(config),
+    )
+    .await;
+    let instance = standalone.fe_instance().clone();
+    execute_all(
+        &instance,
+        "CREATE TABLE native_fs_phy (ts TIMESTAMP TIME INDEX, v DOUBLE) \
+             ENGINE=metric WITH (\"physical_metric_table\" = \"\"); \
+         CREATE TABLE native_fs_demo (host STRING NULL, ts TIMESTAMP NOT NULL, v DOUBLE NULL, \
+             TIME INDEX (ts), PRIMARY KEY (host)) \
+             ENGINE=metric WITH (on_physical_table = 'native_fs_phy'); \
+         CREATE TABLE native_fs_other (host STRING NULL, ts TIMESTAMP NOT NULL, v DOUBLE NULL, \
+             TIME INDEX (ts), PRIMARY KEY (host)) \
+             ENGINE=metric WITH (on_physical_table = 'native_fs_phy'); \
+         INSERT INTO native_fs_demo (host, ts, v) VALUES ('a', 0, 2); \
+         INSERT INTO native_fs_other (host, ts, v) VALUES ('b', 0, 8)",
+        QueryContext::arc(),
+    )
+    .await;
+    // A selector that names no metric is answered from the metric tables discovery is authorized to
+    // read, which the caller states: this fixture passes its two, and the selector's own name
+    // matcher is what leaves it with no table at all.
+    let scoped = || {
+        let mut ctx = QueryContext::with_db_name(None);
+        ctx.set_extension(QUERY_PARALLELISM_HINT, "4".to_string());
+        ctx.set_extension(NATIVE_PROMQL_EXTENSION_KEY, "true".to_string());
+        ctx.set_metric_discovery_scope(MetricDiscoveryScope::allowed([
+            (
+                DEFAULT_CATALOG_NAME.to_string(),
+                DEFAULT_SCHEMA_NAME.to_string(),
+                "native_fs_demo".to_string(),
+            ),
+            (
+                DEFAULT_CATALOG_NAME.to_string(),
+                DEFAULT_SCHEMA_NAME.to_string(),
+                "native_fs_other".to_string(),
+            ),
+        ]));
+        Arc::new(ctx)
+    };
+    for (query, answered) in [
+        // The matcher names the field the selection reads, and no metric table matched it.
+        (
+            r#"TQL EVAL (0, 0, '1s') {__name__=~"no_such_metric_.+", __field__="v"}"#,
+            false,
+        ),
+        // The same statement without the matcher: the field set is not what decides the answer, so
+        // the two layouts have to agree.
+        (
+            r#"TQL EVAL (0, 0, '1s') {__name__=~"no_such_metric_.+"}"#,
+            false,
+        ),
+        // A selection that does read a table, for the layout both empty answers have to match.
+        (r#"TQL EVAL (0, 0, '1s') {host=~"a|b"}"#, true),
+    ] {
+        observer.clear();
+        let output = instance.do_query(query, scoped()).await.remove(0).unwrap();
+        let batches = rows_batches(output).await;
+        let rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        if answered {
+            assert_eq!(2, rows, "{query}: the fixture holds two series");
+        } else {
+            assert_eq!(
+                0, rows,
+                "{query}: a selection that matches no metric answers the empty vector"
+            );
+            assert_native_rows_plan(&observer);
+        }
+        assert_one_field_native_layout(&batches, query);
+    }
+}
+
+/// A canonical merge over a partitioned table runs as a boundary above the regions.
+///
+/// A rewrite that writes a label its input carries can give two stored series one label set, and
+/// the partition column decides where those series are stored: the pieces of that one set can land
+/// in different regions, which no region-local producer can see. The occurrence therefore reads
+/// through its own raw source, its producer merges what each partition holds above the regions, and
+/// the canonical router above the producer collects each label set from every contribution.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_promql_canonical_merge_over_partitioned_table() {
+    common_telemetry::init_default_ut_logging();
+    let config = mito2::config::MitoConfig {
+        experimental_series_scan_v2: true,
+        ..Default::default()
+    };
+    let (standalone, observer) = native_test_instance(
+        GreptimeDbStandaloneBuilder::new("native_promql_canonical_partitioned")
+            .with_mito_config(config),
+    )
+    .await;
+    let instance = standalone.fe_instance().clone();
+    execute_all(
+        &instance,
+        "CREATE TABLE native_canon_part (host STRING, val DOUBLE, ts TIMESTAMP TIME INDEX, \
+         PRIMARY KEY(host)) PARTITION ON COLUMNS (host) (host < 'first', host >= 'first' AND \
+         host < 'second', host >= 'second'); \
+         INSERT INTO native_canon_part (host, val, ts) VALUES ('first', 10, 0), \
+         ('second', 20, 600000)",
+        QueryContext::arc(),
+    )
+    .await;
+    // The two hosts land in different partitions, and the rewrite stores both under one `host`, so
+    // the pieces of that label set are ten minutes apart and never collide.
+    let sql = r#"TQL EVAL (0, 600, '600s') label_replace(native_canon_part, "host", "same", "host", ".*")"#;
+    observer.clear();
+    let native = eval_text_rows(
+        native_tql_output(&instance, sql, true).await,
+        ReportedName::Metric("native_canon_part"),
+    );
+    let router = canonical_router(&observer).unwrap_or_else(|| {
+        panic!(
+            "a collapsing rewrite over a partitioned table must run a canonical boundary: {native}"
+        )
+    });
+    assert_eq!(
+        "FusedSeriesExec",
+        router.children()[0].name(),
+        "the router reads the canonical producer: {native}"
+    );
+    let legacy = eval_text(native_tql_output(&instance, sql, false).await);
+    assert_eq!(
+        legacy, native,
+        "the boundary collects every region's contribution into the existing route's rows"
+    );
+    for expected in ["10.0", "20.0", "same"] {
+        assert!(
+            native.contains(expected),
+            "the label set carries every piece's value: {expected} missing from {native}"
+        );
+    }
+}
+
 /// The plan the last query ran is the native one, so a row assertion above is about this route.
 fn assert_native_rows_plan(observer: &NativePlanObserver) {
     let root = observer.root_plan();
