@@ -4254,6 +4254,160 @@ async fn native_promql_composed_binary_canonical_operand() {
     );
 }
 
+/// The shapes the native route used to refuse answer what the existing plan answers.
+///
+/// A ranking keeps the kind it read, so `topk` over a native-histogram metric declares the
+/// histogram column and runs natively. It ranks no histogram sample - Prometheus ignores them in a
+/// ranking, which `select::topk` states - so both routes answer that column empty.
+///
+/// A comparison between a native histogram and a float pairs no sample at all: the kernel reports
+/// `(Histogram, Float)` as unsupported and skips it without keeping the left element, so its one
+/// column is the empty float layout both routes answer with no rows.
+///
+/// The observer says which route ran - the native one while the option is on, the existing plan
+/// when it is off - and the rows are compared with the existing plan's.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_promql_kind_rules_match_legacy() {
+    use api::greptime_proto::io::prometheus::write::v2::histogram::{Count, ZeroCount};
+    use api::greptime_proto::io::prometheus::write::v2::{Histogram, Sample};
+    use axum::body::{Body, to_bytes};
+    use http::Request;
+    use prost::Message;
+    use servers::prom_remote_write::v2::test_util as remote_write_v2;
+    use servers::prom_store::snappy_compress;
+    use tower::ServiceExt;
+
+    common_telemetry::init_default_ut_logging();
+    let config = mito2::config::MitoConfig {
+        experimental_series_scan_v2: true,
+        ..Default::default()
+    };
+    let (standalone, observer) = native_test_instance(
+        GreptimeDbStandaloneBuilder::new("native_promql_kind_rules").with_mito_config(config),
+    )
+    .await;
+    let instance = standalone.fe_instance().clone();
+    let server = crate::test_util::build_test_prom_server(instance.clone(), false, None).build();
+    let router = server.build(server.make_app()).unwrap();
+    // One histogram metric and one float metric, written through the same remote-write endpoint so
+    // the two tables carry the same column layout: what the existing plan's mixed-kind binary reads
+    // is then the shape it was written for, and a difference in the answers is a difference in the
+    // answer rather than in the fixture.
+    for request in [
+        remote_write_v2::request_with_labels_and_histograms(
+            vec![("__name__", "kind_hist"), ("job", "api")],
+            [0, 600_000]
+                .into_iter()
+                .map(|timestamp| Histogram {
+                    timestamp,
+                    count: Some(Count::CountInt(4)),
+                    zero_count: Some(ZeroCount::ZeroCountInt(4)),
+                    sum: 8.0,
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        remote_write_v2::request_with_labels_and_samples(
+            vec![("__name__", "kind_float"), ("job", "api")],
+            [(0, 2.0), (600_000, 3.0)]
+                .into_iter()
+                .map(|(timestamp, value)| Sample {
+                    timestamp,
+                    value,
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/prometheus/write")
+                    .header("Content-Encoding", "snappy")
+                    .header(
+                        "Content-Type",
+                        "application/x-protobuf;proto=io.prometheus.write.v2.Request",
+                    )
+                    .body(Body::from(
+                        snappy_compress(&request.encode_to_vec()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            204,
+            "{:?}",
+            to_bytes(response.into_body(), usize::MAX).await.unwrap()
+        );
+    }
+
+    // A ranking keeps the kind it read, so the statement declares a histogram column and runs
+    // natively. It ranks no histogram sample - Prometheus ignores them in a ranking, which
+    // `select::topk` states - so both routes answer the empty column rather than a sample.
+    let ranking = "TQL EVAL (0, 600, '600s') topk(1, kind_hist)";
+    observer.clear();
+    let native = native_tql_output(&instance, ranking, true).await;
+    assert!(
+        observer.fused().is_some(),
+        "{ranking} did not run natively: {:#?}",
+        observer.root_plan()
+    );
+    let native_ranking_rows = answer_rows(native).await;
+    observer.clear();
+    let legacy = native_tql_output(&instance, ranking, false).await;
+    assert!(
+        observer.fused().is_none(),
+        "{ranking} must keep the existing plan when the native route is off"
+    );
+    assert_eq!(
+        0, native_ranking_rows,
+        "{ranking} ranks no histogram sample, as Prometheus does"
+    );
+    assert_eq!(
+        answer_rows(legacy).await,
+        native_ranking_rows,
+        "{ranking} must answer the existing plan's rows"
+    );
+
+    // A comparison over two kinds pairs no sample: both routes answer no rows at all.
+    let comparison = "TQL EVAL (0, 600, '600s') kind_hist > on(job) kind_float";
+    observer.clear();
+    let native = native_tql_output(&instance, comparison, true).await;
+    assert!(
+        observer.fused().is_some(),
+        "{comparison} did not run natively: {:#?}",
+        observer.root_plan()
+    );
+    let native_rows = answer_rows(native).await;
+    observer.clear();
+    let legacy = native_tql_output(&instance, comparison, false).await;
+    assert!(
+        observer.fused().is_none(),
+        "{comparison} must keep the existing plan when the native route is off"
+    );
+    assert_eq!(
+        0, native_rows,
+        "{comparison} pairs no histogram with a float"
+    );
+    assert_eq!(
+        answer_rows(legacy).await,
+        native_rows,
+        "{comparison} must answer the existing plan's rows"
+    );
+}
+
+/// How many rows `output` answers, whatever its columns hold.
+async fn answer_rows(output: Output) -> usize {
+    let batches = match output.data {
+        OutputData::Stream(stream) => collect_batches(stream).await.unwrap(),
+        OutputData::RecordBatches(batches) => batches,
+        _ => unreachable!("PromQL answers record batches"),
+    };
+    batches.iter().map(|batch| batch.num_rows()).sum()
+}
+
 /// Two independently planned histogram frames whose reset hints contradict: the pair is dropped and
 /// the warning reaches the query's collector.
 #[tokio::test(flavor = "multi_thread")]

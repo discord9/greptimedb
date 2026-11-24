@@ -5672,32 +5672,6 @@ async fn native_composed_binary_admits_complex_operands() {
 /// because the existing route answers them.
 #[tokio::test]
 async fn native_composed_binary_declines_to_the_existing_plan() {
-    // A comparison between a histogram and a float has no kernel, so the pair is not admitted, and
-    // nothing below it composes either: the whole statement stays on the existing plan.
-    let query = "hist > on(tag_0) floats";
-    let plan =
-        build_native_fused_plan_with_provider(query, true, native_mixed_kind_provider().await)
-            .await;
-    let display = plan.display_indent().to_string();
-    let legacy = PromPlanner::stmt_to_plan_with_annotations(
-        native_mixed_kind_provider().await,
-        &build_eval_stmt(query),
-        &build_query_engine_state(),
-        None,
-        false,
-    )
-    .await
-    .unwrap_or_else(|error| panic!("`{query}`: the existing route must answer it: {error}"));
-    assert!(
-        find_fused_series(&plan).is_none(),
-        "`{query}` has no native answer: {display}"
-    );
-    assert_eq!(
-        legacy.display_indent().to_string(),
-        display,
-        "`{query}` must keep the existing plan"
-    );
-
     // An operand that is not a frame leaves the statement's own wrapper in place: the pair is
     // refused, so the existing plan answers the statement. The offer is the statement's, and the
     // binary that makes it spends it for the whole subtree below: the operand is planned by the
@@ -5709,9 +5683,6 @@ async fn native_composed_binary_declines_to_the_existing_plan() {
         "(hist * on(tag_0) floats) * 2",
         // Neither is a scalar function, however it is written.
         "(hist * on(tag_0) floats) / time()",
-        // A comparison between a histogram and a float has no kernel at this pair either, so the
-        // whole statement stops where the pair was refused.
-        "(hist * on(tag_0) floats) > on(tag_0) floats",
     ] {
         let plan =
             build_native_fused_plan_with_provider(query, true, native_mixed_kind_provider().await)
@@ -5738,6 +5709,95 @@ async fn native_composed_binary_declines_to_the_existing_plan() {
             legacy.display_indent().to_string(),
             display,
             "`{query}` must keep the existing plan"
+        );
+    }
+}
+
+/// A ranking hands on the samples it ranked, so `topk` over a histogram metric stays a histogram.
+///
+/// The constant-`k` ranking is a whole-vector node, and the walk that names a statement's output
+/// column answered nothing for it - which kept every statement whose sources carry native histograms
+/// on the existing plan, since a column the walk cannot name is not a float by default. Naming it
+/// admits the statement and keeps the histogram column it read.
+///
+/// What the answer is worth is checked row for row against the existing plan in
+/// `native_promql_kind_rules_match_legacy` (tests-integration), which runs both routes over one
+/// fixture: this harness's in-memory scan is not a region scan, so a region-backed native plan
+/// cannot execute here.
+#[tokio::test]
+async fn native_fused_topk_over_a_histogram_keeps_its_histogram_column() {
+    let query = "topk(1, hist)";
+    let native =
+        build_native_fused_plan_with_provider(query, true, native_mixed_kind_provider().await)
+            .await;
+    let display = native.display_indent().to_string();
+    let fused = find_fused_series(&native)
+        .unwrap_or_else(|| panic!("`{query}` must run natively: {display}"));
+    assert!(
+        matches!(
+            fused.tree().root().expr,
+            NativeExpr::Vector {
+                op: BoundVectorOp::TopK { .. },
+                ..
+            }
+        ),
+        "`{query}` binds the ranking: {display}"
+    );
+    // The ranking keeps the kind it read, so the statement declares a histogram column rather than
+    // the float layout an answer that can emit no sample keeps.
+    assert_eq!(
+        &native_histogram_value_type().as_arrow_type(),
+        native_value_field(fused, query).data_type(),
+        "`{query}` keeps its histogram column: {display}"
+    );
+
+    let legacy =
+        build_native_fused_plan_with_provider(query, false, native_mixed_kind_provider().await)
+            .await;
+    assert!(
+        find_fused_series(&legacy).is_none(),
+        "the existing plan answers `{query}`: {legacy}"
+    );
+}
+
+/// A comparison over two kinds answers no sample, so its one column is a float.
+///
+/// `hist > on(tag_0) floats` pairs a native histogram with a float at every point, and the kernel
+/// reports such a pair as unsupported and skips it without keeping the left element
+/// (`vector_match::elem_binop`). The answer is therefore empty rather than mixed, and the column the
+/// statement declares is the empty float layout - which is what admits the statement to this route
+/// instead of leaving it on the existing plan.
+///
+/// Both routes' answers are compared row for row in `native_promql_kind_rules_match_legacy`
+/// (tests-integration), for the reason the ranking test above states.
+#[tokio::test]
+async fn native_fused_mixed_comparison_answers_the_empty_float_layout() {
+    for query in [
+        // Two operands of their own, which the composition binds as two frames.
+        "hist > on(tag_0) floats",
+        // The same pair with the left side computed by a composed binary: the comparison is what a
+        // statement stops at, so the nested shape must be admitted through the same rule.
+        "(hist * on(tag_0) floats) > on(tag_0) floats",
+    ] {
+        let native =
+            build_native_fused_plan_with_provider(query, true, native_mixed_kind_provider().await)
+                .await;
+        let display = native.display_indent().to_string();
+        let fused = find_fused_series(&native)
+            .unwrap_or_else(|| panic!("`{query}` must run natively: {display}"));
+        assert_eq!(
+            &ArrowDataType::Float64,
+            native_value_field(fused, query).data_type(),
+            "`{query}` declares the empty float layout: {display}"
+        );
+        assert!(!display.contains("Join:"), "{query}: {display}");
+
+        let legacy =
+            build_native_fused_plan_with_provider(query, false, native_mixed_kind_provider().await)
+                .await;
+        assert!(
+            find_fused_series(&legacy).is_none(),
+            "the existing plan answers `{query}`: {legacy}"
         );
     }
 }
