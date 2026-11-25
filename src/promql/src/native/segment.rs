@@ -443,9 +443,10 @@ pub const NATIVE_ORDERING: SeriesOrdering = SeriesOrdering::Contiguous;
 /// back:
 /// the time column is a non-nullable millisecond timestamp with no timezone, because every
 /// evaluated chunk is addressed on the statement's grid and carries one; a field is a nullable
-/// `Float64`, because a grid point inside the statement's interval can have no sample; and a tag is
-/// a nullable `Utf8`, because a range function drops the metric name and a series can be missing a
-/// label entirely.
+/// `Float64`, because a grid point inside the statement's interval can have no sample; an ordinary
+/// tag is a nullable `Dictionary(UInt32, Utf8)`, which is the same strings one value per series
+/// rather than per row; and the per-row name column is a nullable `Utf8`, because a range function
+/// drops the metric name and a series can be missing a label entirely.
 /// The output schema of a fused node: its time index, one column per field, then its tags.
 ///
 /// `field_kind` says what a field column carries. The physical conversion reads the same kind off
@@ -483,7 +484,21 @@ pub fn fused_output_schema(
         columns.push((None, Arc::new(Field::new(name, field_type.clone(), true))));
     }
     for name in tags {
-        let mut field = Field::new(name, ArrowDataType::Utf8, true);
+        // An ordinary label repeats one value over every row of a series, so it is published as a
+        // dictionary over `Utf8`: the encoding already carries that repetition, and a label column
+        // whose type is its own encoding is a column a reader can tell apart from the plain `Utf8`
+        // name column beside it. `__name__` keeps the plain `Utf8`: the runtime answers it from the
+        // metric name of the series it reports, and the response layer reads that column's metadata
+        // rather than its encoding.
+        let field_type = if name == METRIC_NAME {
+            ArrowDataType::Utf8
+        } else {
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt32),
+                Box::new(ArrowDataType::Utf8),
+            )
+        };
+        let mut field = Field::new(name, field_type, true);
         // The runtime answers `__name__` from the metric name of the series it reports, so a tag
         // column of that name is the name of each row rather than one name for the whole result.
         // Declaring it keeps the response layer from naming every row after the statement.

@@ -2524,11 +2524,13 @@ async fn native_metric_discovery_without_a_matching_metric_answers_absent_and_or
             .flat_map(|batch| {
                 let job = batch
                     .column_by_name("job")
-                    .expect("absent reports the selector's equality labels")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..batch.num_rows()).map(|row| job.value(row).to_string())
+                    .expect("absent reports the selector's equality labels");
+                // A label column may be published dictionary-encoded, so read it as text first.
+                let job = datafusion::arrow::compute::cast(job, &ArrowDataType::Utf8).unwrap();
+                let job = job.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..batch.num_rows())
+                    .map(|row| job.value(row).to_string())
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>(),
         "{plan:?}"
@@ -3307,11 +3309,10 @@ async fn native_fused_plans_dynamic_scalars() {
                 "{query} Arrow schema"
             );
             assert!(batch.num_rows() > 0, "{query}: {batch:?}");
-            let output_label = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            // A label column may be published dictionary-encoded, so read it as text first.
+            let output_label =
+                datafusion::arrow::compute::cast(batch.column(2), &ArrowDataType::Utf8).unwrap();
+            let output_label = output_label.as_any().downcast_ref::<StringArray>().unwrap();
             let output_count = batch
                 .column(1)
                 .as_any()
@@ -6537,8 +6538,12 @@ async fn native_fused_cross_table_union_with_a_colliding_column_stays_native() {
     );
     let field = native_value_field(fused, "some_metric or other_metric");
     assert_eq!(&ArrowDataType::Float64, field.data_type(), "{plan}");
+    let label_type = ArrowDataType::Dictionary(
+        Box::new(ArrowDataType::UInt32),
+        Box::new(ArrowDataType::Utf8),
+    );
     assert_eq!(
-        vec![ArrowDataType::Utf8; 2],
+        vec![label_type; 2],
         fused
             .schema()
             .fields()
@@ -7449,12 +7454,13 @@ async fn native_split_and_complete_aggregate_produce_identical_values() {
         let mut rows = batches
             .iter()
             .flat_map(|batch| {
-                let tags = batch
-                    .column_by_name("tag_0")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                // A tag column may be published dictionary-encoded, so read it as text first.
+                let tags = datafusion::arrow::compute::cast(
+                    batch.column_by_name("tag_0").unwrap(),
+                    &ArrowDataType::Utf8,
+                )
+                .unwrap();
+                let tags = tags.as_any().downcast_ref::<StringArray>().unwrap();
                 let values = batch
                     .column_by_name(&stmt.expr.to_string())
                     .unwrap()

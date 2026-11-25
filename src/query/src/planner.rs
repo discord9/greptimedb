@@ -1828,7 +1828,12 @@ mod tests {
             .flat_map(|batch| {
                 let array = batch
                     .column_by_name(column)
-                    .unwrap_or_else(|| panic!("no `{column}` column"))
+                    .unwrap_or_else(|| panic!("no `{column}` column"));
+                // A rows layout publishes its ordinary labels dictionary-encoded and its name
+                // column as plain text; both read as the same strings.
+                let array = datatypes::arrow::compute::cast(array, &DataType::Utf8)
+                    .expect("a label column is text");
+                let array = array
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("a label column is Utf8");

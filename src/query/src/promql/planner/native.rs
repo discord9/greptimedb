@@ -3677,6 +3677,103 @@ mod tests {
         );
     }
 
+    /// The type a rows layout publishes an ordinary label as.
+    fn label_type() -> ArrowDataType {
+        ArrowDataType::Dictionary(
+            Box::new(ArrowDataType::UInt32),
+            Box::new(ArrowDataType::Utf8),
+        )
+    }
+
+    /// An ordinary label is published dictionary-encoded, and only the per-row name column is a
+    /// plain `Utf8`. Both stay nullable, because a range function drops the name and a series can
+    /// be missing a label.
+    #[test]
+    fn rows_layouts_publish_dictionary_labels() {
+        let sources = [vec!["tag_0".to_string()]];
+        for query in [
+            "some_metric",
+            "sum by (tag_0)(some_metric)",
+            "rate(some_metric[5m])",
+        ] {
+            let tree = compiled_test_tree(query);
+            let schema =
+                PromPlanner::fused_root_schema(query, &tree, &sources, "ts", FieldKind::Float)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{query}: a samples root declares a rows layout"));
+            let label = schema.field_with_unqualified_name("tag_0").unwrap();
+            assert_eq!(&label_type(), label.data_type(), "{query}");
+            assert!(label.is_nullable(), "{query}");
+            let name = schema.field_with_unqualified_name(METRIC_NAME).unwrap();
+            assert_eq!(&ArrowDataType::Utf8, name.data_type(), "{query}");
+            assert!(name.is_nullable(), "{query}");
+            assert!(
+                datatypes::schema::is_metric_name_field(name),
+                "{query}: the name column keeps its metadata"
+            );
+            assert_eq!(
+                Some(METRIC_NAME),
+                schema.fields().last().map(|field| field.name().as_str()),
+                "{query}: the name column stays last"
+            );
+        }
+    }
+
+    /// Two same-typed nullable labels are told apart by name, which is what pairs a native rows
+    /// layout with the existing planner's columns.
+    ///
+    /// The publication that reads a native answer through a legacy-shaped one pairs the columns
+    /// both plans publish alike by name, type, nullability and metadata. Two label columns of one
+    /// type and one nullability therefore pair by name only because the existing planner publishes
+    /// its labels dictionary-encoded too, which is the layout a native rows answer now declares.
+    #[test]
+    fn same_typed_nullable_labels_are_distinguished_by_name() {
+        let sources = [vec!["tag_0".to_string(), "tag_1".to_string()]];
+        let query = "sum by (tag_0, tag_1)(some_metric)";
+        let tree = compiled_test_tree(query);
+        let native = PromPlanner::fused_root_schema(query, &tree, &sources, "ts", FieldKind::Float)
+            .unwrap()
+            .unwrap();
+        let left = native.field_with_unqualified_name("tag_0").unwrap();
+        let right = native.field_with_unqualified_name("tag_1").unwrap();
+        // One type and one nullability: the shape alone does not tell the two apart, the name does.
+        assert_eq!(left.data_type(), right.data_type());
+        assert!(left.is_nullable() && right.is_nullable());
+        assert_ne!(left.name(), right.name());
+        // The existing planner publishes the same two labels the same way, so each native column is
+        // the same column - name, type, nullability, no per-column metadata - and a pairing that
+        // reads a name has two distinct answers instead of two candidates of one unencoded type.
+        let legacy = datafusion::common::DFSchema::new_with_metadata(
+            ["tag_0", "tag_1"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        None,
+                        Arc::new(datafusion::arrow::datatypes::Field::new(
+                            name,
+                            label_type(),
+                            true,
+                        )),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        for (_, legacy_field) in legacy.iter() {
+            let paired = native
+                .iter()
+                .find(|(_, field)| {
+                    field.name() == legacy_field.name()
+                        && field.data_type() == legacy_field.data_type()
+                        && field.is_nullable() == legacy_field.is_nullable()
+                        && field.metadata() == legacy_field.metadata()
+                })
+                .unwrap_or_else(|| panic!("{} is paired by name", legacy_field.name()));
+            assert_eq!(legacy_field, paired.1, "{}", legacy_field.name());
+        }
+    }
+
     /// A label set that already names the metric keeps the one column it has.
     #[test]
     fn a_present_name_tag_is_not_declared_twice() {
@@ -3926,8 +4023,23 @@ mod tests {
         );
         assert_eq!(ArrowDataType::Float64, *output.field(1).data_type());
         assert_eq!(ArrowDataType::Float64, *output.field(2).data_type());
-        assert_eq!(ArrowDataType::Utf8, *output.field(3).data_type());
-        assert_eq!(ArrowDataType::Utf8, *output.field(4).data_type());
+        // An ordinary label is a dictionary over `Utf8` and nullable.
+        assert_eq!(
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt32),
+                Box::new(ArrowDataType::Utf8)
+            ),
+            *output.field(3).data_type()
+        );
+        assert_eq!(
+            ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::UInt32),
+                Box::new(ArrowDataType::Utf8)
+            ),
+            *output.field(4).data_type()
+        );
+        assert!(output.field(3).is_nullable());
+        assert!(output.field(4).is_nullable());
     }
 
     #[test]

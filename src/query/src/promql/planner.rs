@@ -1310,13 +1310,15 @@ impl PromPlanner {
             if let Some(plan) = native? {
                 let mut fields = plan.schema().fields().iter();
                 if let Some(time) = fields.next().map(|field| field.name().clone()) {
+                    // A label column is text, plain or dictionary-encoded, and every other column
+                    // is a value.
                     let values = fields
                         .clone()
-                        .filter(|field| field.data_type() != &ArrowDataType::Utf8)
+                        .filter(|field| Self::string_value_data_type(field.data_type()).is_none())
                         .map(|field| field.name().clone())
                         .collect();
                     let tags = fields
-                        .filter(|field| field.data_type() == &ArrowDataType::Utf8)
+                        .filter(|field| Self::string_value_data_type(field.data_type()).is_some())
                         .map(|field| field.name().clone())
                         .collect();
                     self.ctx.reset();
@@ -6805,16 +6807,19 @@ impl PromPlanner {
 
     fn strip_tsid_column(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let schema = plan.schema();
-        // A series identifier is the internal `UInt64` key or the `Utf8` label synthesized from
-        // it, and only those two representations are stripped. The same name on any other column
-        // is the statement's own answer - `count(m)` aliased to `__tsid` answers an `Int64`, and a
-        // value is `Float64` or the canonical native histogram struct - so a name is not a role.
+        // A series identifier is the internal `UInt64` key or the text label synthesized from it -
+        // plain or dictionary-encoded, which is how a rows layout publishes its labels - and only
+        // those representations are stripped. The same name on any other column is the statement's
+        // own answer - `count(m)` aliased to `__tsid` answers an `Int64`, and a value is `Float64`
+        // or the canonical native histogram struct - so a name is not a role.
         fn is_internal_tsid(field: &Field) -> bool {
             field.name() == DATA_SCHEMA_TSID_COLUMN_NAME
-                && matches!(
-                    field.data_type(),
-                    ArrowDataType::UInt64 | ArrowDataType::Utf8
-                )
+                && (field.data_type() == &ArrowDataType::UInt64
+                    || field.data_type().is_string()
+                    || matches!(
+                        field.data_type(),
+                        ArrowDataType::Dictionary(_, value) if value.is_string()
+                    ))
         }
         if !schema.fields().iter().any(|field| is_internal_tsid(field)) {
             return Ok(plan);

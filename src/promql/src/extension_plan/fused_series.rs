@@ -1077,12 +1077,15 @@ impl FusedSeries {
         if self.format == FusedOutputFormat::PlainRows {
             // Roles are types here too: a value is a float or a native histogram, so every other
             // non-time column of a row table is one of this output's labels, whatever its name.
+            // A label is dictionary-encoded and the name column plain text, and both are labels
+            // here.
             return Ok(self
                 .output_schema
                 .fields()
                 .iter()
                 .filter(|field| {
-                    field.name() != &self.binding.time_index && field.data_type() == &DataType::Utf8
+                    field.name() != &self.binding.time_index
+                        && is_tag_column_type(field.data_type())
                 })
                 .map(|field| field.name().clone())
                 .collect());
@@ -1883,10 +1886,23 @@ fn scalar_root_fields(
 
 /// Whether a column of this type carries a field's samples.
 ///
-/// A role is a type: a field holds floats or the canonical native histogram struct, a tag is
-/// `Utf8` and time is a timestamp. A name says nothing about which of those a column is.
+/// A role is a type: a field holds floats or the canonical native histogram struct, a tag is a
+/// string column and time is a timestamp. A name says nothing about which of those a column is.
 fn is_value_column(data_type: &DataType) -> bool {
     data_type == &DataType::Float64 || data_type == &native_histogram_value_type().as_arrow_type()
+}
+
+/// Whether a column of this type carries a row's label.
+///
+/// A rows layout publishes its ordinary labels dictionary-encoded over `Utf8` and its per-row name
+/// column as plain `Utf8`, so either is a tag column here. Both are read the same way - the value is
+/// a string or a null - and the conversion answers whichever type the schema declares.
+fn is_tag_column_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 => true,
+        DataType::Dictionary(key, value) => **key == DataType::UInt32 && **value == DataType::Utf8,
+        _ => false,
+    }
 }
 
 /// Whether `names` name exactly the columns in `value_names`, one name per column.
@@ -2036,9 +2052,12 @@ pub(crate) fn classify_output(
                     "duplicate tag column {name:?} in FusedSeriesExec output schema"
                 )));
             }
-            if field.data_type() != &DataType::Utf8 {
+            // A tag is a string column: a rows layout publishes an ordinary label
+            // dictionary-encoded over `Utf8` and its per-row name column as plain `Utf8`. Both are
+            // read the same way below.
+            if !is_tag_column_type(field.data_type()) {
                 return Err(DataFusionError::Plan(format!(
-                    "tag column {name:?} of FusedSeriesExec must be Utf8, got {:?}",
+                    "tag column {name:?} of FusedSeriesExec must be Utf8 or a dictionary over Utf8, got {:?}",
                     field.data_type()
                 )));
             }
@@ -3373,7 +3392,22 @@ pub(crate) fn series_to_record_batch(
                     ))
                 })?;
                 let value = series.metric.get(name);
-                columns.push(Arc::new(StringArray::from(vec![value; rows])));
+                // A missing label is a null, never an empty string, and a dictionary column keeps
+                // that null through the cast. An ordinary label is published dictionary-encoded and
+                // the name column plain text, so the conversion answers the declared type.
+                let labels = StringArray::from(vec![value; rows]);
+                columns.push(match output_schema.field(position).data_type() {
+                    DataType::Dictionary(_, _) => datafusion::arrow::compute::cast(
+                        &labels,
+                        output_schema.field(position).data_type(),
+                    )
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "cannot encode tag column {name:?}: {error}"
+                        ))
+                    })?,
+                    _ => Arc::new(labels),
+                });
             }
         }
     }
