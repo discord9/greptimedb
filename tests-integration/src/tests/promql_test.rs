@@ -17449,6 +17449,7 @@ mod native_window_cache_poc {
     use datatypes::arrow::datatypes::{DataType, TimeUnit};
     use datatypes::series::time::{EvalGrid, GridSpec};
     use frontend::instance::Instance;
+    use promql_parser::parser::{AtModifier, EvalStmt, Expr as EvalExpr};
     use query::datafusion::QUERY_PARALLELISM_HINT;
     use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
     use query::promql::planner::{NATIVE_PROMQL_EXTENSION_KEY, plan_statement_on_grid};
@@ -17524,6 +17525,42 @@ mod native_window_cache_poc {
         lookback_ms: i64,
     }
 
+    /// What a chunk's key names about the statement it was planned from.
+    ///
+    /// An expression that reads no statement bound is answered by the chunk, its step and its lookback
+    /// alone: `statement_bound_invariant` proves exactly that, and then the bounds are left out of the
+    /// key. Leaving them in would keep two ranges of one dashboard query - the one a client asked for
+    /// and the wider one it asks for next - from sharing any chunk, which is the whole point of
+    /// caching one. Everything the classification cannot prove invariant keeps the whole statement:
+    /// a statement that differs in a bound there answers at least one chunk differently.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    enum NativeStatementKey {
+        /// A statement whose expression reads no bound, named by what the plan does read.
+        BoundInvariant {
+            expression: String,
+            step_ms: i64,
+            lookback_ms: i64,
+        },
+        /// The whole statement, bounds included.
+        Whole(NativeStatementIdentity),
+    }
+
+    impl NativeStatementKey {
+        /// The key of the statement `statement` belongs to, classified by its expression.
+        fn of(statement: &QueryStatement) -> Self {
+            let identity = statement_identity(statement);
+            if statement_bound_invariant(parsed_statement(statement)) {
+                Self::BoundInvariant {
+                    expression: identity.expression,
+                    step_ms: identity.step_ms,
+                    lookback_ms: identity.lookback_ms,
+                }
+            } else {
+                Self::Whole(identity)
+            }
+        }
+    }
+
     /// One canonical chunk: the positions of its statement's grid it evaluates.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct NativeChunk {
@@ -17557,7 +17594,7 @@ mod native_window_cache_poc {
     /// The key of one canonical chunk of one statement.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct NativeWindowKey {
-        statement: NativeStatementIdentity,
+        statement: NativeStatementKey,
         chunk: NativeChunk,
         scope: NativeWindowScope,
         route: NativeWindowRoute,
@@ -17664,6 +17701,86 @@ mod native_window_cache_poc {
             lookback_ms: i64::try_from(statement.lookback_delta.as_millis())
                 .expect("a millisecond lookback"),
         }
+    }
+
+    /// The parsed statement a [`QueryStatement`] carries, which is what its expression is read from.
+    fn parsed_statement(statement: &QueryStatement) -> &EvalStmt {
+        let QueryStatement::Promql(statement, _) = statement else {
+            panic!("not a ranged PromQL statement")
+        };
+        statement
+    }
+
+    /// Whether `statement`'s expression reads nothing a statement's own bounds decide.
+    ///
+    /// A chunk is the whole statement planned on a subrange of its grid, so a chunk answers the rows
+    /// the statement answers at the chunk's timestamps. What a chunk's rows *are*, though, is a
+    /// function of where the statement starts and ends whenever the expression reads those bounds -
+    /// `@ start()`, `@ end()`, `start()`, `end()` resolve against them, and a subquery derives its
+    /// child grid against them too. Such a statement's chunks are its own, and its key keeps them
+    /// apart from another statement's.
+    ///
+    /// An expression that reads none of them is answered by the chunk's grid, the step and the
+    /// lookback alone. Two statements that agree on those - a dashboard's range and the same range
+    /// widened - then answer a chunk identically, which is what lets one of them serve the other's.
+    ///
+    /// The classification is conservative: it answers `false` for every shape it cannot prove. It
+    /// reads the parsed expression rather than its text, because `@` and a subquery are shapes a text
+    /// scan cannot tell apart from a metric name.
+    fn statement_bound_invariant(statement: &EvalStmt) -> bool {
+        expression_bound_invariant(&statement.expr)
+    }
+
+    /// Whether `expr` reads no bound of the statement that carries it. See
+    /// [`statement_bound_invariant`].
+    fn expression_bound_invariant(expr: &EvalExpr) -> bool {
+        match expr {
+            // A literal answers the same wherever it is evaluated.
+            EvalExpr::NumberLiteral(_) | EvalExpr::StringLiteral(_) => true,
+            // `@ start()` and `@ end()` are the statement's bounds. `@ <timestamp>` is an absolute
+            // instant no statement moves, so it stays invariant.
+            EvalExpr::VectorSelector(selector) => !statement_anchor(&selector.at),
+            EvalExpr::MatrixSelector(selector) => !statement_anchor(&selector.vs.at),
+            EvalExpr::Subquery(subquery) => {
+                // `@` anchors the subquery's child grid, and `[range:]` leaves the child's step to a
+                // global evaluation interval rather than to anything the chunk's key names.
+                !statement_anchor(&subquery.at)
+                    && subquery.step.is_some()
+                    && expression_bound_invariant(&subquery.expr)
+            }
+            EvalExpr::Paren(paren) => expression_bound_invariant(&paren.expr),
+            EvalExpr::Unary(unary) => expression_bound_invariant(&unary.expr),
+            EvalExpr::Binary(binary) => {
+                expression_bound_invariant(&binary.lhs) && expression_bound_invariant(&binary.rhs)
+            }
+            EvalExpr::Aggregate(aggregate) => {
+                expression_bound_invariant(&aggregate.expr)
+                    && aggregate
+                        .param
+                        .as_ref()
+                        .is_none_or(|param| expression_bound_invariant(param))
+            }
+            EvalExpr::Call(call) => {
+                // This parser spells `start` and `end` as keywords, so it builds no call of either
+                // name - but a call that reached here would read a statement bound, so a shape that
+                // names one is refused rather than assumed impossible.
+                call.func.name != "start"
+                    && call.func.name != "end"
+                    && call
+                        .args
+                        .args
+                        .iter()
+                        .all(|argument| expression_bound_invariant(argument))
+            }
+            // The parser builds no extension node for a statement a client sent, so one that reaches
+            // here is a shape this classification knows nothing about.
+            EvalExpr::Extension(_) => false,
+        }
+    }
+
+    /// Whether an `@` modifier names a bound of the statement instead of an absolute instant.
+    fn statement_anchor(at: &Option<AtModifier>) -> bool {
+        matches!(at, Some(AtModifier::Start | AtModifier::End))
     }
 
     /// Splits a statement's evaluation grid into canonical chunks of [`STEPS_PER_CHUNK`] points.
@@ -17864,11 +17981,11 @@ mod native_window_cache_poc {
             scope: &NativeWindowScope,
             label: &str,
         ) -> NativeWindowRun {
-            let identity = statement_identity(statement);
+            let statement_key = NativeStatementKey::of(statement);
             let mut run = NativeWindowRun::default();
             for chunk in chunks {
                 let key = NativeWindowKey {
-                    statement: identity.clone(),
+                    statement: statement_key.clone(),
                     chunk: *chunk,
                     scope: scope.clone(),
                     route: NativeWindowRoute::FusedSeries,
@@ -18219,6 +18336,324 @@ mod native_window_cache_poc {
                  that moved with it would go unnoticed"
             );
         }
+    }
+
+    /// The classification that decides whether one statement's chunks may answer another's.
+    ///
+    /// Both directions are asserted here. A predicate answering `true` everywhere would pass the
+    /// reuse test below and hand an anchored statement another range's rows; one answering `false`
+    /// everywhere would pass the anchored test below and cache nothing across ranges.
+    #[test]
+    fn statement_bound_invariance_is_classified_conservatively() {
+        for (expression, invariant) in [
+            // Nothing in these names a bound.
+            ("up", true),
+            ("sum by (host) (up)", true),
+            ("rate(up[5m])", true),
+            ("rate(up[5m] offset 1m)", true),
+            // `@` with an absolute instant names the same instant in every statement.
+            ("up @ 1000", true),
+            ("rate(up[5m] @ 1000)", true),
+            // A subquery with an explicit step derives its child grid from the outer grid, which is
+            // the chunk's.
+            ("rate(up[5m:1m])", true),
+            ("rate(rate(up[5m:1m])[10m:1m])", true),
+            ("rate(up[5m:1m] @ 1000)", true),
+            // `@ start()` and `@ end()` are the statement's bounds.
+            ("up @ start()", false),
+            ("up @ end()", false),
+            ("rate(up[5m] @ start())", false),
+            ("rate(up[5m] @ end() offset 8h)", false),
+            // An anchor on a subquery moves its child grid with the statement.
+            ("rate(up[5m:1m] @ start())", false),
+            ("rate(up[5m:1m] @ end())", false),
+            // No step leaves the child's step to a global evaluation interval, which a chunk's key
+            // names nowhere.
+            ("rate(up[5m:])", false),
+            // An anchor is found at any depth, and under any shape.
+            ("sum by (host) (up) + on(host) up @ end()", false),
+            ("clamp(up @ start(), 1, 2)", false),
+            ("abs(up) > 0 * rate(up[5m] @ end())", false),
+        ] {
+            let statement = native_range_statement(expression, 0, 60_000, STEP_MS, LOOKBACK_MS);
+            assert_eq!(
+                statement_bound_invariant(parsed_statement(&statement)),
+                invariant,
+                "{expression}"
+            );
+        }
+    }
+
+    /// A statement that reads no bound is answered from chunks a wider or narrower range completed.
+    ///
+    /// The range a dashboard asks for grows and shrinks while the expression stays the same. The
+    /// expression here reads no statement bound, so the chunks of the narrow range are exactly the
+    /// rows the wide range answers at the same timestamps - which the first pair of assertions below
+    /// states before anything is cached, so the reuse is grounded in the answers rather than in the
+    /// key. Only the chunks a range adds are planned and executed, and both ranges' assembled rows
+    /// are their own whole-range answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_promql_bound_invariant_chunks_answer_another_range() {
+        common_telemetry::init_default_ut_logging();
+        const TABLE: &str = "native_window_invariant";
+        // The narrow range holds 16 points, i.e. four canonical chunks.
+        const NARROW_END_MS: i64 = 150_000;
+        // The wide range holds 28 points: the narrow range's four chunks and three more.
+        const WIDE_END_MS: i64 = 270_000;
+
+        let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
+            "native_promql_window_invariant",
+        ))
+        .await;
+        let instance = standalone.fe_instance().clone();
+        execute_all(
+            &instance,
+            &native_window_fixture(TABLE, -7, 32),
+            QueryContext::arc(),
+        )
+        .await;
+        let scope = NativeWindowScope::current(TABLE);
+
+        let mut executor = NativeWindowExecutor::new(instance.clone());
+        for expression in [
+            format!("sum by (host) ({TABLE})"),
+            format!("sum by (host) (rate({TABLE}[30s]))"),
+        ] {
+            let expression = expression.as_str();
+            let narrow = native_range_statement(expression, 0, NARROW_END_MS, STEP_MS, LOOKBACK_MS);
+            let wide = native_range_statement(expression, 0, WIDE_END_MS, STEP_MS, LOOKBACK_MS);
+            assert!(
+                statement_bound_invariant(parsed_statement(&narrow))
+                    && statement_bound_invariant(parsed_statement(&wide)),
+                "{expression}: the expression reads no statement bound"
+            );
+            // The two statements differ in their end, and only there; the invariant key leaves the
+            // end out, so one key names both.
+            assert_ne!(
+                statement_identity(&narrow),
+                statement_identity(&wide),
+                "{expression}: the statements differ in their end"
+            );
+            assert_eq!(
+                NativeStatementKey::of(&narrow),
+                NativeStatementKey::of(&wide),
+                "{expression}: a bound-invariant statement is still keyed by its end"
+            );
+
+            let narrow_chunks = canonical_chunks(&native_statement_grid(&narrow));
+            let wide_chunks = canonical_chunks(&native_statement_grid(&wide));
+            assert_eq!(narrow_chunks.len(), 4, "{expression}");
+            assert_eq!(wide_chunks.len(), 7, "{expression}");
+            // Canonical chunks are positions of the statement's grid, so the wide range asks for the
+            // narrow range's chunks verbatim, and then for three of its own.
+            assert_eq!(
+                wide_chunks[..narrow_chunks.len()],
+                narrow_chunks[..],
+                "{expression}: the ranges' chunks do not line up"
+            );
+
+            let narrow_whole =
+                native_result_rows(whole_statement_answer(&instance, &observer, &narrow).await)
+                    .await;
+            let wide_whole =
+                native_result_rows(whole_statement_answer(&instance, &observer, &wide).await).await;
+            assert!(!narrow_whole.is_empty(), "{expression} answered no rows");
+            assert!(
+                narrow_whole.len() < wide_whole.len(),
+                "{expression}: the wide range is not wider"
+            );
+            // What makes the reuse sound: at the narrow range's timestamps the two statements answer
+            // the same rows. Were that not so, a shared chunk would be a wrong answer.
+            assert_eq!(
+                rows_covered_by(&narrow_whole, &narrow_chunks),
+                rows_covered_by(&wide_whole, &narrow_chunks),
+                "{expression}: the ranges disagree where they overlap, so their chunks are not \
+                 interchangeable"
+            );
+            assert_eq!(
+                rows_covered_by(&narrow_whole, &narrow_chunks),
+                narrow_whole,
+                "{expression}: the chunks of the narrow range do not cover it"
+            );
+
+            // 1. The narrow range first: nothing is cached, so every chunk of it executes.
+            let mut cache = NativeWindowCache::default();
+            observer.clear();
+            let narrow_run = executor
+                .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
+                .await;
+            assert_eq!(narrow_run.executed, 4, "{expression}");
+            assert_eq!(narrow_run.served, 0, "{expression}");
+            assert_eq!(narrow_run.rows, narrow_whole, "{expression}");
+            assert_eq!(cache.len(), 4, "{expression}");
+            assert_eq!(
+                observer.answering_node().as_deref(),
+                Some("FusedSeriesExec"),
+                "{expression}: the chunks did not answer natively"
+            );
+
+            // 2. The wide range next: the four chunks it shares with the narrow range are hits, and
+            //    only the three it adds are planned and executed.
+            observer.clear();
+            let wide_run = executor
+                .run(&mut cache, &wide, &wide_chunks, &scope, "host")
+                .await;
+            assert_eq!(
+                wide_run.served, 4,
+                "{expression}: the chunks the ranges share were not hits"
+            );
+            assert_eq!(
+                wide_run.executed, 3,
+                "{expression}: a shared chunk was executed again"
+            );
+            assert_eq!(
+                wide_run.rows, wide_whole,
+                "{expression}: the wide range is not its own answer"
+            );
+            assert_eq!(cache.len(), 7, "{expression}");
+
+            // 3. The other order, on a fresh cache: the wide range executes every chunk of itself and
+            //    the narrow range is answered by the four chunks it shares with it.
+            let mut cache = NativeWindowCache::default();
+            observer.clear();
+            let wide_cold = executor
+                .run(&mut cache, &wide, &wide_chunks, &scope, "host")
+                .await;
+            assert_eq!(wide_cold.executed, 7, "{expression}");
+            assert_eq!(wide_cold.served, 0, "{expression}");
+            assert_eq!(wide_cold.rows, wide_whole, "{expression}");
+            observer.clear();
+            let narrow_warm = executor
+                .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
+                .await;
+            assert_eq!(
+                narrow_warm.executed, 0,
+                "{expression}: the narrow range executed a chunk"
+            );
+            assert_eq!(narrow_warm.served, 4, "{expression}");
+            assert_eq!(narrow_warm.rows, narrow_whole, "{expression}");
+            assert!(
+                observer.all_plans().is_empty(),
+                "{expression}: a range answered from completed chunks planned a statement"
+            );
+        }
+    }
+
+    /// An anchored statement's chunks are its own, whichever range asks for them.
+    ///
+    /// `@ end()` moves with the statement's end, so the wide range's answer at the narrow range's
+    /// timestamps is a different answer - stated below before anything is cached, so that sharing a
+    /// chunk would be visible as a wrong row rather than as a miss. Every chunk of the wide range
+    /// therefore misses, and each range's assembled rows stay its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_promql_anchored_statements_do_not_share_chunks() {
+        common_telemetry::init_default_ut_logging();
+        const TABLE: &str = "native_window_anchored_share";
+        // The same two ranges as the reuse test above: four chunks and seven, the first four of
+        // which are chunked identically.
+        const NARROW_END_MS: i64 = 150_000;
+        const WIDE_END_MS: i64 = 270_000;
+
+        let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
+            "native_promql_window_anchored_share",
+        ))
+        .await;
+        let instance = standalone.fe_instance().clone();
+        execute_all(
+            &instance,
+            &native_window_fixture(TABLE, -7, 32),
+            QueryContext::arc(),
+        )
+        .await;
+        let scope = NativeWindowScope::current(TABLE);
+
+        let expression = format!("sum by (host) (rate({TABLE}[30s] @ end()))");
+        let expression = expression.as_str();
+        let narrow = native_range_statement(expression, 0, NARROW_END_MS, STEP_MS, LOOKBACK_MS);
+        let wide = native_range_statement(expression, 0, WIDE_END_MS, STEP_MS, LOOKBACK_MS);
+        assert!(
+            !statement_bound_invariant(parsed_statement(&narrow))
+                && !statement_bound_invariant(parsed_statement(&wide)),
+            "{expression}: `@ end()` reads the statement's end"
+        );
+        assert_ne!(
+            NativeStatementKey::of(&narrow),
+            NativeStatementKey::of(&wide),
+            "{expression}: two anchored ranges share a key"
+        );
+
+        let narrow_chunks = canonical_chunks(&native_statement_grid(&narrow));
+        let wide_chunks = canonical_chunks(&native_statement_grid(&wide));
+        assert_eq!(narrow_chunks.len(), 4, "{expression}");
+        assert_eq!(wide_chunks.len(), 7, "{expression}");
+        // The chunk grids line up, so nothing but the key keeps the narrow range's chunks from
+        // answering the wide one's: the first chunk of each asks for the very same grid.
+        assert_eq!(
+            wide_chunks[..narrow_chunks.len()],
+            narrow_chunks[..],
+            "{expression}: the ranges' chunks do not line up"
+        );
+        assert_eq!(
+            narrow_chunks[0].spec(),
+            wide_chunks[0].spec(),
+            "{expression}"
+        );
+
+        let narrow_whole =
+            native_result_rows(whole_statement_answer(&instance, &observer, &narrow).await).await;
+        let wide_whole =
+            native_result_rows(whole_statement_answer(&instance, &observer, &wide).await).await;
+        assert!(
+            !narrow_whole.is_empty() && !wide_whole.is_empty(),
+            "{expression}: an anchored range answered no rows"
+        );
+        // The anchored answer does not agree across ranges at the narrow range's own timestamps, so a
+        // chunk of one cannot stand for the other's.
+        assert_ne!(
+            rows_covered_by(&narrow_whole, &narrow_chunks),
+            rows_covered_by(&wide_whole, &narrow_chunks),
+            "{expression}: the anchor did not move with the range, so a shared chunk would be \
+             indistinguishable from a correct one"
+        );
+
+        // 1. The narrow range: every chunk of it executes.
+        let mut cache = NativeWindowCache::default();
+        let mut executor = NativeWindowExecutor::new(instance.clone());
+        observer.clear();
+        let narrow_run = executor
+            .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
+            .await;
+        assert_eq!(narrow_run.executed, 4, "{expression}");
+        assert_eq!(narrow_run.served, 0, "{expression}");
+        assert_eq!(narrow_run.rows, narrow_whole, "{expression}");
+        assert_eq!(
+            observer.answering_node().as_deref(),
+            Some("FusedSeriesExec"),
+            "{expression}: the chunks did not answer natively"
+        );
+
+        // 2. The wide range: nothing the narrow range cached answers a chunk of it, and its rows are
+        //    its own anchored answer.
+        observer.clear();
+        let wide_run = executor
+            .run(&mut cache, &wide, &wide_chunks, &scope, "host")
+            .await;
+        assert_eq!(
+            wide_run.served, 0,
+            "{expression}: a chunk of the narrow range answered the wide one"
+        );
+        assert_eq!(wide_run.executed, 7, "{expression}");
+        assert_eq!(wide_run.rows, wide_whole, "{expression}");
+        assert_eq!(cache.len(), 11, "{expression}: the ranges share an entry");
+
+        // 3. The narrow range is still answered from its own chunks.
+        observer.clear();
+        let narrow_warm = executor
+            .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
+            .await;
+        assert_eq!(narrow_warm.executed, 0, "{expression}");
+        assert_eq!(narrow_warm.served, 4, "{expression}");
+        assert_eq!(narrow_warm.rows, narrow_whole, "{expression}");
     }
 
     /// A chunk reads across its own boundary: what a point reads is the statement's window, and the

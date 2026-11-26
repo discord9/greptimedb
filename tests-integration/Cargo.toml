@@ -113,6 +113,7 @@ partition.workspace = true
 paste.workspace = true
 plugins.workspace = true
 promql = { workspace = true, features = ["test-utils"] }
+promql-parser.workspace = true
 prost.workspace = true
 rand.workspace = true
 rskafka.workspace = true
