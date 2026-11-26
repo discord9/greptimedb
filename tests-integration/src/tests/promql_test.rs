@@ -17434,12 +17434,22 @@ async fn native_promql_matrix_root_matches_legacy() {
 /// from `query::promql::planner::plan_statement_on_grid`, the test-only entry point of the `query`
 /// crate that replaces the evaluation grid and nothing else, so `@ start()`, `@ end()`, `start()`,
 /// `end()` and a subquery's child grid still resolve against the statement the client asked for.
+///
+/// A canonical chunk is a span of the statement's time, not a fixed number of points: it aims at
+/// [`CHUNK_TARGET_SECONDS`] and is rounded down to whole steps of the statement's grid, so the chunks
+/// of a 10s-step dashboard query are hours wide and follow the query's own phase. The cache itself is
+/// what a dashboard cache has to be to be safe to leave running: every entry carries the instant it
+/// completed and expires after [`CHUNK_TTL`], and the entries are held under an approximate byte cap
+/// ([`CACHE_MAX_BYTES`]) measured from the batches themselves. Nothing is shared between processes or
+/// kept outside the test instance's memory: there is no datanode, no server-side region, and no
+/// configuration - the cache is one `HashMap` in this module.
+///
 /// Nothing here is production code: the plan entry point is behind the crate's `testing` feature and
 /// is not reachable otherwise, and everything else is this module.
 mod native_window_cache_poc {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use common_query::Output;
     use common_query::promql_annotations::promql_annotation_collector;
@@ -17447,7 +17457,10 @@ mod native_window_cache_poc {
     use datatypes::arrow::array::{Array, Float64Array, StringArray, TimestampMillisecondArray};
     use datatypes::arrow::compute::cast;
     use datatypes::arrow::datatypes::{DataType, TimeUnit};
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::{ColumnSchema, Schema};
     use datatypes::series::time::{EvalGrid, GridSpec};
+    use datatypes::vectors::{Float64Vector, VectorRef};
     use frontend::instance::Instance;
     use promql_parser::parser::{AtModifier, EvalStmt, Expr as EvalExpr};
     use query::datafusion::QUERY_PARALLELISM_HINT;
@@ -17460,15 +17473,53 @@ mod native_window_cache_poc {
     };
     use crate::standalone::GreptimeDbStandaloneBuilder;
 
-    /// How many evaluation points one canonical chunk covers.
+    /// The width a canonical chunk aims for.
     ///
-    /// A chunk is a subgrid of the statement it belongs to rather than a statement of its own, so the
-    /// points it evaluates are exactly its positions on the statement's grid, and the chunks of one
-    /// statement never overlap.
-    const STEPS_PER_CHUNK: usize = 4;
+    /// A dashboard asks for a sliding range and refreshes it, so what a cache has to hold is the part
+    /// of that range which stops changing. A chunk is therefore a span of time rather than a fixed
+    /// number of evaluation points: the widest whole number of the statement's own steps that does not
+    /// exceed this target (see [`chunk_steps`]). One hour is wide enough that a refresh adds at most one
+    /// chunk to the work, and narrow enough that a cached chunk answers for a range that moved by a
+    /// step or two.
+    const CHUNK_TARGET_SECONDS: i64 = 3_600;
 
     /// The step every statement of this POC evaluates on.
     const STEP_MS: i64 = 10_000;
+
+    /// How many of a statement's steps one canonical chunk covers at [`STEP_MS`].
+    ///
+    /// Derived rather than written down twice, so the chunk width and the step cannot drift apart.
+    const STEPS_PER_CHUNK: usize = chunk_steps(STEP_MS);
+
+    /// How wide one canonical chunk of a statement at [`STEP_MS`] is: the target, rounded down to whole
+    /// steps, which at this step is the target exactly.
+    const CHUNK_MS: i64 = (STEPS_PER_CHUNK as i64) * STEP_MS;
+
+    /// The end of a statement starting at the epoch that is exactly `chunks` canonical chunks wide.
+    ///
+    /// A statement's grid is inclusive of both its ends, so `chunks` whole chunks hold `chunks *
+    /// STEPS_PER_CHUNK` points and end one step short of that many steps. Ranges built this way hold no
+    /// partial trailing chunk, which is what makes two of them share every chunk they have in common:
+    /// the wider range asks for the narrower one's chunks verbatim.
+    const fn chunks_end_ms(chunks: i64) -> i64 {
+        (chunks * STEPS_PER_CHUNK as i64 - 1) * STEP_MS
+    }
+
+    /// How long a completed chunk stays servable after it completed.
+    ///
+    /// The route reports its annotations while it produces the answer, so an entry is only cached once
+    /// its stream was collected; the TTL runs from that instant. A dashboard refresh interval is far
+    /// below this, so a warm range refreshes from the cache and a range nobody asked for any more
+    /// leaves by itself.
+    const CHUNK_TTL: Duration = Duration::from_secs(3_600);
+
+    /// The most the cache holds, in approximate bytes.
+    ///
+    /// The estimate is `RecordBatch::get_array_memory_size` summed over the entry's batches plus the
+    /// bytes of the annotations it replays: what the arrays would occupy, without the schema, the map
+    /// and the keys around them. Every insertion first drops what expired and then the oldest entries
+    /// until it fits, and an entry larger than the whole cap is not cached at all.
+    const CACHE_MAX_BYTES: usize = 64 << 20;
 
     /// The lookback the statements of this POC name. It is part of the answer (it bounds how far back
     /// an instant selection reads) and therefore part of the statement a chunk is keyed under.
@@ -17607,17 +17658,141 @@ mod native_window_cache_poc {
         batches: RecordBatches,
         warnings: Vec<String>,
         infos: Vec<String>,
+        /// When the chunk's answer completed, which is when its TTL starts running.
+        inserted_at: Instant,
+        /// What this entry counts against the cache's cap: the batches' array memory as Arrow reports
+        /// it, plus the bytes of the annotations it has to replay. An estimate rather than an exact
+        /// allocation: it counts neither the schema nor the map and key around an entry.
+        bytes: usize,
     }
 
-    /// The cache itself: one entry per completed canonical chunk, no TTL.
-    #[derive(Default)]
+    impl NativeWindowEntry {
+        /// The entry of a completed chunk, stamped with the instant it completed.
+        fn new(
+            batches: RecordBatches,
+            warnings: Vec<String>,
+            infos: Vec<String>,
+            inserted_at: Instant,
+        ) -> Self {
+            let bytes = batches
+                .iter()
+                .map(|batch| batch.df_record_batch().get_array_memory_size())
+                .sum::<usize>()
+                + warnings.iter().map(String::len).sum::<usize>()
+                + infos.iter().map(String::len).sum::<usize>();
+            Self {
+                batches,
+                warnings,
+                infos,
+                inserted_at,
+                bytes,
+            }
+        }
+
+        /// Whether this entry is still inside `ttl` at `now`.
+        fn within(&self, ttl: Duration, now: Instant) -> bool {
+            now.checked_duration_since(self.inserted_at)
+                .is_none_or(|age| age < ttl)
+        }
+    }
+
+    /// One entry per completed canonical chunk, under a TTL and a byte cap.
+    ///
+    /// The cache is a dashboard cache: it answers a range that moved, and it does not grow without end.
+    /// An entry stops being servable [`CHUNK_TTL`] after it completed, and the entries are held under
+    /// [`CACHE_MAX_BYTES`] approximate bytes. Eviction happens when an entry is cached - expired entries
+    /// first, then the oldest ones - so a lookup never mutates the cache; an entry past its TTL is
+    /// refused by the lookup itself, before anything drops it.
     struct NativeWindowCache {
         entries: HashMap<NativeWindowKey, NativeWindowEntry>,
+        /// The approximate bytes the entries hold, which is what the cap limits.
+        bytes: usize,
+        ttl: Duration,
+        max_bytes: usize,
+    }
+
+    impl Default for NativeWindowCache {
+        fn default() -> Self {
+            Self::with_limits(CHUNK_TTL, CACHE_MAX_BYTES)
+        }
     }
 
     impl NativeWindowCache {
+        /// A cache holding at most `max_bytes` approximate bytes of chunks younger than `ttl`.
+        fn with_limits(ttl: Duration, max_bytes: usize) -> Self {
+            Self {
+                entries: HashMap::new(),
+                bytes: 0,
+                ttl,
+                max_bytes,
+            }
+        }
+
+        /// How many entries the cache holds, expired ones included until they are dropped.
         fn len(&self) -> usize {
             self.entries.len()
+        }
+
+        /// The approximate bytes the cache holds.
+        fn bytes(&self) -> usize {
+            self.bytes
+        }
+
+        /// The entry of `key`, unless it is missing or past its TTL at `now`.
+        fn get(&self, key: &NativeWindowKey, now: Instant) -> Option<&NativeWindowEntry> {
+            self.entries
+                .get(key)
+                .filter(|entry| entry.within(self.ttl, now))
+        }
+
+        /// Caches `entry` under `key` at `now`, dropping what expired and then the oldest entries until
+        /// the new one fits. Answers whether the entry is held: an entry larger than the whole cap is
+        /// not.
+        fn insert(&mut self, key: NativeWindowKey, entry: NativeWindowEntry, now: Instant) -> bool {
+            self.expire(now);
+            if entry.bytes > self.max_bytes {
+                return false;
+            }
+            if let Some(previous) = self.entries.remove(&key) {
+                self.bytes -= previous.bytes;
+            }
+            while self.bytes + entry.bytes > self.max_bytes {
+                let Some(oldest) = self.oldest_key() else {
+                    break;
+                };
+                self.remove(&oldest);
+            }
+            self.bytes += entry.bytes;
+            self.entries.insert(key, entry);
+            true
+        }
+
+        /// Drops every entry past its TTL at `now`.
+        fn expire(&mut self, now: Instant) {
+            let expired = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.within(self.ttl, now))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in expired {
+                self.remove(&key);
+            }
+        }
+
+        /// The key of the entry that completed first, which is what the cap evicts first.
+        fn oldest_key(&self) -> Option<NativeWindowKey> {
+            self.entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+        }
+
+        /// Drops one entry and takes its bytes off the cap.
+        fn remove(&mut self, key: &NativeWindowKey) {
+            if let Some(entry) = self.entries.remove(key) {
+                self.bytes -= entry.bytes;
+            }
         }
     }
 
@@ -17783,18 +17958,46 @@ mod native_window_cache_poc {
         matches!(at, Some(AtModifier::Start | AtModifier::End))
     }
 
-    /// Splits a statement's evaluation grid into canonical chunks of [`STEPS_PER_CHUNK`] points.
+    /// How many of a statement's steps one canonical chunk covers.
+    ///
+    /// A canonical chunk is a span of time rounded down to whole steps of the statement's grid, so the
+    /// statement's step decides how many of its points one chunk holds:
+    ///
+    /// ```text
+    /// steps = max(1, floor(CHUNK_TARGET_SECONDS * 1000 / step_ms))
+    /// ```
+    ///
+    /// and the chunk is `steps * step_ms` wide, i.e. at most [`CHUNK_TARGET_SECONDS`] wide. The floor of
+    /// one step keeps a statement whose step is wider than the target advancing: it gets a chunk per
+    /// step rather than a chunk of no points. At the POC's 10s step this is 360 steps, so one chunk is
+    /// exactly an hour and a three-hour range is three chunks and the point past them.
+    ///
+    /// `step_ms` is a step of a validated [`GridSpec`], so it is positive.
+    const fn chunk_steps(step_ms: i64) -> usize {
+        let steps = (CHUNK_TARGET_SECONDS * 1_000) / step_ms;
+        if steps < 1 { 1 } else { steps as usize }
+    }
+
+    /// Splits a statement's evaluation grid into canonical chunks of [`CHUNK_TARGET_SECONDS`].
     ///
     /// The split reads the grid's own timestamps, so a chunk's first and last point are points of the
     /// statement's grid: planning the chunk evaluates exactly those positions at the statement's step,
-    /// and no position of the statement belongs to two chunks.
+    /// and no position of the statement belongs to two chunks. Because the first chunk starts where the
+    /// statement's grid starts and every chunk advances a whole number of the statement's steps, the
+    /// chunks follow the statement's own phase - two statements that agree on their start and step cut
+    /// their ranges into the same chunks, and a range that slid by a step or two keeps the chunks it
+    /// already had.
+    ///
+    /// A grid that does not end on a chunk boundary keeps the points past the last full chunk as one
+    /// shorter chunk, down to a single point, which is planned and cached like any other chunk.
     fn canonical_chunks(grid: &EvalGrid) -> Vec<NativeChunk> {
         let step_ms = grid.spec().step_ms;
+        let steps = chunk_steps(step_ms);
         let timestamps = grid.timestamps().expect("the grid materializes");
         (0..timestamps.len())
-            .step_by(STEPS_PER_CHUNK)
+            .step_by(steps)
             .map(|first| {
-                let last = (first + STEPS_PER_CHUNK).min(timestamps.len());
+                let last = (first + steps).min(timestamps.len());
                 NativeChunk {
                     start_ms: timestamps[first],
                     step_ms,
@@ -17973,6 +18176,10 @@ mod native_window_cache_poc {
         }
 
         /// Runs `chunks`, every one of them a chunk of `statement`, serving what the cache holds.
+        ///
+        /// Each chunk is looked up under the whole statement's key. A miss plans the chunk and caches
+        /// what it answered; an entry the cap refuses is simply not held, which shows up as that chunk
+        /// executing again on the next run rather than as an error.
         async fn run(
             &mut self,
             cache: &mut NativeWindowCache,
@@ -17983,6 +18190,9 @@ mod native_window_cache_poc {
         ) -> NativeWindowRun {
             let statement_key = NativeStatementKey::of(statement);
             let mut run = NativeWindowRun::default();
+            // What went past its TTL since the last run is not servable, whether or not anything has
+            // been cached since.
+            cache.expire(Instant::now());
             for chunk in chunks {
                 let key = NativeWindowKey {
                     statement: statement_key.clone(),
@@ -17990,7 +18200,8 @@ mod native_window_cache_poc {
                     scope: scope.clone(),
                     route: NativeWindowRoute::FusedSeries,
                 };
-                if let Some(entry) = cache.entries.get(&key) {
+                let now = Instant::now();
+                if let Some(entry) = cache.get(&key, now) {
                     run.served += 1;
                     run.absorb(entry, label);
                 } else {
@@ -17998,7 +18209,7 @@ mod native_window_cache_poc {
                     self.executions += 1;
                     run.executed += 1;
                     run.absorb(&entry, label);
-                    cache.entries.insert(key, entry);
+                    cache.insert(key, entry, now);
                 }
             }
             run.finish()
@@ -18037,11 +18248,9 @@ mod native_window_cache_poc {
             let mut warnings = Vec::new();
             let mut infos = Vec::new();
             collector.append_to(&mut warnings, &mut infos);
-            NativeWindowEntry {
-                batches,
-                warnings,
-                infos,
-            }
+            // Stamped after the stream is collected: the annotations are only final once the answer is,
+            // and the TTL runs from the instant an entry is worth serving.
+            NativeWindowEntry::new(batches, warnings, infos, Instant::now())
         }
     }
 
@@ -18081,11 +18290,11 @@ mod native_window_cache_poc {
     async fn native_promql_range_reuses_completed_canonical_chunks() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_cache";
-        // The statement every run below reads: 28 points at the POC's step, i.e. seven canonical
-        // chunks of which the first six are the range the earlier runs ask for. The fixture holds a
-        // sample at every point up to 320s, so the chunks asked for later still read data inside their
-        // lookback.
-        const RANGE_END_MS: i64 = 270_000;
+        // The statement every run below reads: four hours at the POC's step, i.e. 1440 points and four
+        // canonical chunks of exactly one hour each. The earlier runs ask for the first three and the
+        // slid run adds the fourth, which is the one a dashboard refresh would add. The fixture holds a
+        // sample at every point, so the chunks asked for later still read data inside their lookback.
+        const RANGE_END_MS: i64 = chunks_end_ms(4);
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_cache",
@@ -18094,7 +18303,7 @@ mod native_window_cache_poc {
         let instance = standalone.fe_instance().clone();
         execute_all(
             &instance,
-            &native_window_fixture(TABLE, -7, 32),
+            &native_window_fixture(TABLE, -7, RANGE_END_MS / STEP_MS),
             QueryContext::arc(),
         )
         .await;
@@ -18136,12 +18345,20 @@ mod native_window_cache_poc {
             let chunks = canonical_chunks(&grid);
             assert_eq!(
                 chunks.len(),
-                7,
-                "{expression}: the statement is seven canonical chunks"
+                4,
+                "{expression}: four hours are four canonical chunks"
             );
-            // The chunks the cold and warm runs ask for: the six the range held before one more was
-            // asked for.
-            let covered = &chunks[..6];
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.len as usize)
+                    .collect::<Vec<_>>(),
+                vec![STEPS_PER_CHUNK; 4],
+                "{expression}: every chunk is a whole hour"
+            );
+            // The chunks the cold and warm runs ask for: the three hours the range held before the
+            // fourth was asked for.
+            let covered = &chunks[..3];
             let expected = rows_covered_by(&whole, covered);
             assert!(!expected.is_empty(), "{expression}");
             assert!(
@@ -18156,11 +18373,11 @@ mod native_window_cache_poc {
                 .run(&mut cache, &statement, covered, &scope, "host")
                 .await;
             assert_eq!(
-                cold.executed, 6,
+                cold.executed, 3,
                 "{expression}: one execution per canonical chunk"
             );
             assert_eq!(cold.served, 0, "{expression}: nothing was cached yet");
-            assert_eq!(cache.len(), 6, "{expression}");
+            assert_eq!(cache.len(), 3, "{expression}");
             assert_eq!(
                 cold.rows, expected,
                 "{expression}: the assembled chunks did not reproduce the statement"
@@ -18182,7 +18399,7 @@ mod native_window_cache_poc {
                 warm.executed, 0,
                 "{expression}: a warm run executed a chunk"
             );
-            assert_eq!(warm.served, 6, "{expression}");
+            assert_eq!(warm.served, 3, "{expression}");
             assert_eq!(warm.rows, expected, "{expression}");
             assert_eq!(
                 executor.executions - before,
@@ -18194,7 +18411,7 @@ mod native_window_cache_poc {
                 "{expression}: a warm run planned a statement"
             );
 
-            // 4. One more chunk of the same statement: the six completed chunks answer, and only the
+            // 4. One more chunk of the same statement: the three completed chunks answer, and only the
             //    one newly asked for is planned and executed.
             observer.clear();
             let slid = executor
@@ -18205,10 +18422,10 @@ mod native_window_cache_poc {
                 "{expression}: only the newly asked chunk executes"
             );
             assert_eq!(
-                slid.served, 6,
+                slid.served, 3,
                 "{expression}: the chunks already asked for are hits"
             );
-            assert_eq!(cache.len(), 7, "{expression}");
+            assert_eq!(cache.len(), 4, "{expression}");
             assert_eq!(
                 slid.rows, whole,
                 "{expression}: the widened run did not match the whole statement"
@@ -18239,12 +18456,271 @@ mod native_window_cache_poc {
                 .run(&mut cache, &other_statement, covered, &scope, "host")
                 .await;
             assert_eq!(
-                other.executed, 6,
+                other.executed, 3,
                 "{expression}: a statement outside the key"
             );
             assert_eq!(other.served, 0, "{expression}");
             assert_eq!(other.rows, expected, "{expression}");
         }
+    }
+
+    /// Reports one measured phase of the timing test: what it cost, and how many statements it planned.
+    ///
+    /// The duration is reported, never asserted - a wall clock on a shared machine says nothing about
+    /// the cache. What the test holds are the counts below it: one plan for the whole range, one plan
+    /// per chunk cold, none warm, and one for the chunk a slide adds.
+    fn report_phase(label: &str, elapsed: Duration, plans: usize, chunk_executions: usize) {
+        println!(
+            "native window cache: {label:<32} {:>10.3} ms  {plans} plan(s), {chunk_executions} chunk \
+             execution(s)",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+    }
+
+    /// What a dashboard cache is for: one plan answers the whole range, then a plan per chunk cold, none
+    /// warm, and one for the chunk a refresh adds.
+    ///
+    /// Every phase below runs the same statement over overlapping points, so only the number of plans
+    /// differs; the durations are printed and asserted nowhere. The range is hours wide at the POC's
+    /// step, which is where a chunk per hour and a range per refresh stop being hypothetical.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_promql_window_cache_timings() {
+        common_telemetry::init_default_ut_logging();
+        const TABLE: &str = "native_window_cache_timing";
+        const RANGE_END_MS: i64 = chunks_end_ms(4);
+
+        let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
+            "native_promql_window_cache_timing",
+        ))
+        .await;
+        let instance = standalone.fe_instance().clone();
+        execute_all(
+            &instance,
+            &native_window_fixture(TABLE, -7, RANGE_END_MS / STEP_MS),
+            QueryContext::arc(),
+        )
+        .await;
+        let scope = NativeWindowScope::current(TABLE);
+
+        let expression = format!("sum by (host) (rate({TABLE}[30s]))");
+        let statement = native_range_statement(&expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
+        let chunks = canonical_chunks(&native_statement_grid(&statement));
+        assert_eq!(chunks.len(), 4, "four hours are four canonical chunks");
+        let covered = &chunks[..3];
+
+        // 1. The whole range in one native plan: the answer every phase below reproduces at its own
+        //    timestamps.
+        observer.clear();
+        let started = Instant::now();
+        let whole =
+            native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
+                .await;
+        let whole_elapsed = started.elapsed();
+        report_phase("whole range, native cold", whole_elapsed, 1, 1);
+        assert!(!whole.is_empty(), "the whole-range answer is empty");
+
+        // 2. The same range through the cache, cold: one plan per canonical chunk.
+        let mut cache = NativeWindowCache::default();
+        let mut executor = NativeWindowExecutor::new(instance.clone());
+        observer.clear();
+        let started = Instant::now();
+        let cold = executor
+            .run(&mut cache, &statement, covered, &scope, "host")
+            .await;
+        let cold_elapsed = started.elapsed();
+        report_phase("chunked cold", cold_elapsed, cold.executed, cold.executed);
+        assert_eq!(
+            cold.executed,
+            covered.len(),
+            "a cold chunked run is one plan per chunk"
+        );
+        assert_eq!(cold.served, 0);
+        assert_eq!(
+            cold.rows,
+            rows_covered_by(&whole, covered),
+            "the cold chunked run did not reproduce the range"
+        );
+        assert_eq!(cache.len(), covered.len());
+
+        // 3. The same window again: nothing is planned and nothing executes.
+        observer.clear();
+        let started = Instant::now();
+        let warm = executor
+            .run(&mut cache, &statement, covered, &scope, "host")
+            .await;
+        let warm_elapsed = started.elapsed();
+        report_phase("warm same window", warm_elapsed, 0, warm.executed);
+        assert_eq!(warm.executed, 0, "a warm run executed a chunk");
+        assert_eq!(warm.served, covered.len());
+        assert_eq!(warm.rows, cold.rows);
+        assert!(
+            observer.all_plans().is_empty(),
+            "a warm run planned a statement"
+        );
+
+        // 4. A refresh that slid one chunk: the completed chunks answer, and the one it added is the
+        //    only plan.
+        observer.clear();
+        let started = Instant::now();
+        let slid = executor
+            .run(&mut cache, &statement, &chunks, &scope, "host")
+            .await;
+        let slid_elapsed = started.elapsed();
+        report_phase(
+            "slide by one chunk",
+            slid_elapsed,
+            slid.executed,
+            slid.executed,
+        );
+        assert_eq!(
+            slid.executed,
+            chunks.len() - covered.len(),
+            "a slide plans only the chunks it adds"
+        );
+        assert_eq!(slid.served, covered.len(), "the completed chunks were hits");
+        assert_eq!(slid.rows, whole, "the slid run is not the whole statement");
+        println!(
+            "native window cache: {} entries, {} bytes (approximate), ttl {}s, cap {} bytes",
+            cache.len(),
+            cache.bytes(),
+            CHUNK_TTL.as_secs(),
+            CACHE_MAX_BYTES
+        );
+    }
+
+    /// A minimal rows answer for the cache's own unit tests: `rows` doubles under one column.
+    fn sample_batches(rows: usize) -> RecordBatches {
+        let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
+            "val",
+            ConcreteDataType::float64_datatype(),
+            false,
+        )]));
+        let values = (0..rows).map(|row| row as f64).collect::<Vec<_>>();
+        RecordBatches::try_from_columns(
+            schema,
+            vec![Arc::new(Float64Vector::from_vec(values)) as VectorRef],
+        )
+        .expect("a sample rows answer")
+    }
+
+    /// An entry of `rows` sample rows, stamped with the instant it completed.
+    fn sample_entry(rows: usize, inserted_at: Instant) -> NativeWindowEntry {
+        NativeWindowEntry::new(sample_batches(rows), Vec::new(), Vec::new(), inserted_at)
+    }
+
+    /// The key of the `chunk`th canonical chunk of `expression`, as a scope of its own.
+    fn sample_key(expression: &str, chunk: usize) -> NativeWindowKey {
+        NativeWindowKey {
+            statement: NativeStatementKey::BoundInvariant {
+                expression: expression.to_string(),
+                step_ms: STEP_MS,
+                lookback_ms: LOOKBACK_MS,
+            },
+            chunk: NativeChunk {
+                start_ms: chunk as i64 * CHUNK_MS,
+                step_ms: STEP_MS,
+                len: STEPS_PER_CHUNK as u64,
+            },
+            scope: NativeWindowScope {
+                catalog: "greptime".to_string(),
+                schema: "public".to_string(),
+                table: "native_window_cache_unit".to_string(),
+                timezone: "UTC".to_string(),
+                user: "greptime".to_string(),
+            },
+            route: NativeWindowRoute::FusedSeries,
+        }
+    }
+
+    /// An entry stops being servable once its TTL is up, and what expired is dropped rather than kept.
+    #[test]
+    fn native_window_cache_expires_entries_after_their_ttl() {
+        let now = Instant::now();
+        assert_eq!(NativeWindowCache::default().ttl, CHUNK_TTL);
+        assert_eq!(NativeWindowCache::default().max_bytes, CACHE_MAX_BYTES);
+
+        let mut cache = NativeWindowCache::default();
+        let key = sample_key("up", 0);
+        let inserted_at = now - CHUNK_TTL / 2;
+        assert!(cache.insert(key.clone(), sample_entry(4, inserted_at), inserted_at));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.bytes() > 0, "an entry counts against the cap");
+        assert!(
+            cache.get(&key, now).is_some(),
+            "an entry inside its TTL is servable"
+        );
+
+        // At the TTL the entry is no longer served, even though nothing has dropped it yet.
+        let expired_at = inserted_at + CHUNK_TTL;
+        assert!(
+            cache.get(&key, expired_at).is_none(),
+            "an entry at its TTL was served"
+        );
+        assert_eq!(cache.len(), 1, "nothing dropped it before it was looked up");
+
+        // Caching anything at that instant drops what expired and takes its bytes off the cap.
+        let next = sample_key("up", 1);
+        assert!(cache.insert(next.clone(), sample_entry(4, expired_at), expired_at));
+        assert_eq!(cache.len(), 1, "the expired entry was not dropped");
+        assert_eq!(
+            cache.bytes(),
+            sample_entry(4, expired_at).bytes,
+            "the expired entry's bytes were not released"
+        );
+        assert!(cache.get(&key, expired_at).is_none());
+        assert!(cache.get(&next, expired_at).is_some());
+
+        // A younger chunk is unaffected by an older one expiring.
+        let younger = sample_key("up", 2);
+        let later = expired_at + CHUNK_TTL / 2;
+        assert!(cache.insert(younger.clone(), sample_entry(4, later), later));
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// The cache holds at most its byte cap: the oldest entries leave first, and an entry larger than the
+    /// whole cap is not held at all.
+    #[test]
+    fn native_window_cache_evicts_to_its_byte_cap() {
+        let now = Instant::now();
+        let bytes = sample_entry(64, now).bytes;
+        assert!(bytes > 0, "an entry of 64 doubles has a size");
+
+        let mut cache = NativeWindowCache::with_limits(CHUNK_TTL, 2 * bytes);
+        let keys = (0..3)
+            .map(|chunk| sample_key("up", chunk))
+            .collect::<Vec<_>>();
+        for (index, key) in keys.iter().enumerate() {
+            let inserted_at = now + Duration::from_secs(index as u64);
+            assert!(
+                cache.insert(key.clone(), sample_entry(64, inserted_at), now),
+                "an entry under the cap is cached"
+            );
+        }
+        assert_eq!(cache.len(), 2, "the cap holds two entries");
+        assert!(
+            cache.bytes() <= 2 * bytes,
+            "{} bytes are over the cap",
+            cache.bytes()
+        );
+        assert!(
+            cache.get(&keys[0], now).is_none(),
+            "the entry cached first was not the one evicted"
+        );
+        assert!(cache.get(&keys[1], now).is_some());
+        assert!(cache.get(&keys[2], now).is_some());
+
+        // Caching the same chunk again replaces it rather than holding both.
+        let before = cache.bytes();
+        assert!(cache.insert(keys[2].clone(), sample_entry(64, now), now));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes(), before, "the entry was counted twice");
+
+        // An entry larger than the whole cap is refused rather than cached and evicting everything.
+        let mut small = NativeWindowCache::with_limits(CHUNK_TTL, bytes - 1);
+        assert!(!small.insert(keys[0].clone(), sample_entry(64, now), now));
+        assert_eq!(small.len(), 0);
+        assert_eq!(small.bytes(), 0);
+        assert!(small.get(&keys[0], now).is_none());
     }
 
     /// A chunk is planned from the whole statement, so every anchor resolves where the statement puts
@@ -18260,7 +18736,10 @@ mod native_window_cache_poc {
     async fn native_promql_statement_anchors_stay_on_the_statement() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_anchor";
-        const RANGE_END_MS: i64 = 150_000;
+        // Three hours at the POC's step: three canonical chunks, of which the middle one is asked for
+        // as a statement of its own below. The middle chunk ends inside the statement rather than at
+        // its end, so an `@ end()` of the statement does not resolve to the chunk's own end.
+        const RANGE_END_MS: i64 = chunks_end_ms(3);
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_anchors",
@@ -18269,7 +18748,7 @@ mod native_window_cache_poc {
         let instance = standalone.fe_instance().clone();
         execute_all(
             &instance,
-            &native_window_fixture(TABLE, -4, 19),
+            &native_window_fixture(TABLE, -7, RANGE_END_MS / STEP_MS),
             QueryContext::arc(),
         )
         .await;
@@ -18285,7 +18764,11 @@ mod native_window_cache_poc {
                 native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
             let grid = native_statement_grid(&statement);
             let chunks = canonical_chunks(&grid);
-            assert_eq!(chunks.len(), 4, "{expression}: four canonical chunks");
+            assert_eq!(
+                chunks.len(),
+                3,
+                "{expression}: three hours are three canonical chunks"
+            );
             let whole =
                 native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
                     .await;
@@ -18316,7 +18799,11 @@ mod native_window_cache_poc {
             // The chunk in the middle of the statement, answered once by the statement's plan and once
             // by a statement narrowed to it: the anchor moves with the narrowed statement, so the two
             // answers cannot be the same rows.
-            let middle = chunks[2];
+            let middle = chunks[chunks.len() / 2];
+            assert_eq!(
+                middle.len as usize, STEPS_PER_CHUNK,
+                "{expression}: the middle chunk is a whole one"
+            );
             let statement_rows = rows_covered_by(&whole, &[middle]);
             assert!(!statement_rows.is_empty(), "{expression}");
             assert_eq!(
@@ -18384,6 +18871,102 @@ mod native_window_cache_poc {
         }
     }
 
+    /// A canonical chunk is a span of the statement's time, cut at whole steps of the statement's grid.
+    ///
+    /// The width comes from [`CHUNK_TARGET_SECONDS`] and the statement's step, never from a fixed point
+    /// count: a chunk is the widest whole number of the statement's steps that stays inside the target,
+    /// a statement whose step is wider than the target gets one step per chunk, and no chunk is empty.
+    /// Because a chunk starts on the statement's grid and advances a whole number of its steps, the
+    /// chunks follow the statement's phase - a range that grew keeps every chunk it already had.
+    #[test]
+    fn canonical_chunks_are_hours_of_the_statement_grid() {
+        // The formula: floor of the target over the statement's step, and never fewer than one step.
+        assert_eq!(
+            chunk_steps(STEP_MS),
+            360,
+            "a 10s step makes an hour-wide chunk"
+        );
+        assert_eq!(chunk_steps(1_000), 3_600);
+        assert_eq!(chunk_steps(60_000), 60);
+        assert_eq!(chunk_steps(CHUNK_TARGET_SECONDS * 1_000), 1);
+        // A step wider than the target cannot be rounded down to a chunk, so a chunk is one step.
+        assert_eq!(chunk_steps(2 * CHUNK_TARGET_SECONDS * 1_000), 1);
+        assert_eq!(chunk_steps(86_400_000), 1);
+        assert_eq!(
+            (STEPS_PER_CHUNK as i64) * STEP_MS,
+            CHUNK_TARGET_SECONDS * 1_000,
+            "at the POC's step a chunk is exactly the target width"
+        );
+
+        let grid = EvalGrid::try_new(
+            GridSpec::try_from_range(0, 3 * CHUNK_MS, STEP_MS).expect("a three-hour grid"),
+        )
+        .expect("a valid grid");
+        let chunks = canonical_chunks(&grid);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
+            vec![360, 360, 360, 1],
+            "three whole chunks and the point past them"
+        );
+        assert_eq!(
+            chunks[0].start_ms,
+            grid.spec().start_ms,
+            "the phase is the grid's"
+        );
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[1].start_ms,
+                pair[0].end_ms() + pair[0].step_ms,
+                "the chunks are contiguous grid points"
+            );
+        }
+        for chunk in &chunks {
+            assert_eq!(chunk.step_ms, grid.spec().step_ms);
+            assert!(
+                chunk.len == 1
+                    || (chunk.len as i64) * chunk.step_ms <= CHUNK_TARGET_SECONDS * 1_000,
+                "a chunk of {} steps is wider than the target",
+                chunk.len
+            );
+        }
+        assert_eq!(
+            chunks.last().expect("chunks").end_ms(),
+            grid.timestamps().expect("timestamps")
+                [grid.timestamps().expect("timestamps").len() - 1],
+            "the chunks cover the grid up to its last point"
+        );
+
+        // A range that grew keeps the chunks it had, because a chunk is cut from the grid's phase
+        // rather than from its end.
+        let narrow = canonical_chunks(
+            &EvalGrid::try_new(
+                GridSpec::try_from_range(0, chunks_end_ms(1), STEP_MS).expect("a grid"),
+            )
+            .expect("a valid grid"),
+        );
+        let wide = canonical_chunks(
+            &EvalGrid::try_new(
+                GridSpec::try_from_range(0, chunks_end_ms(4), STEP_MS).expect("a grid"),
+            )
+            .expect("a valid grid"),
+        );
+        assert_eq!(
+            narrow,
+            vec![NativeChunk {
+                start_ms: 0,
+                step_ms: STEP_MS,
+                len: STEPS_PER_CHUNK as u64,
+            }],
+            "one hour of whole chunks is one chunk"
+        );
+        assert_eq!(wide.len(), 4);
+        assert_eq!(
+            wide[..narrow.len()],
+            narrow[..],
+            "growing a range re-cut the chunks it already had"
+        );
+    }
+
     /// A statement that reads no bound is answered from chunks a wider or narrower range completed.
     ///
     /// The range a dashboard asks for grows and shrinks while the expression stays the same. The
@@ -18396,10 +18979,10 @@ mod native_window_cache_poc {
     async fn native_promql_bound_invariant_chunks_answer_another_range() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_invariant";
-        // The narrow range holds 16 points, i.e. four canonical chunks.
-        const NARROW_END_MS: i64 = 150_000;
-        // The wide range holds 28 points: the narrow range's four chunks and three more.
-        const WIDE_END_MS: i64 = 270_000;
+        // The narrow range is two whole canonical chunks.
+        const NARROW_END_MS: i64 = chunks_end_ms(2);
+        // The wide range is three: the narrow range's two chunks and one more.
+        const WIDE_END_MS: i64 = chunks_end_ms(3);
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_invariant",
@@ -18408,7 +18991,7 @@ mod native_window_cache_poc {
         let instance = standalone.fe_instance().clone();
         execute_all(
             &instance,
-            &native_window_fixture(TABLE, -7, 32),
+            &native_window_fixture(TABLE, -7, WIDE_END_MS / STEP_MS),
             QueryContext::arc(),
         )
         .await;
@@ -18442,10 +19025,18 @@ mod native_window_cache_poc {
 
             let narrow_chunks = canonical_chunks(&native_statement_grid(&narrow));
             let wide_chunks = canonical_chunks(&native_statement_grid(&wide));
-            assert_eq!(narrow_chunks.len(), 4, "{expression}");
-            assert_eq!(wide_chunks.len(), 7, "{expression}");
+            assert_eq!(
+                narrow_chunks.len(),
+                2,
+                "{expression}: two hours are two canonical chunks"
+            );
+            assert_eq!(
+                wide_chunks.len(),
+                3,
+                "{expression}: three hours are three canonical chunks"
+            );
             // Canonical chunks are positions of the statement's grid, so the wide range asks for the
-            // narrow range's chunks verbatim, and then for three of its own.
+            // narrow range's chunks verbatim, and then for one of its own.
             assert_eq!(
                 wide_chunks[..narrow_chunks.len()],
                 narrow_chunks[..],
@@ -18482,44 +19073,44 @@ mod native_window_cache_poc {
             let narrow_run = executor
                 .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
                 .await;
-            assert_eq!(narrow_run.executed, 4, "{expression}");
+            assert_eq!(narrow_run.executed, 2, "{expression}");
             assert_eq!(narrow_run.served, 0, "{expression}");
             assert_eq!(narrow_run.rows, narrow_whole, "{expression}");
-            assert_eq!(cache.len(), 4, "{expression}");
+            assert_eq!(cache.len(), 2, "{expression}");
             assert_eq!(
                 observer.answering_node().as_deref(),
                 Some("FusedSeriesExec"),
                 "{expression}: the chunks did not answer natively"
             );
 
-            // 2. The wide range next: the four chunks it shares with the narrow range are hits, and
-            //    only the three it adds are planned and executed.
+            // 2. The wide range next: the two chunks it shares with the narrow range are hits, and
+            //    only the one it adds is planned and executed.
             observer.clear();
             let wide_run = executor
                 .run(&mut cache, &wide, &wide_chunks, &scope, "host")
                 .await;
             assert_eq!(
-                wide_run.served, 4,
+                wide_run.served, 2,
                 "{expression}: the chunks the ranges share were not hits"
             );
             assert_eq!(
-                wide_run.executed, 3,
+                wide_run.executed, 1,
                 "{expression}: a shared chunk was executed again"
             );
             assert_eq!(
                 wide_run.rows, wide_whole,
                 "{expression}: the wide range is not its own answer"
             );
-            assert_eq!(cache.len(), 7, "{expression}");
+            assert_eq!(cache.len(), 3, "{expression}");
 
             // 3. The other order, on a fresh cache: the wide range executes every chunk of itself and
-            //    the narrow range is answered by the four chunks it shares with it.
+            //    the narrow range is answered by the two chunks it shares with it.
             let mut cache = NativeWindowCache::default();
             observer.clear();
             let wide_cold = executor
                 .run(&mut cache, &wide, &wide_chunks, &scope, "host")
                 .await;
-            assert_eq!(wide_cold.executed, 7, "{expression}");
+            assert_eq!(wide_cold.executed, 3, "{expression}");
             assert_eq!(wide_cold.served, 0, "{expression}");
             assert_eq!(wide_cold.rows, wide_whole, "{expression}");
             observer.clear();
@@ -18530,7 +19121,7 @@ mod native_window_cache_poc {
                 narrow_warm.executed, 0,
                 "{expression}: the narrow range executed a chunk"
             );
-            assert_eq!(narrow_warm.served, 4, "{expression}");
+            assert_eq!(narrow_warm.served, 2, "{expression}");
             assert_eq!(narrow_warm.rows, narrow_whole, "{expression}");
             assert!(
                 observer.all_plans().is_empty(),
@@ -18549,10 +19140,10 @@ mod native_window_cache_poc {
     async fn native_promql_anchored_statements_do_not_share_chunks() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_anchored_share";
-        // The same two ranges as the reuse test above: four chunks and seven, the first four of
-        // which are chunked identically.
-        const NARROW_END_MS: i64 = 150_000;
-        const WIDE_END_MS: i64 = 270_000;
+        // The same two ranges as the reuse test above: two whole canonical chunks and three, the first
+        // two of which are chunked identically.
+        const NARROW_END_MS: i64 = chunks_end_ms(2);
+        const WIDE_END_MS: i64 = chunks_end_ms(3);
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_anchored_share",
@@ -18561,7 +19152,7 @@ mod native_window_cache_poc {
         let instance = standalone.fe_instance().clone();
         execute_all(
             &instance,
-            &native_window_fixture(TABLE, -7, 32),
+            &native_window_fixture(TABLE, -7, WIDE_END_MS / STEP_MS),
             QueryContext::arc(),
         )
         .await;
@@ -18584,8 +19175,8 @@ mod native_window_cache_poc {
 
         let narrow_chunks = canonical_chunks(&native_statement_grid(&narrow));
         let wide_chunks = canonical_chunks(&native_statement_grid(&wide));
-        assert_eq!(narrow_chunks.len(), 4, "{expression}");
-        assert_eq!(wide_chunks.len(), 7, "{expression}");
+        assert_eq!(narrow_chunks.len(), 2, "{expression}");
+        assert_eq!(wide_chunks.len(), 3, "{expression}");
         // The chunk grids line up, so nothing but the key keeps the narrow range's chunks from
         // answering the wide one's: the first chunk of each asks for the very same grid.
         assert_eq!(
@@ -18623,7 +19214,7 @@ mod native_window_cache_poc {
         let narrow_run = executor
             .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
             .await;
-        assert_eq!(narrow_run.executed, 4, "{expression}");
+        assert_eq!(narrow_run.executed, 2, "{expression}");
         assert_eq!(narrow_run.served, 0, "{expression}");
         assert_eq!(narrow_run.rows, narrow_whole, "{expression}");
         assert_eq!(
@@ -18642,9 +19233,9 @@ mod native_window_cache_poc {
             wide_run.served, 0,
             "{expression}: a chunk of the narrow range answered the wide one"
         );
-        assert_eq!(wide_run.executed, 7, "{expression}");
+        assert_eq!(wide_run.executed, 3, "{expression}");
         assert_eq!(wide_run.rows, wide_whole, "{expression}");
-        assert_eq!(cache.len(), 11, "{expression}: the ranges share an entry");
+        assert_eq!(cache.len(), 5, "{expression}: the ranges share an entry");
 
         // 3. The narrow range is still answered from its own chunks.
         observer.clear();
@@ -18652,7 +19243,7 @@ mod native_window_cache_poc {
             .run(&mut cache, &narrow, &narrow_chunks, &scope, "host")
             .await;
         assert_eq!(narrow_warm.executed, 0, "{expression}");
-        assert_eq!(narrow_warm.served, 4, "{expression}");
+        assert_eq!(narrow_warm.served, 2, "{expression}");
         assert_eq!(narrow_warm.rows, narrow_whole, "{expression}");
     }
 
@@ -18668,7 +19259,8 @@ mod native_window_cache_poc {
     async fn native_promql_chunks_read_across_their_boundary() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_boundary";
-        const RANGE_END_MS: i64 = 190_000;
+        // Two hours at the POC's step: two whole canonical chunks.
+        const RANGE_END_MS: i64 = chunks_end_ms(2);
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_boundary",
@@ -18680,7 +19272,7 @@ mod native_window_cache_poc {
         // boundary finds the ones the chunk before it evaluated.
         execute_all(
             &instance,
-            &native_window_fixture(TABLE, -7, 25),
+            &native_window_fixture(TABLE, -7, RANGE_END_MS / STEP_MS),
             QueryContext::arc(),
         )
         .await;
@@ -18696,7 +19288,11 @@ mod native_window_cache_poc {
                 native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
             let grid = native_statement_grid(&statement);
             let chunks = canonical_chunks(&grid);
-            assert_eq!(chunks.len(), 5, "{expression}: five canonical chunks");
+            assert_eq!(
+                chunks.len(),
+                2,
+                "{expression}: two hours are two canonical chunks"
+            );
             let whole =
                 native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
                     .await;
@@ -18776,7 +19372,10 @@ mod native_window_cache_poc {
         common_telemetry::init_default_ut_logging();
         const METRIC: &str = "native_window_reset_hist";
         const HIST_STEP_MS: i64 = 20_000;
-        const HIST_END_MS: i64 = 220_000;
+        // Two hours at a 20s step: a chunk is 180 steps here (an hour), so this is two whole canonical
+        // chunks of the histogram's own grid.
+        const HIST_END_MS: i64 =
+            (2 * (CHUNK_TARGET_SECONDS * 1_000 / HIST_STEP_MS) - 1) * HIST_STEP_MS;
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_cache_annotations",
@@ -18786,7 +19385,7 @@ mod native_window_cache_poc {
         let server =
             crate::test_util::build_test_prom_server(instance.clone(), false, None).build();
         let router = server.build(server.make_app()).unwrap();
-        let samples = (0..=12_i64)
+        let samples = (0..=HIST_END_MS / HIST_STEP_MS)
             .map(|step| Histogram {
                 timestamp: step * HIST_STEP_MS,
                 count: Some(Count::CountInt(4)),
@@ -18836,9 +19435,12 @@ mod native_window_cache_poc {
         let grid = native_statement_grid(&statement);
         let chunks = canonical_chunks(&grid);
         assert_eq!(
-            chunks.len(),
-            3,
-            "three canonical chunks of the histogram range"
+            chunks
+                .iter()
+                .map(|chunk| chunk.len as usize)
+                .collect::<Vec<_>>(),
+            vec![180, 180],
+            "two canonical chunks of the histogram range"
         );
         let expected = answer_rows(
             &rows_batches(whole_statement_answer(&instance, &observer, &statement).await).await,
@@ -18857,7 +19459,8 @@ mod native_window_cache_poc {
             .run(&mut cache, &statement, &chunks, &scope, "job")
             .await;
         assert_eq!(
-            cold.executed, 3,
+            cold.executed,
+            chunks.len(),
             "one execution per canonical chunk of the histogram range"
         );
         assert_eq!(cold.served, 0);
@@ -18905,7 +19508,7 @@ mod native_window_cache_poc {
             .run(&mut cache, &statement, &chunks, &scope, "job")
             .await;
         assert_eq!(warm.executed, 0, "a warm run executed a chunk");
-        assert_eq!(warm.served, 3);
+        assert_eq!(warm.served, chunks.len());
         assert_eq!(warm.rows, expected);
         assert_eq!(
             warm.warnings, cold.warnings,
