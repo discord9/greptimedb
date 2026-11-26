@@ -11,6 +11,9 @@ workspace = true
 default = ["ai_functions"]
 ai_functions = ["common-function/ai_functions"]
 enterprise = ["sql/enterprise"]
+# Exposes what only a test needs: the native route's entry point for planning one statement on a
+# subrange of its own evaluation grid.
+testing = []
 
 [dependencies]
 ahash.workspace = true

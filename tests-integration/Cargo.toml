@@ -36,7 +36,7 @@ common-grpc.workspace = true
 common-memory-manager.workspace = true
 common-meta.workspace = true
 common-procedure.workspace = true
-common-query.workspace = true
+common-query = { workspace = true, features = ["testing"] }
 common-recordbatch.workspace = true
 common-runtime.workspace = true
 common-telemetry.workspace = true
@@ -59,7 +59,7 @@ object-store.workspace = true
 operator.workspace = true
 pipeline.workspace = true
 prost.workspace = true
-query.workspace = true
+query = { workspace = true, features = ["testing"] }
 rand.workspace = true
 serde_json.workspace = true
 servers.workspace = true

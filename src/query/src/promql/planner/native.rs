@@ -52,6 +52,8 @@ use datatypes::data_type::DataType as _;
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use datatypes::series::time::EvalGrid;
+#[cfg(any(test, feature = "testing"))]
+use datatypes::series::time::GridSpec;
 use futures::future::BoxFuture;
 use promql::extension_plan::{
     FieldKind, FusedOutputFormat, FusedSeries, FusedSeriesBinding, FusedSeriesExec, InputLocality,
@@ -83,6 +85,8 @@ use snafu::{ResultExt, ensure};
 use store_api::metric_engine_consts::{DATA_SCHEMA_TABLE_ID_COLUMN_NAME, METRIC_ENGINE_NAME};
 use store_api::region_engine::RawLabelSource;
 
+#[cfg(any(test, feature = "testing"))]
+use crate::planner::DfLogicalPlanner;
 use crate::promql::error::{DataFusionPlanningSnafu, DuplicateOutputColumnsSnafu, Result};
 use crate::promql::native_compile::{
     InfoInput, bind_evaluated_binary, compile_selectors_with_grid, compile_statement_with_grid,
@@ -91,6 +95,8 @@ use crate::promql::native_compile::{
 use crate::promql::planner::{
     DEFAULT_FIELD_COLUMN, DEFAULT_TIME_INDEX_COLUMN, GrownStack, PromPlanner,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::query_engine::QueryEngine;
 use crate::query_engine::QueryEngineState;
 
 /// The query option that turns the native fused-series route on for one query.
@@ -818,11 +824,20 @@ impl PromPlanner {
         let Some(stmt) = self.native_statement(prom_expr) else {
             return Ok(declined("statement_has_no_evaluation_grid"));
         };
+        // The grid the statement evaluates on: its own, or - only in a test or `testing` build, and
+        // only when the entry point of a test asked for one - a subrange of it. What a chunked plan
+        // replaces is this grid and nothing else: the statement above keeps its own bounds, so
+        // `@ start()`, `@ end()`, `start()` and `end()` resolve where the whole statement resolves
+        // them and a subquery derives its child grid from the statement's grid as usual.
+        let outer_grid = match self.ctx.native_grid_override() {
+            Some(grid) => Some(grid),
+            None => statement_grid(&stmt).ok(),
+        };
         // The subquery root's inner expression is compiled on the child grid, with the statement left
         // untouched: `@ start()` and `@ end()` inside it resolve against the statement's bounds. A statement
         // whose grid cannot be built keeps the existing plan.
         let child_grid = if let Some(subquery) = subquery_root {
-            let Ok(outer) = statement_grid(&stmt) else {
+            let Some(outer) = outer_grid.clone() else {
                 return Ok(declined("subquery_outer_grid_unavailable"));
             };
             let Some(child) =
@@ -854,7 +869,7 @@ impl PromPlanner {
         }
         // The compiler decides which calls and shapes this route answers: a name it has no kernel for comes
         // back as `NotImplemented`, which is a decline below.
-        let Ok(statement) = statement_grid(&stmt) else {
+        let Some(statement) = outer_grid else {
             return Ok(declined("statement_grid_unavailable"));
         };
         // The one grid every lowering path below binds: a subquery root is compiled on its child
@@ -2742,6 +2757,100 @@ fn local_empty_layouts(
 /// A scanner capability boundary: it avoids probing a region during logical planning.
 fn supports_native_raw_series(engine: &str) -> bool {
     matches!(engine, MITO_ENGINE | MITO2_ENGINE | METRIC_ENGINE)
+}
+
+/// Plans `stmt` on `grid` instead of the grid the statement derives.
+///
+/// The test-only entry point of the native-window cache POC, and the whole of what that POC asks of
+/// the planner: it takes a statement the client asked for - bounds, step and lookback included - and
+/// the subrange of that statement's own evaluation grid one chunk of it covers, and answers the plan
+/// of the same statement reporting only the chunk's timestamps. The statement is never narrowed, so
+/// `@ start()`, `@ end()`, `start()`, `end()` and a subquery's child grid all resolve against it, and
+/// a chunk answers the rows the whole statement answers at the same timestamps.
+///
+/// `grid` has to be a subrange of the statement's grid: a start on that grid, the statement's step and
+/// an end inside its range. Anything else names points the statement never evaluates, or points at a
+/// step of its own, and is refused here rather than planned as a chunk of a statement it is not one
+/// of. A statement the native route declines is refused too: the existing planner has no place for a
+/// grid of its own, so its plan of the same statement answers the whole range instead of the chunk.
+///
+/// The plan is executed by the caller: this returns what to run, not what it answered. Nothing about
+/// the route a client asks for changes - a statement planned here is still the native fused-series
+/// plan, built by the same compiler, over the same scans, with the grid of a chunk.
+#[cfg(any(test, feature = "testing"))]
+pub async fn plan_statement_on_grid(
+    query_engine: &dyn QueryEngine,
+    stmt: &EvalStmt,
+    grid: GridSpec,
+    query_ctx: QueryContextRef,
+) -> Result<LogicalPlan> {
+    let grid = chunk_grid(stmt, grid)?;
+    let planner = query_engine.planner();
+    let Some(planner) = planner.as_any().downcast_ref::<DfLogicalPlanner>() else {
+        return Err(DataFusionError::Internal(
+            "a statement can only be planned on a grid by the DataFusion planner, which this \
+             engine is not"
+                .into(),
+        ))
+        .context(DataFusionPlanningSnafu);
+    };
+    let plan = planner.plan_promql_with_grid(stmt, grid, query_ctx).await?;
+    if !contains_fused_series(&plan) {
+        return Err(DataFusionError::Plan(format!(
+            "the native route declined `{}`, so no chunk of it can be planned on a grid of its own",
+            stmt.expr
+        )))
+        .context(DataFusionPlanningSnafu);
+    }
+    Ok(plan)
+}
+
+/// The evaluation grid of one chunk: `grid`, once it is proved to be a subrange of `stmt`'s own.
+///
+/// The comparison is against the statement's grid rather than against its bounds, because the two
+/// grids have to name the same points: `[start, end]` at a step is `(end - start) / step + 1`
+/// timestamps and the statement's last point is not after `end`, so a chunk that ends between two of
+/// its points still covers only points the statement evaluates.
+#[cfg(any(test, feature = "testing"))]
+fn chunk_grid(stmt: &EvalStmt, grid: GridSpec) -> Result<Arc<EvalGrid>> {
+    let statement = statement_grid(stmt).context(DataFusionPlanningSnafu)?;
+    let spec = statement.spec();
+    let chunk_end =
+        i128::from(grid.start_ms) + (i128::from(grid.len) - 1) * i128::from(grid.step_ms);
+    let statement_end =
+        i128::from(spec.start_ms) + (i128::from(spec.len) - 1) * i128::from(spec.step_ms);
+    let on_grid = grid.step_ms == spec.step_ms
+        && grid.start_ms >= spec.start_ms
+        && (grid.start_ms - spec.start_ms) % spec.step_ms == 0;
+    if !on_grid || chunk_end > statement_end {
+        return Err(DataFusionError::Plan(format!(
+            "the grid {}ms..{}ms at {}ms per step is not a subrange of the statement's grid \
+             {}ms..{}ms at {}ms per step",
+            grid.start_ms,
+            i64::try_from(chunk_end).unwrap_or(i64::MAX),
+            grid.step_ms,
+            spec.start_ms,
+            i64::try_from(statement_end).unwrap_or(i64::MAX),
+            spec.step_ms
+        )))
+        .context(DataFusionPlanningSnafu);
+    }
+    // Deferred like the statement's own grid: only the scan bindings and whoever executes the plan
+    // pay for the timestamps, and this plan may never be executed.
+    let grid = EvalGrid::try_deferred(grid)
+        .map_err(|error| DataFusionError::Plan(format!("the chunk's grid is invalid: {error}")))
+        .context(DataFusionPlanningSnafu)?;
+    Ok(Arc::new(grid))
+}
+
+/// Whether `plan` holds a native fused-series node, which is what says the native route planned it.
+#[cfg(any(test, feature = "testing"))]
+fn contains_fused_series(plan: &LogicalPlan) -> bool {
+    (matches!(plan, LogicalPlan::Extension(extension) if extension.node.as_any().is::<FusedSeries>()))
+        || plan
+            .inputs()
+            .iter()
+            .any(|input| contains_fused_series(*input))
 }
 
 /// Recognizes only the metric logical-table scan emitted by `create_table_scan_plan`, and reports

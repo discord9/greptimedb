@@ -26,6 +26,7 @@ use common_error::ext::BoxedError;
 use common_query::promql_annotations::promql_annotation_collector;
 use common_telemetry::tracing;
 use datafusion::common::{DFSchema, plan_err};
+use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::sql::planner::PlannerContext;
@@ -38,6 +39,7 @@ use datafusion_expr::{
 };
 use datafusion_sql::parser::Statement as DfStatement;
 use datafusion_sql::planner::{IdentNormalizer, ParserOptions, SqlToRel};
+use datatypes::series::time::EvalGrid;
 use log_query::LogQuery;
 use promql_parser::parser::EvalStmt;
 use session::context::QueryContextRef;
@@ -709,12 +711,17 @@ impl DfLogicalPlanner {
     /// may. Everything else the route depends on is read from the query options snapshot the
     /// statement is planned with, where every option is already resolved as request > session
     /// `SET` > engine default.
+    ///
+    /// `native_grid` is the test-only evaluation grid of
+    /// [`Self::plan_promql_with_grid`] and is `None` for every plan a client asks for: a statement
+    /// planned with one is the same statement, evaluated on a subrange of its own grid.
     #[tracing::instrument(skip_all)]
     async fn plan_pql(
         &self,
         stmt: &EvalStmt,
         query_ctx: QueryContextRef,
         native_route_allowed: bool,
+        native_grid: Option<Arc<EvalGrid>>,
     ) -> Result<LogicalPlan> {
         let engine_context = self.derive_session_state_with_scheduled_time(query_ctx)?;
         let query_ctx = engine_context.query_ctx();
@@ -765,24 +772,45 @@ impl DfLogicalPlanner {
             )
         };
         let native_requested = native_route_allowed && !allow_query_fallback && native_promql;
-        let plan = PromPlanner::stmt_to_plan_with_annotations(
-            table_provider(),
-            stmt,
-            &self.engine_state,
-            promql_annotations.clone(),
-            // A fallback rewriter can wrap a native region scan in an unusable MergeScan.
-            native_requested,
-        )
-        .await
-        .map_err(BoxedError::new)
-        .context(QueryPlanSnafu)?;
+        let windowed = native_grid.is_some();
+        let plan = match native_grid {
+            // A statement planned on a test-only grid is offered the native route alone: the
+            // existing path derives the statement's own grid from the statement and has no place for
+            // a narrowed one, so a chunk the route declines is reported by the entry point that
+            // asked for it rather than answered by silently planning the whole statement. The arm
+            // does not exist in a production build, where `native_grid` is always `None`.
+            #[cfg(any(test, feature = "testing"))]
+            Some(grid) => PromPlanner::stmt_to_plan_with_native_grid(
+                table_provider(),
+                stmt,
+                grid,
+                &self.engine_state,
+                promql_annotations.clone(),
+            )
+            .await
+            .map_err(BoxedError::new)
+            .context(QueryPlanSnafu)?,
+            _ => PromPlanner::stmt_to_plan_with_annotations(
+                table_provider(),
+                stmt,
+                &self.engine_state,
+                promql_annotations.clone(),
+                // A fallback rewriter can wrap a native region scan in an unusable MergeScan.
+                native_requested,
+            )
+            .await
+            .map_err(BoxedError::new)
+            .context(QueryPlanSnafu)?,
+        };
 
         // A distributed planner plans a native statement over per-selector raw sources, and a
         // statement that reads no table needs none. Anything else keeps the existing plan. Decide
         // while the original statement is still available: physical planning cannot fall back
         // safely. An engine with no distributed planner plans no region, so there is nothing to
-        // admit its plan against.
-        let plan = if native_requested
+        // admit its plan against. A chunked statement is run as the plan it is, one execution on
+        // the caller's own engine, so there is no distributed plan to admit it against either.
+        let plan = if !windowed
+            && native_requested
             && self.engine_state.with_dist_planner()
             && !remote_native_raw_plan_supported(&plan)
         {
@@ -803,6 +831,26 @@ impl DfLogicalPlanner {
         Ok(self
             .engine_state
             .optimize_by_extension_rules(plan, &context)?)
+    }
+
+    /// Plans `stmt` on `grid` instead of the grid the statement derives.
+    ///
+    /// Test-only: the entry point of the native-window cache POC is
+    /// [`crate::promql::planner::native::plan_statement_on_grid`], which builds `grid` from a
+    /// statement and refuses one that is not a subrange of it. Nothing else about the statement is
+    /// narrowed, so a chunk answers the rows the whole statement answers at the chunk's timestamps;
+    /// see [`PromPlanner::stmt_to_plan_with_native_grid`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn plan_promql_with_grid(
+        &self,
+        stmt: &EvalStmt,
+        grid: Arc<EvalGrid>,
+        query_ctx: QueryContextRef,
+    ) -> crate::promql::error::Result<LogicalPlan> {
+        self.plan_pql(stmt, query_ctx, true, Some(grid))
+            .await
+            .map_err(DataFusionError::from)
+            .context(crate::promql::error::DataFusionPlanningSnafu)
     }
 
     #[tracing::instrument(skip_all)]
@@ -921,7 +969,7 @@ impl DfLogicalPlanner {
                 let QueryStatement::Promql(eval, _alias) = &stmt else {
                     unreachable!("a TQL eval parses to a PromQL statement");
                 };
-                let plan = self.plan_pql(eval, query_ctx.clone(), true).await?;
+                let plan = self.plan_pql(eval, query_ctx.clone(), true, None).await?;
                 if !contains_native_fused(&plan) {
                     // The route was not taken - it is off for this query, or it declined this
                     // shape - so this is the existing plan, which already publishes what a CTE has
@@ -933,7 +981,7 @@ impl DfLogicalPlanner {
                 // the statement for that schema and publish it over the native answer. A statement
                 // whose columns that projection cannot fill faithfully keeps the existing plan
                 // instead of changing the schema the CTE exposes.
-                let existing = self.plan_pql(eval, query_ctx, false).await?;
+                let existing = self.plan_pql(eval, query_ctx, false, None).await?;
                 Ok(publish_legacy_schema(plan, &existing).unwrap_or(existing))
             }
             Tql::Explain(_) => UnimplementedSnafu {
@@ -1172,7 +1220,9 @@ impl LogicalPlanner for DfLogicalPlanner {
         match stmt {
             QueryStatement::Sql(stmt) => self.plan_sql(stmt, query_ctx).await,
             // The statement's own plan is what a region receives, so the native route is offered.
-            QueryStatement::Promql(stmt, _alias) => self.plan_pql(stmt, query_ctx, true).await,
+            QueryStatement::Promql(stmt, _alias) => {
+                self.plan_pql(stmt, query_ctx, true, None).await
+            }
         }
     }
 

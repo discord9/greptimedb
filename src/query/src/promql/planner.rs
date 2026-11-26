@@ -17,6 +17,8 @@ mod function_plans;
 mod island;
 mod matching_filters;
 pub(crate) mod native;
+#[cfg(any(test, feature = "testing"))]
+pub use native::plan_statement_on_grid;
 pub use native::{NATIVE_PROMQL_EXTENSION_KEY, discovers_metric_name, native_promql_resolved};
 
 mod set_operator;
@@ -67,6 +69,7 @@ use datafusion_expr::{ExprSchemable, Literal, SortExpr, TableSource, ident, lit}
 use datafusion_functions::core::coalesce;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, TimeUnit as ArrowTimeUnit};
 use datatypes::data_type::{ConcreteDataType, DataType as GreptimeDataType};
+use datatypes::series::time::EvalGrid;
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use promql::extension_plan::{
@@ -180,6 +183,15 @@ struct PromPlannerContext {
     /// selector inside a subquery still resolves `@ start()` / `@ end()` against the statement.
     stmt_start: Millisecond,
     stmt_end: Millisecond,
+    /// The evaluation grid a test-only entry point asked the native route to plan on.
+    ///
+    /// `None` in every production build: the only writer is
+    /// [`PromPlanner::stmt_to_plan_with_native_grid`], which exists only for tests and for a build
+    /// with the `testing` feature. What it replaces is the grid, not the statement: the bounds above
+    /// stay the statement's, so `@ start()`, `@ end()`, `start()` and `end()` keep resolving against
+    /// them, and only the timestamps the plan reports are the subrange's.
+    #[cfg(any(test, feature = "testing"))]
+    native_grid: Option<Arc<EvalGrid>>,
 
     // planner states
     table_name: Option<String>,
@@ -304,6 +316,21 @@ impl PromPlannerContext {
         })
     }
 
+    /// The grid [`Self::native_grid`] holds, if this build can hold one.
+    ///
+    /// A production build answers `None` and the field does not exist at all, so the native route
+    /// always plans on the statement's own grid there.
+    fn native_grid_override(&self) -> Option<Arc<EvalGrid>> {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.native_grid.clone()
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            None
+        }
+    }
+
     /// Reset all planner states
     fn reset(&mut self) {
         self.table_name = None;
@@ -381,7 +408,41 @@ impl PromPlanner {
         promql_annotations: Option<PromqlAnnotationCollector>,
         native_fused: bool,
     ) -> Result<LogicalPlan> {
-        let mut planner = Self {
+        let planner = Self::new(table_provider, stmt, promql_annotations, native_fused)?;
+        Self::statement_to_plan(planner, stmt, query_engine_state).await
+    }
+
+    /// Plans `stmt` exactly as [`Self::stmt_to_plan_with_annotations`] does, on `grid` instead of the
+    /// grid the statement derives.
+    ///
+    /// Test-only entry point of the native-window cache POC: the statement is kept whole, so
+    /// `@ start()`, `@ end()`, `start()` and `end()` still resolve against its bounds and a subquery
+    /// still derives its child grid from them, while the plan reports only `grid`'s timestamps. A
+    /// chunk of a statement therefore answers the rows the whole statement answers at those
+    /// timestamps, which is what lets completed chunks be cached and replayed.
+    ///
+    /// `grid` has to be a subrange of the statement's own grid; the entry point that builds one from
+    /// a statement ([`crate::promql::planner::native::plan_statement_on_grid`]) refuses anything else.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn stmt_to_plan_with_native_grid(
+        table_provider: DfTableSourceProvider,
+        stmt: &EvalStmt,
+        grid: Arc<EvalGrid>,
+        query_engine_state: &QueryEngineState,
+        promql_annotations: Option<PromqlAnnotationCollector>,
+    ) -> Result<LogicalPlan> {
+        let mut planner = Self::new(table_provider, stmt, promql_annotations, true)?;
+        planner.ctx.native_grid = Some(grid);
+        Self::statement_to_plan(planner, stmt, query_engine_state).await
+    }
+
+    fn new(
+        table_provider: DfTableSourceProvider,
+        stmt: &EvalStmt,
+        promql_annotations: Option<PromqlAnnotationCollector>,
+        native_fused: bool,
+    ) -> Result<Self> {
+        Ok(Self {
             table_provider,
             ctx: PromPlannerContext::from_eval_stmt(stmt)?,
             promql_annotations,
@@ -389,8 +450,14 @@ impl PromPlanner {
             // The statement's own expression is offered below before anything else is planned, so
             // the first binary node reached still holds the offer a wrapper would have spent.
             native_binary_offer: true,
-        };
+        })
+    }
 
+    async fn statement_to_plan(
+        mut planner: Self,
+        stmt: &EvalStmt,
+        query_engine_state: &QueryEngineState,
+    ) -> Result<LogicalPlan> {
         // The whole statement is offered to the native compiler first, because that compiler folds
         // a range function and the math functions over it into one tree: offered any later, the
         // expression has already been split into the nodes those functions would have shared. A

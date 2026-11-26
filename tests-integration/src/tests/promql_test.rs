@@ -17424,14 +17424,18 @@ async fn native_promql_matrix_root_matches_legacy() {
 /// A test-level POC of a window cache for native PromQL range queries.
 ///
 /// The native route evaluates a ranged statement point by point on a fixed grid, and every point's
-/// value is a function of the samples at or before it. A completed canonical subrange of a
-/// statement can therefore answer any later statement that covers it, however the outer range
-/// slides.
+/// value is a function of the samples at or before it. A completed canonical chunk of a statement can
+/// therefore answer that statement whenever the client asks for the chunk's points - whether it asks
+/// for one more chunk than the time before, or for the same ones again.
 ///
-/// The cache below is the whole mechanism: it splits a statement into canonical subranges on the
-/// statement's own native grid, runs each subrange as its own ranged statement through the native
-/// route, and keeps the final batches under a key naming everything the answer depends on. Nothing
-/// here is production code: no planner change, no config, no datanode hook.
+/// The cache below is the whole mechanism: it splits a statement into canonical chunks of the
+/// statement's own native grid, plans each chunk as *the same statement* evaluated on that subgrid,
+/// and keeps the final batches under a key naming the whole statement and the chunk. The plan comes
+/// from `query::promql::planner::plan_statement_on_grid`, the test-only entry point of the `query`
+/// crate that replaces the evaluation grid and nothing else, so `@ start()`, `@ end()`, `start()`,
+/// `end()` and a subquery's child grid still resolve against the statement the client asked for.
+/// Nothing here is production code: the plan entry point is behind the crate's `testing` feature and
+/// is not reachable otherwise, and everything else is this module.
 mod native_window_cache_poc {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -17447,40 +17451,39 @@ mod native_window_cache_poc {
     use frontend::instance::Instance;
     use query::datafusion::QUERY_PARALLELISM_HINT;
     use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
-    use query::promql::planner::NATIVE_PROMQL_EXTENSION_KEY;
-    use servers::query_handler::sql::SqlQueryHandler;
+    use query::promql::planner::{NATIVE_PROMQL_EXTENSION_KEY, plan_statement_on_grid};
     use session::context::{QueryContext, REMOTE_QUERY_ID_EXTENSION_KEY, generate_remote_query_id};
 
     use super::{
-        NativePlanObserver, execute_all, native_result_rows, native_test_instance,
-        native_tql_output, rows_batches,
+        NativePlanObserver, execute_all, native_result_rows, native_test_instance, rows_batches,
     };
     use crate::standalone::GreptimeDbStandaloneBuilder;
 
-    /// How many evaluation points one canonical subrange covers.
+    /// How many evaluation points one canonical chunk covers.
     ///
-    /// A subrange is a statement in its own right, with its own grid, so the points it evaluates
-    /// are exactly its positions on the outer grid and the subranges of a statement never overlap.
-    const STEPS_PER_SUBRANGE: usize = 4;
+    /// A chunk is a subgrid of the statement it belongs to rather than a statement of its own, so the
+    /// points it evaluates are exactly its positions on the statement's grid, and the chunks of one
+    /// statement never overlap.
+    const STEPS_PER_CHUNK: usize = 4;
 
     /// The step every statement of this POC evaluates on.
     const STEP_MS: i64 = 10_000;
 
-    /// The lookback the statements of this POC name. It is part of the answer (it bounds how far
-    /// back an instant selection reads) and therefore part of the cache key.
+    /// The lookback the statements of this POC name. It is part of the answer (it bounds how far back
+    /// an instant selection reads) and therefore part of the statement a chunk is keyed under.
     const LOOKBACK_MS: i64 = 60_000;
 
-    /// Which planner produced a subrange's rows.
+    /// Which planner produced a chunk's rows.
     ///
-    /// The POC only ever fills the cache through the native route, and the marker keeps a cached
-    /// answer from being served to the existing join-based route, whose plan of the same statement
-    /// is a different one.
+    /// The POC only ever plans a chunk through the native route, and the marker keeps a cached answer
+    /// from being served to the existing join-based route, whose plan of the same statement is a
+    /// different one.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum NativeWindowRoute {
         FusedSeries,
     }
 
-    /// Everything outside the expression and the subrange that a subrange's rows can depend on.
+    /// Everything outside the statement and the chunk that a chunk's rows can depend on.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct NativeWindowScope {
         catalog: String,
@@ -17504,38 +17507,72 @@ mod native_window_cache_poc {
         }
     }
 
-    /// The key of one canonical subrange.
+    /// The whole statement a chunk belongs to.
     ///
-    /// Every field is something the subrange's rows depend on: the expression text (another
-    /// expression, even over the same selectors, answers differently), the step and lookback (they
-    /// decide which samples each point reads), the grid's phase and the subrange's own bounds (they
-    /// decide which timestamps its points are), the scope its selectors resolve in, the session
-    /// settings that can change a selector's answer, and the route that planned it.
+    /// A chunk is planned from the statement, not from a statement narrowed to the chunk, so the
+    /// statement is what its key has to name: the expression, and the bounds, step and lookback the
+    /// statement itself carries. The bounds are here because they stay in the plan - `@ start()`,
+    /// `@ end()`, `start()`, `end()` and a subquery's child grid all resolve against them - so two
+    /// statements that differ in a bound answer at least one chunk differently. A chunk keyed by the
+    /// range it covers alone is exactly what would let one statement's chunk answer for another's.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct NativeWindowKey {
+    struct NativeStatementIdentity {
         expression: String,
+        start_ms: i64,
+        end_ms: i64,
         step_ms: i64,
         lookback_ms: i64,
-        /// Where the statement's first point sits inside a step. Two grids of the same step that
-        /// disagree here never share a subrange: their points are different timestamps.
-        phase_ms: i64,
-        chunk_start_ms: i64,
-        chunk_end_ms: i64,
+    }
+
+    /// One canonical chunk: the positions of its statement's grid it evaluates.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct NativeChunk {
+        /// First evaluation point of the chunk, which is a point of the statement's grid.
+        start_ms: i64,
+        /// The statement's step: the chunk evaluates the statement's step at its own first point.
+        step_ms: i64,
+        /// How many of the statement's points the chunk covers.
+        len: u64,
+    }
+
+    impl NativeChunk {
+        /// The subgrid this chunk is planned on.
+        fn spec(self) -> GridSpec {
+            GridSpec::try_new(self.start_ms, self.step_ms, self.len).expect("a valid chunk grid")
+        }
+
+        /// The last timestamp this chunk reports.
+        fn end_ms(self) -> i64 {
+            self.start_ms + (self.len as i64 - 1) * self.step_ms
+        }
+
+        /// Whether this chunk reports `timestamp`.
+        fn reports(self, timestamp: i64) -> bool {
+            timestamp >= self.start_ms
+                && timestamp <= self.end_ms()
+                && (timestamp - self.start_ms) % self.step_ms == 0
+        }
+    }
+
+    /// The key of one canonical chunk of one statement.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct NativeWindowKey {
+        statement: NativeStatementIdentity,
+        chunk: NativeChunk,
         scope: NativeWindowScope,
         route: NativeWindowRoute,
     }
 
-    /// What a completed subrange answered: its final batches, and the annotations the route
-    /// reported while producing them. Both are part of the answer a client sees, so a hit has to
-    /// replay both.
+    /// What a completed chunk answered: its final batches, and the annotations the route reported while
+    /// producing them. Both are part of the answer a client sees, so a hit has to replay both.
     struct NativeWindowEntry {
-        /// The subrange's rows, final: an entry is only cached once its stream was collected.
+        /// The chunk's rows, final: an entry is only cached once its stream was collected.
         batches: RecordBatches,
         warnings: Vec<String>,
         infos: Vec<String>,
     }
 
-    /// The cache itself: one entry per completed canonical subrange, no TTL.
+    /// The cache itself: one entry per completed canonical chunk, no TTL.
     #[derive(Default)]
     struct NativeWindowCache {
         entries: HashMap<NativeWindowKey, NativeWindowEntry>,
@@ -17547,34 +17584,8 @@ mod native_window_cache_poc {
         }
     }
 
-    /// One canonical subrange: the timestamps of its inclusive grid positions.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct NativeSubrange {
-        start_ms: i64,
-        end_ms: i64,
-    }
-
-    /// Splits a native evaluation grid into canonical subranges of [`STEPS_PER_SUBRANGE`] points.
-    ///
-    /// The split reads the grid's own timestamps, so a subrange's first and last point are grid
-    /// points: its statement evaluates exactly those positions at the same step and phase, and no
-    /// position of the outer statement belongs to two subranges.
-    fn canonical_subranges(grid: &EvalGrid) -> Vec<NativeSubrange> {
-        let timestamps = grid.timestamps().expect("the grid materializes");
-        (0..timestamps.len())
-            .step_by(STEPS_PER_SUBRANGE)
-            .map(|first| {
-                let last = (first + STEPS_PER_SUBRANGE).min(timestamps.len()) - 1;
-                NativeSubrange {
-                    start_ms: timestamps[first],
-                    end_ms: timestamps[last],
-                }
-            })
-            .collect()
-    }
-
-    /// The native route's context for one execution, carrying a query id so the annotations the
-    /// route records can be read back once the answer is complete.
+    /// The native route's context for one execution, carrying a query id so the annotations the route
+    /// records can be read back once the answer is complete.
     fn native_window_context(query_id: &str) -> Arc<QueryContext> {
         let mut ctx = QueryContext::with_db_name(None);
         ctx.set_extension(QUERY_PARALLELISM_HINT, "4");
@@ -17622,11 +17633,11 @@ mod native_window_cache_poc {
             .expect("the expression parses")
     }
 
-    /// The grid the native compiler binds a ranged statement to: `(end - start) / step + 1` points
-    /// of which the first is `start`.
+    /// The grid the native compiler binds a ranged statement to: `(end - start) / step + 1` points of
+    /// which the first is `start`.
     ///
     /// This is the statement's own grid, read off the parsed statement rather than derived a second
-    /// time, so the POC splits the range the engine would have evaluated.
+    /// time, so the POC splits the grid the engine would have evaluated.
     fn native_statement_grid(statement: &QueryStatement) -> Arc<EvalGrid> {
         let QueryStatement::Promql(statement, _) = statement else {
             panic!("not a ranged PromQL statement")
@@ -17640,12 +17651,60 @@ mod native_window_cache_poc {
         Arc::new(EvalGrid::try_new(spec).expect("a materialized grid"))
     }
 
+    /// The identity of the statement a chunk is planned from, read off that statement.
+    fn statement_identity(statement: &QueryStatement) -> NativeStatementIdentity {
+        let QueryStatement::Promql(statement, _) = statement else {
+            panic!("not a ranged PromQL statement")
+        };
+        NativeStatementIdentity {
+            expression: statement.expr.to_string(),
+            start_ms: epoch_millis(statement.start),
+            end_ms: epoch_millis(statement.end),
+            step_ms: i64::try_from(statement.interval.as_millis()).expect("a millisecond step"),
+            lookback_ms: i64::try_from(statement.lookback_delta.as_millis())
+                .expect("a millisecond lookback"),
+        }
+    }
+
+    /// Splits a statement's evaluation grid into canonical chunks of [`STEPS_PER_CHUNK`] points.
+    ///
+    /// The split reads the grid's own timestamps, so a chunk's first and last point are points of the
+    /// statement's grid: planning the chunk evaluates exactly those positions at the statement's step,
+    /// and no position of the statement belongs to two chunks.
+    fn canonical_chunks(grid: &EvalGrid) -> Vec<NativeChunk> {
+        let step_ms = grid.spec().step_ms;
+        let timestamps = grid.timestamps().expect("the grid materializes");
+        (0..timestamps.len())
+            .step_by(STEPS_PER_CHUNK)
+            .map(|first| {
+                let last = (first + STEPS_PER_CHUNK).min(timestamps.len());
+                NativeChunk {
+                    start_ms: timestamps[first],
+                    step_ms,
+                    len: (last - first) as u64,
+                }
+            })
+            .collect()
+    }
+
+    /// The whole statement's rows at the timestamps `chunks` cover: what a chunked run has to
+    /// reproduce, whether it runs every chunk of the statement or only some of them.
+    fn rows_covered_by(
+        rows: &[(i64, String, f64)],
+        chunks: &[NativeChunk],
+    ) -> Vec<(i64, String, f64)> {
+        rows.iter()
+            .filter(|row| chunks.iter().any(|chunk| chunk.reports(row.0)))
+            .cloned()
+            .collect()
+    }
+
     /// The rows of a native answer, in the shape [`native_result_rows`] reports them.
     ///
-    /// The cache owns each subrange's batches, so its rows are read from a borrow here instead of
-    /// from the [`Output`] the whole-range helper takes. The time index is found by type rather than
-    /// by name: a metric table written through remote write names it `greptime_timestamp`, not the
-    /// `ts` the whole-range helper's fixtures use.
+    /// The cache owns each chunk's batches, so its rows are read from a borrow here instead of from the
+    /// [`Output`] the whole-statement helper takes. The time index is found by type rather than by name:
+    /// a metric table written through remote write names it `greptime_timestamp`, not the `ts` the
+    /// whole-statement helper's fixtures use.
     fn answer_rows(batches: &RecordBatches, label: &str) -> Vec<(i64, String, f64)> {
         let mut rows = Vec::new();
         for batch in batches.iter() {
@@ -17665,9 +17724,7 @@ mod native_window_cache_poc {
             let labels = cast(
                 batch
                     .column_by_name(label)
-                    .unwrap_or_else(|| {
-                        panic!("a subrange answer carries {label}: {:?}", batch.schema)
-                    })
+                    .unwrap_or_else(|| panic!("a chunk answer carries {label}: {:?}", batch.schema))
                     .as_ref(),
                 &DataType::Utf8,
             )
@@ -17692,21 +17749,75 @@ mod native_window_cache_poc {
         rows
     }
 
+    /// The whole statement answered natively, through the same statement every chunk of it is planned
+    /// from.
+    ///
+    /// This is the answer a chunked run is compared against: one statement, asked for once, over the
+    /// whole grid the chunks are cut from.
+    async fn whole_statement_answer(
+        instance: &Arc<Instance>,
+        observer: &NativePlanObserver,
+        statement: &QueryStatement,
+    ) -> Output {
+        let query_id = generate_remote_query_id();
+        observer.clear();
+        let output = instance
+            .statement_executor()
+            .execute_stmt(statement.clone(), native_window_context(&query_id))
+            .await
+            .expect("the whole statement answers");
+        assert_eq!(
+            observer.answering_node().as_deref(),
+            Some("FusedSeriesExec"),
+            "the whole statement did not answer natively: {statement:?}"
+        );
+        output
+    }
+
+    /// The rows the same range answers when it is asked for as a statement of its own.
+    ///
+    /// This is what a chunked plan must not be: a statement narrowed to a chunk moves every bound the
+    /// expression reads, so a chunk of an anchored statement would answer something else. The
+    /// assertions that use it hold this POC's fix to its teeth - they fail if the rows a chunk answers
+    /// and the rows a narrowed statement answers cannot be told apart.
+    async fn narrowed_statement_answer(
+        instance: &Arc<Instance>,
+        expression: &str,
+        chunk: NativeChunk,
+        lookback_ms: i64,
+        label: &str,
+    ) -> Vec<(i64, String, f64)> {
+        let statement = native_range_statement(
+            expression,
+            chunk.start_ms,
+            chunk.end_ms(),
+            chunk.step_ms,
+            lookback_ms,
+        );
+        let query_id = generate_remote_query_id();
+        let output = instance
+            .statement_executor()
+            .execute_stmt(statement, native_window_context(&query_id))
+            .await
+            .expect("the narrowed statement answers");
+        answer_rows(&rows_batches(output).await, label)
+    }
+
     /// What one chunked run of a statement answered.
     #[derive(Default)]
     struct NativeWindowRun {
-        /// The subranges' rows, assembled in statement order.
+        /// The chunks' rows, assembled in statement order.
         rows: Vec<(i64, String, f64)>,
         warnings: Vec<String>,
         infos: Vec<String>,
-        /// Subranges this run had to execute.
+        /// Chunks this run had to execute.
         executed: usize,
-        /// Subranges this run answered from the cache.
+        /// Chunks this run answered from the cache.
         served: usize,
     }
 
     impl NativeWindowRun {
-        /// Takes one subrange's answer into this run, dropping annotations it already reported.
+        /// Takes one chunk's answer into this run, dropping annotations it already reported.
         fn absorb(&mut self, entry: &NativeWindowEntry, label: &str) {
             self.rows.extend(answer_rows(&entry.batches, label));
             for warning in &entry.warnings {
@@ -17721,7 +17832,7 @@ mod native_window_cache_poc {
             }
         }
 
-        /// Orders the assembled rows the way the whole-range helpers order theirs.
+        /// Orders the assembled rows the way the whole-statement helpers order theirs.
         fn finish(mut self) -> Self {
             self.rows
                 .sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
@@ -17729,10 +17840,10 @@ mod native_window_cache_poc {
         }
     }
 
-    /// Runs native range statements one canonical subrange at a time, serving what the cache holds.
+    /// Runs the chunks of one statement through the native route, serving what the cache holds.
     struct NativeWindowExecutor {
         instance: Arc<Instance>,
-        /// Native subrange executions this executor issued. A warm run leaves it unchanged.
+        /// Native chunk executions this executor issued. A warm run leaves it unchanged.
         executions: usize,
     }
 
@@ -17744,27 +17855,21 @@ mod native_window_cache_poc {
             }
         }
 
-        /// Runs `expression` over `grid`, one canonical subrange at a time.
+        /// Runs `chunks`, every one of them a chunk of `statement`, serving what the cache holds.
         async fn run(
             &mut self,
             cache: &mut NativeWindowCache,
-            expression: &str,
-            grid: &EvalGrid,
+            statement: &QueryStatement,
+            chunks: &[NativeChunk],
             scope: &NativeWindowScope,
-            lookback_ms: i64,
             label: &str,
         ) -> NativeWindowRun {
-            let spec = grid.spec();
-            let phase_ms = spec.start_ms.rem_euclid(spec.step_ms);
+            let identity = statement_identity(statement);
             let mut run = NativeWindowRun::default();
-            for subrange in canonical_subranges(grid) {
+            for chunk in chunks {
                 let key = NativeWindowKey {
-                    expression: expression.to_string(),
-                    step_ms: spec.step_ms,
-                    lookback_ms,
-                    phase_ms,
-                    chunk_start_ms: subrange.start_ms,
-                    chunk_end_ms: subrange.end_ms,
+                    statement: identity.clone(),
+                    chunk: *chunk,
                     scope: scope.clone(),
                     route: NativeWindowRoute::FusedSeries,
                 };
@@ -17772,9 +17877,7 @@ mod native_window_cache_poc {
                     run.served += 1;
                     run.absorb(entry, label);
                 } else {
-                    let entry = self
-                        .execute(expression, subrange, spec.step_ms, lookback_ms)
-                        .await;
+                    let entry = self.execute(statement, *chunk).await;
                     self.executions += 1;
                     run.executed += 1;
                     run.absorb(&entry, label);
@@ -17784,13 +17887,11 @@ mod native_window_cache_poc {
             run.finish()
         }
 
-        /// Executes one subrange as its own ranged statement on the native route.
+        /// Executes one chunk: the whole statement, planned on the chunk's subgrid.
         async fn execute(
             &self,
-            expression: &str,
-            subrange: NativeSubrange,
-            step_ms: i64,
-            lookback_ms: i64,
+            statement: &QueryStatement,
+            chunk: NativeChunk,
         ) -> NativeWindowEntry {
             let query_id = generate_remote_query_id();
             let ctx = native_window_context(&query_id);
@@ -17798,20 +17899,23 @@ mod native_window_cache_poc {
             // holds a weak reference: this one keeps it alive across the execution, and reading it
             // after the batches are collected is what makes the annotations final.
             let collector = promql_annotation_collector(&query_id);
-            let query = PromQuery {
-                query: expression.to_string(),
-                start: promql_time(subrange.start_ms),
-                end: promql_time(subrange.end_ms),
-                step: promql_duration(step_ms),
-                lookback: promql_duration(lookback_ms),
-                alias: None,
+            let QueryStatement::Promql(statement, _) = statement else {
+                panic!("not a ranged PromQL statement")
             };
-            let output: Output = self
+            let plan = plan_statement_on_grid(
+                &**self.instance.query_engine(),
+                statement,
+                chunk.spec(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the chunk {chunk:?} plans: {error}"));
+            let output = self
                 .instance
-                .do_promql_query(&query, ctx)
+                .statement_executor()
+                .exec_plan(plan, ctx)
                 .await
-                .remove(0)
-                .expect("the native subrange answers");
+                .unwrap_or_else(|error| panic!("the chunk {chunk:?} answers: {error}"));
             let batches = rows_batches(output).await;
             let mut warnings = Vec::new();
             let mut infos = Vec::new();
@@ -17824,78 +17928,64 @@ mod native_window_cache_poc {
         }
     }
 
-    /// Runs one ranged statement over the whole grid through the native route, so a chunked answer
-    /// is compared against the answer of the same statement asked for whole, and returns that
-    /// answer for the caller's own row shape ([`native_result_rows`] or [`native_rows`]).
-    async fn native_whole_range_answer(
-        instance: &Arc<Instance>,
-        observer: &NativePlanObserver,
-        expression: &str,
-        grid: &EvalGrid,
-    ) -> Output {
-        let spec = grid.spec();
-        let end_ms = spec.start_ms + (spec.len as i64 - 1) * spec.step_ms;
-        let sql = format!(
-            "TQL EVAL ({}, {}, '{}') {expression}",
-            promql_time(spec.start_ms),
-            promql_time(end_ms),
-            promql_duration(spec.step_ms)
-        );
-        observer.clear();
-        let output = native_tql_output(instance, &sql, true).await;
-        assert_eq!(
-            observer.answering_node().as_deref(),
-            Some("FusedSeriesExec"),
-            "the whole range did not answer natively: {sql}"
-        );
-        output
+    /// A statement with samples at every step of its range, so a window always has something to read.
+    ///
+    /// The samples start before the statement does, so even a window function has data at the very
+    /// first point and no answer below is about a missing sample. The values grow quadratically rather
+    /// than linearly: a linear series makes `rate` answer the same number over every window, which
+    /// would leave an anchor that moved with a chunk invisible.
+    fn native_window_fixture(table: &str, first_step: i64, last_step: i64) -> String {
+        let mut values = Vec::new();
+        for (index, host) in ["a", "b"].into_iter().enumerate() {
+            for step in first_step..=last_step {
+                values.push(format!(
+                    "('{host}', {}, {})",
+                    step * STEP_MS,
+                    (step + 8) * (step + 8) + index as i64
+                ));
+            }
+        }
+        format!(
+            "CREATE TABLE {table} (host STRING, ts TIMESTAMP(3) TIME INDEX, val DOUBLE, \
+             PRIMARY KEY(host)); INSERT INTO {table} (host, ts, val) VALUES {}",
+            values.join(",")
+        )
     }
 
-    /// A native range is answered from completed canonical subranges: a cold run executes one per
-    /// subrange, a warm run executes none, and a range whose end slides forward executes only what
-    /// it newly covers.
+    /// A statement is answered from completed canonical chunks of itself: a cold run executes one per
+    /// chunk, a warm run executes none, and a run that asks for one more chunk executes only that one.
+    ///
+    /// The statement a chunk belongs to never changes here: what grows is the set of its chunks asked
+    /// for, because a chunk is a subgrid of one statement, and keeping that statement whole is what
+    /// makes its chunks cacheable at all. A range that names another end is another statement and its
+    /// chunks are other answers - see `native_promql_statement_anchors_stay_on_the_statement`, which
+    /// holds both halves of that rule.
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_promql_range_reuses_completed_canonical_subranges() {
+    async fn native_promql_range_reuses_completed_canonical_chunks() {
         common_telemetry::init_default_ut_logging();
         const TABLE: &str = "native_window_cache";
-        // The end of the range every run below covers: 24 points at the POC's step, i.e. six
-        // canonical subranges. The fixture holds a sample at every point up to 300s, so the ranges
-        // that slide forward still read data inside their lookback.
-        const RANGE_END_MS: i64 = 230_000;
-        let slid_end_ms = RANGE_END_MS + STEPS_PER_SUBRANGE as i64 * STEP_MS;
+        // The statement every run below reads: 28 points at the POC's step, i.e. seven canonical
+        // chunks of which the first six are the range the earlier runs ask for. The fixture holds a
+        // sample at every point up to 320s, so the chunks asked for later still read data inside their
+        // lookback.
+        const RANGE_END_MS: i64 = 270_000;
 
         let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
             "native_promql_window_cache",
         ))
         .await;
         let instance = standalone.fe_instance().clone();
-        // Two samples before the range begins, so even a window function has something to read at
-        // the very first point and no answer below is about a missing sample.
-        let mut values = Vec::new();
-        for (index, host) in ["a", "b"].into_iter().enumerate() {
-            for step in -2..=30 {
-                values.push(format!(
-                    "('{host}', {}, {})",
-                    step * STEP_MS,
-                    (step + 3) * 10 + index as i64
-                ));
-            }
-        }
         execute_all(
             &instance,
-            &format!(
-                "CREATE TABLE {TABLE} (host STRING, ts TIMESTAMP(3) TIME INDEX, val DOUBLE, \
-                 PRIMARY KEY(host)); INSERT INTO {TABLE} (host, ts, val) VALUES {}",
-                values.join(",")
-            ),
+            &native_window_fixture(TABLE, -7, 32),
             QueryContext::arc(),
         )
         .await;
         let scope = NativeWindowScope::current(TABLE);
 
-        // A plain selection and a range function: the first reads the one sample an instant
-        // selection lands on, the second a window of samples behind every point. Both look only
-        // backwards, which is what lets a completed subrange answer on its own.
+        // A plain selection and a range function: the first reads the one sample an instant selection
+        // lands on, the second a window of samples behind every point. Both look only backwards, which
+        // is what lets a completed chunk answer on its own.
         let mut executor = NativeWindowExecutor::new(instance.clone());
         for expression in [
             format!("sum by (host) ({TABLE})"),
@@ -17904,8 +17994,8 @@ mod native_window_cache_poc {
             let expression = expression.as_str();
             let before = executor.executions;
 
-            // 1. The whole range, asked for once on the native route: the rows every chunked run
-            //    below has to reproduce.
+            // 1. The statement, and the whole-statement answer every chunked run below reproduces at
+            //    its own timestamps.
             let statement =
                 native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
             let grid = native_statement_grid(&statement);
@@ -17914,49 +18004,66 @@ mod native_window_cache_poc {
                 GridSpec::try_from_range(0, RANGE_END_MS, STEP_MS).unwrap(),
                 "{expression}: the statement grid is the range at the statement's step"
             );
-            let expected = native_result_rows(
-                native_whole_range_answer(&instance, &observer, expression, &grid).await,
-            )
-            .await;
-            assert!(!expected.is_empty(), "{expression} answered no rows");
+            let identity = statement_identity(&statement);
+            assert_eq!(identity.start_ms, 0, "{expression}");
+            assert_eq!(identity.end_ms, RANGE_END_MS, "{expression}");
+            assert_eq!(identity.step_ms, STEP_MS, "{expression}");
             assert_eq!(
-                canonical_subranges(&grid).len(),
-                6,
-                "{expression}: the range is six canonical subranges"
+                identity.lookback_ms, LOOKBACK_MS,
+                "{expression}: the key names the whole statement"
+            );
+            let whole =
+                native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
+                    .await;
+            assert!(!whole.is_empty(), "{expression} answered no rows");
+            let chunks = canonical_chunks(&grid);
+            assert_eq!(
+                chunks.len(),
+                7,
+                "{expression}: the statement is seven canonical chunks"
+            );
+            // The chunks the cold and warm runs ask for: the six the range held before one more was
+            // asked for.
+            let covered = &chunks[..6];
+            let expected = rows_covered_by(&whole, covered);
+            assert!(!expected.is_empty(), "{expression}");
+            assert!(
+                expected.len() < whole.len(),
+                "{expression}: the chunks asked for cover the whole statement"
             );
 
-            // 2. Cold: every subrange of the range has to be executed natively.
+            // 2. Cold: every chunk asked for has to be planned and executed natively.
             let mut cache = NativeWindowCache::default();
             observer.clear();
             let cold = executor
-                .run(&mut cache, expression, &grid, &scope, LOOKBACK_MS, "host")
+                .run(&mut cache, &statement, covered, &scope, "host")
                 .await;
             assert_eq!(
                 cold.executed, 6,
-                "{expression}: one execution per canonical subrange"
+                "{expression}: one execution per canonical chunk"
             );
             assert_eq!(cold.served, 0, "{expression}: nothing was cached yet");
             assert_eq!(cache.len(), 6, "{expression}");
             assert_eq!(
                 cold.rows, expected,
-                "{expression}: the assembled subranges did not reproduce the whole range"
+                "{expression}: the assembled chunks did not reproduce the statement"
             );
             assert_eq!(executor.executions - before, cold.executed, "{expression}");
             assert_eq!(
                 observer.answering_node().as_deref(),
                 Some("FusedSeriesExec"),
-                "{expression}: the subranges did not answer natively"
+                "{expression}: the chunks did not answer natively"
             );
 
-            // 3. Warm: the same range again. Nothing is planned, nothing executes, and the rows are
-            //    still the whole range's.
+            // 3. Warm: the same chunks again. Nothing is planned, nothing executes, and the rows are
+            //    still the statement's.
             observer.clear();
             let warm = executor
-                .run(&mut cache, expression, &grid, &scope, LOOKBACK_MS, "host")
+                .run(&mut cache, &statement, covered, &scope, "host")
                 .await;
             assert_eq!(
                 warm.executed, 0,
-                "{expression}: a warm run executed a subrange"
+                "{expression}: a warm run executed a chunk"
             );
             assert_eq!(warm.served, 6, "{expression}");
             assert_eq!(warm.rows, expected, "{expression}");
@@ -17970,42 +18077,24 @@ mod native_window_cache_poc {
                 "{expression}: a warm run planned a statement"
             );
 
-            // 4. The end slides forward by one canonical subrange: the six subranges already cached
-            //    answer, and only the one the wider range newly covers executes.
-            let slid_statement =
-                native_range_statement(expression, 0, slid_end_ms, STEP_MS, LOOKBACK_MS);
-            let slid_grid = native_statement_grid(&slid_statement);
-            let fresh = native_result_rows(
-                native_whole_range_answer(&instance, &observer, expression, &slid_grid).await,
-            )
-            .await;
-            assert!(
-                fresh.len() > expected.len(),
-                "{expression}: the slid range does not cover more points"
-            );
+            // 4. One more chunk of the same statement: the six completed chunks answer, and only the
+            //    one newly asked for is planned and executed.
             observer.clear();
             let slid = executor
-                .run(
-                    &mut cache,
-                    expression,
-                    &slid_grid,
-                    &scope,
-                    LOOKBACK_MS,
-                    "host",
-                )
+                .run(&mut cache, &statement, &chunks, &scope, "host")
                 .await;
             assert_eq!(
                 slid.executed, 1,
-                "{expression}: only the new subrange executes"
+                "{expression}: only the newly asked chunk executes"
             );
             assert_eq!(
                 slid.served, 6,
-                "{expression}: the overlapping subranges are hits"
+                "{expression}: the chunks already asked for are hits"
             );
             assert_eq!(cache.len(), 7, "{expression}");
             assert_eq!(
-                slid.rows, fresh,
-                "{expression}: the slid range did not match a whole native run"
+                slid.rows, whole,
+                "{expression}: the widened run did not match the whole statement"
             );
             assert_eq!(
                 executor.executions - before,
@@ -18015,37 +18104,231 @@ mod native_window_cache_poc {
             assert_eq!(
                 observer.answering_node().as_deref(),
                 Some("FusedSeriesExec"),
-                "{expression}: the new subrange did not answer natively"
+                "{expression}: the newly asked chunk did not answer natively"
             );
 
-            // 5. The lookback is part of the answer, so the same range at another lookback misses
-            //    throughout and still answers the whole range's rows.
+            // 5. The statement's lookback is part of its identity, so the same range at another
+            //    lookback is another statement: every chunk misses, and the rows are still the ones
+            //    the chunks of the first statement answered.
+            let other_statement =
+                native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS * 2);
+            assert_ne!(
+                statement_identity(&other_statement),
+                statement_identity(&statement),
+                "{expression}: the lookback is outside the key"
+            );
             observer.clear();
             let other = executor
-                .run(
-                    &mut cache,
-                    expression,
-                    &grid,
-                    &scope,
-                    LOOKBACK_MS * 2,
-                    "host",
-                )
+                .run(&mut cache, &other_statement, covered, &scope, "host")
                 .await;
             assert_eq!(
                 other.executed, 6,
-                "{expression}: a lookback outside the key"
+                "{expression}: a statement outside the key"
             );
             assert_eq!(other.served, 0, "{expression}");
             assert_eq!(other.rows, expected, "{expression}");
         }
     }
 
-    /// The annotations a subrange's route reports are part of its answer: a hit replays them.
+    /// A chunk is planned from the whole statement, so every anchor resolves where the statement puts
+    /// it.
+    ///
+    /// `@ start()` and `@ end()` name the statement's bounds, not the chunk's: a plan that narrowed the
+    /// statement to the chunk would read another anchor and answer other rows. Each expression below is
+    /// asked for whole and chunk by chunk, and the chunked rows have to be the whole statement's rows at
+    /// the same timestamps. The same chunk asked for as a narrowed statement is read too, and has to
+    /// differ from them - which is what makes the first assertion evidence that the statement was kept
+    /// rather than a tautology.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_promql_statement_anchors_stay_on_the_statement() {
+        common_telemetry::init_default_ut_logging();
+        const TABLE: &str = "native_window_anchor";
+        const RANGE_END_MS: i64 = 150_000;
+
+        let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
+            "native_promql_window_anchors",
+        ))
+        .await;
+        let instance = standalone.fe_instance().clone();
+        execute_all(
+            &instance,
+            &native_window_fixture(TABLE, -4, 19),
+            QueryContext::arc(),
+        )
+        .await;
+        let scope = NativeWindowScope::current(TABLE);
+
+        let mut executor = NativeWindowExecutor::new(instance.clone());
+        for expression in [
+            format!("sum by (host) (rate({TABLE}[30s] @ end()))"),
+            format!("sum by (host) ({TABLE} @ start())"),
+        ] {
+            let expression = expression.as_str();
+            let statement =
+                native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
+            let grid = native_statement_grid(&statement);
+            let chunks = canonical_chunks(&grid);
+            assert_eq!(chunks.len(), 4, "{expression}: four canonical chunks");
+            let whole =
+                native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
+                    .await;
+            assert!(!whole.is_empty(), "{expression} answered no rows");
+
+            let mut cache = NativeWindowCache::default();
+            observer.clear();
+            let chunked = executor
+                .run(&mut cache, &statement, &chunks, &scope, "host")
+                .await;
+            assert_eq!(chunked.executed, chunks.len(), "{expression}");
+            assert_eq!(chunked.served, 0, "{expression}");
+            assert_eq!(
+                chunked.rows, whole,
+                "{expression}: the chunked answer is not the statement's"
+            );
+            assert_eq!(
+                cache.len(),
+                chunks.len(),
+                "{expression}: one entry per chunk"
+            );
+            assert_eq!(
+                observer.answering_node().as_deref(),
+                Some("FusedSeriesExec"),
+                "{expression}: the chunks did not answer natively"
+            );
+
+            // The chunk in the middle of the statement, answered once by the statement's plan and once
+            // by a statement narrowed to it: the anchor moves with the narrowed statement, so the two
+            // answers cannot be the same rows.
+            let middle = chunks[2];
+            let statement_rows = rows_covered_by(&whole, &[middle]);
+            assert!(!statement_rows.is_empty(), "{expression}");
+            assert_eq!(
+                rows_covered_by(&chunked.rows, &[middle]),
+                statement_rows,
+                "{expression}: the chunk did not answer the statement's rows"
+            );
+            let narrowed =
+                narrowed_statement_answer(&instance, expression, middle, LOOKBACK_MS, "host").await;
+            assert!(
+                !narrowed.is_empty(),
+                "{expression}: the narrowed statement answered no row, so nothing is compared"
+            );
+            assert_ne!(
+                narrowed, statement_rows,
+                "{expression}: a statement narrowed to the chunk answers the same rows, so an anchor \
+                 that moved with it would go unnoticed"
+            );
+        }
+    }
+
+    /// A chunk reads across its own boundary: what a point reads is the statement's window, and the
+    /// samples behind a chunk's first point are not cut at the chunk.
+    ///
+    /// `rate(m[60s])` reads a minute behind every point, so the first point of each chunk reads five
+    /// points of the chunk before it, out of a scan that a chunk's own grid bounds. `rate(m[40s:10s])`
+    /// nests a subquery, whose child grid is derived per chunk from the statement's grid, so a chunk
+    /// evaluates a subquery of its own. Both are asked for whole and chunk by chunk, and both answers
+    /// have to be the same rows at the same timestamps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_promql_chunks_read_across_their_boundary() {
+        common_telemetry::init_default_ut_logging();
+        const TABLE: &str = "native_window_boundary";
+        const RANGE_END_MS: i64 = 190_000;
+
+        let (standalone, observer) = native_test_instance(GreptimeDbStandaloneBuilder::new(
+            "native_promql_window_boundary",
+        ))
+        .await;
+        let instance = standalone.fe_instance().clone();
+        // The fixture starts seven steps before the range, so a window that reads a minute back from
+        // the statement's very first point still finds samples, and a window that reads across a chunk
+        // boundary finds the ones the chunk before it evaluated.
+        execute_all(
+            &instance,
+            &native_window_fixture(TABLE, -7, 25),
+            QueryContext::arc(),
+        )
+        .await;
+        let scope = NativeWindowScope::current(TABLE);
+
+        let mut executor = NativeWindowExecutor::new(instance.clone());
+        for expression in [
+            format!("sum by (host) (rate({TABLE}[60s]))"),
+            format!("sum by (host) (rate({TABLE}[40s:10s]))"),
+        ] {
+            let expression = expression.as_str();
+            let statement =
+                native_range_statement(expression, 0, RANGE_END_MS, STEP_MS, LOOKBACK_MS);
+            let grid = native_statement_grid(&statement);
+            let chunks = canonical_chunks(&grid);
+            assert_eq!(chunks.len(), 5, "{expression}: five canonical chunks");
+            let whole =
+                native_result_rows(whole_statement_answer(&instance, &observer, &statement).await)
+                    .await;
+            assert!(!whole.is_empty(), "{expression} answered no rows");
+
+            let mut cache = NativeWindowCache::default();
+            observer.clear();
+            let chunked = executor
+                .run(&mut cache, &statement, &chunks, &scope, "host")
+                .await;
+            assert_eq!(chunked.executed, chunks.len(), "{expression}");
+            assert_eq!(chunked.served, 0, "{expression}");
+            assert_eq!(
+                chunked.rows, whole,
+                "{expression}: the chunks did not reproduce the whole statement's rows"
+            );
+            assert_eq!(
+                observer.answering_node().as_deref(),
+                Some("FusedSeriesExec"),
+                "{expression}: the chunks did not answer natively"
+            );
+
+            // Every chunk's first point reads a window that reaches into the chunk before it, and
+            // the rows the chunk reports there are the whole statement's.
+            for chunk in &chunks {
+                assert_eq!(
+                    rows_covered_by(&chunked.rows, &[*chunk]),
+                    rows_covered_by(&whole, &[*chunk]),
+                    "{expression}: the chunk at {}ms did not answer the statement's rows",
+                    chunk.start_ms
+                );
+                let first_point = NativeChunk {
+                    start_ms: chunk.start_ms,
+                    step_ms: chunk.step_ms,
+                    len: 1,
+                };
+                assert!(
+                    !rows_covered_by(&whole, &[first_point]).is_empty(),
+                    "{expression}: the first point of the chunk at {}ms answered no row",
+                    chunk.start_ms
+                );
+            }
+
+            // The same chunks again answer from the cache, and the rows do not change.
+            observer.clear();
+            let warm = executor
+                .run(&mut cache, &statement, &chunks, &scope, "host")
+                .await;
+            assert_eq!(
+                warm.executed, 0,
+                "{expression}: a warm run executed a chunk"
+            );
+            assert_eq!(warm.served, chunks.len(), "{expression}");
+            assert_eq!(warm.rows, whole, "{expression}");
+            assert!(
+                observer.all_plans().is_empty(),
+                "{expression}: a warm run planned a statement"
+            );
+        }
+    }
+
+    /// The annotations a chunk's route reports are part of its answer: a hit replays them.
     ///
     /// The fixture is a counter histogram whose consecutive reset hints contradict, which makes
     /// `sum_over_time` warn on every window holding a pair of them.
     #[tokio::test(flavor = "multi_thread")]
-    async fn native_promql_cached_subrange_replays_annotations() {
+    async fn native_promql_cached_chunk_replays_annotations() {
         use api::greptime_proto::io::prometheus::write::v2::histogram::Count;
         use api::greptime_proto::io::prometheus::write::v2::{BucketSpan, Histogram};
         use axum::body::{Body, to_bytes};
@@ -18109,21 +18392,26 @@ mod native_window_cache_poc {
             to_bytes(response.into_body(), usize::MAX).await.unwrap()
         );
 
-        // A float answer over a range function that warns: the rows stay comparable, and the
-        // warning comes from the window the subrange evaluated.
+        // A float answer over a range function that warns: the rows stay comparable, and the warning
+        // comes from the window the chunk evaluated.
         let expression = format!("histogram_count(sum_over_time({METRIC}[30s]))");
         let expression = expression.as_str();
         let statement =
             native_range_statement(expression, 0, HIST_END_MS, HIST_STEP_MS, LOOKBACK_MS);
         let grid = native_statement_grid(&statement);
+        let chunks = canonical_chunks(&grid);
+        assert_eq!(
+            chunks.len(),
+            3,
+            "three canonical chunks of the histogram range"
+        );
         let expected = answer_rows(
-            &rows_batches(native_whole_range_answer(&instance, &observer, expression, &grid).await)
-                .await,
+            &rows_batches(whole_statement_answer(&instance, &observer, &statement).await).await,
             "job",
         );
         assert!(
             !expected.is_empty(),
-            "the warning-bearing range answered no rows"
+            "the warning-bearing statement answered no rows"
         );
         let scope = NativeWindowScope::current(METRIC);
 
@@ -18131,21 +18419,21 @@ mod native_window_cache_poc {
         let mut executor = NativeWindowExecutor::new(instance.clone());
         observer.clear();
         let cold = executor
-            .run(&mut cache, expression, &grid, &scope, LOOKBACK_MS, "job")
+            .run(&mut cache, &statement, &chunks, &scope, "job")
             .await;
         assert_eq!(
             cold.executed, 3,
-            "one execution per canonical subrange of the histogram range"
+            "one execution per canonical chunk of the histogram range"
         );
         assert_eq!(cold.served, 0);
         assert_eq!(
             cold.rows, expected,
-            "the assembled subranges did not reproduce the warning-bearing range"
+            "the assembled chunks did not reproduce the warning-bearing statement"
         );
         assert_eq!(
             cold.warnings.len(),
             1,
-            "one warning, not one per subrange: {:?}",
+            "one warning, not one per chunk: {:?}",
             cold.warnings
         );
         assert!(
@@ -18156,31 +18444,32 @@ mod native_window_cache_poc {
         assert_eq!(
             observer.answering_node().as_deref(),
             Some("FusedSeriesExec"),
-            "the warning-bearing subranges did not answer natively"
+            "the warning-bearing chunks did not answer natively"
         );
 
-        // The same statement asked for whole reports the same annotation: chunking reproduces it.
+        // The same statement planned as one chunk that covers its whole grid: a chunk of every point is
+        // the statement, so it reports what its own chunks report.
         let whole = executor
             .execute(
-                expression,
-                NativeSubrange {
+                &statement,
+                NativeChunk {
                     start_ms: 0,
-                    end_ms: HIST_END_MS,
+                    step_ms: HIST_STEP_MS,
+                    len: grid.spec().len,
                 },
-                HIST_STEP_MS,
-                LOOKBACK_MS,
             )
             .await;
         assert_eq!(
             whole.warnings, cold.warnings,
-            "a whole-range statement reports what its subranges report"
+            "a whole-statement chunk reports what the smaller chunks report"
         );
+        assert_eq!(answer_rows(&whole.batches, "job"), expected);
 
         observer.clear();
         let warm = executor
-            .run(&mut cache, expression, &grid, &scope, LOOKBACK_MS, "job")
+            .run(&mut cache, &statement, &chunks, &scope, "job")
             .await;
-        assert_eq!(warm.executed, 0, "a warm run executed a subrange");
+        assert_eq!(warm.executed, 0, "a warm run executed a chunk");
         assert_eq!(warm.served, 3);
         assert_eq!(warm.rows, expected);
         assert_eq!(
