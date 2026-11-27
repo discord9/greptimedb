@@ -150,7 +150,23 @@ fn parse_flow_name(
         }
         .fail();
     };
-    let obj_name = ParserContext::parse_table_name(flow_name, query_ctx.sql_dialect())
+    parse_flow_name_arg(flow_name, query_ctx)
+}
+
+/// Resolves the flow a `flow_backfill`/`flow_backfill_status` argument names.
+///
+/// The target is always parsed with the connection's own dialect, exactly as the
+/// entry points have always read it. The parser reads the fully double-quoted
+/// `<catalog>.<flow>` target an audit's advisory `ADMIN flow_backfill` command emits
+/// as two identifiers under every supported dialect, so those commands resolve to
+/// exactly the pair the audit resolved. A target the dialect parses only as a prefix
+/// of the given text is refused instead of being resolved with the rest silently
+/// dropped.
+pub fn parse_flow_name_arg(
+    flow_name: &str,
+    query_ctx: &QueryContextRef,
+) -> Result<(String, String)> {
+    let obj_name = ParserContext::parse_table_name_fully(flow_name, query_ctx.sql_dialect())
         .map_err(BoxedError::new)
         .context(ExecuteSnafu)?;
 
@@ -391,6 +407,54 @@ mod tests {
             err,
             common_query::error::Error::UnsupportedInputDataType { .. }
         ));
+    }
+
+    /// The advisory `ADMIN flow_backfill` command an audit emits names one fully
+    /// double-quoted `<catalog>.<flow>` target, and every supported connection
+    /// dialect resolves it to exactly the pair the audit resolved.
+    ///
+    /// A target a dialect parses only as a prefix of itself is refused instead of
+    /// being resolved with the rest silently dropped.
+    #[test]
+    fn test_parse_flow_name_reads_the_emitted_target_under_every_dialect() {
+        use session::context::QueryContextBuilder;
+        use sql::dialect::{MySqlDialect, PostgreSqlDialect};
+
+        let greptime = QueryContext::arc();
+        // The emitted target: identifier-quoted, so the flow's case survives.
+        assert_eq!(
+            parse_flow_name_arg("\"cat\".\"Orders\"", &greptime).unwrap(),
+            ("cat".to_string(), "Orders".to_string())
+        );
+        // A MySQL connection's dialect reads `"..."` as a string literal, but the
+        // pinned parser still takes a fully double-quoted target as two identifiers.
+        let mysql: QueryContextRef = QueryContextBuilder::default()
+            .sql_dialect(Arc::new(MySqlDialect {}))
+            .build()
+            .into();
+        assert_eq!(
+            parse_flow_name_arg("\"cat\".\"Orders\"", &mysql).unwrap(),
+            ("cat".to_string(), "Orders".to_string())
+        );
+        // PostgreSQL treats every non-ASCII character as an identifier part, so the
+        // combining accent stays inside the unquoted second component. The Greptime
+        // dialect stops that identifier at `cafe` and leaves the mark behind, which is
+        // refused rather than resolved as the truncated prefix.
+        let postgres: QueryContextRef = QueryContextBuilder::default()
+            .sql_dialect(Arc::new(PostgreSqlDialect {}))
+            .build()
+            .into();
+        assert_eq!(
+            parse_flow_name_arg("\"cat\".cafe\u{301}", &postgres).unwrap(),
+            ("cat".to_string(), "cafe\u{301}".to_string())
+        );
+        assert!(parse_flow_name_arg("\"cat\".cafe\u{301}", &greptime).is_err());
+        for dialect in [&greptime, &mysql, &postgres] {
+            assert!(
+                parse_flow_name_arg("\"cat\".\"Orders\" trailing", dialect).is_err(),
+                "a target that parses only as a prefix must be refused"
+            );
+        }
     }
 
     #[test]

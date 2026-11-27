@@ -126,6 +126,35 @@ impl ParserContext<'_> {
         Self::canonicalize_object_name(raw_table_name)
     }
 
+    /// [`Self::parse_table_name`] that also refuses a text the dialect parses only
+    /// as a prefix of itself.
+    ///
+    /// [`Self::parse_table_name`] reads one object name and stops at the first token
+    /// it cannot use, so `"a"."b" trailing` would otherwise resolve to `a.b` with the
+    /// rest silently dropped. The same parser setup is asked for the object name here
+    /// and has to be at its end afterwards.
+    pub fn parse_table_name_fully(sql: &str, dialect: &dyn Dialect) -> Result<ObjectName> {
+        let parser = Parser::new(dialect)
+            .with_options(ParserOptions::new().with_trailing_commas(true))
+            .try_with_sql(sql)
+            .context(SyntaxSnafu)?;
+        let mut context = ParserContext {
+            parser,
+            sql,
+            scheduled_time: None,
+        };
+        let name = context.intern_parse_table_name()?;
+        let trailing = context.parser.peek_token();
+        if trailing.token != Token::EOF {
+            return error::UnexpectedTokenSnafu {
+                expected: "the end of the table name",
+                actual: trailing.to_string(),
+            }
+            .fail();
+        }
+        Ok(name)
+    }
+
     pub fn parse_function(sql: &str, dialect: &dyn Dialect) -> Result<Expr> {
         let mut parser = Parser::new(dialect)
             .with_options(ParserOptions::new().with_trailing_commas(true))

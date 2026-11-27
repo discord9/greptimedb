@@ -34,3 +34,8 @@ pub mod utils;
 // Public for `admin_fn` expansions in downstream crates; the module stays private.
 #[doc(hidden)]
 pub use permission::ensure_admin_privilege;
+// Public so a downstream acceptance can resolve a flow-admin target through the very
+// parser `ADMIN flow_backfill` resolves its argument with; the module stays private.
+#[cfg(feature = "enterprise")]
+#[doc(hidden)]
+pub use backfill::parse_flow_name_arg;
