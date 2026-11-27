@@ -61,9 +61,8 @@ use crate::log_query::planner::LogQueryPlanner;
 use crate::optimizer::expr_depth;
 use crate::options::{NativePromqlExtension, ScheduledTimeExtension};
 use crate::parser::{DEFAULT_LOOKBACK_STRING, PromQuery, QueryLanguageParser, QueryStatement};
-use crate::promql::error::NativeRouteDeclinedSnafu;
+use crate::promql::error::UnsupportedNativeShapeSnafu;
 use crate::promql::planner::PromPlanner;
-use crate::promql::planner::native::take_decline_reason;
 use crate::query_engine::{DefaultPlanDecoder, QueryEngineState};
 use crate::range_select::plan_rewrite::RangePlanRewriter;
 use crate::{DfContextProviderAdapter, QueryEngineContext};
@@ -216,20 +215,16 @@ fn strips_only_tsid(plan: &LogicalPlan, inner: &LogicalPlan) -> bool {
     projected == stripped && projected.len() + 1 == inner.schema().fields().len()
 }
 
-/// The error a statement that asked for the native route is answered with when the route does not
-/// answer its shape.
+/// The error a statement that asked for the native route is answered with when this CTE cannot
+/// publish the route's own answer.
 ///
-/// The cause it names is the one the refusal recorded (see
-/// [`take_decline_reason`](crate::promql::planner::native::take_decline_reason)), so the answer
-/// says which shape of this statement the route does not serve rather than leaving the reader to
-/// infer it from a different plan. Planning reports it as a plan failure, like every other error it
-/// raises while planning.
-fn native_declined() -> crate::error::Error {
-    let declined = NativeRouteDeclinedSnafu {
-        reason: take_decline_reason().to_string(),
+/// Planning reports it as a plan failure, like every other error it raises while planning.
+fn native_unsupported() -> crate::error::Error {
+    let unsupported = UnsupportedNativeShapeSnafu {
+        reason: "unspecified",
     }
     .build();
-    QueryPlanSnafu.into_error(BoxedError::new(declined))
+    QueryPlanSnafu.into_error(BoxedError::new(unsupported))
 }
 
 /// Whether `plan` runs on the native fused-series route.
@@ -972,7 +967,7 @@ impl DfLogicalPlanner {
                     // reason it recorded instead of publishing a different plan under the CTE's
                     // name. A plan the route did answer carries its node, so an answer without one
                     // is a statement this CTE cannot be given by the route at all.
-                    return Err(native_declined());
+                    return Err(native_unsupported());
                 }
                 // What the CTE publishes is SQL-visible, and this route names and orders its output
                 // its own way, so its own schema cannot stand in for the existing planner's: plan
@@ -983,7 +978,7 @@ impl DfLogicalPlanner {
                 let existing = self.plan_pql(eval, query_ctx, false).await?;
                 match publish_legacy_schema(plan, &existing) {
                     Some(published) => Ok(published),
-                    None => Err(native_declined()),
+                    None => Err(native_unsupported()),
                 }
             }
             Tql::Explain(_) => UnimplementedSnafu {
@@ -1615,14 +1610,14 @@ mod tests {
     /// resolves from the same snapshot, so a stated value overrides the engine default in both
     /// directions instead of only ever turning the fallback on.
     #[tokio::test]
-    async fn test_plan_pql_declines_native_route_when_query_may_fall_back() {
+    async fn test_plan_pql_keeps_the_native_route_off_when_the_query_may_fall_back() {
         // (engine option, session variable, hint, native route admitted)
         for (engine, session, request, native) in [
             // Nothing asks for the fallback, so the route is planned as before.
             (false, None, None, true),
             (false, None, Some("false"), true),
             (false, Some(false), None, true),
-            // A per-query source turns the fallback on, so the route is declined.
+            // A per-query source turns the fallback on, so the route is refused.
             (false, Some(true), None, false),
             (false, None, Some("true"), false),
             (false, None, Some("TRUE"), false),
@@ -1783,7 +1778,7 @@ mod tests {
     }
 
     /// A query context that asks for the native route and states what a nameless selector may
-    /// discover; the default context declines discovery altogether.
+    /// discover; the default context refuses discovery altogether.
     fn native_query_ctx(scope: MetricDiscoveryScope) -> QueryContextRef {
         let mut ctx = (*QueryContext::arc()).clone();
         ctx.set_metric_discovery_scope(scope);

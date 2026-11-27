@@ -109,14 +109,13 @@ use crate::parser::{
     EXPLAIN_VERBOSE_NODE_NAME,
 };
 use crate::promql::error::{
-    CatalogSnafu, ColumnNotFoundSnafu, DataFusionPlanningSnafu, Error, ExpectRangeSelectorSnafu,
+    CatalogSnafu, ColumnNotFoundSnafu, DataFusionPlanningSnafu, ExpectRangeSelectorSnafu,
     FunctionInvalidArgumentSnafu, InvalidDestinationLabelNameSnafu, InvalidRegularExpressionSnafu,
     InvalidTimeRangeSnafu, MultiFieldsNotSupportedSnafu, MultipleMetricMatchersSnafu,
-    MultipleVectorSnafu, NativeRouteDeclinedSnafu, NoMetricMatcherSnafu,
-    RangeVectorInRangeQuerySnafu, Result, SubqueryTimestampOutOfRangeSnafu, TableNameNotFoundSnafu,
-    TimeIndexNotFoundSnafu, UnexpectedPlanExprSnafu, UnexpectedTokenSnafu, UnknownTableSnafu,
-    UnsupportedExprSnafu, UnsupportedMatcherOpSnafu, ValueNotFoundSnafu, ZeroRangeSelectorSnafu,
-    ZeroSubqueryStepSnafu,
+    MultipleVectorSnafu, NoMetricMatcherSnafu, RangeVectorInRangeQuerySnafu, Result,
+    SubqueryTimestampOutOfRangeSnafu, TableNameNotFoundSnafu, TimeIndexNotFoundSnafu,
+    UnexpectedPlanExprSnafu, UnexpectedTokenSnafu, UnknownTableSnafu, UnsupportedExprSnafu,
+    UnsupportedMatcherOpSnafu, ValueNotFoundSnafu, ZeroRangeSelectorSnafu, ZeroSubqueryStepSnafu,
 };
 use crate::promql::label_values::signed_millis_since_epoch;
 use crate::query_engine::QueryEngineState;
@@ -359,19 +358,6 @@ pub struct PromPlanner {
 
 type BinaryFieldPair<'a> = (&'a String, &'a String);
 
-/// The answer to a statement the native route was asked to plan and does not answer.
-///
-/// A query that asks for the native route gets that route or the cause of its refusal: the existing
-/// planner's answer for the same statement is a different plan, so it is not a quiet substitute for
-/// one. The cause is the one the refusal recorded (see
-/// [`native::take_decline_reason`](crate::promql::planner::native::take_decline_reason)).
-fn native_declined() -> Error {
-    NativeRouteDeclinedSnafu {
-        reason: native::take_decline_reason().to_string(),
-    }
-    .build()
-}
-
 impl PromPlanner {
     pub async fn stmt_to_plan(
         table_provider: DfTableSourceProvider,
@@ -386,8 +372,8 @@ impl PromPlanner {
     ///
     /// `native_fused` enables the native fused-series route: the statement is offered to
     /// [`compile`](crate::promql::native_compile::compile) first, and a shape that compiler does not
-    /// accept is reported as [`Error::NativeRouteDeclined`] naming the refusal's cause. With it off
-    /// the statement is planned by the existing path unchanged. See
+    /// accept is reported as `Error::UnsupportedNativeShape` naming the cause of the refusal. With
+    /// it off the statement is planned by the existing path unchanged. See
     /// [`Self::try_plan_native_fused`].
     pub async fn stmt_to_plan_with_annotations(
         table_provider: DfTableSourceProvider,
@@ -414,18 +400,11 @@ impl PromPlanner {
         // is the expression this route answers, and `prom_ext_expr_to_plan` offers that one instead
         // of the wrapper. Offering the wrapper here would refuse the statement for a cause that is
         // not the query's, so those roots go straight to the walk that dispatches them.
-        if !matches!(stmt.expr, PromExpr::Extension(_)) {
-            if let Some(plan) = planner
+        if planner.native_fused && !matches!(stmt.expr, PromExpr::Extension(_)) {
+            let plan = planner
                 .try_plan_native_fused(&stmt.expr, query_engine_state)
-                .await?
-            {
-                return planner.strip_tsid_column(plan);
-            }
-            // The query asked for this route and the route does not answer this shape: the cause of
-            // that refusal is the answer, not the existing planner's plan for the same statement.
-            if planner.native_fused {
-                return Err(native_declined());
-            }
+                .await?;
+            return planner.strip_tsid_column(plan);
         }
         let plan = planner
             .prom_root_expr_to_plan(&stmt.expr, query_engine_state)
@@ -1334,11 +1313,7 @@ impl PromPlanner {
                 .try_plan_native_fused(&PromExpr::Binary(binary_expr.clone()), query_engine_state)
                 .await;
             self.ctx = saved;
-            let Some(plan) = native? else {
-                // The query asked for this route and the route does not answer this binary: the
-                // cause of that refusal is the answer, not a plan from the existing path below.
-                return Err(native_declined());
-            };
+            let plan = native?;
             let mut fields = plan.schema().fields().iter();
             if let Some(time) = fields.next().map(|field| field.name().clone()) {
                 let values = fields
@@ -1550,7 +1525,7 @@ impl PromPlanner {
             }
             // both are columns. join them on time index
             (None, None) => {
-                // A declined binary uses the existing planner for its operands.
+                // A refused binary uses the existing planner for its operands.
                 let (mut left_input, mut left_context, mut right_input, mut right_context) = {
                     let left = self.prom_expr_to_plan(lhs, query_engine_state).await?;
                     let left_ctx = self.ctx.clone();
@@ -2637,21 +2612,17 @@ impl PromPlanner {
                 | EXPLAIN_NODE_NAME
                 | EXPLAIN_VERBOSE_NODE_NAME
         );
-        let native_plan = if publishes_a_plan {
-            self.try_plan_native_fused(&children[0], query_engine_state)
-                .await?
+        let native_plan = if publishes_a_plan && self.native_fused {
+            Some(
+                self.try_plan_native_fused(&children[0], query_engine_state)
+                    .await?,
+            )
         } else {
             None
         };
         let plan = match native_plan {
             Some(plan) => plan,
             None => {
-                // The query asked for this route and the route does not answer what the wrapper
-                // publishes: the cause of that refusal is the answer, not a plan of the existing
-                // path published under the same `EXPLAIN`/`ANALYZE`.
-                if publishes_a_plan && self.native_fused {
-                    return Err(native_declined());
-                }
                 self.prom_root_expr_to_plan(&children[0], query_engine_state)
                     .await?
             }
@@ -4539,7 +4510,7 @@ impl PromPlanner {
         Self::validate_label_name(&dst_label)?;
         // A destination label is a tag, and a tag is published under its own name. A value field
         // of that name would have to be dropped or renamed to make room, so report the collision
-        // before any no-op path below can silently decline the rewrite.
+        // before any no-op path below can silently refuse the rewrite.
         if self
             .ctx
             .field_columns
